@@ -1,0 +1,14 @@
+# Fully pinned development environment for Python 3.11+.
+# Regenerate deliberately when pyproject.toml dependencies change.
+build==1.2.2.post1
+click==8.1.8
+colorama==0.4.6; platform_system == "Windows"
+iniconfig==2.1.0
+packaging==25.0
+pluggy==1.6.0
+pygments==2.19.2
+pyproject-hooks==1.2.0
+pytest==8.4.1
+ruff==0.12.7
+setuptools==80.9.0
+wheel==0.45.1
