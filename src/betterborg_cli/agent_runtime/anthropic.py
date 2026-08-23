@@ -132,7 +132,13 @@ class UrllibAnthropicTransport:
                         raise AnthropicApiError("agent run cancelled")
             body = b"".join(chunks).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
-            body = error.read().decode("utf-8", errors="replace")
+            try:
+                body = error.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.HTTPException) as body_error:
+                raise AnthropicApiError(
+                    f"Anthropic HTTP {error.code} response body failed: {body_error}",
+                    status_code=error.code,
+                ) from body_error
             error_type, message = _api_error_details(body, str(error.reason))
             raise AnthropicApiError(
                 message,

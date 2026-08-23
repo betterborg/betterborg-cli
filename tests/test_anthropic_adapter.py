@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import time
+import urllib.error
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,26 @@ class FakeTransport:
         if callable(response):
             return response(cancel)
         return response
+
+
+class _ChunkedHttpResponse:
+    def __init__(self, chunks: list[bytes | Exception]) -> None:
+        self.chunks = iter(chunks)
+
+    def __enter__(self) -> _ChunkedHttpResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, _size: int = -1) -> bytes:
+        chunk = next(self.chunks)
+        if isinstance(chunk, Exception):
+            raise chunk
+        return chunk
+
+    def close(self) -> None:
+        return None
 
 
 def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
@@ -434,26 +455,64 @@ def test_mid_response_disconnect_retries_through_urllib_transport(
     ]
     request_bodies: list[bytes | None] = []
 
-    class Response:
-        def __init__(self, chunks: list[bytes | Exception]) -> None:
-            self.chunks = iter(chunks)
-
-        def __enter__(self) -> Response:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def read(self, _size: int) -> bytes:
-            chunk = next(self.chunks)
-            if isinstance(chunk, Exception):
-                raise chunk
-            return chunk
-
-    def urlopen(request: Any, *, timeout: float) -> Response:
+    def urlopen(request: Any, *, timeout: float) -> _ChunkedHttpResponse:
         assert timeout > 0
         request_bodies.append(request.data)
-        return Response(response_chunks.pop(0))
+        return _ChunkedHttpResponse(response_chunks.pop(0))
+
+    monkeypatch.setattr(
+        "betterborg_cli.agent_runtime.anthropic.urllib.request.urlopen",
+        urlopen,
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="key",
+        transport=UrllibAnthropicTransport(),
+        transient_backoff_seconds=0,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert len(request_bodies) == 2
+    assert request_bodies[0] == request_bodies[1]
+
+
+@pytest.mark.parametrize("status_code", [429, 529])
+def test_transient_http_error_retries_when_error_body_disconnects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    response_body = json.dumps(
+        _message(
+            [
+                {
+                    "type": "tool_use",
+                    "id": "submit",
+                    "name": "submit_result",
+                    "input": {"status": "completed", "version": "retry"},
+                }
+            ]
+        )
+    ).encode()
+    request_bodies: list[bytes | None] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _ChunkedHttpResponse:
+        assert timeout > 0
+        request_bodies.append(request.data)
+        if len(request_bodies) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status_code,
+                "transient error",
+                {},
+                _ChunkedHttpResponse(
+                    [http.client.IncompleteRead(b'{"type":"error"')]
+                ),
+            )
+        return _ChunkedHttpResponse([response_body, b""])
 
     monkeypatch.setattr(
         "betterborg_cli.agent_runtime.anthropic.urllib.request.urlopen",
