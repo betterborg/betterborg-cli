@@ -32,6 +32,15 @@ from betterborg_cli.agent_runtime import (
 )
 
 
+def _failed_response(message: str) -> dict[str, Any]:
+    return {
+        "id": "resp_failed",
+        "object": "response",
+        "status": "failed",
+        "error": {"code": "server_error", "message": message},
+    }
+
+
 def test_multi_turn_responses_use_openai_wire_format(tmp_path: Path) -> None:
     (tmp_path / "VERSION").write_text("1.2.3\n", encoding="utf-8")
     transport = FakeTransport(
@@ -104,6 +113,58 @@ def test_incomplete_response_does_not_dispatch_tool(tmp_path: Path) -> None:
     assert result.status == AgentStatus.FAILED
     assert "max_output_tokens" in (result.error or "")
     assert target.read_text(encoding="utf-8") == "unchanged\n"
+
+
+def test_transient_failed_response_retries_same_request(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            _failed_response("The server encountered an error."),
+            _response(
+                [
+                    _call(
+                        "submit_result",
+                        {"status": "completed", "version": "retry"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+    adapter = OpenAIAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="key",
+        transport=transport,
+        transient_backoff_seconds=0,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert transport.payloads[0] == transport.payloads[1]
+
+
+def test_transient_failed_response_exhaustion_is_resumable(
+    tmp_path: Path,
+) -> None:
+    adapter = OpenAIAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="key",
+        transport=FakeTransport(
+            [_failed_response("try again later") for _attempt in range(2)]
+        ),
+        transient_backoff_seconds=0,
+        transient_max_attempts=2,
+    )
+
+    result = adapter.run(_spec(tmp_path, resume_token="operation-123"))
+
+    assert result.status == AgentStatus.CANCELLED
+    assert result.retryable and result.resumable
+    assert result.resume_token == "operation-123"
+    assert result.attempts == 2
+    assert "transient retry exhausted" in (result.error or "")
+    assert "try again later" in (result.error or "")
 
 
 def test_mid_response_disconnect_retries_through_urllib_transport(

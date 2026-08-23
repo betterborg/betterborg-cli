@@ -256,7 +256,8 @@ class OpenAIAdapter:
                 request_payload["reasoning"] = {"effort": spec.effort}
             response = runtime.request(
                 lambda request_cancel, payload=request_payload: (
-                    self.transport.create_response(
+                    _create_response(
+                        self.transport,
                         payload,
                         api_key=key,
                         cancel=request_cancel,
@@ -272,6 +273,12 @@ class OpenAIAdapter:
                 return response
 
             runtime.append_log(response)
+            response_status = response.get("status")
+            if response_status == "failed":
+                return runtime.result(
+                    AgentStatus.FAILED,
+                    error=_incomplete_response_error(response, response_status),
+                )
             try:
                 output = _response_output(response)
                 response_usage = _response_usage(response)
@@ -284,7 +291,6 @@ class OpenAIAdapter:
                     AgentStatus.FAILED,
                     error="OpenAI response is missing an id",
                 )
-            response_status = response.get("status")
             if response_status != "completed":
                 return runtime.result(
                     AgentStatus.FAILED,
@@ -336,6 +342,33 @@ class OpenAIAdapter:
             AgentStatus.FAILED,
             error=f"OpenAI exceeded the {self.max_turns}-turn limit",
         )
+
+
+def _create_response(
+    transport: OpenAITransport,
+    payload: Mapping[str, Any],
+    *,
+    api_key: str,
+    cancel: CancellationToken | None,
+) -> Mapping[str, Any]:
+    response = transport.create_response(
+        payload,
+        api_key=api_key,
+        cancel=cancel,
+    )
+    if response.get("status") != "failed":
+        return response
+    detail = response.get("error")
+    if not isinstance(detail, Mapping):
+        return response
+    error_type = detail.get("type") or detail.get("code")
+    error = OpenAIApiError(
+        _incomplete_response_error(response, "failed"),
+        error_type=error_type if isinstance(error_type, str) else None,
+    )
+    if error.transient:
+        raise error
+    return response
 
 
 def _tool_definition(name: str) -> dict[str, Any]:
