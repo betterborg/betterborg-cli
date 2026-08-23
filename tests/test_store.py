@@ -102,7 +102,9 @@ def test_commit_failure_rolls_back_and_leaves_store_usable(tmp_path: Path) -> No
         assert store.list_operations(repository.id) == []
 
 
-def test_operation_ledger_rejects_mutation_and_deletion(tmp_path: Path) -> None:
+def test_operation_ledger_rejects_mutation_deletion_and_replacement(
+    tmp_path: Path,
+) -> None:
     repository = Repository(root=tmp_path / "repo")
     operation = Operation(repository_id=repository.id, kind="test.completed")
 
@@ -124,6 +126,25 @@ def test_operation_ledger_rejects_mutation_and_deletion(tmp_path: Path) -> None:
                 connection.execute(
                     "DELETE FROM operations WHERE id = ?",
                     (str(operation.id),),
+                )
+
+        assert store.list_operations(repository.id) == [operation]
+
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            with store.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO operations(
+                        id, repository_id, kind, payload, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(operation.id),
+                        str(repository.id),
+                        "changed",
+                        "{}",
+                        operation.created_at.isoformat(),
+                    ),
                 )
 
         assert store.list_operations(repository.id) == [operation]
