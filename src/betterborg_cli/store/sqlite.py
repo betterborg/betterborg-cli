@@ -66,8 +66,11 @@ class SqliteStore:
             self._transaction_depth += 1
             try:
                 yield self._connection
+                if depth == 0:
+                    self._connection.execute("COMMIT")
+                else:
+                    self._connection.execute(f"RELEASE {savepoint}")
             except BaseException:
-                self._transaction_depth -= 1
                 if depth == 0:
                     if self._connection.in_transaction:
                         self._connection.execute("ROLLBACK")
@@ -75,12 +78,8 @@ class SqliteStore:
                     self._connection.execute(f"ROLLBACK TO {savepoint}")
                     self._connection.execute(f"RELEASE {savepoint}")
                 raise
-            else:
+            finally:
                 self._transaction_depth -= 1
-                if depth == 0:
-                    self._connection.execute("COMMIT")
-                else:
-                    self._connection.execute(f"RELEASE {savepoint}")
 
     def close(self) -> None:
         """Close the store after all current access has completed."""

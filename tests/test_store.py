@@ -58,6 +58,25 @@ def test_reentrant_transaction_rolls_back_as_one_unit(tmp_path: Path) -> None:
         assert store.list_operations(repository.id) == []
 
 
+def test_commit_failure_rolls_back_and_leaves_store_usable(tmp_path: Path) -> None:
+    repository = Repository(root=tmp_path / "repo")
+    orphaned_operation = Operation(
+        repository_id=repository.id,
+        kind="test.orphaned",
+    )
+
+    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            with store.transaction() as connection:
+                connection.execute("PRAGMA defer_foreign_keys = ON")
+                store.append_operation(orphaned_operation)
+
+        store.add_repository(repository)
+
+        assert store.get_repository(repository.id) == repository
+        assert store.list_operations(repository.id) == []
+
+
 def test_operation_ledger_rejects_mutation(tmp_path: Path) -> None:
     repository = Repository(root=tmp_path / "repo")
     operation = Operation(repository_id=repository.id, kind="test.completed")
