@@ -56,20 +56,22 @@ def run_streamed(
             start_new_session=os.name == "posix",
         )
         try:
-            if process.stdin is not None:
-                try:
-                    process.stdin.write(stdin_text)
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-
+            input_text: str | None = stdin_text
             while True:
+                if cancel is not None and cancel.is_set():
+                    _terminate_process(process)
+                    return -1
                 try:
-                    return process.wait(timeout=0.1)
+                    process.communicate(input_text, timeout=0.1)
                 except subprocess.TimeoutExpired:
-                    if cancel is not None and cancel.is_set():
-                        _terminate_process(process)
-                        return -1
+                    # communicate() retains unwritten input after a timeout;
+                    # subsequent calls must resume without passing it again.
+                    input_text = None
+                    continue
+
+                if cancel is not None and cancel.is_set():
+                    return -1
+                return process.returncode
         finally:
             if process.stdin is not None and not process.stdin.closed:
                 process.stdin.close()
