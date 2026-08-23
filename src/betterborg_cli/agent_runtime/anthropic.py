@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -146,6 +147,11 @@ class UrllibAnthropicTransport:
         except TimeoutError as error:
             raise AnthropicApiError(
                 "Anthropic network request timed out",
+                error_type="api_error",
+            ) from error
+        except (OSError, http.client.HTTPException) as error:
+            raise AnthropicApiError(
+                f"Anthropic network response failed: {error}",
                 error_type="api_error",
             ) from error
         if cancel is not None and cancel.is_set():

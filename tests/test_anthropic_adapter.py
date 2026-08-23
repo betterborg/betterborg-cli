@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import threading
@@ -10,6 +11,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from betterborg_cli.agent_runtime import (
     AgentRunSpec,
@@ -20,6 +23,7 @@ from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     BillingMode,
     CancellationToken,
+    UrllibAnthropicTransport,
 )
 
 Response = Mapping[str, Any]
@@ -398,6 +402,76 @@ def test_transient_failure_retries_same_turn_and_then_completes(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert transport.payloads[0] == transport.payloads[1]
+
+
+@pytest.mark.parametrize(
+    "disconnect",
+    [
+        ConnectionResetError("connection reset during response"),
+        http.client.IncompleteRead(b'{"type":"message"'),
+    ],
+)
+def test_mid_response_disconnect_retries_through_urllib_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect: Exception,
+) -> None:
+    response_body = json.dumps(
+        _message(
+            [
+                {
+                    "type": "tool_use",
+                    "id": "submit",
+                    "name": "submit_result",
+                    "input": {"status": "completed", "version": "retry"},
+                }
+            ]
+        )
+    ).encode()
+    response_chunks: list[list[bytes | Exception]] = [
+        [disconnect],
+        [response_body, b""],
+    ]
+    request_bodies: list[bytes | None] = []
+
+    class Response:
+        def __init__(self, chunks: list[bytes | Exception]) -> None:
+            self.chunks = iter(chunks)
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            chunk = next(self.chunks)
+            if isinstance(chunk, Exception):
+                raise chunk
+            return chunk
+
+    def urlopen(request: Any, *, timeout: float) -> Response:
+        assert timeout > 0
+        request_bodies.append(request.data)
+        return Response(response_chunks.pop(0))
+
+    monkeypatch.setattr(
+        "betterborg_cli.agent_runtime.anthropic.urllib.request.urlopen",
+        urlopen,
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="key",
+        transport=UrllibAnthropicTransport(),
+        transient_backoff_seconds=0,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert len(request_bodies) == 2
+    assert request_bodies[0] == request_bodies[1]
 
 
 def test_transient_exhaustion_is_cancelled_and_resumable(tmp_path: Path) -> None:
