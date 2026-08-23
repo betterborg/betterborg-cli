@@ -1,5 +1,13 @@
 """Provider-neutral agent runtime contracts and helpers."""
 
+from betterborg_cli.agent_runtime.anthropic import (
+    ANTHROPIC_API_URL,
+    ANTHROPIC_API_VERSION,
+    AnthropicAdapter,
+    AnthropicApiError,
+    AnthropicTransport,
+    UrllibAnthropicTransport,
+)
 from betterborg_cli.agent_runtime.api_tools import (
     ApiAgentRole,
     ApiToolError,
@@ -41,6 +49,8 @@ from betterborg_cli.agent_runtime.structured import (
 __all__ = [
     "DEFAULT_TRANSIENT_BACKOFF_SECONDS",
     "DEFAULT_TRANSIENT_MAX_ATTEMPTS",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_API_VERSION",
     "AgentAdapter",
     "AgentArtifact",
     "AgentCapabilities",
@@ -48,6 +58,9 @@ __all__ = [
     "AgentRunSpec",
     "AgentStatus",
     "AgentUsage",
+    "AnthropicAdapter",
+    "AnthropicApiError",
+    "AnthropicTransport",
     "ApiAgentRole",
     "ApiToolError",
     "BillingMode",
@@ -62,6 +75,7 @@ __all__ = [
     "StructuredResultError",
     "SearchMatch",
     "ToolGrantError",
+    "UrllibAnthropicTransport",
     "combine_agent_usage",
     "extract_json",
     "extract_structured_result",
