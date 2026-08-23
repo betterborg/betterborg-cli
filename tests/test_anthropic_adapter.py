@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +79,7 @@ def _message(
     output_tokens: int = 4,
     cache_read: int = 0,
     cache_write: int = 0,
+    stop_reason: str = "tool_use",
 ) -> dict[str, Any]:
     return {
         "id": "msg_test",
@@ -83,7 +87,7 @@ def _message(
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": "tool_use",
+        "stop_reason": stop_reason,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -233,6 +237,130 @@ def test_cancellation_after_in_flight_response_wins(tmp_path: Path) -> None:
     assert result.resumable
     assert result.attempts == 1
     assert not (tmp_path / "result.json").exists()
+
+
+def test_cancellation_interrupts_blocked_transport(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def block_request(_cancel: CancellationToken | None) -> Response:
+        started.set()
+        release.wait()
+        return _message([])
+
+    cancel = CancellationToken()
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="key",
+        transport=FakeTransport([block_request]),
+    )
+
+    def cancel_when_started() -> None:
+        assert started.wait(1)
+        cancel.cancel()
+
+    canceller = threading.Thread(target=cancel_when_started)
+    canceller.start()
+    before = time.monotonic()
+    try:
+        result = adapter.run(_spec(tmp_path), cancel=cancel)
+    finally:
+        release.set()
+        canceller.join()
+
+    assert time.monotonic() - before < 1
+    assert result.status == AgentStatus.CANCELLED
+    assert result.resumable
+
+
+def test_cancellation_terminates_in_flight_command(tmp_path: Path) -> None:
+    started_path = tmp_path / "command-started"
+    cancel = CancellationToken()
+    transport = FakeTransport(
+        [
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "command",
+                        "name": "run_command",
+                        "input": {
+                            "argv": [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "from pathlib import Path; import time; "
+                                    "Path('command-started').write_text('yes'); "
+                                    "time.sleep(3)"
+                                ),
+                            ]
+                        },
+                    }
+                ]
+            )
+        ]
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.CODING,
+        api_key="key",
+        workspace_trusted=True,
+        transport=transport,
+    )
+
+    def cancel_when_started() -> None:
+        deadline = time.monotonic() + 1
+        while not started_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started_path.exists()
+        cancel.cancel()
+
+    canceller = threading.Thread(target=cancel_when_started)
+    canceller.start()
+    before = time.monotonic()
+    result = adapter.run(_spec(tmp_path), cancel=cancel)
+    canceller.join()
+
+    assert time.monotonic() - before < 2
+    assert result.status == AgentStatus.CANCELLED
+    assert result.resumable
+    assert len(transport.payloads) == 1
+
+
+def test_truncated_tool_response_does_not_dispatch_tool(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("unchanged\n", encoding="utf-8")
+    transport = FakeTransport(
+        [
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "patch",
+                        "name": "apply_patch",
+                        "input": {
+                            "patch": (
+                                "*** Begin Patch\n"
+                                "*** Delete File: target.txt\n"
+                                "*** End Patch"
+                            )
+                        },
+                    }
+                ],
+                stop_reason="max_tokens",
+            )
+        ]
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.CODING,
+        api_key="key",
+        transport=transport,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.FAILED
+    assert "without a tool_use stop reason (max_tokens)" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "unchanged\n"
 
 
 def test_transient_failure_retries_same_turn_and_then_completes(

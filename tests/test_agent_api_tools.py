@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     ApiToolError,
+    CancellationToken,
     ContainedApiTools,
     PathContainmentError,
     ToolGrantError,
@@ -164,6 +167,44 @@ def test_run_command_treats_shell_metacharacters_as_literal_argv(
     assert result.returncode == 0
     assert result.stdout == f"{injected}\n"
     assert not (tmp_path / "command-injection").exists()
+
+
+def test_run_command_terminates_when_cancelled(tmp_path: Path) -> None:
+    tools = ContainedApiTools(
+        tmp_path,
+        ApiAgentRole.CODING,
+        workspace_trusted=True,
+    )
+    started = tmp_path / "started"
+    finished = tmp_path / "finished"
+    cancel = CancellationToken()
+
+    def cancel_when_started() -> None:
+        deadline = time.monotonic() + 1
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists()
+        cancel.cancel()
+
+    canceller = threading.Thread(target=cancel_when_started)
+    canceller.start()
+    result = tools.run_command(
+        (
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import time; "
+                "Path('started').write_text('yes'); time.sleep(3); "
+                "Path('finished').write_text('no')"
+            ),
+        ),
+        cancel=cancel,
+    )
+    canceller.join()
+
+    assert result.returncode == -1
+    assert started.exists()
+    assert not finished.exists()
 
 
 def test_patch_validates_every_path_before_writing(tmp_path: Path) -> None:

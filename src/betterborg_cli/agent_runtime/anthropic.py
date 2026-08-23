@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,6 +42,7 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 _PROVIDER = "anthropic"
 _SUBMIT_TOOL = "submit_result"
+_HTTP_TIMEOUT_SECONDS = 60.0
 _TRANSIENT_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _TRANSIENT_ERROR_TYPES = frozenset(
     {"api_error", "overloaded_error", "rate_limit_error"}
@@ -118,8 +120,16 @@ class UrllibAnthropicTransport:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request) as response:
-                body = response.read().decode("utf-8", errors="replace")
+            chunks: list[bytes] = []
+            with urllib.request.urlopen(
+                request,
+                timeout=_HTTP_TIMEOUT_SECONDS,
+            ) as response:
+                while chunk := response.read(64 * 1024):
+                    chunks.append(chunk)
+                    if cancel is not None and cancel.is_set():
+                        raise AnthropicApiError("agent run cancelled")
+            body = b"".join(chunks).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
             error_type, message = _api_error_details(body, str(error.reason))
@@ -131,6 +141,11 @@ class UrllibAnthropicTransport:
         except urllib.error.URLError as error:
             raise AnthropicApiError(
                 f"Anthropic network error: {error.reason}",
+                error_type="api_error",
+            ) from error
+        except TimeoutError as error:
+            raise AnthropicApiError(
+                "Anthropic network request timed out",
                 error_type="api_error",
             ) from error
         if cancel is not None and cancel.is_set():
@@ -274,22 +289,51 @@ class AnthropicAdapter:
                 payload: Mapping[str, Any] = request_payload,
                 state: _RequestState = request_state,
             ) -> int:
+                state.response = None
                 state.error = None
-                if cancel is not None and cancel.is_set():
-                    return -1
-                try:
-                    state.response = self.transport.create_message(
-                        payload,
-                        api_key=key,
-                        cancel=cancel,
+                if cancel is None:
+                    try:
+                        state.response = self.transport.create_message(
+                            payload,
+                            api_key=key,
+                            cancel=None,
+                        )
+                    except Exception as error:
+                        state.error = error
+                else:
+                    if cancel.is_set():
+                        return -1
+                    completed = threading.Event()
+
+                    def send_request() -> None:
+                        try:
+                            state.response = self.transport.create_message(
+                                payload,
+                                api_key=key,
+                                cancel=cancel,
+                            )
+                        except Exception as error:
+                            state.error = error
+                        finally:
+                            completed.set()
+
+                    threading.Thread(
+                        target=send_request,
+                        name="betterborg-anthropic-request",
+                        daemon=True,
+                    ).start()
+                    while not completed.wait(0.05):
+                        if cancel.is_set():
+                            return -1
+                    if cancel.is_set():
+                        return -1
+                if state.error is not None:
+                    _append_log(
+                        spec.log_path,
+                        {"error": _redact(str(state.error), key)},
                     )
-                except AnthropicApiError as error:
-                    state.error = error
-                    _append_log(spec.log_path, {"error": _redact(str(error), key)})
-                    return error.status_code or 1
-                except Exception as error:
-                    state.error = error
-                    _append_log(spec.log_path, {"error": _redact(str(error), key)})
+                    if isinstance(state.error, AnthropicApiError):
+                        return state.error.status_code or 1
                     return 1
                 return 0
 
@@ -337,6 +381,15 @@ class AnthropicAdapter:
                 model = response_model
 
             tool_uses = [block for block in content if block.get("type") == "tool_use"]
+            stop_reason = response.get("stop_reason")
+            if tool_uses and stop_reason != "tool_use":
+                return result(
+                    AgentStatus.FAILED,
+                    error=(
+                        "Anthropic returned tool calls without a tool_use "
+                        f"stop reason ({stop_reason or 'missing'})"
+                    ),
+                )
             submissions = [
                 block for block in tool_uses if block.get("name") == _SUBMIT_TOOL
             ]
@@ -372,18 +425,38 @@ class AnthropicAdapter:
                 )
 
             if not tool_uses:
-                stop_reason = response.get("stop_reason", "unknown")
                 return result(
                     AgentStatus.FAILED,
-                    error=f"Anthropic ended without submit_result ({stop_reason})",
+                    error=(
+                        "Anthropic ended without submit_result "
+                        f"({stop_reason or 'unknown'})"
+                    ),
                 )
             messages.append({"role": "assistant", "content": content})
-            try:
-                tool_results = [
-                    _execute_tool_use(block, tools, allowed) for block in tool_uses
-                ]
-            except AnthropicApiError as error:
-                return result(AgentStatus.FAILED, error=str(error))
+            tool_results: list[dict[str, Any]] = []
+            for block in tool_uses:
+                if cancel is not None and cancel.is_set():
+                    return result(
+                        AgentStatus.CANCELLED,
+                        error="agent run cancelled",
+                        retryable=True,
+                    )
+                try:
+                    tool_result = _execute_tool_use(
+                        block,
+                        tools,
+                        allowed,
+                        cancel=cancel,
+                    )
+                except AnthropicApiError as error:
+                    return result(AgentStatus.FAILED, error=str(error))
+                if cancel is not None and cancel.is_set():
+                    return result(
+                        AgentStatus.CANCELLED,
+                        error="agent run cancelled",
+                        retryable=True,
+                    )
+                tool_results.append(tool_result)
             messages.append({"role": "user", "content": tool_results})
 
         return result(
@@ -468,6 +541,8 @@ def _execute_tool_use(
     block: Mapping[str, Any],
     tools: ContainedApiTools,
     allowed: frozenset[str],
+    *,
+    cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
     tool_id = block.get("id")
     name = block.get("name")
@@ -493,7 +568,7 @@ def _execute_tool_use(
         elif name == "apply_patch":
             value = {"changed_files": list(tools.apply_patch(**arguments))}
         else:
-            value = asdict(tools.run_command(**arguments))
+            value = asdict(tools.run_command(**arguments, cancel=cancel))
         result["content"] = json.dumps(value, sort_keys=True)
     except Exception as error:
         result.update(content=str(error), is_error=True)
