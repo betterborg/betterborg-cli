@@ -472,3 +472,80 @@ def test_credentials_are_redacted_from_errors_and_logs(tmp_path: Path) -> None:
     assert credential not in log
     assert "[REDACTED]" in (result.error or "")
     assert "[REDACTED]" in log
+
+
+def test_credentials_are_redacted_before_tool_results_reach_model(
+    tmp_path: Path,
+) -> None:
+    credential = "sk-ant-api03-tool-output-secret"
+    (tmp_path / "credential.txt").write_text(credential, encoding="utf-8")
+    transport = FakeTransport(
+        [
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "read_credential",
+                        "name": "read_file",
+                        "input": {"path": "credential.txt"},
+                    }
+                ]
+            ),
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "submit",
+                        "name": "submit_result",
+                        "input": {"status": "completed", "version": "safe"},
+                    }
+                ]
+            ),
+        ]
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key=credential,
+        transport=transport,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    tool_result = transport.payloads[1]["messages"][-1]["content"][0]
+    assert result.status == AgentStatus.COMPLETED
+    assert credential not in tool_result["content"]
+    assert json.loads(tool_result["content"]) == {"content": "[REDACTED]"}
+
+
+def test_credentials_are_redacted_from_completed_payload(tmp_path: Path) -> None:
+    credential = "sk-ant-api03-submitted-secret"
+    transport = FakeTransport(
+        [
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "submit",
+                        "name": "submit_result",
+                        "input": {
+                            "status": "completed",
+                            "version": credential,
+                        },
+                    }
+                ]
+            )
+        ]
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key=credential,
+        transport=transport,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    persisted = (tmp_path / "result.json").read_text(encoding="utf-8")
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "[REDACTED]"}
+    assert credential not in persisted
+    assert json.loads(persisted) == result.payload

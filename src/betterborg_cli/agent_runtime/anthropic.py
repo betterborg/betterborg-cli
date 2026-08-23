@@ -405,7 +405,10 @@ class AnthropicAdapter:
                         AgentStatus.FAILED,
                         error="submit_result input must be an object",
                     )
-                payload = dict(candidate)
+                payload = cast(
+                    dict[str, Any],
+                    _redact_value(dict(candidate), key),
+                )
                 try:
                     validate_structured_result(payload, spec.schema)
                 except StructuredResultError as error:
@@ -446,6 +449,7 @@ class AnthropicAdapter:
                         block,
                         tools,
                         allowed,
+                        api_key=key,
                         cancel=cancel,
                     )
                 except AnthropicApiError as error:
@@ -542,6 +546,7 @@ def _execute_tool_use(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
+    api_key: str | None,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
     tool_id = block.get("id")
@@ -550,12 +555,16 @@ def _execute_tool_use(
     if not isinstance(tool_id, str) or not tool_id:
         raise AnthropicApiError("Anthropic tool call is missing an id")
     result: dict[str, Any] = {"type": "tool_result", "tool_use_id": tool_id}
+
+    def redacted_result() -> dict[str, Any]:
+        return cast(dict[str, Any], _redact_value(result, api_key))
+
     if not isinstance(name, str) or name not in allowed:
         result.update(content=f"tool is not allowed: {name}", is_error=True)
-        return result
+        return redacted_result()
     if not isinstance(arguments, Mapping):
         result.update(content="tool input must be an object", is_error=True)
-        return result
+        return redacted_result()
     try:
         if name == "list_files":
             value: Any = {"files": list(tools.list_files(**arguments))}
@@ -572,7 +581,7 @@ def _execute_tool_use(
         result["content"] = json.dumps(value, sort_keys=True)
     except Exception as error:
         result.update(content=str(error), is_error=True)
-    return result
+    return redacted_result()
 
 
 def _response_content(response: Mapping[str, Any]) -> list[dict[str, Any]]:
