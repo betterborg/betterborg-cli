@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -51,15 +50,10 @@ def _envelope(
     return json.dumps(payload)
 
 
-def _unpack_invocation(
-    command: Sequence[str], stdin_text: str
-) -> tuple[list[str], str, str]:
-    assert command[:2] == ["sh", "-c"]
-    assert command[3] == "betterborg-claude-system-prompt"
-    assert '--system-prompt-file "$prompt_file"' in command[2]
-    encoded_size = int(command[4])
-    system_prompt = base64.b64decode(stdin_text[:encoded_size]).decode()
-    return list(command[5:]), system_prompt, stdin_text[encoded_size:]
+def _stream(*events: str | Mapping[str, Any]) -> str:
+    return "\n".join(
+        event if isinstance(event, str) else json.dumps(event) for event in events
+    )
 
 
 @pytest.mark.parametrize("role", list(ApiAgentRole))
@@ -87,18 +81,30 @@ def test_native_command_validates_and_persists_result_metadata(
         cancel: CancellationToken | None,
         env: Mapping[str, str] | None,
     ) -> int:
-        captured.update(command=list(command), cwd=cwd, stdin=stdin_text, env=env)
+        prompt_path = Path(command[-1])
+        captured.update(
+            command=list(command),
+            cwd=cwd,
+            stdin=stdin_text,
+            env=env,
+            system_prompt=prompt_path.read_text(encoding="utf-8"),
+            prompt_path=prompt_path,
+        )
         log_path.write_text(
-            _envelope(
-                {"status": "completed", "version": "1.2.3"},
-                usage={
-                    "input_tokens": 20,
-                    "output_tokens": 5,
-                    "cache_read_input_tokens": 7,
-                    "cache_creation_input_tokens": 2,
-                },
-                cost=0.25,
-                turns=3,
+            _stream(
+                {"type": "system", "subtype": "init", "session_id": "test"},
+                {"type": "assistant", "message": {"content": [{"type": "text"}]}},
+                _envelope(
+                    {"status": "completed", "version": "1.2.3"},
+                    usage={
+                        "input_tokens": 20,
+                        "output_tokens": 5,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 2,
+                    },
+                    cost=0.25,
+                    turns=3,
+                ),
             ),
             encoding="utf-8",
         )
@@ -120,14 +126,14 @@ def test_native_command_validates_and_persists_result_metadata(
 
     result = adapter.run(spec)
 
-    command, system_prompt, user_prompt = _unpack_invocation(
-        captured["command"], captured["stdin"]
-    )
+    command = captured["command"]
+    system_prompt = captured["system_prompt"]
     assert command == [
         "claude-custom",
         "-p",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--model",
         "claude-model-override",
         "--effort",
@@ -135,12 +141,15 @@ def test_native_command_validates_and_persists_result_metadata(
         "--dangerously-skip-permissions",
         "--allowed-tools",
         "Read,Edit",
+        "--system-prompt-file",
+        str(captured["prompt_path"]),
     ]
     assert captured["cwd"] == tmp_path
     assert captured["env"]["BETTERBORG_TEST_ENV"] == "present"
     assert "JSON Schema" in system_prompt
     assert '"version"' in system_prompt
-    assert user_prompt == spec.user_prompt
+    assert captured["stdin"] == spec.user_prompt
+    assert not captured["prompt_path"].exists()
     assert result.status == AgentStatus.COMPLETED
     assert result.provider == "claude"
     assert result.model == "claude-model-override"
@@ -246,6 +255,33 @@ def test_transient_error_retries_same_native_invocation(tmp_path: Path) -> None:
     assert calls[0] == calls[1]
 
 
+def test_process_spawn_failure_returns_failed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_spawn(*_args: Any, **_kwargs: Any) -> None:
+        raise FileNotFoundError("configured executable disappeared")
+
+    monkeypatch.setattr(
+        "betterborg_cli.agent_runtime.claude.shutil.which",
+        lambda _binary: "/installed/claude-custom",
+    )
+    monkeypatch.setattr(
+        "betterborg_cli.agent_runtime.process.subprocess.Popen",
+        fail_spawn,
+    )
+
+    result = ClaudeAdapter(ApiAgentRole.CODING, binary="claude-custom").run(
+        claude_spec(tmp_path)
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert result.attempts == 1
+    assert result.exit_code is None
+    assert "unable to start Claude process" in (result.error or "")
+    assert "configured executable disappeared" in (result.error or "")
+
+
 def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
     def runner(
         _command: Sequence[str],
@@ -275,18 +311,15 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
     assert "transient retry exhausted" in (result.error or "")
 
 
-def test_transcript_array_and_prose_wrapped_result_are_supported(
+def test_stream_json_and_prose_wrapped_result_are_supported(
     tmp_path: Path,
 ) -> None:
-    transcript = json.dumps(
-        [
-            {"type": "system", "subtype": "init"},
-            json.loads(
-                _envelope(
-                    'Result:\n```json\n{"status":"completed","version":"2.x"}\n```'
-                )
-            ),
-        ]
+    transcript = _stream(
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": []}},
+        _envelope(
+            'Result:\n```json\n{"status":"completed","version":"2.x"}\n```'
+        ),
     )
 
     def runner(

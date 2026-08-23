@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import shutil
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -50,16 +50,6 @@ Your response MUST be a single JSON object matching this JSON Schema:
 Do not wrap the JSON in prose. Do not include any text before or after the
 JSON object.
 """.strip()
-_SYSTEM_PROMPT_WRAPPER_SENTINEL = "betterborg-claude-system-prompt"
-_SYSTEM_PROMPT_WRAPPER_SCRIPT = """set -eu
-encoded_size=$1
-shift
-prompt_file=$(mktemp "${TMPDIR:-/tmp}/betterborg-claude-system.XXXXXX")
-cleanup() { rm -f -- "$prompt_file"; }
-trap cleanup EXIT HUP INT TERM
-dd iflag=fullblock bs="$encoded_size" count=1 status=none | base64 -d > "$prompt_file"
-"$@" --system-prompt-file "$prompt_file"
-"""
 
 
 @dataclass(slots=True)
@@ -132,7 +122,8 @@ class ClaudeAdapter:
             self.binary,
             "-p",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--model",
             spec.model,
         ]
@@ -141,19 +132,41 @@ class ClaudeAdapter:
         claude_command.append("--dangerously-skip-permissions")
         if spec.allowed_tools:
             claude_command.extend(("--allowed-tools", ",".join(spec.allowed_tools)))
-        command, stdin_text = _command_and_stdin(
-            claude_command,
-            system_prompt=system_prompt,
-            user_prompt=spec.user_prompt,
-        )
+        try:
+            system_prompt_path = _write_system_prompt(
+                spec.log_path.parent, system_prompt
+            )
+        except OSError as error:
+            return self._result(
+                spec,
+                start,
+                AgentStatus.FAILED,
+                error=f"unable to prepare Claude process: {error}",
+            )
+        claude_command.extend(("--system-prompt-file", str(system_prompt_path)))
+        try:
+            return self._run_native(spec, start, claude_command, cancel)
+        finally:
+            system_prompt_path.unlink(missing_ok=True)
+
+    def _run_native(
+        self,
+        spec: AgentRunSpec,
+        start: float,
+        command: list[str],
+        cancel: CancellationToken | None,
+    ) -> AgentResult:
         environment = {**os.environ, **spec.env}
         attempt_usage: list[AgentUsage | None] = []
+        attempts = 0
 
         def run_once() -> int:
+            nonlocal attempts
+            attempts += 1
             exit_code = self.proc_runner(
                 command,
                 spec.cwd,
-                stdin_text,
+                spec.user_prompt,
                 spec.log_path,
                 cancel,
                 environment,
@@ -161,16 +174,25 @@ class ClaudeAdapter:
             attempt_usage.append(_extract_usage(spec.log_path))
             return exit_code
 
-        outcome = run_with_transient_retry(
-            run_once,
-            lambda exit_code: _classify_transient_error(
-                spec.log_path,
-                allow_text_fallback=exit_code != 0,
-            ),
-            cancel=cancel,
-            backoff_seconds=self.transient_backoff_seconds,
-            max_attempts=self.transient_max_attempts,
-        )
+        try:
+            outcome = run_with_transient_retry(
+                run_once,
+                lambda exit_code: _classify_transient_error(
+                    spec.log_path,
+                    allow_text_fallback=exit_code != 0,
+                ),
+                cancel=cancel,
+                backoff_seconds=self.transient_backoff_seconds,
+                max_attempts=self.transient_max_attempts,
+            )
+        except OSError as error:
+            return self._result(
+                spec,
+                start,
+                AgentStatus.FAILED,
+                error=f"unable to start Claude process: {error}",
+                attempts=attempts,
+            )
         usage = combine_agent_usage(attempt_usage)
         if outcome.cancelled or (cancel is not None and cancel.is_set()):
             return self._cancelled(
@@ -319,40 +341,48 @@ class ClaudeAdapter:
         )
 
 
-def _command_and_stdin(
-    claude_command: list[str],
-    *,
-    system_prompt: str,
-    user_prompt: str,
-) -> tuple[list[str], str]:
-    """Pass an arbitrarily large system prompt through a transient file."""
-    encoded_prompt = base64.b64encode(system_prompt.encode()).decode("ascii")
-    return (
-        [
-            "sh",
-            "-c",
-            _SYSTEM_PROMPT_WRAPPER_SCRIPT,
-            _SYSTEM_PROMPT_WRAPPER_SENTINEL,
-            str(len(encoded_prompt)),
-            *claude_command,
-        ],
-        encoded_prompt + user_prompt,
+def _write_system_prompt(directory: Path, system_prompt: str) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        dir=directory,
+        prefix=".betterborg-claude-system-",
+        suffix=".txt",
+        text=True,
     )
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as prompt_file:
+            prompt_file.write(system_prompt)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def _result_envelope(log_path: Path) -> dict[str, Any] | None:
     if not log_path.exists() or log_path.stat().st_size == 0:
         return None
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    parsed_objects: list[dict[str, Any]] = []
     try:
-        parsed = extract_json(log_path.read_text(encoding="utf-8", errors="replace"))
-    except StructuredResultError:
-        return None
-    if isinstance(parsed, dict):
-        return parsed
-    for item in reversed(parsed):
-        if isinstance(item, dict) and item.get("type") == "result":
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        for line in text.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                parsed_objects.append(event)
+    else:
+        if isinstance(parsed, dict):
+            parsed_objects.append(parsed)
+        elif isinstance(parsed, list):
+            parsed_objects.extend(item for item in parsed if isinstance(item, dict))
+
+    for item in reversed(parsed_objects):
+        if item.get("type") == "result":
             return item
-    return next((item for item in reversed(parsed) if isinstance(item, dict)), None)
+    return parsed_objects[-1] if parsed_objects else None
 
 
 def _classify_transient_error(
