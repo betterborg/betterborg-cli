@@ -42,6 +42,9 @@ version = { attr = "betterborg_cli.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+betterborg_cli = ["store/migrations/*.sql"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
