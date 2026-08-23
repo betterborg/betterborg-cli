@@ -1,5 +1,14 @@
 """Provider-neutral agent runtime contracts and helpers."""
 
+from betterborg_cli.agent_runtime.api_tools import (
+    ApiAgentRole,
+    ApiToolError,
+    CommandResult,
+    ContainedApiTools,
+    PathContainmentError,
+    SearchMatch,
+    ToolGrantError,
+)
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentArtifact,
@@ -39,13 +48,20 @@ __all__ = [
     "AgentRunSpec",
     "AgentStatus",
     "AgentUsage",
+    "ApiAgentRole",
+    "ApiToolError",
     "BillingMode",
     "CancellationToken",
+    "CommandResult",
+    "ContainedApiTools",
     "MockAdapter",
     "MockResponse",
     "ProcessRunner",
+    "PathContainmentError",
     "RetryOutcome",
     "StructuredResultError",
+    "SearchMatch",
+    "ToolGrantError",
     "combine_agent_usage",
     "extract_json",
     "extract_structured_result",
