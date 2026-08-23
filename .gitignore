@@ -7,3 +7,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# >>> BetterBorg managed ignores >>>
+.borg/state/
+# <<< BetterBorg managed ignores <<<
