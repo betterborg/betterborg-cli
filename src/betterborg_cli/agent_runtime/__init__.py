@@ -10,12 +10,15 @@ from betterborg_cli.agent_runtime.anthropic import (
 )
 from betterborg_cli.agent_runtime.api_tools import (
     ApiAgentRole,
+    ApiToolDefinition,
     ApiToolError,
     CommandResult,
     ContainedApiTools,
     PathContainmentError,
     SearchMatch,
     ToolGrantError,
+    api_tool_definition,
+    select_api_tool_names,
 )
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
@@ -30,6 +33,13 @@ from betterborg_cli.agent_runtime.base import (
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime.openai import (
+    OPENAI_API_URL,
+    OpenAIAdapter,
+    OpenAIApiError,
+    OpenAITransport,
+    UrllibOpenAITransport,
+)
 from betterborg_cli.agent_runtime.process import ProcessRunner, run_streamed
 from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
@@ -51,6 +61,7 @@ __all__ = [
     "DEFAULT_TRANSIENT_MAX_ATTEMPTS",
     "ANTHROPIC_API_URL",
     "ANTHROPIC_API_VERSION",
+    "OPENAI_API_URL",
     "AgentAdapter",
     "AgentArtifact",
     "AgentCapabilities",
@@ -62,6 +73,7 @@ __all__ = [
     "AnthropicApiError",
     "AnthropicTransport",
     "ApiAgentRole",
+    "ApiToolDefinition",
     "ApiToolError",
     "BillingMode",
     "CancellationToken",
@@ -69,6 +81,9 @@ __all__ = [
     "ContainedApiTools",
     "MockAdapter",
     "MockResponse",
+    "OpenAIAdapter",
+    "OpenAIApiError",
+    "OpenAITransport",
     "ProcessRunner",
     "PathContainmentError",
     "RetryOutcome",
@@ -76,6 +91,8 @@ __all__ = [
     "SearchMatch",
     "ToolGrantError",
     "UrllibAnthropicTransport",
+    "UrllibOpenAITransport",
+    "api_tool_definition",
     "combine_agent_usage",
     "extract_json",
     "extract_structured_result",
@@ -83,5 +100,6 @@ __all__ = [
     "retry_outcome_to_result",
     "run_streamed",
     "run_with_transient_retry",
+    "select_api_tool_names",
     "validate_structured_result",
 ]
