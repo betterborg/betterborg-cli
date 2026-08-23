@@ -52,6 +52,7 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 88
+extend-exclude = [".betterborg-analysis", ".betterborg-task", ".orchestry"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
