@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
+from uuid import UUID
 
 from betterborg_cli.store.models import Operation, Repository, utcnow
 
@@ -100,23 +101,23 @@ class SqliteStore:
             connection.execute(
                 "INSERT INTO repositories(id, root, created_at) VALUES (?, ?, ?)",
                 (
-                    repository.id,
+                    str(repository.id),
                     str(repository.root),
                     repository.created_at.isoformat(),
                 ),
             )
 
-    def get_repository(self, repository_id: str) -> Repository | None:
+    def get_repository(self, repository_id: UUID) -> Repository | None:
         """Return one repository by ID, if it exists."""
         with self.locked_connection() as connection:
             row = connection.execute(
                 "SELECT id, root, created_at FROM repositories WHERE id = ?",
-                (repository_id,),
+                (str(repository_id),),
             ).fetchone()
         if row is None:
             return None
         return Repository(
-            id=row["id"],
+            id=UUID(row["id"]),
             root=Path(row["root"]),
             created_at=datetime.fromisoformat(row["created_at"]),
         )
@@ -130,8 +131,8 @@ class SqliteStore:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    operation.id,
-                    operation.repository_id,
+                    str(operation.id),
+                    str(operation.repository_id),
                     operation.kind,
                     json.dumps(
                         operation.payload,
@@ -142,7 +143,7 @@ class SqliteStore:
                 ),
             )
 
-    def list_operations(self, repository_id: str) -> list[Operation]:
+    def list_operations(self, repository_id: UUID) -> list[Operation]:
         """Return ledger entries in stable append order."""
         with self.locked_connection() as connection:
             rows = connection.execute(
@@ -152,12 +153,12 @@ class SqliteStore:
                 WHERE repository_id = ?
                 ORDER BY created_at, id
                 """,
-                (repository_id,),
+                (str(repository_id),),
             ).fetchall()
         return [
             Operation(
-                id=row["id"],
-                repository_id=row["repository_id"],
+                id=UUID(row["id"]),
+                repository_id=UUID(row["repository_id"]),
                 kind=row["kind"],
                 payload=json.loads(row["payload"]),
                 created_at=datetime.fromisoformat(row["created_at"]),

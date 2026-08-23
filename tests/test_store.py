@@ -2,6 +2,7 @@
 
 import sqlite3
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -19,6 +20,13 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
         payload={"source": "test"},
     )
 
+    assert isinstance(repository.id, UUID)
+    assert repository.id.version == 4
+    assert isinstance(operation.id, UUID)
+    assert operation.id.version == 4
+    assert isinstance(operation.repository_id, UUID)
+    assert operation.repository_id == repository.id
+
     with SqliteStore.open(database) as store:
         with store.transaction():
             store.add_repository(repository)
@@ -28,11 +36,28 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
             applied_at = connection.execute(
                 "SELECT applied_at FROM schema_version WHERE version = 1"
             ).fetchone()[0]
+            stored_repository_id = connection.execute(
+                "SELECT id FROM repositories"
+            ).fetchone()[0]
+            stored_operation_ids = connection.execute(
+                "SELECT id, repository_id FROM operations"
+            ).fetchone()
+
+        assert stored_repository_id == str(repository.id)
+        assert tuple(stored_operation_ids) == (
+            str(operation.id),
+            str(repository.id),
+        )
 
     with SqliteStore.open(database) as reopened:
         assert reopened.applied_migrations() == (1,)
-        assert reopened.get_repository(repository.id) == repository
-        assert reopened.list_operations(repository.id) == [operation]
+        reopened_repository = reopened.get_repository(repository.id)
+        reopened_operations = reopened.list_operations(repository.id)
+        assert reopened_repository == repository
+        assert isinstance(reopened_repository.id, UUID)
+        assert reopened_operations == [operation]
+        assert isinstance(reopened_operations[0].id, UUID)
+        assert isinstance(reopened_operations[0].repository_id, UUID)
         with reopened.locked_connection() as connection:
             reopened_applied_at = connection.execute(
                 "SELECT applied_at FROM schema_version WHERE version = 1"
@@ -77,7 +102,7 @@ def test_commit_failure_rolls_back_and_leaves_store_usable(tmp_path: Path) -> No
         assert store.list_operations(repository.id) == []
 
 
-def test_operation_ledger_rejects_mutation(tmp_path: Path) -> None:
+def test_operation_ledger_rejects_mutation_and_deletion(tmp_path: Path) -> None:
     repository = Repository(root=tmp_path / "repo")
     operation = Operation(repository_id=repository.id, kind="test.completed")
 
@@ -89,7 +114,16 @@ def test_operation_ledger_rejects_mutation(tmp_path: Path) -> None:
             with store.transaction() as connection:
                 connection.execute(
                     "UPDATE operations SET kind = ? WHERE id = ?",
-                    ("changed", operation.id),
+                    ("changed", str(operation.id)),
+                )
+
+        assert store.list_operations(repository.id) == [operation]
+
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            with store.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM operations WHERE id = ?",
+                    (str(operation.id),),
                 )
 
         assert store.list_operations(repository.id) == [operation]
