@@ -179,7 +179,7 @@ class CodexAdapter:
             return exit_code
 
         def classify(exit_code: int) -> str | None:
-            if exit_code == 0 or _load_payload(invocation_result_path) is not None:
+            if exit_code == 0:
                 return None
             return _classify_transient_error(spec.log_path)
 
@@ -216,6 +216,16 @@ class CodexAdapter:
                 usage=usage,
                 exit_code=outcome.exit_code,
                 error=f"transient retry exhausted: {outcome.transient_reason}",
+            )
+        if outcome.exit_code != 0:
+            return self._result(
+                spec,
+                start,
+                AgentStatus.FAILED,
+                exit_code=outcome.exit_code,
+                error=_terminal_error(spec.log_path, outcome.exit_code),
+                usage=usage,
+                attempts=outcome.attempts,
             )
 
         payload = _load_payload(invocation_result_path)
@@ -376,7 +386,11 @@ def _matching_log_line(text: str, marker: str) -> str:
 
 
 def _terminal_error(log_path: Path, exit_code: int) -> str:
-    message = f"Codex exited {exit_code} and produced no result"
+    message = (
+        "Codex exited 0 and produced no result"
+        if exit_code == 0
+        else f"Codex exited {exit_code} without completing successfully"
+    )
     if not log_path.exists():
         return message
     lines = [
@@ -406,8 +420,9 @@ def _terminal_error(log_path: Path, exit_code: int) -> str:
 def _extract_usage(log_path: Path) -> AgentUsage | None:
     if not log_path.exists() or log_path.stat().st_size == 0:
         return None
-    fresh_input = 0
+    total_input = 0
     cached_input = 0
+    cache_write_input = 0
     output = 0
     turns = 0
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -420,20 +435,18 @@ def _extract_usage(log_path: Path) -> AgentUsage | None:
         usage = event.get("usage")
         if not isinstance(usage, Mapping):
             continue
-        total = _token(usage.get("input_tokens"))
-        cached = _token(usage.get("cached_input_tokens"))
-        emitted = _token(usage.get("output_tokens"))
-        reasoning = _token(usage.get("reasoning_output_tokens"))
-        fresh_input += max(0, total - cached)
-        cached_input += cached
-        output += emitted + reasoning
+        total_input += _token(usage.get("input_tokens"))
+        cached_input += _token(usage.get("cached_input_tokens"))
+        cache_write_input += _token(usage.get("cache_write_input_tokens"))
+        output += _token(usage.get("output_tokens"))
         turns += 1
     if turns == 0:
         return None
     return AgentUsage(
-        tokens_input=fresh_input,
+        tokens_input=total_input,
         tokens_output=output,
         tokens_cache_read=cached_input,
+        tokens_cache_write=cache_write_input,
         num_turns=turns,
     )
 

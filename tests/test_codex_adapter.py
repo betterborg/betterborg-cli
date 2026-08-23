@@ -26,6 +26,7 @@ def _usage_event(
     cached_input_tokens: int,
     output_tokens: int,
     reasoning_output_tokens: int = 0,
+    cache_write_input_tokens: int = 0,
 ) -> str:
     return json.dumps(
         {
@@ -35,6 +36,7 @@ def _usage_event(
                 "cached_input_tokens": cached_input_tokens,
                 "output_tokens": output_tokens,
                 "reasoning_output_tokens": reasoning_output_tokens,
+                "cache_write_input_tokens": cache_write_input_tokens,
             },
         }
     )
@@ -85,8 +87,8 @@ def test_native_command_validates_and_persists_result_metadata(
             "\n".join(
                 (
                     json.dumps({"type": "thread.started", "thread_id": "test"}),
-                    _usage_event(20, 7, 5, 2),
-                    _usage_event(12, 10, 3),
+                    _usage_event(20, 7, 5, 2, 4),
+                    _usage_event(12, 10, 3, cache_write_input_tokens=6),
                 )
             ),
             encoding="utf-8",
@@ -146,9 +148,10 @@ def test_native_command_validates_and_persists_result_metadata(
     assert result.billing_mode == BillingMode.SUBSCRIPTION
     assert result.artifacts == (artifact,)
     assert result.usage == AgentUsage(
-        tokens_input=15,
-        tokens_output=10,
+        tokens_input=32,
+        tokens_output=8,
         tokens_cache_read=17,
+        tokens_cache_write=10,
         num_turns=2,
     )
     assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
@@ -221,7 +224,7 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
         calls.append((list(command), stdin_text))
         if len(calls) == 1:
             log_path.write_text(
-                _usage_event(100, 25, 10, 5)
+                _usage_event(100, 25, 10, 5, 7)
                 + "\n"
                 + json.dumps(
                     {
@@ -231,11 +234,13 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
                 ),
                 encoding="utf-8",
             )
-            Path(command[command.index("-o") + 1]).write_text(
-                '{"status":', encoding="utf-8"
+            _write_invocation_result(
+                command, {"status": "completed", "version": "transient"}
             )
             return 1
-        log_path.write_text(_usage_event(300, 50, 30, 15), encoding="utf-8")
+        log_path.write_text(
+            _usage_event(300, 50, 30, 15, 8), encoding="utf-8"
+        )
         _write_invocation_result(
             command, {"status": "completed", "version": "retry"}
         )
@@ -250,9 +255,10 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert result.usage == AgentUsage(
-        tokens_input=325,
-        tokens_output=60,
+        tokens_input=400,
+        tokens_output=40,
         tokens_cache_read=75,
+        tokens_cache_write=15,
         num_turns=2,
     )
     assert calls[0] == calls[1]
@@ -314,7 +320,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
     assert "transient retry exhausted" in (result.error or "")
 
 
-def test_nonzero_exit_with_valid_result_is_preserved(tmp_path: Path) -> None:
+def test_nonzero_exit_with_valid_result_fails(tmp_path: Path) -> None:
     def runner(
         command: Sequence[str],
         _cwd: Path,
@@ -329,10 +335,11 @@ def test_nonzero_exit_with_valid_result_is_preserved(tmp_path: Path) -> None:
         )
         return 2
 
-    result = CodexAdapter(ApiAgentRole.MERGE, proc_runner=runner).run(
-        codex_spec(tmp_path)
-    )
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.MERGE, proc_runner=runner).run(spec)
 
-    assert result.status == AgentStatus.COMPLETED
+    assert result.status == AgentStatus.FAILED
     assert result.exit_code == 2
-    assert result.payload == {"status": "completed", "version": "nonzero"}
+    assert result.payload is None
+    assert "Codex exited 2" in (result.error or "")
+    assert not spec.result_path.exists()
