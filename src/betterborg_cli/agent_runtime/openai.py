@@ -6,15 +6,16 @@ import http.client
 import json
 import os
 import re
-import threading
-import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Protocol, cast
 
+from betterborg_cli.agent_runtime.api_adapter import (
+    ApiCredentialRedactor,
+    ApiRunContext,
+)
 from betterborg_cli.agent_runtime.api_tools import (
     ApiAgentRole,
     ContainedApiTools,
@@ -29,16 +30,10 @@ from betterborg_cli.agent_runtime.base import (
     AgentUsage,
     BillingMode,
     CancellationToken,
-    combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
-    run_with_transient_retry,
-)
-from betterborg_cli.agent_runtime.structured import (
-    StructuredResultError,
-    validate_structured_result,
 )
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
@@ -89,12 +84,6 @@ class OpenAIApiError(RuntimeError):
             self.status_code in _TRANSIENT_STATUS_CODES
             or self.error_type in _TRANSIENT_ERROR_TYPES
         )
-
-
-@dataclass(slots=True)
-class _RequestState:
-    response: Mapping[str, Any] | None = None
-    error: Exception | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,59 +202,24 @@ class OpenAIAdapter:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        start = time.monotonic()
-        attempts = 0
-        usage: list[AgentUsage] = []
-        model = spec.model
         key = self.api_key or spec.env.get("OPENAI_API_KEY") or os.environ.get(
             "OPENAI_API_KEY"
         )
-        _prepare_log(spec.log_path)
-
-        def result(
-            status: AgentStatus,
-            *,
-            error: str | None = None,
-            payload: dict[str, Any] | None = None,
-            result_path: Path | None = None,
-            retryable: bool = False,
-        ) -> AgentResult:
-            return AgentResult(
-                status=status,
-                exit_code=(
-                    0
-                    if status == AgentStatus.COMPLETED
-                    else -1
-                    if status == AgentStatus.CANCELLED
-                    else 1
-                ),
-                payload=payload,
-                error=_redact(error or "", key) or None,
-                log_path=spec.log_path,
-                result_path=result_path,
-                duration_seconds=time.monotonic() - start,
-                usage=combine_agent_usage(usage),
-                billing_mode=BillingMode.API,
-                provider=_PROVIDER,
-                model=model,
-                attempts=attempts,
-                retryable=retryable,
-                resume_token=spec.resume_token,
-            )
+        runtime = ApiRunContext(
+            spec,
+            _PROVIDER,
+            ApiCredentialRedactor(key, _CREDENTIAL_PATTERN),
+        )
 
         if spec.billing_mode != BillingMode.API:
-            return result(
+            return runtime.result(
                 AgentStatus.FAILED,
                 error="OpenAI API adapter requires API billing mode",
             )
         if cancel is not None and cancel.is_set():
-            return result(
-                AgentStatus.CANCELLED,
-                error="agent run cancelled",
-                retryable=True,
-            )
+            return runtime.cancelled()
         if not key:
-            return result(
+            return runtime.result(
                 AgentStatus.FAILED,
                 error="OpenAI API credential is not configured",
             )
@@ -277,7 +231,7 @@ class OpenAIAdapter:
                 workspace_trusted=self.workspace_trusted,
             )
         except (OSError, ValueError) as error:
-            return result(AgentStatus.FAILED, error=str(error))
+            return runtime.result(AgentStatus.FAILED, error=str(error))
         allowed = select_api_tool_names(tools, spec.allowed_tools)
         tool_definitions = [
             _tool_definition(name) for name in sorted(allowed)
@@ -287,11 +241,7 @@ class OpenAIAdapter:
 
         for _turn in range(self.max_turns):
             if cancel is not None and cancel.is_set():
-                return result(
-                    AgentStatus.CANCELLED,
-                    error="agent run cancelled",
-                    retryable=True,
-                )
+                return runtime.cancelled()
             request_payload: dict[str, Any] = {
                 "model": spec.model,
                 "instructions": spec.system_prompt,
@@ -304,111 +254,39 @@ class OpenAIAdapter:
                 request_payload["previous_response_id"] = previous_response_id
             if spec.effort is not None:
                 request_payload["reasoning"] = {"effort": spec.effort}
-            request_state = _RequestState()
-
-            def request_once(
-                payload: Mapping[str, Any] = request_payload,
-                state: _RequestState = request_state,
-            ) -> int:
-                state.response = None
-                state.error = None
-                if cancel is None:
-                    try:
-                        state.response = self.transport.create_response(
-                            payload,
-                            api_key=key,
-                            cancel=None,
-                        )
-                    except Exception as error:
-                        state.error = error
-                else:
-                    if cancel.is_set():
-                        return -1
-                    completed = threading.Event()
-
-                    def send_request() -> None:
-                        try:
-                            state.response = self.transport.create_response(
-                                payload,
-                                api_key=key,
-                                cancel=cancel,
-                            )
-                        except Exception as error:
-                            state.error = error
-                        finally:
-                            completed.set()
-
-                    threading.Thread(
-                        target=send_request,
-                        name="betterborg-openai-request",
-                        daemon=True,
-                    ).start()
-                    while not completed.wait(0.05):
-                        if cancel.is_set():
-                            return -1
-                    if cancel.is_set():
-                        return -1
-                if state.error is not None:
-                    _append_log(
-                        spec.log_path,
-                        {"error": _redact(str(state.error), key)},
+            response = runtime.request(
+                lambda request_cancel, payload=request_payload: (
+                    self.transport.create_response(
+                        payload,
+                        api_key=key,
+                        cancel=request_cancel,
                     )
-                    if isinstance(state.error, OpenAIApiError):
-                        return state.error.status_code or 1
-                    return 1
-                return 0
-
-            def classify_request(
-                _exit_code: int,
-                state: _RequestState = request_state,
-            ) -> str | None:
-                if isinstance(state.error, OpenAIApiError):
-                    return str(state.error) if state.error.transient else None
-                return None
-
-            retry = run_with_transient_retry(
-                request_once,
-                classify_request,
+                ),
+                api_error_type=OpenAIApiError,
                 cancel=cancel,
+                thread_name="betterborg-openai-request",
                 backoff_seconds=self.transient_backoff_seconds,
                 max_attempts=self.transient_max_attempts,
             )
-            attempts += retry.attempts
-            if (cancel is not None and cancel.is_set()) or retry.cancelled:
-                return result(
-                    AgentStatus.CANCELLED,
-                    error="agent run cancelled",
-                    retryable=True,
-                )
-            if retry.exhausted:
-                return result(
-                    AgentStatus.CANCELLED,
-                    error=f"transient retry exhausted: {retry.transient_reason}",
-                    retryable=True,
-                )
-            if retry.exit_code != 0 or request_state.response is None:
-                return result(AgentStatus.FAILED, error=str(request_state.error))
-            response = request_state.response
+            if isinstance(response, AgentResult):
+                return response
 
-            _append_log(spec.log_path, _redact_value(response, key))
+            runtime.append_log(response)
             try:
                 output = _response_output(response)
                 response_usage = _response_usage(response)
             except OpenAIApiError as error:
-                return result(AgentStatus.FAILED, error=str(error))
-            usage.append(response_usage)
-            response_model = response.get("model")
-            if isinstance(response_model, str) and response_model:
-                model = response_model
+                return runtime.result(AgentStatus.FAILED, error=str(error))
+            runtime.record_response(response, response_usage)
             response_id = response.get("id")
             if not isinstance(response_id, str) or not response_id:
-                return result(
+                return runtime.result(
                     AgentStatus.FAILED,
                     error="OpenAI response is missing an id",
                 )
             response_status = response.get("status")
             if response_status != "completed":
-                return result(
+                return runtime.result(
                     AgentStatus.FAILED,
                     error=_incomplete_response_error(response, response_status),
                 )
@@ -419,67 +297,42 @@ class OpenAIAdapter:
             ]
             if submissions:
                 if len(calls) != 1 or len(submissions) != 1:
-                    return result(
+                    return runtime.result(
                         AgentStatus.FAILED,
                         error="submit_result must be the only tool call in its turn",
                     )
                 try:
                     payload = _tool_arguments(submissions[0])
                 except OpenAIApiError as error:
-                    return result(AgentStatus.FAILED, error=str(error))
-                payload = cast(dict[str, Any], _redact_value(payload, key))
-                try:
-                    validate_structured_result(payload, spec.schema)
-                except StructuredResultError as error:
-                    return result(
-                        AgentStatus.FAILED,
-                        error=f"structured result validation failed: {error}",
-                    )
-                spec.result_path.parent.mkdir(parents=True, exist_ok=True)
-                spec.result_path.write_text(
-                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                return result(
-                    AgentStatus.COMPLETED,
-                    payload=payload,
-                    result_path=spec.result_path,
-                )
+                    return runtime.result(AgentStatus.FAILED, error=str(error))
+                return runtime.complete(payload)
 
             if not calls:
-                return result(
+                return runtime.result(
                     AgentStatus.FAILED,
                     error="OpenAI ended without submit_result",
                 )
             function_outputs: list[dict[str, Any]] = []
             for call in calls:
                 if cancel is not None and cancel.is_set():
-                    return result(
-                        AgentStatus.CANCELLED,
-                        error="agent run cancelled",
-                        retryable=True,
-                    )
+                    return runtime.cancelled()
                 try:
                     function_output = _execute_tool_call(
                         call,
                         tools,
                         allowed,
-                        api_key=key,
+                        redactor=runtime.redactor,
                         cancel=cancel,
                     )
                 except OpenAIApiError as error:
-                    return result(AgentStatus.FAILED, error=str(error))
+                    return runtime.result(AgentStatus.FAILED, error=str(error))
                 if cancel is not None and cancel.is_set():
-                    return result(
-                        AgentStatus.CANCELLED,
-                        error="agent run cancelled",
-                        retryable=True,
-                    )
+                    return runtime.cancelled()
                 function_outputs.append(function_output)
             input_items = function_outputs
             previous_response_id = response_id
 
-        return result(
+        return runtime.result(
             AgentStatus.FAILED,
             error=f"OpenAI exceeded the {self.max_turns}-turn limit",
         )
@@ -524,7 +377,7 @@ def _execute_tool_call(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
-    api_key: str | None,
+    redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
     call_id = call.get("call_id")
@@ -544,7 +397,7 @@ def _execute_tool_call(
         except Exception as error:
             value = {"error": str(error)}
     result["output"] = json.dumps(
-        _redact_value(value, api_key),
+        redactor.value(value),
         sort_keys=True,
     )
     return result
@@ -609,32 +462,3 @@ def _api_error_details(body: str, fallback: str) -> tuple[str | None, str]:
         error_type if isinstance(error_type, str) else None,
         message if isinstance(message, str) else fallback,
     )
-
-
-def _prepare_log(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("", encoding="utf-8")
-
-
-def _append_log(path: Path, event: Any) -> None:
-    with path.open("a", encoding="utf-8") as log:
-        log.write(json.dumps(event, sort_keys=True) + "\n")
-
-
-def _redact(text: str, api_key: str | None) -> str:
-    if api_key:
-        text = text.replace(api_key, "[REDACTED]")
-    return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
-
-
-def _redact_value(value: Any, api_key: str | None) -> Any:
-    if isinstance(value, str):
-        return _redact(value, api_key)
-    if isinstance(value, Mapping):
-        return {
-            _redact(str(key), api_key): _redact_value(item, api_key)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value(item, api_key) for item in value]
-    return value
