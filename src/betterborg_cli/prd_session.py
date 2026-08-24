@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, TypeAlias
-from uuid import uuid4
 
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
@@ -23,6 +21,11 @@ from betterborg_cli.agent_runtime.selection import (
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_files import (
+    RepositoryPathError,
+    is_windows_reserved_filename,
+    publish_repository_text,
+)
 from betterborg_cli.store import (
     Borg,
     Repository,
@@ -65,14 +68,6 @@ _BRAINSTORM_OPENING = (
     "No starting PRD was supplied. Help me brainstorm and write a product "
     "requirements document."
 )
-_WINDOWS_RESERVED_BASENAMES = {
-    "aux",
-    "con",
-    "nul",
-    "prn",
-    *(f"com{number}" for number in range(1, 10)),
-    *(f"lpt{number}" for number in range(1, 10)),
-}
 _WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 
 Prompt: TypeAlias = Callable[[str], str | None]
@@ -365,7 +360,7 @@ def _validate_borg_name(name: str) -> None:
         or name.endswith((".", " "))
     ):
         raise ValueError("Borg name must be a portable filename stem")
-    if name.casefold().split(".", 1)[0] in _WINDOWS_RESERVED_BASENAMES:
+    if is_windows_reserved_filename(name):
         raise ValueError("Borg name must not be a reserved filename")
 
 
@@ -400,21 +395,11 @@ def _normalize_questions(questions: list[str]) -> tuple[str, ...]:
 
 
 def _publish_confirmed_prd(path: Path, body: str, *, root: Path) -> None:
-    parent = path.parent
-    if not parent.resolve().is_relative_to(root):
-        raise PrdSessionError(f"Borg PRD directory escapes repository: {parent}")
-    parent.mkdir(parents=True, exist_ok=True)
-    resolved_parent = parent.resolve(strict=True)
-    if not resolved_parent.is_relative_to(root):
-        raise PrdSessionError(f"Borg PRD directory escapes repository: {parent}")
-
-    destination = resolved_parent / path.name
-    temporary = resolved_parent / f".{path.name}.{uuid4().hex}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as output:
-            output.write(body)
-        os.link(temporary, destination)
+        publish_repository_text(path, body, root=root, overwrite=False)
+    except RepositoryPathError as error:
+        raise PrdSessionError(
+            f"Borg PRD directory escapes repository: {path.parent}"
+        ) from error
     except FileExistsError as error:
         raise FileExistsError(f"confirmed Borg PRD already exists: {path}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
