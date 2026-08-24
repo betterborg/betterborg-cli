@@ -148,8 +148,8 @@ def test_native_command_validates_and_persists_result_metadata(
     assert result.billing_mode == BillingMode.SUBSCRIPTION
     assert result.artifacts == (artifact,)
     assert result.usage == AgentUsage(
-        tokens_input=15,
-        tokens_output=10,
+        tokens_input=32,
+        tokens_output=8,
         tokens_cache_read=17,
         tokens_cache_write=10,
         num_turns=2,
@@ -252,8 +252,8 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert result.usage == AgentUsage(
-        tokens_input=325,
-        tokens_output=60,
+        tokens_input=400,
+        tokens_output=40,
         tokens_cache_read=75,
         tokens_cache_write=15,
         num_turns=2,

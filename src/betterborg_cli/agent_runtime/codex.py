@@ -280,12 +280,18 @@ def _terminal_error(log_path: Path, exit_code: int) -> str:
 
 
 def _extract_usage(log_path: Path) -> AgentUsage | None:
+    """Sum Codex totals while preserving cache breakdowns separately.
+
+    Codex mirrors the Responses API: ``input_tokens`` already includes cached
+    input and ``output_tokens`` already includes reasoning output.  The detail
+    fields must therefore not be subtracted from or added to those totals.
+    """
     if not log_path.exists() or log_path.stat().st_size == 0:
         return None
-    fresh_input = 0
+    total_input = 0
     cached_input = 0
     cache_write_input = 0
-    output = 0
+    total_output = 0
     turns = 0
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -297,20 +303,16 @@ def _extract_usage(log_path: Path) -> AgentUsage | None:
         usage = event.get("usage")
         if not isinstance(usage, Mapping):
             continue
-        input_tokens = _token(usage.get("input_tokens"))
-        cached_tokens = _token(usage.get("cached_input_tokens"))
-        fresh_input += max(0, input_tokens - cached_tokens)
-        cached_input += cached_tokens
+        total_input += _token(usage.get("input_tokens"))
+        cached_input += _token(usage.get("cached_input_tokens"))
         cache_write_input += _token(usage.get("cache_write_input_tokens"))
-        output += _token(usage.get("output_tokens")) + _token(
-            usage.get("reasoning_output_tokens")
-        )
+        total_output += _token(usage.get("output_tokens"))
         turns += 1
     if turns == 0:
         return None
     return AgentUsage(
-        tokens_input=fresh_input,
-        tokens_output=output,
+        tokens_input=total_input,
+        tokens_output=total_output,
         tokens_cache_read=cached_input,
         tokens_cache_write=cache_write_input,
         num_turns=turns,
