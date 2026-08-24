@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.planning import ArchitectLoop
+from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.store import (
@@ -218,6 +218,217 @@ def test_recovers_provider_completed_plan_without_duplicate_invocation_or_cost(
         assert resumed.borg.state is BorgState.TECH_REVIEW_WORKING
         assert len(adapter.calls) == 2
         assert len(store.list_planning_attempts(borg.id)) == 2
+
+
+def test_plan_open_questions_are_answered_inline_before_replanning(
+    committed_git_repo: Path,
+) -> None:
+    ambiguous_plan = _plan()
+    ambiguous_plan["open_questions"] = [
+        "Should releases default to the stable or preview channel?"
+    ]
+
+    def replan_after_answer(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".borg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        current_plan_path = manifest["current_plan"]
+        assert current_plan_path is not None
+        assert json.loads(
+            (spec.cwd / current_plan_path).read_text(encoding="utf-8")
+        ) == ambiguous_plan
+        questions = json.loads(
+            (
+                spec.cwd / ".borg/state/planning/context/questions.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert questions[-1]["answers"] == [
+            {"q_id": "q1", "answer": "Use the stable channel."}
+        ]
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=ambiguous_plan))
+    adapter.queue(MockResponse(dynamic=replan_after_answer))
+    database = committed_git_repo.parent / "architect-plan-question.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = _planning_context(
+            committed_git_repo, store, "plan-question"
+        )
+        with pytest.raises(ArchitectCancelled, match="awaiting answers"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert len(adapter.calls) == 2
+        assert store.get_borg(borg.id).state is BorgState.ARCHITECT_AWAITING_ANSWERS
+        result = ArchitectLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            adapter,
+            io=_io(iter(["Use the stable channel."]), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        questions = store.list_planning_questions(borg.id)
+        assert len(questions) == 1
+        assert questions[0].questions == [
+            {
+                "id": "q1",
+                "question": "Should releases default to the stable or preview channel?",
+            }
+        ]
+        plan_attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "architect_plan"
+        ]
+        assert [attempt.result for attempt in plan_attempts] == [
+            ambiguous_plan,
+            _plan(),
+        ]
+        assert len(adapter.calls) == 3
+
+
+def test_recovered_semantically_invalid_questions_are_failed_and_retryable(
+    committed_git_repo: Path,
+) -> None:
+    database = committed_git_repo.parent / "architect-invalid-resume.sqlite3"
+    result_path = committed_git_repo.parent / "invalid-question-result.json"
+    result_path.write_text(
+        json.dumps({"decision": "ask_more"}) + "\n", encoding="utf-8"
+    )
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = _planning_context(committed_git_repo, store, "invalid")
+        interrupted = PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_questions",
+            round=1,
+            adapter="openai",
+            model="test-model",
+            request={"result_path": str(result_path)},
+        )
+        store.append_planning_attempt(interrupted)
+
+        with pytest.raises(
+            ArchitectError, match="ask_more result must contain questions"
+        ):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        failed = store.list_planning_attempts(borg.id)[0]
+        assert failed.status is PlanningAttemptStatus.FAILED
+        assert failed.result == {"decision": "ask_more"}
+        assert len(adapter.calls) == 0
+
+        resumed = ArchitectLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert resumed.plan == _plan()
+        question_attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "architect_questions"
+        ]
+        assert [attempt.round for attempt in question_attempts] == [1, 2]
+        assert [attempt.status for attempt in question_attempts] == [
+            PlanningAttemptStatus.FAILED,
+            PlanningAttemptStatus.COMPLETED,
+        ]
+        assert len(adapter.calls) == 2
+
+
+def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
+    committed_git_repo: Path,
+) -> None:
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which users are in scope?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=_plan()))
+    database = committed_git_repo.parent / "architect-failed-budget.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = _planning_context(committed_git_repo, store, "budget")
+        for round_number, status in enumerate(
+            (
+                PlanningAttemptStatus.CANCELLED,
+                PlanningAttemptStatus.FAILED,
+                PlanningAttemptStatus.CANCELLED,
+            ),
+            start=1,
+        ):
+            attempt = PlanningAttempt(
+                borg_id=borg.id,
+                phase="architect_questions",
+                round=round_number,
+                adapter="openai",
+                model="test-model",
+            )
+            store.append_planning_attempt(attempt)
+            store.complete_planning_attempt(
+                attempt.id,
+                status=status,
+                summary="interrupted provider invocation",
+            )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(["Small internal teams."]), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert "question round 1" in adapter.calls[0].user_prompt
+        question_attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "architect_questions"
+        ]
+        assert [attempt.round for attempt in question_attempts] == [1, 2, 3, 4, 5]
+        assert [attempt.status for attempt in question_attempts[-2:]] == [
+            PlanningAttemptStatus.COMPLETED,
+            PlanningAttemptStatus.COMPLETED,
+        ]
+        questions = store.list_planning_questions(borg.id)
+        assert len(questions) == 1
+        assert questions[0].round == 1
+        assert len(adapter.calls) == 3
 
 
 def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:

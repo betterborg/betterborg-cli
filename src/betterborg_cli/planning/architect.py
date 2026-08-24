@@ -298,35 +298,49 @@ class ArchitectLoop:
                 raise ArchitectCancelled("Architect run cancelled")
 
             question_attempts = self._phase_attempts(_QUESTIONS_PHASE)
-            latest = question_attempts[-1] if question_attempts else None
+            completed_questions = [
+                attempt
+                for attempt in question_attempts
+                if attempt.status is PlanningAttemptStatus.COMPLETED
+            ]
+            latest = completed_questions[-1] if completed_questions else None
             ready = (
                 latest is not None
-                and latest.status is PlanningAttemptStatus.COMPLETED
                 and (latest.result or {}).get("decision") == "ready_to_plan"
             )
-            forced = len(question_attempts) >= ARCHITECT_QUESTION_ROUND_CAP
+            forced = len(completed_questions) >= ARCHITECT_QUESTION_ROUND_CAP
             if ready or forced:
                 return self._run_plan()
 
+            question_round = len(completed_questions) + 1
             attempt, payload = self._run_turn(
                 phase=_QUESTIONS_PHASE,
-                round_number=len(question_attempts) + 1,
+                round_number=self._next_attempt_round(_QUESTIONS_PHASE),
                 schema=ARCHITECT_QUESTIONS_SCHEMA,
                 system_prompt=_QUESTIONS_SYSTEM_PROMPT,
                 user_prompt=(
                     "Inspect .borg/state/planning/context/manifest.json and its "
                     "referenced evidence. This is Architect question round "
-                    f"{len(question_attempts) + 1} "
+                    f"{question_round} "
                     f"of {ARCHITECT_QUESTION_ROUND_CAP}."
                 ),
             )
             questions = list(payload.get("questions") or [])
-            self._validate_question_payload(payload, questions)
+            try:
+                self._validate_question_payload(payload, questions)
+            except ArchitectError as error:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=payload,
+                    summary=str(error),
+                )
+                raise
             if payload["decision"] == "ready_to_plan":
                 self._complete_attempt(attempt, payload, "ready to plan")
                 continue
 
-            if attempt.round >= ARCHITECT_QUESTION_ROUND_CAP:
+            if question_round >= ARCHITECT_QUESTION_ROUND_CAP:
                 self._complete_attempt(
                     attempt,
                     payload,
@@ -338,48 +352,67 @@ class ArchitectLoop:
             question = PlanningQuestion(
                 borg_id=self.borg_id,
                 attempt_id=attempt.id,
-                round=attempt.round,
+                round=self._next_question_round(),
                 questions=questions,
             )
             borg = self._store_question_turn(borg, attempt, payload, question)
             borg = self._answer_question_round(borg, question)
 
     def _run_plan(self) -> ArchitectResult:
-        attempts = self._phase_attempts(_PLAN_PHASE)
-        completed = next(
-            (
-                item
-                for item in reversed(attempts)
-                if item.status is PlanningAttemptStatus.COMPLETED
-            ),
-            None,
-        )
-        if completed is not None:
-            return ArchitectResult(
-                borg=self._current_borg(),
-                plan=completed.result or {},
-                attempt=completed,
+        while True:
+            completed = self._completed_plan()
+            if completed is not None:
+                return ArchitectResult(
+                    borg=self._current_borg(),
+                    plan=completed.result or {},
+                    attempt=completed,
+                )
+
+            current_plan = self._latest_ambiguous_plan()
+            attempt, payload = self._run_turn(
+                phase=_PLAN_PHASE,
+                round_number=self._next_attempt_round(_PLAN_PHASE),
+                schema=ARCHITECT_PLAN_SCHEMA,
+                system_prompt=_PLAN_SYSTEM_PROMPT,
+                user_prompt=(
+                    "Read .borg/state/planning/context/manifest.json and every "
+                    "relevant referenced context file, then emit the implementation "
+                    "plan. Resolve every answered product question and leave "
+                    "open_questions empty unless a genuine uncertainty remains."
+                ),
+                current_plan=(
+                    json.dumps(current_plan.result, indent=2, sort_keys=True)
+                    if current_plan is not None
+                    else None
+                ),
             )
-        attempt, payload = self._run_turn(
-            phase=_PLAN_PHASE,
-            round_number=len(attempts) + 1,
-            schema=ARCHITECT_PLAN_SCHEMA,
-            system_prompt=_PLAN_SYSTEM_PROMPT,
-            user_prompt=(
-                "Read .borg/state/planning/context/manifest.json and every relevant "
-                "referenced context file, then emit the implementation plan."
-            ),
-        )
-        borg = self._current_borg()
-        with self.store.transaction():
-            completed = self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.COMPLETED,
-                result=payload,
-                summary=str(payload["title"]),
-            )
-            borg = self._transition(borg, BorgState.TECH_REVIEW_WORKING)
-        return ArchitectResult(borg=borg, plan=payload, attempt=completed)
+            open_questions = self._plan_open_questions(payload)
+            borg = self._current_borg()
+            if open_questions:
+                question = PlanningQuestion(
+                    borg_id=self.borg_id,
+                    attempt_id=attempt.id,
+                    round=self._next_question_round(),
+                    questions=[
+                        {"id": f"q{index}", "question": text}
+                        for index, text in enumerate(open_questions, start=1)
+                    ],
+                )
+                borg = self._store_plan_question_turn(
+                    borg, attempt, payload, question
+                )
+                self._answer_question_round(borg, question)
+                continue
+
+            with self.store.transaction():
+                completed = self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.COMPLETED,
+                    result=payload,
+                    summary=str(payload["title"]),
+                )
+                borg = self._transition(borg, BorgState.TECH_REVIEW_WORKING)
+            return ArchitectResult(borg=borg, plan=payload, attempt=completed)
 
     def _run_turn(
         self,
@@ -389,6 +422,7 @@ class ArchitectLoop:
         schema: dict[str, Any],
         system_prompt: str,
         user_prompt: str,
+        current_plan: str | None = None,
     ) -> tuple[PlanningAttempt, dict[str, Any]]:
         running = next(
             (
@@ -414,6 +448,7 @@ class ArchitectLoop:
                     schema=schema,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
+                    current_plan=current_plan,
                 )
             attempt = running
         else:
@@ -446,6 +481,7 @@ class ArchitectLoop:
                 self.repository,
                 self._current_borg(),
                 self.store,
+                current_plan=current_plan,
                 dirty_borg_documents=self.dirty_borg_documents,
                 worktrees_root=self.worktrees_root,
             ) as worktree:
@@ -480,7 +516,18 @@ class ArchitectLoop:
             raise ArchitectError(
                 result.error or f"Architect {phase} returned {result.status.value}"
             )
-        validate_structured_result(result.payload, schema)
+        try:
+            validate_structured_result(result.payload, schema)
+        except StructuredResultError as error:
+            self.store.complete_planning_attempt(
+                attempt.id,
+                status=PlanningAttemptStatus.FAILED,
+                result=result.payload,
+                summary=f"invalid structured result: {error}",
+            )
+            raise ArchitectError(
+                f"Architect {phase} returned an invalid structured result: {error}"
+            ) from error
         return attempt, result.payload
 
     def _recover_payload(
@@ -525,6 +572,23 @@ class ArchitectLoop:
             self.store.append_planning_question(question)
             return self._transition(borg, BorgState.ARCHITECT_AWAITING_ANSWERS)
 
+    def _store_plan_question_turn(
+        self,
+        borg: Borg,
+        attempt: PlanningAttempt,
+        payload: dict[str, Any],
+        question: PlanningQuestion,
+    ) -> Borg:
+        with self.store.transaction():
+            self.store.complete_planning_attempt(
+                attempt.id,
+                status=PlanningAttemptStatus.COMPLETED,
+                result=payload,
+                summary=f"plan has {len(question.questions)} open question(s)",
+            )
+            self.store.append_planning_question(question)
+            return self._transition(borg, BorgState.ARCHITECT_AWAITING_ANSWERS)
+
     def _answer_question_round(self, borg: Borg, question: PlanningQuestion) -> Borg:
         answers: list[dict[str, object]] = []
         for item in question.questions:
@@ -562,6 +626,18 @@ class ArchitectLoop:
                 item
                 for item in reversed(self._phase_attempts(_PLAN_PHASE))
                 if item.status is PlanningAttemptStatus.COMPLETED
+                and not self._plan_open_questions(item.result)
+            ),
+            None,
+        )
+
+    def _latest_ambiguous_plan(self) -> PlanningAttempt | None:
+        return next(
+            (
+                item
+                for item in reversed(self._phase_attempts(_PLAN_PHASE))
+                if item.status is PlanningAttemptStatus.COMPLETED
+                and self._plan_open_questions(item.result)
             ),
             None,
         )
@@ -581,6 +657,22 @@ class ArchitectLoop:
             item
             for item in self.store.list_planning_attempts(self.borg_id)
             if item.phase == phase
+        ]
+
+    def _next_attempt_round(self, phase: str) -> int:
+        attempts = self._phase_attempts(phase)
+        return max((attempt.round for attempt in attempts), default=0) + 1
+
+    def _next_question_round(self) -> int:
+        questions = self.store.list_planning_questions(self.borg_id)
+        return max((question.round for question in questions), default=0) + 1
+
+    @staticmethod
+    def _plan_open_questions(result: dict[str, Any] | None) -> list[str]:
+        return [
+            question.strip()
+            for question in (result or {}).get("open_questions", [])
+            if isinstance(question, str) and question.strip()
         ]
 
     def _current_borg(self) -> Borg:
