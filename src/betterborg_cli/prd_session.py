@@ -9,6 +9,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, TypeAlias
 from uuid import uuid4
 
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentRunSpec,
@@ -218,7 +219,7 @@ class PrdSession:
                 payload = self._run_agent(session, round_number)
             except _PrdSessionCancelled:
                 return PrdSessionResult(**base_result, confirmed=False)
-            questions = tuple(question.strip() for question in payload["questions"])
+            questions = _normalize_questions(payload["questions"])
             draft = payload["prd_markdown"]
             if bool(questions) == bool(draft):
                 raise PrdSessionError(
@@ -296,6 +297,7 @@ class PrdSession:
             schema=PRD_SESSION_OUTPUT_SCHEMA,
             cwd=self.repository.root,
             model=self.model,
+            allowed_tools=READ_ONLY_API_TOOLS,
             log_path=self.artifact_dir / f"{session.id}.round-{round_number}.log",
             result_path=self.artifact_dir / f"{session.id}.round-{round_number}.json",
         )
@@ -380,6 +382,15 @@ def _normalize_draft(body: object) -> str:
     if not isinstance(body, str) or not body.strip():
         raise PrdSessionError("PRD draft must not be empty")
     return body if body.endswith("\n") else f"{body}\n"
+
+
+def _normalize_questions(questions: list[str]) -> tuple[str, ...]:
+    normalized = tuple(question.strip() for question in questions)
+    if any(not question for question in normalized):
+        raise PrdSessionError("material questions must not be empty")
+    if len(set(normalized)) != len(normalized):
+        raise PrdSessionError("material questions must not be duplicated")
+    return normalized
 
 
 def _publish_confirmed_prd(path: Path, body: str, *, root: Path) -> None:

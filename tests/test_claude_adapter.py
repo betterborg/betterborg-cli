@@ -166,6 +166,41 @@ def test_native_command_validates_and_persists_result_metadata(
     assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
 
 
+def test_read_only_tool_allowlist_uses_plan_mode(tmp_path: Path) -> None:
+    captured_command: list[str] = []
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        captured_command.extend(command)
+        log_path.write_text(
+            _envelope({"status": "completed", "version": "1.2.3"}),
+            encoding="utf-8",
+        )
+        return 0
+
+    spec = claude_spec(
+        tmp_path,
+        allowed_tools=("list_files", "read_file", "search_text"),
+    )
+
+    result = ClaudeAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert "--dangerously-skip-permissions" not in captured_command
+    assert captured_command[
+        captured_command.index("--permission-mode") + 1
+    ] == "plan"
+    assert captured_command[
+        captured_command.index("--allowed-tools") + 1
+    ] == "Glob,Read,Grep"
+
+
 def test_schema_invalid_result_fails_without_persisting_result(
     tmp_path: Path,
 ) -> None:

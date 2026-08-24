@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -63,15 +62,6 @@ def _analysis_payload() -> dict[str, object]:
     }
 
 
-def _commit_repository(repository: Path) -> None:
-    (repository / "README.md").write_text("# Example\n\nBuild and test docs.\n")
-    subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repository), "commit", "--quiet", "-m", "initial"],
-        check=True,
-    )
-
-
 def _adapter(repository: Path) -> tuple[MockAdapter, SelectedAgent]:
     adapter = MockAdapter(name="openai")
     adapter.queue(MockResponse(payload=_analysis_payload()))
@@ -98,10 +88,10 @@ def _adapter(repository: Path) -> tuple[MockAdapter, SelectedAgent]:
 
 def test_init_creates_outputs_once_and_preserves_repository_identity(
     cli_runner: CliRunner,
-    git_repo: Path,
+    committed_git_repo: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    _commit_repository(git_repo)
+    git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
     adapter, selected = _adapter(git_repo)
     selections = 0

@@ -157,6 +157,35 @@ def test_native_command_validates_and_persists_result_metadata(
     assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
 
 
+def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None:
+    captured_command: list[str] = []
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        captured_command.extend(command)
+        log_path.write_text("{}\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "version": "1.2.3"}
+        )
+        return 0
+
+    spec = codex_spec(
+        tmp_path,
+        allowed_tools=("list_files", "read_file", "search_text"),
+    )
+
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert captured_command[captured_command.index("-s") + 1] == "read-only"
+
+
 def test_schema_invalid_result_fails_without_persisting_result(
     tmp_path: Path,
 ) -> None:

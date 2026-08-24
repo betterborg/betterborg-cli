@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS, ApiAgentRole
 from betterborg_cli.agent_runtime.base import (
     AgentArtifact,
     AgentCapabilities,
@@ -35,6 +35,13 @@ from betterborg_cli.agent_runtime.structured import (
 )
 
 _PROVIDER = "claude"
+_CLAUDE_TOOL_NAMES = {
+    "list_files": "Glob",
+    "read_file": "Read",
+    "search_text": "Grep",
+    "apply_patch": "Edit",
+    "run_command": "Bash",
+}
 _TRANSIENT_API_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 _SCHEMA_INSTRUCTIONS = """
 ## Output format requirement
@@ -99,9 +106,21 @@ class ClaudeAdapter(NativeCliAdapter):
         ]
         if spec.effort:
             claude_command.extend(("--effort", spec.effort))
-        claude_command.append("--dangerously-skip-permissions")
+        read_only = bool(spec.allowed_tools) and (
+            set(spec.allowed_tools) <= set(READ_ONLY_API_TOOLS)
+        )
+        if read_only:
+            claude_command.extend(("--permission-mode", "plan"))
+        else:
+            claude_command.append("--dangerously-skip-permissions")
         if spec.allowed_tools:
-            claude_command.extend(("--allowed-tools", ",".join(spec.allowed_tools)))
+            allowed_tools = tuple(
+                dict.fromkeys(
+                    _CLAUDE_TOOL_NAMES.get(tool, tool)
+                    for tool in spec.allowed_tools
+                )
+            )
+            claude_command.extend(("--allowed-tools", ",".join(allowed_tools)))
         system_prompt_path = _write_system_prompt(spec.log_path.parent, system_prompt)
         claude_command.extend(("--system-prompt-file", str(system_prompt_path)))
         try:

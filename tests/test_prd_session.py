@@ -2,24 +2,14 @@
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.prd_session import InteractiveIO, PrdSession
+from betterborg_cli.prd_session import InteractiveIO, PrdSession, PrdSessionError
 from betterborg_cli.store import Repository, SqliteStore
-
-
-def _commit_repository(repository: Path) -> None:
-    (repository / "README.md").write_text("# Test repository\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repository), "commit", "--quiet", "-m", "initial"],
-        check=True,
-    )
 
 
 def _responses(*payloads: dict[str, object]) -> MockAdapter:
@@ -46,10 +36,11 @@ def _io(
 
 
 @pytest.fixture
-def repository_store(git_repo: Path):
-    _commit_repository(git_repo)
-    repository = Repository(root=git_repo)
-    with SqliteStore.open(git_repo / ".borg/state/borg.sqlite3") as store:
+def repository_store(committed_git_repo: Path):
+    repository = Repository(root=committed_git_repo)
+    with SqliteStore.open(
+        committed_git_repo / ".borg/state/borg.sqlite3"
+    ) as store:
         store.add_repository(repository)
         yield repository, store
 
@@ -150,7 +141,39 @@ def test_markdown_doors_share_editing_and_preserve_their_input(
     assert turns[0].content == original
     assert turns[-1].content == result.body_md
     assert "Never start planning" in adapter.calls[0].system_prompt
-    assert adapter.calls[0].allowed_tools == ()
+    assert adapter.calls[0].allowed_tools == (
+        "list_files",
+        "read_file",
+        "search_text",
+    )
+
+
+@pytest.mark.parametrize(
+    "questions",
+    [["   "], ["Who is this for?", " Who is this for? "]],
+    ids=["empty-after-trimming", "duplicate-after-trimming"],
+)
+def test_agent_questions_must_be_material_after_normalization(
+    repository_store,
+    questions: list[str],
+) -> None:
+    repository, store = repository_store
+    prompted: list[str] = []
+    session = PrdSession(
+        repository,
+        store,
+        _responses({"questions": questions, "prd_markdown": None}),
+        io=InteractiveIO(
+            prompt=lambda message: prompted.append(message) or "answer",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+    )
+
+    with pytest.raises(PrdSessionError, match="must not be (empty|duplicated)"):
+        session.run("InvalidQuestion")
+
+    assert prompted == []
 
 
 def test_cancelling_a_material_question_keeps_only_the_draft_records(

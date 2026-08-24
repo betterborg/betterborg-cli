@@ -9,6 +9,7 @@ from betterborg_cli.agent_runtime.anthropic import (
     UrllibAnthropicTransport,
 )
 from betterborg_cli.agent_runtime.api_tools import (
+    READ_ONLY_API_TOOLS,
     ApiAgentRole,
     ApiToolDefinition,
     ApiToolError,
@@ -96,6 +97,7 @@ __all__ = [
     "OpenAITransport",
     "ProcessRunner",
     "PathContainmentError",
+    "READ_ONLY_API_TOOLS",
     "RetryOutcome",
     "StructuredResultError",
     "SearchMatch",

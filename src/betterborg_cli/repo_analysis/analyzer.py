@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentRunSpec,
@@ -401,7 +402,7 @@ def _run_in_workspace(
         cwd=workspace_dir.resolve(),
         model=resolve_analysis_model(agent, config.model),
         effort=config.effort,
-        allowed_tools=("list_files", "read_file", "search_text"),
+        allowed_tools=READ_ONLY_API_TOOLS,
         log_path=artifact_dir / f"{run_id}.log",
         result_path=artifact_dir / f"{run_id}.json",
     )

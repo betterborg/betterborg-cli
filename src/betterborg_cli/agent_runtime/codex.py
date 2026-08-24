@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS, ApiAgentRole
 from betterborg_cli.agent_runtime.base import (
     AgentArtifact,
     AgentCapabilities,
@@ -35,7 +35,6 @@ from betterborg_cli.agent_runtime.structured import (
 )
 
 _PROVIDER = "codex"
-_SANDBOX = "danger-full-access"
 _PROMPT_SCHEMA_INSTRUCTIONS = """
 ## Output format requirement
 
@@ -147,7 +146,7 @@ class CodexAdapter(NativeCliAdapter):
             "-m",
             spec.model,
             "-s",
-            _SANDBOX,
+            _sandbox_for(spec),
             "--skip-git-repo-check",
             "--ignore-user-config",
             "--ephemeral",
@@ -187,6 +186,12 @@ class CodexAdapter(NativeCliAdapter):
 
     def _terminal_error(self, log_path: Path, exit_code: int) -> str:
         return _terminal_error(log_path, exit_code)
+
+
+def _sandbox_for(spec: AgentRunSpec) -> str:
+    if spec.allowed_tools and set(spec.allowed_tools) <= set(READ_ONLY_API_TOOLS):
+        return "read-only"
+    return "danger-full-access"
 
 
 def _stdin_prompt(
