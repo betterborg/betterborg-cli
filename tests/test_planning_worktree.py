@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import betterborg_cli.planning.worktree as worktree_module
 from betterborg_cli.planning import (
     PlanningWorktreeError,
     materialize_planning_worktree,
@@ -222,6 +223,97 @@ def test_rejects_dirty_source_outside_borg_documents(
                 pytest.fail("unsafe dirty source reached a planning worktree")
 
 
+def test_surfaces_worktree_removal_failure(
+    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = committed_git_repo.parent / f"{committed_git_repo.name}-cleanup.db"
+    original_run_git = worktree_module._run_git
+
+    def fail_worktree_removal(root: Path, *arguments: str) -> None:
+        if arguments[:2] == ("worktree", "remove"):
+            raise subprocess.CalledProcessError(
+                1,
+                ["git", *arguments],
+                stderr="simulated cleanup failure",
+            )
+        original_run_git(root, *arguments)
+
+    materialized_path: Path | None = None
+    with SqliteStore.open(database) as store:
+        repository, borg = _persist_planning_context(
+            committed_git_repo, store, "cleanup-failure"
+        )
+        try:
+            with monkeypatch.context() as cleanup_failure:
+                cleanup_failure.setattr(
+                    worktree_module, "_run_git", fail_worktree_removal
+                )
+                with pytest.raises(
+                    PlanningWorktreeError,
+                    match="unable to remove planning worktree",
+                ):
+                    with materialize_planning_worktree(
+                        repository, borg, store
+                    ) as materialized_path:
+                        assert materialized_path.is_dir()
+            assert materialized_path is not None
+            assert materialized_path.is_dir()
+        finally:
+            if materialized_path is not None and materialized_path.exists():
+                original_run_git(
+                    committed_git_repo,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(materialized_path),
+                )
+
+
+def test_preserves_caller_error_when_worktree_removal_also_fails(
+    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = committed_git_repo.parent / f"{committed_git_repo.name}-body-error.db"
+    original_run_git = worktree_module._run_git
+
+    def fail_worktree_removal(root: Path, *arguments: str) -> None:
+        if arguments[:2] == ("worktree", "remove"):
+            raise subprocess.CalledProcessError(1, ["git", *arguments])
+        original_run_git(root, *arguments)
+
+    materialized_path: Path | None = None
+    caller_error = OSError("architect validation failed")
+    with SqliteStore.open(database) as store:
+        repository, borg = _persist_planning_context(
+            committed_git_repo, store, "caller-failure"
+        )
+        try:
+            with monkeypatch.context() as cleanup_failure:
+                cleanup_failure.setattr(
+                    worktree_module, "_run_git", fail_worktree_removal
+                )
+                with pytest.raises(
+                    OSError, match="architect validation failed"
+                ) as caught:
+                    with materialize_planning_worktree(
+                        repository, borg, store
+                    ) as materialized_path:
+                        raise caller_error
+            assert caught.value is caller_error
+            assert any(
+                "unable to remove planning worktree" in note
+                for note in caught.value.__notes__
+            )
+        finally:
+            if materialized_path is not None and materialized_path.exists():
+                original_run_git(
+                    committed_git_repo,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(materialized_path),
+                )
+
+
 def _write_config(root: Path, repository: Repository) -> None:
     (root / ".borg").mkdir()
     (root / ".borg/config.toml").write_text(
@@ -231,6 +323,28 @@ def _write_config(root: Path, repository: Repository) -> None:
         'default_branch = "main"\n',
         encoding="utf-8",
     )
+
+
+def _persist_planning_context(
+    root: Path, store: SqliteStore, name: str
+) -> tuple[Repository, Borg]:
+    repository = Repository(root=root)
+    borg = Borg(repository_id=repository.id, name=name)
+    _write_config(root, repository)
+    prd_path = Path(".borg/prds") / f"{name}.md"
+    (root / prd_path).parent.mkdir(parents=True)
+    (root / prd_path).write_text(f"# {name}\n", encoding="utf-8")
+    store.add_repository(repository)
+    store.add_borg(borg)
+    store.add_prd_session(
+        PrdSession(
+            repository_id=repository.id,
+            borg_id=borg.id,
+            prd_path=prd_path,
+        )
+    )
+    _persist_analysis(store, repository)
+    return repository, borg
 
 
 def _persist_analysis(

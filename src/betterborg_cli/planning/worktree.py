@@ -69,47 +69,64 @@ def materialize_planning_worktree(
     head_sha = _git_output(paths.root, "rev-parse", "--verify", "HEAD^{commit}")
 
     created = False
+    active_error: BaseException | None = None
     try:
-        _run_git(
-            paths.root,
-            "worktree",
-            "add",
-            "--detach",
-            str(destination),
-            head_sha,
-        )
-        created = True
-        _materialize_context(
-            destination=destination,
-            paths=paths,
-            repository=repository,
-            borg=borg,
-            store=store,
-            head_sha=head_sha,
-            current_plan=current_plan,
-            supplied_documents=supplied_documents,
-        )
+        try:
+            _run_git(
+                paths.root,
+                "worktree",
+                "add",
+                "--detach",
+                str(destination),
+                head_sha,
+            )
+            created = True
+            _materialize_context(
+                destination=destination,
+                paths=paths,
+                repository=repository,
+                borg=borg,
+                store=store,
+                head_sha=head_sha,
+                current_plan=current_plan,
+                supplied_documents=supplied_documents,
+            )
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            raise PlanningWorktreeError(
+                f"unable to materialize planning worktree: {error}"
+            ) from error
         yield destination
-    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError) as error:
-        raise PlanningWorktreeError(
-            f"unable to materialize planning worktree: {error}"
-        ) from error
+    except BaseException as error:
+        active_error = error
+        raise
     finally:
         if created:
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(paths.root),
+            try:
+                _run_git(
+                    paths.root,
                     "worktree",
                     "remove",
                     "--force",
                     str(destination),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+                )
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                UnicodeError,
+                ValueError,
+            ) as error:
+                cleanup_error = PlanningWorktreeError(
+                    f"unable to remove planning worktree {destination}: {error}"
+                )
+                if active_error is not None:
+                    active_error.add_note(str(cleanup_error))
+                else:
+                    raise cleanup_error from error
 
 
 def _validate_inputs(
