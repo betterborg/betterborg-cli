@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.repo_analysis.analyzer import run_analyzer
+from betterborg_cli.repo_analysis.analyzer import AnalyzerError, run_analyzer
 from betterborg_cli.repo_analysis.reporting import (
     build_machine_report,
     render_json_report,
@@ -155,6 +155,11 @@ def test_harness_impact_distinguishes_unknown_from_detected_and_not_detected(
         "status": "unknown",
         "label": "Unknown",
         "summary": "No reliable environment inputs were persisted.",
+        "files": [],
+        "toolchains": [],
+        "package_managers": [],
+        "prepare_commands": [],
+        "materialize_commands": [],
     }
     assert impact["secrets"]["status"] == "detected"
     assert impact["services"]["status"] == "not_detected"
@@ -193,21 +198,41 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
         "recommendations": [],
         "themes": [],
         "command_catalog": {
+            "source": "Makefile",
             "commands": [
                 {
                     "stage": "test",
                     "argv": ["make", "test"],
                     "source": "Makefile",
+                    "uses_services": ["postgres"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
                 }
             ]
         },
         "environment": {
             "version": 1,
             "files": ["pyproject.toml", ".python-version"],
-            "toolchains": [{"name": "python", "version": "3.11.9"}],
+            "toolchains": [
+                {
+                    "name": "python",
+                    "version": "3.11",
+                    "source": ".python-version",
+                },
+                {"name": "java", "version": "21", "source": "README.md"},
+            ],
             "package_managers": ["pip"],
             "prepare_commands": [
-                {"argv": ["python", "-m", "pip", "install", "-e", "."]}
+                {
+                    "argv": ["python", "-m", "pip", "install", "-e", "."],
+                    "source": "pyproject.toml",
+                }
+            ],
+            "materialize_commands": [
+                {
+                    "argv": ["git", "submodule", "update", "--init"],
+                    "cwd": ".",
+                    "source": "README.md",
+                }
             ],
         },
         "required_secrets": [
@@ -257,6 +282,184 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
         "secrets": "detected",
         "services": "detected",
     }
+    impact = report["harness_impact"]
+    assert impact["commands"]["commands"] == payload["command_catalog"]["commands"]
+    assert impact["environment"]["toolchains"] == payload["environment"][
+        "toolchains"
+    ]
+    assert impact["environment"]["prepare_commands"] == payload["environment"][
+        "prepare_commands"
+    ]
+    assert impact["environment"]["materialize_commands"] == payload[
+        "environment"
+    ]["materialize_commands"]
+    assert impact["environment"]["summary"] == (
+        "7 environment inputs persisted for harness use."
+    )
+    assert [secret["name"] for secret in impact["secrets"]["secrets"]] == [
+        "PACKAGE_TOKEN"
+    ]
+    assert [service["name"] for service in impact["services"]["services"]] == [
+        "postgres"
+    ]
+
+    terminal = render_terminal_report(report)
+    markdown = render_markdown_report(report)
+    assert '["make", "test"]' in terminal
+    assert '["python", "-m", "pip", "install", "-e", "."]' in terminal
+    assert '["git", "submodule", "update", "--init"]' in terminal
+    assert r'\["make", "test"\]' in markdown
+    assert (
+        r'\["python", "-m", "pip", "install", "-e", "."\]' in markdown
+    )
+    assert r'\["git", "submodule", "update", "--init"\]' in markdown
+    assert "PACKAGE_TOKEN" in terminal
+    assert r"PACKAGE\_TOKEN" in markdown
+    for rendered in (terminal, markdown):
+        assert "python 3.11" in rendered
+        assert "java 21" in rendered
+        assert "postgres" in rendered
+
+
+def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
+    git_repo: Path,
+) -> None:
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small Python command-line application.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "not-discovered.yml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["make", "test"],
+                    "source": "command.missing.yml",
+                }
+            ],
+        },
+        "environment": {
+            "files": ["missing.lock"],
+            "toolchains": [
+                {"name": "java", "version": "21", "source": "jdk.missing"}
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "secrets.example",
+            }
+        ],
+        "service_dependencies": [
+            {
+                "name": "postgres",
+                "source": "compose.missing.yml",
+                "ports": [{"port": 5432, "source": "port.missing.yml"}],
+            }
+        ],
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+
+        with pytest.raises(AnalyzerError, match="absent from manifest") as error:
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+
+        assert store.list_analyses(repository.id) == []
+
+    assert all(
+        source in str(error.value)
+        for source in (
+            "not-discovered.yml",
+            "command.missing.yml",
+            "missing.lock",
+            "jdk.missing",
+            "secrets.example",
+            "compose.missing.yml",
+            "port.missing.yml",
+        )
+    )
+
+
+def test_materialize_command_alone_is_a_valid_environment_input(
+    git_repo: Path,
+) -> None:
+    (git_repo / "README.md").write_text(
+        "# Example\n\nInitialize submodules before building.\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    materialize = {
+        "argv": ["git", "submodule", "update", "--init"],
+        "source": "README.md",
+    }
+    payload = {
+        "summary": "A small repository with an offline materialization step.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "environment": {"materialize_commands": [materialize]},
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        persisted = run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+        report = build_machine_report(persisted, store.list_packages(persisted.id))
+
+    assert report["harness_impact"]["environment"] == {
+        "status": "detected",
+        "label": "Detected",
+        "summary": "1 environment input persisted for harness use.",
+        "files": [],
+        "toolchains": [],
+        "package_managers": [],
+        "prepare_commands": [],
+        "materialize_commands": [materialize],
+    }
 
 
 def test_terminal_markdown_and_json_render_the_same_labeled_report(
@@ -300,6 +503,24 @@ def test_human_reports_sanitize_control_characters_and_escape_markdown(
             "effort_rationale": "Use | pipes\r\n- forged \u202e text.",
         }
     ]
+    malicious_payload["command_catalog"] = {
+        "commands": [
+            {
+                "stage": "test\n## Command\x1b[31m",
+                "argv": ["make", "bad\n## Arg"],
+            }
+        ]
+    }
+    malicious_payload["required_secrets"] = [
+        {
+            "name": "FORGED|TOKEN\n## Secret",
+            "used_by": ["test"],
+            "scope": "build",
+        }
+    ]
+    malicious_payload["service_dependencies"] = [
+        {"name": "postgres\n## Service", "image": "bad|image"}
+    ]
     malicious_analysis = replace(analysis, analysis_json=malicious_payload)
     malicious_packages = [
         replace(
@@ -322,12 +543,18 @@ def test_human_reports_sanitize_control_characters_and_escape_markdown(
     assert "\n## Forged" not in terminal
     assert "packages/evil|row ## Forged" in terminal
     assert "Break **bold** ## Forged[31m" in terminal
+    assert "test ## Command[31m" in terminal
+    assert "FORGED|TOKEN ## Secret" in terminal
+    assert "postgres ## Service" in terminal
 
     assert "\n## Forged" not in markdown
     assert r"packages/evil\|row \#\# Forged" in markdown
     assert r"\[link\](javascript:alert(1))" in markdown
     assert r"Break \*\*bold\*\* \#\# Forged\[31m" in markdown
     assert r"Use \| pipes - forged text." in markdown
+    assert r"test \#\# Command\[31m" in markdown
+    assert r"FORGED\|TOKEN \#\# Secret" in markdown
+    assert r"postgres \#\# Service" in markdown
 
 
 def test_report_rejects_packages_from_another_analysis(

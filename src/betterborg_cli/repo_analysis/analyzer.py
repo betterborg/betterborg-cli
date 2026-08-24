@@ -150,6 +150,7 @@ _ENVIRONMENT_COMMAND_SCHEMA: dict[str, Any] = {
             "items": {"type": "string", "minLength": 1},
         },
         "cwd": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
     },
 }
 _ENVIRONMENT_TOOLCHAIN_SCHEMA: dict[str, Any] = {
@@ -157,29 +158,12 @@ _ENVIRONMENT_TOOLCHAIN_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["name"],
     "properties": {
-        "name": {
-            "type": "string",
-            "enum": [
-                "python",
-                "uv",
-                "poetry",
-                "node",
-                "pnpm",
-                "yarn",
-                "rust",
-                "go",
-                "ruby",
-            ],
-        },
+        "name": {"type": "string", "minLength": 1},
         "version": {
             "type": ["string", "null"],
-            "pattern": (
-                r"^v?[0-9]+\.[0-9]+\.[0-9]+"
-                r"(?:(?:a|b|rc)[0-9]+|(?:\.dev|\.post)[0-9]+|"
-                r"-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-                r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-            ),
+            "minLength": 1,
         },
+        "source": {"type": "string", "minLength": 1},
     },
 }
 _ENVIRONMENT_SCHEMA: dict[str, Any] = {
@@ -189,6 +173,7 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
         {"required": ["files"]},
         {"required": ["toolchains"]},
         {"required": ["prepare_commands"]},
+        {"required": ["materialize_commands"]},
     ],
     "properties": {
         "version": {"type": "integer", "const": 1},
@@ -213,6 +198,7 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
         },
         "materialize_commands": {
             "type": "array",
+            "minItems": 1,
             "items": {"$ref": "#/$defs/environment_command"},
         },
     },
@@ -455,6 +441,7 @@ def _persist_payload(
         validate_recommendation(recommendation, manifest)
         for recommendation in payload["recommendations"]
     ]
+    _validate_harness_evidence(payload, manifest)
     themes = [validate_recommendation_theme(theme) for theme in payload["themes"]]
     ranked_themes = rank_recommendation_themes(
         package_rubrics, recommendations, themes
@@ -523,6 +510,57 @@ def _persist_payload(
         ]
         store.append_analysis(analysis, packages)
     return analysis
+
+
+def _validate_harness_evidence(
+    payload: Mapping[str, Any], manifest: DiscoveryManifest
+) -> None:
+    """Reject Harness claims that cite files outside bounded discovery."""
+    cited_paths: set[str] = set()
+
+    catalog = payload.get("command_catalog")
+    if isinstance(catalog, Mapping):
+        _add_source(cited_paths, catalog)
+        commands = catalog.get("commands")
+        if isinstance(commands, list):
+            for command in commands:
+                _add_source(cited_paths, command)
+
+    environment = payload.get("environment")
+    if isinstance(environment, Mapping):
+        files = environment.get("files")
+        if isinstance(files, list):
+            cited_paths.update(path for path in files if isinstance(path, str))
+        for key in ("toolchains", "prepare_commands", "materialize_commands"):
+            records = environment.get(key)
+            if isinstance(records, list):
+                for record in records:
+                    _add_source(cited_paths, record)
+
+    for key in ("required_secrets", "service_dependencies"):
+        records = payload.get(key)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            _add_source(cited_paths, record)
+            if key == "service_dependencies" and isinstance(record, Mapping):
+                ports = record.get("ports")
+                if isinstance(ports, list):
+                    for port in ports:
+                        _add_source(cited_paths, port)
+
+    known_paths = {file.path for file in manifest.files}
+    unknown_paths = cited_paths - known_paths
+    if unknown_paths:
+        names = ", ".join(sorted(unknown_paths))
+        raise AnalyzerError(
+            f"Harness input cites evidence absent from manifest: {names}"
+        )
+
+
+def _add_source(paths: set[str], value: object) -> None:
+    if isinstance(value, Mapping) and isinstance(value.get("source"), str):
+        paths.add(value["source"])
 
 
 def resolve_analysis_model(

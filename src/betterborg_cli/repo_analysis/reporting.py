@@ -136,6 +136,10 @@ def render_terminal_report(report: Mapping[str, Any]) -> str:
             f"  {key.title()}: {_terminal_text(impact['label'])} — "
             f"{_terminal_text(impact['summary'])}"
         )
+        lines.extend(
+            f"    - {_terminal_text(detail)}"
+            for detail in _impact_details(key, impact)
+        )
     lines.extend(["", _terminal_text(report["labels"]["effort"])])
     return "\n".join(lines) + "\n"
 
@@ -200,6 +204,10 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         lines.append(
             f"- **{key.title()}:** {_markdown_text(impact['label'])} — "
             f"{_markdown_text(impact['summary'])}"
+        )
+        lines.extend(
+            f"  - {_markdown_text(detail)}"
+            for detail in _impact_details(key, impact)
         )
     lines.extend(["", f"_{_markdown_text(report['labels']['effort'])}_"])
     return "\n".join(lines) + "\n"
@@ -272,60 +280,111 @@ def _recommendation_results(theme: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [dict(result) for result in raw_results if isinstance(result, Mapping)]
 
 
-def _harness_impact(payload: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+def _harness_impact(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {
-        "commands": _catalog_impact(payload, "command_catalog", "commands"),
+        "commands": _catalog_impact(payload),
         "environment": _environment_impact(payload),
         "secrets": _list_impact(
             payload,
             "required_secrets",
+            detail_key="secrets",
             singular="required secret name",
             plural="required secret names",
         ),
         "services": _list_impact(
             payload,
             "service_dependencies",
+            detail_key="services",
             singular="service dependency",
             plural="service dependencies",
         ),
     }
 
 
-def _catalog_impact(
-    payload: Mapping[str, Any], key: str, collection_key: str
-) -> dict[str, str]:
-    if key not in payload:
-        return _unknown_impact("No reliable command catalog was persisted.")
-    catalog = payload[key]
-    items = catalog.get(collection_key) if isinstance(catalog, Mapping) else None
+def _catalog_impact(payload: Mapping[str, Any]) -> dict[str, Any]:
+    catalog = payload.get("command_catalog")
+    if catalog is None:
+        return {
+            **_unknown_impact("No reliable command catalog was persisted."),
+            "commands": [],
+            "source": None,
+            "notes": None,
+        }
+    items = catalog.get("commands") if isinstance(catalog, Mapping) else None
     if not isinstance(items, list):
-        return _unknown_impact("The persisted command catalog was incomplete.")
-    return _count_impact(len(items), "cataloged command", "cataloged commands")
+        return {
+            **_unknown_impact("The persisted command catalog was incomplete."),
+            "commands": [],
+            "source": None,
+            "notes": None,
+        }
+    commands = [dict(item) for item in items if isinstance(item, Mapping)]
+    return {
+        **_count_impact(
+            len(commands), "cataloged command", "cataloged commands"
+        ),
+        "commands": commands,
+        "source": catalog.get("source"),
+        "notes": catalog.get("notes"),
+    }
 
 
-def _environment_impact(payload: Mapping[str, Any]) -> dict[str, str]:
+def _environment_impact(payload: Mapping[str, Any]) -> dict[str, Any]:
+    fields = (
+        "files",
+        "toolchains",
+        "package_managers",
+        "prepare_commands",
+        "materialize_commands",
+    )
     if "environment" not in payload:
-        return _unknown_impact("No reliable environment inputs were persisted.")
+        return {
+            **_unknown_impact("No reliable environment inputs were persisted."),
+            **dict.fromkeys(fields, []),
+        }
     environment = payload["environment"]
     if not isinstance(environment, Mapping):
-        return _unknown_impact("The persisted environment inputs were incomplete.")
-    count = sum(
-        len(value)
-        for key in ("files", "toolchains", "package_managers", "prepare_commands")
+        return {
+            **_unknown_impact("The persisted environment inputs were incomplete."),
+            **dict.fromkeys(fields, []),
+        }
+    details = {
+        key: [dict(item) if isinstance(item, Mapping) else item for item in value]
         if isinstance((value := environment.get(key)), list)
-    )
-    return _count_impact(count, "environment input", "environment inputs")
+        else []
+        for key in fields
+    }
+    count = sum(len(details[key]) for key in fields)
+    return {
+        **_count_impact(count, "environment input", "environment inputs"),
+        **details,
+    }
 
 
 def _list_impact(
-    payload: Mapping[str, Any], key: str, *, singular: str, plural: str
-) -> dict[str, str]:
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    detail_key: str,
+    singular: str,
+    plural: str,
+) -> dict[str, Any]:
     if key not in payload:
-        return _unknown_impact(f"No reliable {plural} were persisted.")
+        return {
+            **_unknown_impact(f"No reliable {plural} were persisted."),
+            detail_key: [],
+        }
     values = payload[key]
     if not isinstance(values, list):
-        return _unknown_impact(f"The persisted {plural} were incomplete.")
-    return _count_impact(len(values), singular, plural)
+        return {
+            **_unknown_impact(f"The persisted {plural} were incomplete."),
+            detail_key: [],
+        }
+    records = [dict(value) for value in values if isinstance(value, Mapping)]
+    return {
+        **_count_impact(len(records), singular, plural),
+        detail_key: records,
+    }
 
 
 def _count_impact(count: int, singular: str, plural: str) -> dict[str, str]:
@@ -345,6 +404,118 @@ def _count_impact(count: int, singular: str, plural: str) -> dict[str, str]:
 
 def _unknown_impact(summary: str) -> dict[str, str]:
     return {"status": "unknown", "label": "Unknown", "summary": summary}
+
+
+def _impact_details(key: str, impact: Mapping[str, Any]) -> list[str]:
+    if key == "commands":
+        return [
+            f"Command {_describe_command(command)}"
+            for command in impact.get("commands", [])
+            if isinstance(command, Mapping)
+        ]
+    if key == "environment":
+        details = [
+            f"Environment file: {path}" for path in impact.get("files", [])
+        ]
+        details.extend(
+            f"Toolchain: {_describe_toolchain(toolchain)}"
+            for toolchain in impact.get("toolchains", [])
+            if isinstance(toolchain, Mapping)
+        )
+        details.extend(
+            f"Package manager: {manager}"
+            for manager in impact.get("package_managers", [])
+        )
+        details.extend(
+            f"Prepare command {_describe_command(command, include_stage=False)}"
+            for command in impact.get("prepare_commands", [])
+            if isinstance(command, Mapping)
+        )
+        details.extend(
+            "Materialize command "
+            f"{_describe_command(command, include_stage=False)}"
+            for command in impact.get("materialize_commands", [])
+            if isinstance(command, Mapping)
+        )
+        return details
+    if key == "secrets":
+        return [
+            f"Secret: {_describe_secret(secret)}"
+            for secret in impact.get("secrets", [])
+            if isinstance(secret, Mapping)
+        ]
+    if key == "services":
+        return [
+            f"Service: {_describe_service(service)}"
+            for service in impact.get("services", [])
+            if isinstance(service, Mapping)
+        ]
+    return []
+
+
+def _describe_command(
+    command: Mapping[str, Any], *, include_stage: bool = True
+) -> str:
+    stage = f"{command.get('stage', 'unnamed')}: " if include_stage else ""
+    argv = command.get("argv")
+    rendered_argv = (
+        json.dumps(argv, ensure_ascii=False) if isinstance(argv, list) else "[]"
+    )
+    qualifiers: list[str] = []
+    _append_qualifier(qualifiers, "cwd", command.get("cwd"))
+    _append_qualifier(qualifiers, "source", command.get("source"))
+    _append_values(qualifiers, "services", command.get("uses_services"))
+    _append_values(qualifiers, "secrets", command.get("required_secrets"))
+    suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
+    return f"{stage}{rendered_argv}{suffix}"
+
+
+def _describe_toolchain(toolchain: Mapping[str, Any]) -> str:
+    version = toolchain.get("version")
+    return (
+        f"{toolchain.get('name', 'unnamed')} {version}"
+        if version is not None
+        else str(toolchain.get("name", "unnamed"))
+    )
+
+
+def _describe_secret(secret: Mapping[str, Any]) -> str:
+    qualifiers: list[str] = []
+    _append_qualifier(qualifiers, "scope", secret.get("scope"))
+    _append_values(qualifiers, "used by", secret.get("used_by"))
+    _append_qualifier(qualifiers, "source", secret.get("source"))
+    suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
+    return f"{secret.get('name', 'unnamed')}{suffix}"
+
+
+def _describe_service(service: Mapping[str, Any]) -> str:
+    qualifiers: list[str] = []
+    _append_qualifier(qualifiers, "image", service.get("image"))
+    _append_qualifier(qualifiers, "port", service.get("port"))
+    ports = service.get("ports")
+    if isinstance(ports, list):
+        rendered_ports = [
+            f"{port.get('port')}/{port.get('protocol', 'tcp')}"
+            for port in ports
+            if isinstance(port, Mapping)
+        ]
+        if rendered_ports:
+            qualifiers.append(f"ports: {', '.join(rendered_ports)}")
+    _append_qualifier(qualifiers, "compose service", service.get("compose_service"))
+    _append_qualifier(qualifiers, "URL environment", service.get("url_env"))
+    _append_qualifier(qualifiers, "source", service.get("source"))
+    suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
+    return f"{service.get('name', 'unnamed')}{suffix}"
+
+
+def _append_qualifier(values: list[str], label: str, value: object) -> None:
+    if value is not None:
+        values.append(f"{label}: {value}")
+
+
+def _append_values(values: list[str], label: str, raw: object) -> None:
+    if isinstance(raw, list) and raw:
+        values.append(f"{label}: {', '.join(str(value) for value in raw)}")
 
 
 def _score_line(report: Mapping[str, Any]) -> str:
