@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -16,6 +17,10 @@ from betterborg_cli.repo_analysis.scoring import (
     Recommendation,
     rank_recommendation_themes,
     validate_recommendation_theme,
+)
+from betterborg_cli.repo_analysis.text_rendering import (
+    markdown_code_span,
+    markdown_text,
 )
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import RepositoryAnalysis, SqliteStore
@@ -116,10 +121,35 @@ def generate_improvement_prds(
         )
         for key, ranked in keyed_themes
     )
-    paths.improvement_prds_dir.mkdir(parents=True, exist_ok=True)
+    publication_directory = _prepare_publication_directory(paths)
     for document in documents:
-        document.path.write_text(document.body_md, encoding="utf-8")
+        _publish_prd(
+            publication_directory / document.path.name,
+            document.body_md,
+        )
     return documents
+
+
+def _prepare_publication_directory(paths: RepoPaths) -> Path:
+    directory = paths.improvement_prds_dir
+    resolved = directory.resolve()
+    if not resolved.is_relative_to(paths.root):
+        raise ValueError(f"improvement PRD directory escapes repository: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    resolved = directory.resolve(strict=True)
+    if not resolved.is_relative_to(paths.root):
+        raise ValueError(f"improvement PRD directory escapes repository: {directory}")
+    return resolved
+
+
+def _publish_prd(path: Path, body_md: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.urandom(16).hex()}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(body_md)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _ranked_themes(payload: Mapping[str, Any]) -> list[RankedRecommendationTheme]:
@@ -185,13 +215,13 @@ def _render_prd(
 ) -> str:
     theme = ranked.theme
     lines = [
-        f"# {_markdown_text(theme.title)}",
+        f"# {markdown_text(theme.title)}",
         "",
         f"Theme key: `{theme_key}`",
         "",
         "## Suggested Borg",
         "",
-        _markdown_text(suggested_name),
+        markdown_text(suggested_name),
         "",
         "## Scope",
         "",
@@ -199,8 +229,8 @@ def _render_prd(
     for scored in ranked.recommendations:
         recommendation = scored.recommendation
         lines.append(
-            f"- **{_markdown_text(recommendation.title)}** in "
-            f"`{_code_text(recommendation.package_path)}`"
+            f"- **{markdown_text(recommendation.title)}** in "
+            f"{markdown_code_span(recommendation.package_path)}"
         )
 
     lines.extend(
@@ -208,7 +238,7 @@ def _render_prd(
             "",
             "## Estimated effort",
             "",
-            f"**{theme.effort}** — {_markdown_text(theme.effort_rationale)}",
+            f"**{theme.effort}** — {markdown_text(theme.effort_rationale)}",
             "",
             "## Dimension changes",
             "",
@@ -219,8 +249,8 @@ def _render_prd(
     for scored in ranked.recommendations:
         recommendation = scored.recommendation
         lines.append(
-            f"| `{_code_text(recommendation.package_path)}` | "
-            f"`{_code_text(recommendation.dimension)}` | "
+            f"| {markdown_code_span(recommendation.package_path, table_cell=True)} | "
+            f"{markdown_code_span(recommendation.dimension, table_cell=True)} | "
             f"+{recommendation.estimated_delta} | +{scored.effective_delta} |"
         )
 
@@ -238,18 +268,7 @@ def _render_prd(
     for scored in ranked.recommendations:
         recommendation = scored.recommendation
         evidence = ", ".join(
-            f"`{_code_text(path)}`" for path in recommendation.manifest_evidence
+            markdown_code_span(path) for path in recommendation.manifest_evidence
         )
-        lines.append(f"- **{_markdown_text(recommendation.title)}:** {evidence}")
+        lines.append(f"- **{markdown_text(recommendation.title)}:** {evidence}")
     return "\n".join(lines) + "\n"
-
-
-def _markdown_text(value: str) -> str:
-    escaped = value.replace("\\", "\\\\")
-    for character in "`*_{}[]<>#+!|":
-        escaped = escaped.replace(character, f"\\{character}")
-    return escaped
-
-
-def _code_text(value: str) -> str:
-    return value.replace("`", "\\`").replace("\n", " ").replace("\r", " ")

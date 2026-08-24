@@ -150,6 +150,93 @@ def test_generates_one_prd_per_theme_with_exact_canonical_values(
 
 
 @pytest.mark.parametrize(
+    "symlink_path",
+    [Path(".borg"), Path(".borg/prds"), Path(".borg/prds/improvements")],
+)
+def test_improvement_prd_directory_cannot_escape_repository_through_symlink(
+    git_repo: Path,
+    analysis: RepositoryAnalysis,
+    symlink_path: Path,
+) -> None:
+    outside = git_repo.parent / f"{git_repo.name}-outside"
+    outside.mkdir()
+    link = git_repo / symlink_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    paths = RepoPaths.discover(git_repo)
+
+    with pytest.raises(ValueError, match="PRD directory escapes repository"):
+        generate_improvement_prds(
+            analysis,
+            paths,
+            {"ci-safety": "Sentinel", "docs": "Scribe"},
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_improvement_prd_publication_replaces_file_symlink_without_following_it(
+    git_repo: Path, analysis: RepositoryAnalysis
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    paths.improvement_prds_dir.mkdir(parents=True)
+    outside = git_repo.parent / f"{git_repo.name}-outside.md"
+    outside.write_text("do not overwrite\n", encoding="utf-8")
+    linked_prd = paths.improvement_prds_dir / "ci-safety.md"
+    linked_prd.symlink_to(outside)
+
+    generate_improvement_prds(
+        analysis,
+        paths,
+        {"ci-safety": "Sentinel", "docs": "Scribe"},
+    )
+
+    assert outside.read_text(encoding="utf-8") == "do not overwrite\n"
+    assert not linked_prd.is_symlink()
+    assert linked_prd.read_text(encoding="utf-8").startswith("# Reliable checks\n")
+
+
+def test_generated_prd_sanitizes_analyzer_markdown_and_code_spans(
+    git_repo: Path, analysis: RepositoryAnalysis
+) -> None:
+    package_path = "pkg/`name`|row\n- forged\x1b[31m\u202e"
+    analysis.analysis_json["packages"].append(
+        {**analysis.analysis_json["packages"][0], "path": package_path}
+    )
+    recommendation = analysis.analysis_json["recommendations"][0]
+    recommendation["package_path"] = package_path
+    recommendation["title"] = "Check **title**\n- forged\x00\u202e"
+    recommendation["manifest_evidence"] = [
+        "docs/`proof`|item\n- forged\x1b[31m\u202e.md"
+    ]
+    theme = analysis.analysis_json["themes"][0]
+    theme["title"] = "Reliable\n## forged\x1b[31m\u202e **checks**"
+    theme["effort_rationale"] = "One\r\n- forged | reason.\x00\u202e"
+    paths = RepoPaths.discover(git_repo)
+
+    generate_improvement_prds(
+        analysis,
+        paths,
+        {"ci-safety": "Sentinel", "docs": "Scribe"},
+    )
+
+    body = (paths.improvement_prds_dir / "ci-safety.md").read_text(
+        encoding="utf-8"
+    )
+    assert "\x1b" not in body
+    assert "\x00" not in body
+    assert "\u202e" not in body
+    assert "\n## forged" not in body
+    assert "\n- forged" not in body
+    assert r"# Reliable \#\# forged\[31m \*\*checks\*\*" in body
+    assert r"**Check \*\*title\*\* - forged**" in body
+    assert "in ``pkg/`name`|row - forged[31m``" in body
+    assert "| ``pkg/`name`\\|row - forged[31m`` | `ci` |" in body
+    assert r"**S** — One - forged \| reason." in body
+    assert "``docs/`proof`|item - forged[31m.md``" in body
+
+
+@pytest.mark.parametrize(
     ("suggestions", "message"),
     [
         ({"ci-safety": "Sentinel"}, "match theme keys exactly"),
