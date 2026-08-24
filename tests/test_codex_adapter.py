@@ -272,7 +272,7 @@ def test_process_spawn_failure_returns_failed_result(
         raise FileNotFoundError("configured executable disappeared")
 
     monkeypatch.setattr(
-        "betterborg_cli.agent_runtime.codex.shutil.which",
+        "betterborg_cli.agent_runtime.native_cli.shutil.which",
         lambda _binary: "/installed/codex-custom",
     )
     monkeypatch.setattr(
@@ -289,6 +289,26 @@ def test_process_spawn_failure_returns_failed_result(
     assert result.exit_code is None
     assert "unable to start Codex process" in (result.error or "")
     assert "configured executable disappeared" in (result.error or "")
+
+
+def test_directory_preparation_failure_returns_failed_result(tmp_path: Path) -> None:
+    non_directory = tmp_path / "not-a-directory"
+    non_directory.write_text("occupied", encoding="utf-8")
+    spec = codex_spec(
+        tmp_path,
+        log_path=non_directory / "codex.jsonl",
+    )
+
+    def runner(*_args: Any) -> int:
+        pytest.fail("process runner must not be called when preparation fails")
+
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.FAILED
+    assert result.exit_code is None
+    assert result.payload is None
+    assert "unable to prepare Codex process" in (result.error or "")
+    assert not spec.result_path.exists()
 
 
 def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
