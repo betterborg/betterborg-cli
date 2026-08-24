@@ -125,6 +125,10 @@ _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
     "or truncated evidence as uncertainty; do not inspect the raw repository."
 )
+_DEFAULT_ANALYSIS_MODELS = {
+    "anthropic": "claude-opus-4-8",
+    "openai": "gpt-5",
+}
 
 
 class AnalyzerError(RuntimeError):
@@ -135,7 +139,7 @@ class AnalyzerError(RuntimeError):
 class AnalyzerConfig:
     """Resource and model settings for one bounded analysis."""
 
-    model: str = "default"
+    model: str | None = None
     effort: str | None = None
     limits: DiscoveryLimits = DiscoveryLimits()
 
@@ -200,13 +204,24 @@ def _run_in_workspace(
         workspace_dir,
         limits=config.limits,
     )
+    if agent.capabilities.host_capable:
+        raise AnalyzerError(
+            f"adapter {agent.name!r} is host-capable and cannot be confined to "
+            "the bounded discovery workspace; select the 'anthropic' or "
+            "'openai' API adapter"
+        )
+    if not agent.capabilities.tool_allowlist:
+        raise AnalyzerError(
+            f"adapter {agent.name!r} cannot enforce the bounded analyzer "
+            "tool allowlist"
+        )
     run_id = uuid4()
     spec = AgentRunSpec(
         system_prompt=_SYSTEM_PROMPT,
         user_prompt=_USER_PROMPT,
         schema=ANALYZER_OUTPUT_SCHEMA,
         cwd=workspace_dir.resolve(),
-        model=config.model,
+        model=_analysis_model(agent, config.model),
         effort=config.effort,
         allowed_tools=("list_files", "read_file", "search_text"),
         log_path=artifact_dir / f"{run_id}.log",
@@ -324,6 +339,21 @@ def _persist_payload(
         ]
         store.append_analysis(analysis, packages)
     return analysis
+
+
+def _analysis_model(
+    agent: AgentAdapter | SelectedAgent, configured_model: str | None
+) -> str:
+    if configured_model is not None:
+        return configured_model
+    if isinstance(agent, SelectedAgent) and agent.model is not None:
+        return agent.model
+    try:
+        return _DEFAULT_ANALYSIS_MODELS[agent.name]
+    except KeyError as error:
+        raise AnalyzerError(
+            f"analysis model must be configured for adapter {agent.name!r}"
+        ) from error
 
 
 def _git_head(repository_root: Path) -> str:

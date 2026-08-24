@@ -110,12 +110,22 @@ class SelectedAgent:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        """Invoke the selected adapter in a caller-built contained workspace.
+        """Invoke a file-tool adapter in a caller-built contained workspace.
 
         The caller owns the containment boundary, so this path deliberately
         does not interpret the sanitized directory as a raw Git checkout or
         grant repository trust to provider tools.
         """
+        if self.capabilities.host_capable:
+            raise AgentSelectionError(
+                f"Adapter {self.name!r} is host-capable and cannot be confined "
+                "to a bounded evidence workspace; select the 'anthropic' or "
+                "'openai' API adapter."
+            )
+        if not self.capabilities.tool_allowlist:
+            raise AgentSelectionError(
+                f"Adapter {self.name!r} cannot enforce a bounded tool allowlist"
+            )
         return self.adapter.run(self._resolve_spec(spec), cancel=cancel)
 
     def _resolve_spec(self, spec: AgentRunSpec) -> AgentRunSpec:
@@ -204,7 +214,11 @@ def select_agent(
                 )
             )
     else:
-        candidates = (*_NATIVE_ADAPTERS, *_API_ADAPTERS) if tty else _API_ADAPTERS
+        candidates = (
+            _API_ADAPTERS
+            if resolved_role is ApiAgentRole.ANALYSIS or not tty
+            else (*_NATIVE_ADAPTERS, *_API_ADAPTERS)
+        )
         adapter_name = next(
             (
                 candidate
