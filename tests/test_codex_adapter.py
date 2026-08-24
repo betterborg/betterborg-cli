@@ -516,6 +516,69 @@ def test_optional_schema_fields_are_normalized_for_strict_transport(
     assert schema["properties"]["summary"]["type"] == "string"
 
 
+@pytest.mark.parametrize(
+    ("property_schema", "expected_transport_schema"),
+    (
+        (
+            {"type": "string", "enum": ["approve", "reject"]},
+            {
+                "type": ["string", "null"],
+                "enum": ["approve", "reject", None],
+            },
+        ),
+        (
+            {"type": "string", "const": "approve"},
+            {
+                "anyOf": [
+                    {"type": "string", "const": "approve"},
+                    {"type": "null"},
+                ]
+            },
+        ),
+    ),
+)
+def test_optional_typed_enum_and_const_accept_null_transport_placeholders(
+    tmp_path: Path,
+    property_schema: dict[str, Any],
+    expected_transport_schema: dict[str, Any],
+) -> None:
+    captured_schema: dict[str, Any] = {}
+    schema = {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+            "status": {"const": "completed"},
+            "decision": property_schema,
+        },
+        "additionalProperties": False,
+    }
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
+        log_path.write_text("ok\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "decision": None}
+        )
+        return 0
+
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(
+        codex_spec(tmp_path, schema=schema)
+    )
+
+    assert captured_schema["properties"]["decision"] == expected_transport_schema
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed"}
+    assert schema["properties"]["decision"] == property_schema
+
+
 def test_unconstrained_optional_null_is_preserved(tmp_path: Path) -> None:
     schema = {
         "type": "object",

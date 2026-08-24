@@ -400,6 +400,17 @@ def _normalize_for_openai_strict(
 def _make_nullable(schema: Any) -> None:
     if not isinstance(schema, dict):
         raise _PromptSchemaFallback("property schema must be an object")
+
+    if "const" in schema:
+        original = dict(schema)
+        schema.clear()
+        schema["anyOf"] = [original, {"type": "null"}]
+        return
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and None not in enum:
+        schema["enum"] = [*enum, None]
+
     expected_type = schema.get("type")
     if isinstance(expected_type, str):
         if expected_type != "null":
@@ -409,10 +420,7 @@ def _make_nullable(schema: Any) -> None:
         if "null" not in expected_type:
             schema["type"] = [*expected_type, "null"]
         return
-    enum = schema.get("enum")
     if isinstance(enum, list):
-        if None not in enum:
-            schema["enum"] = [*enum, None]
         return
     original = dict(schema)
     schema.clear()
