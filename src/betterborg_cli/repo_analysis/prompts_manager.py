@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -209,14 +210,19 @@ def _generate_one_role(
         body_md = result.payload["body_md"]
         if not body_md.strip():
             raise ValueError("prompt manager returned an empty body_md")
-        with store.transaction():
-            prompt = store.append_generated_prompt(
-                repository_id=repository.id,
-                analysis_id=analysis.id,
-                role=role,
-                body_md=body_md,
-            )
-            _write_stable_prompt(prompt_path, body_md, repository.root)
+        with _stable_prompt_publication(
+            prompt_path,
+            body_md,
+            repository.root,
+        ) as publish:
+            with store.transaction():
+                prompt = store.append_generated_prompt(
+                    repository_id=repository.id,
+                    analysis_id=analysis.id,
+                    role=role,
+                    body_md=body_md,
+                )
+                publish()
     except Exception as error:
         return PromptGeneration(
             role=role,
@@ -304,18 +310,57 @@ def _prepare_stable_prompt_directory(paths: RepoPaths) -> None:
         )
 
 
-def _write_stable_prompt(
+@contextmanager
+def _stable_prompt_publication(
     path: Path,
     body_md: str,
     repository_root: Path,
-) -> None:
+) -> Iterator[Callable[[], None]]:
     resolved_directory = path.parent.resolve(strict=True)
     if not resolved_directory.is_relative_to(repository_root):
         raise ValueError(f"stable prompt path escapes repository: {path}")
     path = resolved_directory / path.name
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    backup = path.with_name(f".{path.name}.{uuid4().hex}.bak")
+    prior_moved = False
+    published = False
+
+    def publish() -> None:
+        nonlocal prior_moved, published
+        if path.exists() or path.is_symlink():
+            os.replace(path, backup)
+            prior_moved = True
+        try:
+            os.replace(temporary, path)
+        except BaseException:
+            if prior_moved:
+                os.replace(backup, path)
+                prior_moved = False
+            raise
+        published = True
+
     try:
         temporary.write_text(body_md, encoding="utf-8")
-        os.replace(temporary, path)
+        try:
+            yield publish
+            if not published:
+                raise RuntimeError("stable prompt was not published")
+        except BaseException as error:
+            if published:
+                try:
+                    if prior_moved:
+                        os.replace(backup, path)
+                        prior_moved = False
+                    else:
+                        path.unlink(missing_ok=True)
+                    published = False
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        f"{error}; stable prompt rollback failed: {rollback_error}"
+                    ) from rollback_error
+            raise
+        else:
+            backup.unlink(missing_ok=True)
+            prior_moved = False
     finally:
         temporary.unlink(missing_ok=True)
