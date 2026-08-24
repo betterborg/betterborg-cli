@@ -56,6 +56,167 @@ _RUBRIC_SCHEMA: dict[str, Any] = {
         dimension: {"$ref": "#/$defs/dimension"} for dimension in DIMENSIONS
     },
 }
+_COMMAND_STEP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["stage", "argv"],
+    "properties": {
+        "stage": {"type": "string", "minLength": 1},
+        "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "cwd": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+        "uses_services": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "required_secrets": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+}
+_COMMAND_CATALOG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "commands": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/command_step"},
+        },
+        "source": {"type": "string", "minLength": 1},
+        "notes": {"type": "string"},
+    },
+}
+_SECRET_REQUIREMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name", "used_by", "scope"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "used_by": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "scope": {"type": "string", "enum": ["all", "build", "agent"]},
+        "source": {"type": "string", "minLength": 1},
+        "description": {"type": "string"},
+    },
+}
+_SERVICE_PORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["port"],
+    "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "protocol": {"type": "string", "enum": ["tcp", "udp"]},
+        "env": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+    },
+}
+_SERVICE_DEPENDENCY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "image": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "ports": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/service_port"},
+        },
+        "source": {"type": "string", "minLength": 1},
+        "compose_service": {"type": "string", "minLength": 1},
+        "url_env": {"type": "string", "minLength": 1},
+        "env": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+}
+_ENVIRONMENT_COMMAND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["argv"],
+    "properties": {
+        "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "cwd": {"type": "string", "minLength": 1},
+    },
+}
+_ENVIRONMENT_TOOLCHAIN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name"],
+    "properties": {
+        "name": {
+            "type": "string",
+            "enum": [
+                "python",
+                "uv",
+                "poetry",
+                "node",
+                "pnpm",
+                "yarn",
+                "rust",
+                "go",
+                "ruby",
+            ],
+        },
+        "version": {
+            "type": ["string", "null"],
+            "pattern": (
+                r"^v?[0-9]+\.[0-9]+\.[0-9]+"
+                r"(?:(?:a|b|rc)[0-9]+|(?:\.dev|\.post)[0-9]+|"
+                r"-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+                r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+            ),
+        },
+    },
+}
+_ENVIRONMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "anyOf": [
+        {"required": ["files"]},
+        {"required": ["toolchains"]},
+        {"required": ["prepare_commands"]},
+    ],
+    "properties": {
+        "version": {"type": "integer", "const": 1},
+        "files": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "toolchains": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/environment_toolchain"},
+        },
+        "package_managers": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "prepare_commands": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/environment_command"},
+        },
+        "materialize_commands": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/environment_command"},
+        },
+    },
+}
 ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "BetterBorg bounded repository analysis",
@@ -86,10 +247,28 @@ ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"$ref": "#/$defs/theme"},
         },
+        "command_catalog": {"$ref": "#/$defs/command_catalog"},
+        "environment": {"$ref": "#/$defs/environment"},
+        "required_secrets": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/secret_requirement"},
+        },
+        "service_dependencies": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/service_dependency"},
+        },
     },
     "$defs": {
         "dimension": _DIMENSION_SCHEMA,
         "rubric": _RUBRIC_SCHEMA,
+        "command_step": _COMMAND_STEP_SCHEMA,
+        "command_catalog": _COMMAND_CATALOG_SCHEMA,
+        "secret_requirement": _SECRET_REQUIREMENT_SCHEMA,
+        "service_port": _SERVICE_PORT_SCHEMA,
+        "service_dependency": _SERVICE_DEPENDENCY_SCHEMA,
+        "environment_command": _ENVIRONMENT_COMMAND_SCHEMA,
+        "environment_toolchain": _ENVIRONMENT_TOOLCHAIN_SCHEMA,
+        "environment": _ENVIRONMENT_SCHEMA,
         "package": {
             "type": "object",
             "additionalProperties": False,
@@ -119,7 +298,10 @@ Open analysis_input.json first and inspect only files listed in its files array.
 Score every package on the eight required dimensions. Every recommendation must
 cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
-rationale. Return only the JSON object required by the supplied schema.
+rationale. When bounded evidence is reliable, report the command catalog,
+environment inputs, required secret names (never values), and service
+dependencies; omit an optional category when evidence is insufficient. Return
+only the JSON object required by the supplied schema.
 """
 _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "

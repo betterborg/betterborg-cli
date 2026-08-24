@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.repo_analysis.analyzer import run_analyzer
 from betterborg_cli.repo_analysis.reporting import (
     build_machine_report,
     render_json_report,
@@ -15,7 +20,12 @@ from betterborg_cli.repo_analysis.reporting import (
     render_terminal_report,
 )
 from betterborg_cli.repo_analysis.scoring import DIMENSIONS
-from betterborg_cli.store import RepositoryAnalysis, RepositoryPackage
+from betterborg_cli.store import (
+    Repository,
+    RepositoryAnalysis,
+    RepositoryPackage,
+    SqliteStore,
+)
 
 _REPOSITORY_ID = UUID("10000000-0000-0000-0000-000000000000")
 _ANALYSIS_ID = UUID("20000000-0000-0000-0000-000000000000")
@@ -43,8 +53,12 @@ def analysis() -> RepositoryAnalysis:
         score_delta=0.5,
         created_at=datetime(2026, 8, 24, tzinfo=UTC),
         analysis_json={
-            "command_catalog": {"commands": [{"argv": ["make", "test"]}]},
-            "required_secrets": [{"name": "PACKAGE_TOKEN"}],
+            "command_catalog": {
+                "commands": [{"stage": "test", "argv": ["make", "test"]}]
+            },
+            "required_secrets": [
+                {"name": "PACKAGE_TOKEN", "used_by": ["test"], "scope": "build"}
+            ],
             "service_dependencies": [],
             "themes": [
                 {
@@ -146,6 +160,105 @@ def test_harness_impact_distinguishes_unknown_from_detected_and_not_detected(
     assert impact["services"]["status"] == "not_detected"
 
 
+def test_analyzer_persists_harness_inputs_consumed_by_report(
+    git_repo: Path,
+) -> None:
+    evidence = {
+        "README.md": "# Example\n",
+        "Makefile": "test:\n\tpython -m pytest\n",
+        "pyproject.toml": "[project]\nname = 'example'\nversion = '1.0.0'\n",
+        ".python-version": "3.11.9\n",
+        ".env.example": "PACKAGE_TOKEN=\n",
+        "docker-compose.yml": "services:\n  postgres:\n    image: postgres:16\n",
+    }
+    for path, body in evidence.items():
+        (git_repo / path).write_text(body, encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "--all"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small Python command-line application.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["make", "test"],
+                    "source": "Makefile",
+                }
+            ]
+        },
+        "environment": {
+            "version": 1,
+            "files": ["pyproject.toml", ".python-version"],
+            "toolchains": [{"name": "python", "version": "3.11.9"}],
+            "package_managers": ["pip"],
+            "prepare_commands": [
+                {"argv": ["python", "-m", "pip", "install", "-e", "."]}
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": ".env.example",
+            }
+        ],
+        "service_dependencies": [
+            {
+                "name": "postgres",
+                "image": "postgres:16",
+                "port": 5432,
+                "source": "docker-compose.yml",
+            }
+        ],
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        persisted = run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+        report = build_machine_report(
+            persisted,
+            store.list_packages(persisted.id),
+        )
+
+    assert persisted.analysis_json["command_catalog"] == payload["command_catalog"]
+    assert persisted.analysis_json["environment"] == payload["environment"]
+    assert persisted.analysis_json["required_secrets"] == payload["required_secrets"]
+    assert persisted.analysis_json["service_dependencies"] == payload[
+        "service_dependencies"
+    ]
+    assert {
+        key: impact["status"] for key, impact in report["harness_impact"].items()
+    } == {
+        "commands": "detected",
+        "environment": "detected",
+        "secrets": "detected",
+        "services": "detected",
+    }
+
+
 def test_terminal_markdown_and_json_render_the_same_labeled_report(
     analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
 ) -> None:
@@ -173,6 +286,48 @@ def test_terminal_markdown_and_json_render_the_same_labeled_report(
         assert "reproducib" not in lowered
 
     assert machine == report
+
+
+def test_human_reports_sanitize_control_characters_and_escape_markdown(
+    analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
+) -> None:
+    malicious_payload = dict(analysis.analysis_json)
+    [theme] = malicious_payload["themes"]
+    malicious_payload["themes"] = [
+        {
+            **theme,
+            "title": "Break **bold**\n## Forged\x1b[31m",
+            "effort_rationale": "Use | pipes\r\n- forged \u202e text.",
+        }
+    ]
+    malicious_analysis = replace(analysis, analysis_json=malicious_payload)
+    malicious_packages = [
+        replace(
+            packages[0],
+            package_path="packages/evil|row\n## Forged",
+            package_name="[link](javascript:alert(1))",
+            primary_language="py\x00thon",
+        ),
+        packages[1],
+    ]
+    report = build_machine_report(malicious_analysis, malicious_packages)
+
+    terminal = render_terminal_report(report)
+    markdown = render_markdown_report(report)
+
+    assert "\x1b" not in terminal
+    assert "\x00" not in terminal
+    assert "\r" not in terminal
+    assert "\u202e" not in terminal
+    assert "\n## Forged" not in terminal
+    assert "packages/evil|row ## Forged" in terminal
+    assert "Break **bold** ## Forged[31m" in terminal
+
+    assert "\n## Forged" not in markdown
+    assert r"packages/evil\|row \#\# Forged" in markdown
+    assert r"\[link\](javascript:alert(1))" in markdown
+    assert r"Break \*\*bold\*\* \#\# Forged\[31m" in markdown
+    assert r"Use \| pipes - forged text." in markdown
 
 
 def test_report_rejects_packages_from_another_analysis(

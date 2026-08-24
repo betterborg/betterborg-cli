@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -26,6 +27,7 @@ _EFFORT_LABEL = "S/M/L are estimated effort labels."
 _NON_DETERMINISM_LABEL = (
     "Analyzer output is non-deterministic and may vary between runs."
 )
+_MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]<>#+!|")
 
 
 def build_machine_report(
@@ -92,15 +94,15 @@ def render_terminal_report(report: Mapping[str, Any]) -> str:
     lines.append(_score_line(report))
     lines.extend(
         [
-            str(report["labels"]["score"]),
-            str(report["labels"]["non_determinism"]),
+            _terminal_text(report["labels"]["score"]),
+            _terminal_text(report["labels"]["non_determinism"]),
             "",
             "Dimensions",
         ]
     )
     for dimension in report["dimensions"]:
         lines.append(
-            f"  {dimension['label']:<18} "
+            f"  {_terminal_text(dimension['label']):<18} "
             f"[{_score_bar(float(dimension['score']))}] "
             f"{float(dimension['score']):.2f}/{int(dimension['max_score'])}"
         )
@@ -108,8 +110,9 @@ def render_terminal_report(report: Mapping[str, Any]) -> str:
     lines.extend(["", "Packages"])
     for package in report["packages"]:
         lines.append(
-            f"  {package['path']} ({package['name']}, "
-            f"{package['primary_language']}): "
+            f"  {_terminal_text(package['path'])} "
+            f"({_terminal_text(package['name'])}, "
+            f"{_terminal_text(package['primary_language'])}): "
             f"{float(package['score']):.2f}/{int(package['max_score'])}"
         )
 
@@ -117,19 +120,23 @@ def render_terminal_report(report: Mapping[str, Any]) -> str:
     if report["themes"]:
         for theme in report["themes"]:
             lines.append(
-                f"  {theme['rank']}. {theme['title']} — "
-                f"effort {theme['effort_label']}; estimated impact "
+                f"  {theme['rank']}. {_terminal_text(theme['title'])} — "
+                f"effort {_terminal_text(theme['effort_label'])}; "
+                "estimated impact "
                 f"+{float(theme['estimated_impact']):.2f}"
             )
-            lines.append(f"     {theme['effort_rationale']}")
+            lines.append(f"     {_terminal_text(theme['effort_rationale'])}")
     else:
         lines.append("  No recommendation themes were reported.")
 
     lines.extend(["", "Harness Impact"])
     for key in ("commands", "environment", "secrets", "services"):
         impact = report["harness_impact"][key]
-        lines.append(f"  {key.title()}: {impact['label']} — {impact['summary']}")
-    lines.extend(["", str(report["labels"]["effort"])])
+        lines.append(
+            f"  {key.title()}: {_terminal_text(impact['label'])} — "
+            f"{_terminal_text(impact['summary'])}"
+        )
+    lines.extend(["", _terminal_text(report["labels"]["effort"])])
     return "\n".join(lines) + "\n"
 
 
@@ -140,7 +147,8 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         _score_line(report),
         "",
-        f"> {report['labels']['score']} {report['labels']['non_determinism']}",
+        f"> {_markdown_text(report['labels']['score'])} "
+        f"{_markdown_text(report['labels']['non_determinism'])}",
         "",
         "## Dimensions",
         "",
@@ -149,7 +157,8 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     ]
     for dimension in report["dimensions"]:
         lines.append(
-            f"| {dimension['label']} | `{_score_bar(float(dimension['score']))}` "
+            f"| {_markdown_text(dimension['label'])} | "
+            f"`{_score_bar(float(dimension['score']))}` "
             f"{float(dimension['score']):.2f}/{int(dimension['max_score'])} |"
         )
 
@@ -164,8 +173,9 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     )
     for package in report["packages"]:
         lines.append(
-            f"| `{package['path']}` | {package['name']} | "
-            f"{package['primary_language']} | "
+            f"| {_markdown_text(package['path'])} | "
+            f"{_markdown_text(package['name'])} | "
+            f"{_markdown_text(package['primary_language'])} | "
             f"{float(package['score']):.2f}/{int(package['max_score'])} |"
         )
 
@@ -174,10 +184,11 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         for theme in report["themes"]:
             lines.extend(
                 [
-                    f"{theme['rank']}. **{theme['title']}** — effort "
-                    f"**{theme['effort_label']}**, estimated impact "
+                    f"{theme['rank']}. **{_markdown_text(theme['title'])}** — "
+                    f"effort **{_markdown_text(theme['effort_label'])}**, "
+                    "estimated impact "
                     f"**+{float(theme['estimated_impact']):.2f}**",
-                    f"   - {theme['effort_rationale']}",
+                    f"   - {_markdown_text(theme['effort_rationale'])}",
                 ]
             )
     else:
@@ -186,8 +197,11 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     lines.extend(["", "## Harness Impact", ""])
     for key in ("commands", "environment", "secrets", "services"):
         impact = report["harness_impact"][key]
-        lines.append(f"- **{key.title()}:** {impact['label']} — {impact['summary']}")
-    lines.extend(["", f"_{report['labels']['effort']}_"])
+        lines.append(
+            f"- **{key.title()}:** {_markdown_text(impact['label'])} — "
+            f"{_markdown_text(impact['summary'])}"
+        )
+    lines.extend(["", f"_{_markdown_text(report['labels']['effort'])}_"])
     return "\n".join(lines) + "\n"
 
 
@@ -352,3 +366,22 @@ def _score_bar(score: float) -> str:
 
 def _number(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
+
+
+def _terminal_text(value: object) -> str:
+    """Flatten text and remove characters that can control a terminal."""
+    cleaned: list[str] = []
+    for character in str(value):
+        if character.isspace():
+            cleaned.append(" ")
+        elif not unicodedata.category(character).startswith("C"):
+            cleaned.append(character)
+    return " ".join("".join(cleaned).split())
+
+
+def _markdown_text(value: object) -> str:
+    """Render analyzer-controlled text as one escaped Markdown fragment."""
+    return "".join(
+        f"\\{character}" if character in _MARKDOWN_SPECIALS else character
+        for character in _terminal_text(value)
+    )
