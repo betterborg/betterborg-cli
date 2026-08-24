@@ -15,8 +15,14 @@ from uuid import UUID
 
 from betterborg_cli.store.models import (
     Borg,
+    BorgState,
     GeneratedPrompt,
     Operation,
+    PlanChangeRequest,
+    PlanningAttempt,
+    PlanningAttemptStatus,
+    PlanningFinding,
+    PlanningQuestion,
     PrdSession,
     PrdTurn,
     Repository,
@@ -26,6 +32,10 @@ from betterborg_cli.store.models import (
 )
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
+
+
+class StaleBorgStateError(RuntimeError):
+    """Raised when a Borg state compare-and-set loses a concurrent race."""
 
 
 class SqliteStore:
@@ -377,13 +387,16 @@ class SqliteStore:
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO borgs(id, repository_id, name, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO borgs(
+                    id, repository_id, name, state, state_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(borg.id),
                     str(borg.repository_id),
                     borg.name,
+                    borg.state.value,
+                    borg.state_version,
                     borg.created_at.isoformat(),
                 ),
             )
@@ -407,6 +420,271 @@ class SqliteStore:
                 (str(repository_id), name),
             ).fetchone()
         return _row_to_borg(row) if row is not None else None
+
+    def compare_and_set_borg_state(
+        self,
+        borg_id: UUID,
+        *,
+        expected_state: BorgState,
+        expected_version: int,
+        new_state: BorgState,
+    ) -> Borg:
+        """Atomically transition a Borg when its state snapshot is still current."""
+        if not isinstance(expected_state, BorgState) or not isinstance(
+            new_state, BorgState
+        ):
+            raise TypeError("Borg states must be BorgState values")
+        if expected_version < 0:
+            raise ValueError("expected Borg state version must not be negative")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE borgs
+                SET state = ?, state_version = state_version + 1
+                WHERE id = ? AND state = ? AND state_version = ?
+                """,
+                (
+                    new_state.value,
+                    str(borg_id),
+                    expected_state.value,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM borgs WHERE id = ?", (str(borg_id),)
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Borg {borg_id} not found")
+                raise StaleBorgStateError(
+                    "Borg state changed before compare-and-set transition"
+                )
+            row = connection.execute(
+                "SELECT * FROM borgs WHERE id = ?", (str(borg_id),)
+            ).fetchone()
+        return _row_to_borg(row)
+
+    def append_planning_attempt(self, attempt: PlanningAttempt) -> None:
+        """Append one planning attempt, whether running or already completed."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO planning_attempts(
+                    id, borg_id, phase, round, adapter, model, request_json,
+                    status, result_json, summary, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(attempt.id),
+                    str(attempt.borg_id),
+                    attempt.phase,
+                    attempt.round,
+                    attempt.adapter,
+                    attempt.model,
+                    _encode_json(attempt.request),
+                    attempt.status.value,
+                    _encode_json(attempt.result)
+                    if attempt.result is not None
+                    else None,
+                    attempt.summary,
+                    attempt.started_at.isoformat(),
+                    attempt.finished_at.isoformat()
+                    if attempt.finished_at is not None
+                    else None,
+                ),
+            )
+
+    def complete_planning_attempt(
+        self,
+        attempt_id: UUID,
+        *,
+        status: PlanningAttemptStatus,
+        result: dict[str, object] | None = None,
+        summary: str | None = None,
+    ) -> PlanningAttempt:
+        """Finish a running attempt exactly once and return its durable record."""
+        if status is PlanningAttemptStatus.RUNNING:
+            raise ValueError("a completed planning attempt cannot remain running")
+        if not isinstance(status, PlanningAttemptStatus):
+            raise TypeError("planning attempt status must be a PlanningAttemptStatus")
+        finished_at = utcnow()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE planning_attempts
+                SET status = ?, result_json = ?, summary = ?, finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    status.value,
+                    _encode_json(result) if result is not None else None,
+                    summary,
+                    finished_at.isoformat(),
+                    str(attempt_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM planning_attempts WHERE id = ?",
+                    (str(attempt_id),),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"planning attempt {attempt_id} not found")
+                raise ValueError("planning attempt has already completed")
+            row = connection.execute(
+                "SELECT * FROM planning_attempts WHERE id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+        return _row_to_planning_attempt(row)
+
+    def list_planning_attempts(self, borg_id: UUID) -> list[PlanningAttempt]:
+        """Return a Borg's attempts in stable invocation order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM planning_attempts
+                WHERE borg_id = ?
+                ORDER BY started_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_planning_attempt(row) for row in rows]
+
+    def append_planning_question(self, question: PlanningQuestion) -> None:
+        """Append one architect Q&A round."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO planning_questions(
+                    id, borg_id, attempt_id, round, questions_json,
+                    answers_json, asked_at, answered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(question.id),
+                    str(question.borg_id),
+                    str(question.attempt_id)
+                    if question.attempt_id is not None
+                    else None,
+                    question.round,
+                    _encode_json(question.questions),
+                    _encode_json(question.answers)
+                    if question.answers is not None
+                    else None,
+                    question.asked_at.isoformat(),
+                    question.answered_at.isoformat()
+                    if question.answered_at is not None
+                    else None,
+                ),
+            )
+
+    def answer_planning_question(
+        self, question_id: UUID, answers: list[dict[str, object]]
+    ) -> PlanningQuestion:
+        """Record answers for a pending question round exactly once."""
+        answered_at = utcnow()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE planning_questions
+                SET answers_json = ?, answered_at = ?
+                WHERE id = ? AND answers_json IS NULL
+                """,
+                (_encode_json(answers), answered_at.isoformat(), str(question_id)),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM planning_questions WHERE id = ?",
+                    (str(question_id),),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"planning question {question_id} not found")
+                raise ValueError("planning question has already been answered")
+            row = connection.execute(
+                "SELECT * FROM planning_questions WHERE id = ?",
+                (str(question_id),),
+            ).fetchone()
+        return _row_to_planning_question(row)
+
+    def list_planning_questions(self, borg_id: UUID) -> list[PlanningQuestion]:
+        """Return a Borg's complete Q&A history in round order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM planning_questions
+                WHERE borg_id = ?
+                ORDER BY round
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_planning_question(row) for row in rows]
+
+    def append_planning_finding(self, finding: PlanningFinding) -> None:
+        """Append one immutable tech-lead finding."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO planning_findings(
+                    id, borg_id, attempt_id, round, severity, message,
+                    suggestion, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(finding.id),
+                    str(finding.borg_id),
+                    str(finding.attempt_id),
+                    finding.round,
+                    finding.severity,
+                    finding.message,
+                    finding.suggestion,
+                    finding.created_at.isoformat(),
+                ),
+            )
+
+    def list_planning_findings(self, borg_id: UUID) -> list[PlanningFinding]:
+        """Return all review findings in stable append order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM planning_findings
+                WHERE borg_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_planning_finding(row) for row in rows]
+
+    def append_plan_change_request(self, request: PlanChangeRequest) -> None:
+        """Append one immutable human plan-revision request."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO plan_change_requests(
+                    id, borg_id, round, note, decided_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(request.id),
+                    str(request.borg_id),
+                    request.round,
+                    request.note,
+                    request.decided_by,
+                    request.created_at.isoformat(),
+                ),
+            )
+
+    def list_plan_change_requests(self, borg_id: UUID) -> list[PlanChangeRequest]:
+        """Return the full plan change-request thread in append order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM plan_change_requests
+                WHERE borg_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_plan_change_request(row) for row in rows]
 
     def add_prd_session(self, session: PrdSession) -> None:
         """Persist a PRD session that points to tracked Markdown."""
@@ -604,6 +882,8 @@ def _row_to_borg(row: sqlite3.Row) -> Borg:
         id=UUID(row["id"]),
         repository_id=UUID(row["repository_id"]),
         name=row["name"],
+        state=BorgState(row["state"]),
+        state_version=row["state_version"],
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 
@@ -625,5 +905,77 @@ def _row_to_prd_turn(row: sqlite3.Row) -> PrdTurn:
         position=row["position"],
         role=row["role"],
         content=row["content"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_planning_attempt(row: sqlite3.Row) -> PlanningAttempt:
+    return PlanningAttempt(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        phase=row["phase"],
+        round=row["round"],
+        adapter=row["adapter"],
+        model=row["model"],
+        request=json.loads(row["request_json"]),
+        status=PlanningAttemptStatus(row["status"]),
+        result=(
+            json.loads(row["result_json"])
+            if row["result_json"] is not None
+            else None
+        ),
+        summary=row["summary"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        finished_at=(
+            datetime.fromisoformat(row["finished_at"])
+            if row["finished_at"] is not None
+            else None
+        ),
+    )
+
+
+def _row_to_planning_question(row: sqlite3.Row) -> PlanningQuestion:
+    return PlanningQuestion(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        attempt_id=(
+            UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
+        ),
+        round=row["round"],
+        questions=json.loads(row["questions_json"]),
+        answers=(
+            json.loads(row["answers_json"])
+            if row["answers_json"] is not None
+            else None
+        ),
+        asked_at=datetime.fromisoformat(row["asked_at"]),
+        answered_at=(
+            datetime.fromisoformat(row["answered_at"])
+            if row["answered_at"] is not None
+            else None
+        ),
+    )
+
+
+def _row_to_planning_finding(row: sqlite3.Row) -> PlanningFinding:
+    return PlanningFinding(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        attempt_id=UUID(row["attempt_id"]),
+        round=row["round"],
+        severity=row["severity"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_plan_change_request(row: sqlite3.Row) -> PlanChangeRequest:
+    return PlanChangeRequest(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        round=row["round"],
+        note=row["note"],
+        decided_by=row["decided_by"],
         created_at=datetime.fromisoformat(row["created_at"]),
     )
