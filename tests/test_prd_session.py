@@ -7,13 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
+from betterborg_cli.agent_runtime.base import AgentCapabilities
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.prd_session import InteractiveIO, PrdSession, PrdSessionError
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
 
 
 def _responses(*payloads: dict[str, object]) -> MockAdapter:
-    adapter = MockAdapter()
+    adapter = MockAdapter(name="openai")
     for payload in payloads:
         adapter.queue(MockResponse(payload=payload))
     return adapter
@@ -279,6 +283,103 @@ def test_machine_mode_returns_questions_instead_of_prompting(
     assert not result.prd_path.exists()
 
 
+@pytest.mark.parametrize(
+    "capabilities, message",
+    [
+        (AgentCapabilities(), "read-only tool allowlist"),
+        (
+            AgentCapabilities(
+                tool_allowlist=True,
+                host_capable=True,
+            ),
+            "wrapped by SelectedAgent",
+        ),
+    ],
+    ids=["no-tool-allowlist", "raw-host-capable"],
+)
+def test_prd_session_rejects_unconfined_adapters(
+    repository_store,
+    capabilities: AgentCapabilities,
+    message: str,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(name="openai", capabilities=capabilities)
+
+    with pytest.raises(PrdSessionError, match=message):
+        PrdSession(repository, store, adapter, interactive=False)
+
+    assert adapter.calls == []
+
+
+def test_selected_host_capable_agent_requires_workspace_trust(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(
+        name="openai",
+        capabilities=AgentCapabilities(
+            tool_allowlist=True,
+            host_capable=True,
+        ),
+    ).queue(
+        MockResponse(
+            payload={"questions": [], "prd_markdown": "# Trusted\n\nRead only."}
+        )
+    )
+    trusted: list[Path] = []
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(repository.root),
+        trust_requirement=lambda paths, **_kwargs: trusted.append(paths.root),
+    )
+    session = PrdSession(repository, store, selected, interactive=False)
+
+    result = session.run("Trusted", confirmed=True)
+
+    assert result.confirmed
+    assert trusted == [repository.root]
+    assert adapter.calls[0].allowed_tools == (
+        "list_files",
+        "read_file",
+        "search_text",
+    )
+
+
+def test_prd_model_must_be_explicit_for_an_unknown_adapter(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(name="custom")
+
+    with pytest.raises(PrdSessionError, match="model must be configured"):
+        PrdSession(repository, store, adapter, interactive=False)
+
+    assert adapter.calls == []
+
+
+def test_prd_model_prefers_the_selected_agent_override(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(name="custom").queue(
+        MockResponse(
+            payload={"questions": [], "prd_markdown": "# Model\n\nConfigured."}
+        )
+    )
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(repository.root),
+        model="configured-model",
+    )
+    session = PrdSession(repository, store, selected, interactive=False)
+
+    session.run("ConfiguredModel")
+
+    assert adapter.calls[0].model == "configured-model"
+
+
 def test_source_must_be_nonempty_local_markdown_before_creating_a_borg(
     repository_store,
     tmp_path: Path,
@@ -291,6 +392,7 @@ def test_source_must_be_nonempty_local_markdown_before_creating_a_borg(
         store,
         MockAdapter(),
         io=_io(),
+        model="test-model",
     )
 
     with pytest.raises(ValueError, match="local Markdown"):
@@ -326,6 +428,7 @@ def test_invalid_borg_name_is_rejected_before_creating_records(
         store,
         MockAdapter(),
         io=_io(),
+        model="test-model",
     )
 
     with pytest.raises(ValueError, match="filename"):

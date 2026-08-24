@@ -54,6 +54,7 @@ from betterborg_cli.agent_runtime.retry import (
 from betterborg_cli.agent_runtime.selection import (
     AgentSelectionError,
     SelectedAgent,
+    resolve_agent_model,
     select_agent,
 )
 from betterborg_cli.agent_runtime.structured import (
@@ -113,6 +114,7 @@ __all__ = [
     "retry_outcome_to_result",
     "run_streamed",
     "run_with_transient_retry",
+    "resolve_agent_model",
     "select_api_tool_names",
     "select_agent",
     "validate_structured_result",

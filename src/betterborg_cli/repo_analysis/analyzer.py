@@ -17,7 +17,11 @@ from betterborg_cli.agent_runtime.base import (
     AgentStatus,
     CancellationToken,
 )
-from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.selection import (
+    AgentSelectionError,
+    SelectedAgent,
+    resolve_agent_model,
+)
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.repo_analysis.discovery import (
     DiscoveryLimits,
@@ -302,12 +306,6 @@ _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
     "or truncated evidence as uncertainty; do not inspect the raw repository."
 )
-_DEFAULT_ANALYSIS_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-5",
-}
-
-
 class AnalyzerError(RuntimeError):
     """Raised when an analyzer run cannot produce a persistent result."""
 
@@ -631,13 +629,9 @@ def resolve_analysis_model(
     agent: AgentAdapter | SelectedAgent, configured_model: str | None
 ) -> str:
     """Resolve an explicit, selected, or provider-default analysis model."""
-    if configured_model is not None:
-        return configured_model
-    if isinstance(agent, SelectedAgent) and agent.model is not None:
-        return agent.model
     try:
-        return _DEFAULT_ANALYSIS_MODELS[agent.name]
-    except KeyError as error:
+        return resolve_agent_model(agent, configured_model)
+    except AgentSelectionError as error:
         raise AnalyzerError(
             f"analysis model must be configured for adapter {agent.name!r}"
         ) from error

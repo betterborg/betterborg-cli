@@ -16,7 +16,11 @@ from betterborg_cli.agent_runtime.base import (
     AgentStatus,
     CancellationToken,
 )
-from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.selection import (
+    AgentSelectionError,
+    SelectedAgent,
+    resolve_agent_model,
+)
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -61,12 +65,6 @@ _BRAINSTORM_OPENING = (
     "No starting PRD was supplied. Help me brainstorm and write a product "
     "requirements document."
 )
-_DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "claude": "claude-opus-4-8",
-    "codex": "gpt-5",
-    "openai": "gpt-5",
-}
 _WINDOWS_RESERVED_BASENAMES = {
     "aux",
     "con",
@@ -152,6 +150,20 @@ class PrdSession:
             raise ValueError("repository root does not match its discovered Git root")
         if interactive and io is None:
             raise ValueError("interactive PRD sessions require InteractiveIO")
+        if not agent.capabilities.tool_allowlist:
+            raise PrdSessionError(
+                f"adapter {agent.name!r} cannot enforce the PRD read-only "
+                "tool allowlist"
+            )
+        if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
+            raise PrdSessionError(
+                f"host-capable adapter {agent.name!r} must be wrapped by "
+                "SelectedAgent to enforce workspace trust"
+            )
+        try:
+            resolved_model = resolve_agent_model(agent, model)
+        except AgentSelectionError as error:
+            raise PrdSessionError(str(error)) from error
 
         self.repository = repository
         self.store = store
@@ -161,7 +173,7 @@ class PrdSession:
         self.editor = editor
         self.interactive = interactive
         self.artifact_dir = Path(artifact_dir or paths.artifacts_dir / "prd-sessions")
-        self.model = model or _selected_model(agent)
+        self.model = resolved_model
         self.cancel = cancel
 
     def run(
@@ -331,12 +343,6 @@ class PrdSession:
                 content=answer,
             )
         return True
-
-
-def _selected_model(agent: AgentAdapter | SelectedAgent) -> str:
-    if isinstance(agent, SelectedAgent) and agent.model is not None:
-        return agent.model
-    return _DEFAULT_MODELS.get(agent.name, "prd-session-model")
 
 
 def _validate_borg_name(name: str) -> None:
