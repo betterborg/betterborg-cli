@@ -143,11 +143,11 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
         assert f"# {role.title()} agent" in prompt.read_text(encoding="utf-8")
     improvement = paths.improvement_prds_dir / "theme-ci.md"
     assert improvement.is_file()
-    assert "Theme Ci" in improvement.read_text(encoding="utf-8")
+    assert "theme-ci" in improvement.read_text(encoding="utf-8")
     assert len(adapter.calls) == 4
     assert selections == 1
     assert (
-        "borg create --name 'Theme Ci' --prd "
+        "borg create theme-ci --prd "
         ".borg/prds/improvements/theme-ci.md\n"
     ) in first.output
 
@@ -168,7 +168,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
             "repository.initialized"
         ]
         assert store.get_repository(config.repository_id).root == git_repo
-        assert store.get_borg_by_name(config.repository_id, "Theme Ci") is None
+        assert store.get_borg_by_name(config.repository_id, "theme-ci") is None
 
     with sqlite3.connect(paths.state_dir / "borg.sqlite3") as connection:
         repository_count = connection.execute(
@@ -201,7 +201,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == {
         "create_commands": [
-            "borg create --name 'Theme Ci' --prd "
+            "borg create theme-ci --prd "
             ".borg/prds/improvements/theme-ci.md"
         ],
         "initialized": True,
@@ -213,7 +213,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         assert (
             store.get_borg_by_name(
-                load_repository_config(paths).repository_id, "Theme Ci"
+                load_repository_config(paths).repository_id, "theme-ci"
             )
             is None
         )
@@ -261,7 +261,7 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
         result.output
     )
     generated = paths.improvement_prds_dir / "theme-ci.md"
-    confirmed = paths.tracked_dir / "prds" / "Theme Ci.md"
+    confirmed = paths.tracked_dir / "prds" / "theme-ci.md"
     assert generated.is_file()
     assert confirmed.read_text(encoding="utf-8") == (
         "# CI Borg\n\nMake repository validation visible.\n"

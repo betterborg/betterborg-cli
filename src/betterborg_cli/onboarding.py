@@ -187,7 +187,6 @@ def create_commands(
         (
             "borg",
             "create",
-            "--name",
             document.suggested_borg_name,
             "--prd",
             document.path.relative_to(repository_root).as_posix(),

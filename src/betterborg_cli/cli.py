@@ -1,6 +1,7 @@
 """Command-line entry point for BetterBorg."""
 
 import json
+import re
 import shlex
 from functools import wraps
 from pathlib import Path
@@ -15,7 +16,7 @@ from betterborg_cli.onboarding import (
     OnboardingDispatcher,
     create_commands,
 )
-from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
@@ -229,11 +230,7 @@ def analyze_repository(
 
 
 @cli.command(name="create")
-@click.option(
-    "--name",
-    required=True,
-    help="Name for the Borg and its confirmed PRD.",
-)
+@click.argument("name")
 @click.option(
     "--prd",
     "source",
@@ -253,6 +250,10 @@ def create_borg(
     source: Path | None,
 ) -> None:
     """Brainstorm or improve a PRD and create a named Borg."""
+    try:
+        _validate_create_name(name)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
     if not _stdin_is_interactive():
         raise click.ClickException("borg create requires an interactive terminal")
     paths = RepoPaths.discover(repository_path)
@@ -280,6 +281,7 @@ def create_borg(
 
     if result.confirmed:
         click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
+        click.echo(f"borg plan start {result.borg.name}")
     elif result.questions:
         click.echo("Borg PRD needs more input before it can be created.")
     else:
@@ -291,6 +293,14 @@ def _write_initialized(result) -> None:
         f"Initialized repository {result.repository.id} "
         f"with score {result.analysis.overall_score:.2f}/5."
     )
+
+
+def _validate_create_name(name: str) -> None:
+    validate_borg_name(name)
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None:
+        raise ValueError(
+            "Borg name must use kebab-case lowercase letters and numbers"
+        )
 
 
 def _interactive_io() -> InteractiveIO:
