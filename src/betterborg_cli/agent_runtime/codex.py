@@ -473,6 +473,8 @@ def _strip_optional_nulls(
         if node.get("const", object()) is None:
             return True
         enum = node.get("enum")
-        return isinstance(enum, list) and None in enum
+        if isinstance(enum, list):
+            return None in enum
+        return expected_type is None and "const" not in node
 
     return walk(payload, schema)

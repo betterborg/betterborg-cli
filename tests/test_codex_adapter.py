@@ -261,6 +261,46 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
     assert calls[0] == calls[1]
 
 
+def test_schema_invalid_partial_result_does_not_suppress_transient_retry(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            log_path.write_text(
+                '{"type":"error","message":"status 503: overloaded"}\n',
+                encoding="utf-8",
+            )
+            _write_invocation_result(command, {"status": "completed"})
+            return 1
+        log_path.write_text("Codex completed retry\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "version": "retry"}
+        )
+        return 0
+
+    result = CodexAdapter(
+        ApiAgentRole.PLANNING,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+    ).run(codex_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert result.payload == {"status": "completed", "version": "retry"}
+    assert calls == 2
+
+
 def test_process_spawn_failure_returns_failed_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -474,6 +514,40 @@ def test_optional_schema_fields_are_normalized_for_strict_transport(
     assert result.status == AgentStatus.COMPLETED
     assert result.payload == {"status": "completed", "comment": None}
     assert schema["properties"]["summary"]["type"] == "string"
+
+
+def test_unconstrained_optional_null_is_preserved(tmp_path: Path) -> None:
+    schema = {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+            "status": {"const": "completed"},
+            "metadata": {},
+        },
+        "additionalProperties": False,
+    }
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        log_path.write_text("ok\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "metadata": None}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, schema=schema)
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    expected = {"status": "completed", "metadata": None}
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == expected
+    assert json.loads(spec.result_path.read_text(encoding="utf-8")) == expected
 
 
 def test_unrepresentable_strict_schema_falls_back_to_prompt_and_local_validation(

@@ -148,7 +148,7 @@ class NativeCliAdapter:
             if (
                 exit_code != 0
                 and invocation.accept_payload_on_nonzero_exit
-                and invocation.load_payload().payload is not None
+                and self._has_valid_payload(invocation, spec)
             ):
                 return None
             return self._classify_transient_error(spec.log_path, exit_code)
@@ -256,6 +256,21 @@ class NativeCliAdapter:
             usage=usage,
             attempts=outcome.attempts,
         )
+
+    @staticmethod
+    def _has_valid_payload(
+        invocation: NativeInvocation,
+        spec: AgentRunSpec,
+    ) -> bool:
+        """Return whether a nonzero invocation left a usable result artifact."""
+        payload = invocation.load_payload().payload
+        if payload is None:
+            return False
+        try:
+            validate_structured_result(payload, spec.schema)
+        except StructuredResultError:
+            return False
+        return True
 
     def _cancelled(
         self,
