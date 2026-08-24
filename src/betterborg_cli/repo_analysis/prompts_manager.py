@@ -1,0 +1,292 @@
+"""Generate stable role prompts without coupling failures to analysis state."""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from betterborg_cli.agent_runtime.base import (
+    AgentAdapter,
+    AgentRunSpec,
+    AgentStatus,
+    CancellationToken,
+)
+from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.structured import validate_structured_result
+from betterborg_cli.repo_analysis.analyzer import resolve_analysis_model
+from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.store import (
+    GeneratedPrompt,
+    Repository,
+    RepositoryAnalysis,
+    SqliteStore,
+)
+
+PROMPT_ROLES = ("coding", "review", "merge")
+
+PROMPT_MANAGER_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "BetterBorg repository prompt",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["body_md"],
+    "properties": {
+        "body_md": {
+            "type": "string",
+            "minLength": 32,
+            "description": "The complete role system prompt as Markdown.",
+        },
+        "notes": {
+            "type": "string",
+            "description": "Optional generation notes retained in agent artifacts.",
+        },
+    },
+}
+
+_COMMON_SYSTEM_PROMPT = """You are a principal prompt engineer. Generate the
+complete {role} system prompt for the repository at cwd. Ground every command,
+path, convention, and invariant in the persisted analyzer report or files you
+inspect. Preserve the engineering discipline, testing expectations, completion
+standard, and structured output contract appropriate to the role. Do not invent
+commands or repository facts. Return only the object required by the schema;
+body_md must start with a Markdown heading and contain no front matter or
+preamble.
+
+{role_requirements}
+"""
+
+_ROLE_REQUIREMENTS = {
+    "coding": """The coding prompt must cover mission, runtime inputs, concrete
+source and test layout, exact build/lint/test commands, reuse and locality,
+meaningful tests using established fixtures, commit conventions, completion,
+and the coding agent's final result contract.""",
+    "review": """The review prompt must cover mission, runtime inputs, review
+method by file class, duplication/over-abstraction/orphaned-code lenses, test
+value and established test infrastructure, verification commands, sensitive
+paths, blocker/major/minor severity, approval criteria, and the review result
+contract. It must instruct the reviewer to inspect rather than edit.""",
+    "merge": """The merge prompt must cover mission, rebase inputs, conflict
+resolution using surrounding code, append-only migrations when present,
+regeneration of generated code and lock files using discovered commands, Git
+rules, post-merge verification, fail-loud criteria, and the merge result
+contract.""",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PromptManagerConfig:
+    """Model settings for repository prompt generation."""
+
+    model: str | None = None
+    effort: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGeneration:
+    """The isolated outcome of generating one role prompt."""
+
+    role: str
+    ok: bool
+    path: Path
+    prompt: GeneratedPrompt | None = None
+    error: str | None = None
+
+    @property
+    def version(self) -> int | None:
+        """Return the persisted version when generation succeeded."""
+        return self.prompt.version if self.prompt is not None else None
+
+
+def generate_role_prompts(
+    repository: Repository,
+    analysis: RepositoryAnalysis,
+    store: SqliteStore,
+    agent: AgentAdapter | SelectedAgent,
+    *,
+    artifact_dir: Path,
+    config: PromptManagerConfig | None = None,
+    roles: Iterable[str] | None = None,
+    cancel: CancellationToken | None = None,
+) -> list[PromptGeneration]:
+    """Generate and persist independent coding, review, and merge prompts.
+
+    The analysis is a prerequisite, not part of this transaction. A failed role
+    therefore returns a failed outcome while the successful score and any other
+    successful role prompts remain durable and inspectable.
+    """
+    _validate_persisted_inputs(repository, analysis, store)
+    selected_roles = _validate_roles(roles)
+    resolved_config = config or PromptManagerConfig()
+    model = resolve_analysis_model(agent, resolved_config.model)
+    paths = RepoPaths.discover(repository.root)
+    if paths.root != repository.root:
+        raise ValueError("repository root does not match its discovered Git root")
+
+    artifact_dir = Path(artifact_dir).resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    paths.prompts_dir.mkdir(parents=True, exist_ok=True)
+    prior_prompts = store.get_latest_generated_prompts(repository.id)
+
+    def generate(role: str) -> PromptGeneration:
+        return _generate_one_role(
+            role=role,
+            repository=repository,
+            analysis=analysis,
+            store=store,
+            agent=agent,
+            artifact_dir=artifact_dir,
+            prompt_path=paths.prompts_dir / f"{role}.system.md",
+            prior_prompt=prior_prompts.get(role),
+            model=model,
+            effort=resolved_config.effort,
+            cancel=cancel,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(selected_roles)) as executor:
+        futures = [executor.submit(generate, role) for role in selected_roles]
+        return [future.result() for future in futures]
+
+
+def _generate_one_role(
+    *,
+    role: str,
+    repository: Repository,
+    analysis: RepositoryAnalysis,
+    store: SqliteStore,
+    agent: AgentAdapter | SelectedAgent,
+    artifact_dir: Path,
+    prompt_path: Path,
+    prior_prompt: GeneratedPrompt | None,
+    model: str,
+    effort: str | None,
+    cancel: CancellationToken | None,
+) -> PromptGeneration:
+    spec = AgentRunSpec(
+        system_prompt=_system_prompt(role),
+        user_prompt=_render_user_prompt(
+            role=role,
+            analysis_json=analysis.analysis_json,
+            prior_prompt=prior_prompt,
+        ),
+        schema=PROMPT_MANAGER_OUTPUT_SCHEMA,
+        cwd=repository.root,
+        model=model,
+        effort=effort,
+        allowed_tools=("list_files", "read_file", "search_text"),
+        log_path=artifact_dir / f"{analysis.id}.{role}.log",
+        result_path=artifact_dir / f"{analysis.id}.{role}.json",
+    )
+    try:
+        result = agent.run(spec, cancel=cancel)
+    except Exception as error:  # adapters are isolated at the role boundary
+        return PromptGeneration(
+            role=role,
+            ok=False,
+            path=prompt_path,
+            error=f"adapter crashed: {error}",
+        )
+    if result.status is not AgentStatus.COMPLETED or result.payload is None:
+        return PromptGeneration(
+            role=role,
+            ok=False,
+            path=prompt_path,
+            error=result.error or f"prompt manager returned {result.status.value}",
+        )
+
+    try:
+        validate_structured_result(result.payload, PROMPT_MANAGER_OUTPUT_SCHEMA)
+        body_md = result.payload["body_md"]
+        if not body_md.strip():
+            raise ValueError("prompt manager returned an empty body_md")
+        prompt = store.append_generated_prompt(
+            repository_id=repository.id,
+            analysis_id=analysis.id,
+            role=role,
+            body_md=body_md,
+        )
+        _write_stable_prompt(prompt_path, body_md)
+    except Exception as error:
+        return PromptGeneration(
+            role=role,
+            ok=False,
+            path=prompt_path,
+            error=f"prompt could not be recorded: {error}",
+        )
+    return PromptGeneration(
+        role=role,
+        ok=True,
+        path=prompt_path,
+        prompt=prompt,
+    )
+
+
+def _render_user_prompt(
+    *,
+    role: str,
+    analysis_json: dict[str, Any],
+    prior_prompt: GeneratedPrompt | None,
+) -> str:
+    parts = [
+        "# Persisted repository analysis",
+        "```json",
+        json.dumps(analysis_json, indent=2, sort_keys=True),
+        "```",
+    ]
+    if prior_prompt is not None:
+        parts.extend(
+            [
+                "",
+                f"# Prior {role} prompt",
+                "Keep what still applies and refresh facts changed by the analysis.",
+                "",
+                prior_prompt.body_md,
+            ]
+        )
+    return "\n".join(parts)
+
+
+def _system_prompt(role: str) -> str:
+    return _COMMON_SYSTEM_PROMPT.format(
+        role=role,
+        role_requirements=_ROLE_REQUIREMENTS[role],
+    )
+
+
+def _validate_persisted_inputs(
+    repository: Repository,
+    analysis: RepositoryAnalysis,
+    store: SqliteStore,
+) -> None:
+    if store.get_repository(repository.id) != repository:
+        raise ValueError("repository must already be present in the supplied store")
+    if analysis.repository_id != repository.id:
+        raise ValueError("analysis does not belong to the supplied repository")
+    if store.get_analysis(analysis.id) != analysis:
+        raise ValueError("analysis must already be present in the supplied store")
+
+
+def _validate_roles(roles: Iterable[str] | None) -> tuple[str, ...]:
+    selected = tuple(PROMPT_ROLES if roles is None else roles)
+    if not selected:
+        raise ValueError("at least one prompt role must be selected")
+    if len(selected) != len(set(selected)):
+        raise ValueError("prompt roles must not contain duplicates")
+    unknown = [role for role in selected if role not in PROMPT_ROLES]
+    if unknown:
+        raise ValueError(f"unknown prompt role: {unknown[0]!r}")
+    return selected
+
+
+def _write_stable_prompt(path: Path, body_md: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(body_md, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
