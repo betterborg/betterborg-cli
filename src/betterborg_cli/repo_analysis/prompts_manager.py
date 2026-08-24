@@ -204,13 +204,14 @@ def _generate_one_role(
         body_md = result.payload["body_md"]
         if not body_md.strip():
             raise ValueError("prompt manager returned an empty body_md")
-        prompt = store.append_generated_prompt(
-            repository_id=repository.id,
-            analysis_id=analysis.id,
-            role=role,
-            body_md=body_md,
-        )
-        _write_stable_prompt(prompt_path, body_md)
+        with store.transaction():
+            prompt = store.append_generated_prompt(
+                repository_id=repository.id,
+                analysis_id=analysis.id,
+                role=role,
+                body_md=body_md,
+            )
+            _write_stable_prompt(prompt_path, body_md)
     except Exception as error:
         return PromptGeneration(
             role=role,

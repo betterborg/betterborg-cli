@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
-from betterborg_cli.repo_analysis import PROMPT_ROLES, generate_role_prompts
+from betterborg_cli.repo_analysis import (
+    PROMPT_ROLES,
+    generate_role_prompts,
+    prompts_manager,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Repository,
@@ -215,3 +221,92 @@ def test_partial_failure_preserves_score_then_reanalysis_refreshes_prompts(
     assert "# Prior coding prompt" in second_calls["coding"].user_prompt
     assert "# Prior merge prompt" in second_calls["merge"].user_prompt
     assert "# Prior review prompt" not in second_calls["review"].user_prompt
+
+
+def test_stable_publish_failure_does_not_commit_prompt_metadata(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    first_body = "# Coding v1\n\nFirst complete coding prompt body."
+    _first_adapter, first_selected = _selected_adapter(
+        git_repo,
+        {"coding": first_body},
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        first_analysis = _append_analysis(store, repository, score=2)
+        first_run = generate_role_prompts(
+            repository,
+            first_analysis,
+            store,
+            first_selected,
+            artifact_dir=git_repo / "artifacts",
+            roles=("coding",),
+        )[0]
+        assert first_run.ok
+
+        second_analysis = _append_analysis(
+            store,
+            repository,
+            score=4,
+            prior=first_analysis,
+        )
+        failed_body = (
+            "# Coding unpublished\n\nThis body must never become the prior prompt."
+        )
+        _failed_adapter, failed_selected = _selected_adapter(
+            git_repo,
+            {"coding": failed_body},
+        )
+
+        def fail_publish(_source: Path, _destination: Path) -> None:
+            raise OSError("stable publish unavailable")
+
+        with monkeypatch.context() as publish_failure:
+            publish_failure.setattr(prompts_manager.os, "replace", fail_publish)
+            failed_run = generate_role_prompts(
+                repository,
+                second_analysis,
+                store,
+                failed_selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+            )[0]
+
+        stable_path = git_repo / ".borg/prompts/coding.system.md"
+        assert not failed_run.ok
+        assert failed_run.error == (
+            "prompt could not be recorded: stable publish unavailable"
+        )
+        assert stable_path.read_text(encoding="utf-8") == first_body
+        latest_after_failure = store.get_latest_generated_prompts(repository.id)
+        assert latest_after_failure["coding"].version == 1
+        assert latest_after_failure["coding"].body_md == first_body
+        assert list(stable_path.parent.glob(".coding.system.md.*.tmp")) == []
+
+        retry_body = (
+            "# Coding v2\n\nSuccessfully published refreshed coding prompt body."
+        )
+        retry_adapter, retry_selected = _selected_adapter(
+            git_repo,
+            {"coding": retry_body},
+        )
+        retry_run = generate_role_prompts(
+            repository,
+            second_analysis,
+            store,
+            retry_selected,
+            artifact_dir=git_repo / "artifacts",
+            roles=("coding",),
+        )[0]
+
+        assert retry_run.ok
+        assert retry_run.version == 2
+        assert stable_path.read_text(encoding="utf-8") == retry_body
+        latest_after_retry = store.get_latest_generated_prompts(repository.id)
+        assert latest_after_retry["coding"].body_md == retry_body
+
+    assert first_body in retry_adapter.calls[0].user_prompt
+    assert failed_body not in retry_adapter.calls[0].user_prompt
