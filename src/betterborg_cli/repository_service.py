@@ -112,7 +112,6 @@ class RepositoryService:
             analysis,
             self.paths,
             _suggested_borg_names(analysis),
-            store=self.store,
         )
         self.store.append_operation(
             Operation(

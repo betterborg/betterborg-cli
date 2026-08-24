@@ -185,7 +185,7 @@ class PrdSession:
         confirmation; material questions are returned to the caller instead of
         being prompted.
         """
-        _validate_borg_name(name)
+        validate_borg_name(name)
         initial_markdown = _read_source(source) if source is not None else None
         relative_prd_path = Path(".borg") / "prds" / f"{name}.md"
         prd_path = self.repository.root / relative_prd_path
@@ -340,7 +340,8 @@ class PrdSession:
         return True
 
 
-def _validate_borg_name(name: str) -> None:
+def validate_borg_name(name: str) -> None:
+    """Require a nonempty Borg name that is a portable filename stem."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Borg name must not be empty")
     if name != name.strip() or "\n" in name or "\r" in name:

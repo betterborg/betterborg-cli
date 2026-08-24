@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -124,6 +125,10 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert "Theme Ci" in improvement.read_text(encoding="utf-8")
     assert len(adapter.calls) == 4
     assert selections == 1
+    assert (
+        "borg create --name 'Theme Ci' --prd "
+        ".borg/prds/improvements/theme-ci.md\n"
+    ) in first.output
 
     second = cli_runner.invoke(cli, ["init", "--yes"])
 
@@ -142,9 +147,106 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
             "repository.initialized"
         ]
         assert store.get_repository(config.repository_id).root == git_repo
+        assert store.get_borg_by_name(config.repository_id, "Theme Ci") is None
 
     with sqlite3.connect(paths.state_dir / "borg.sqlite3") as connection:
         repository_count = connection.execute(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
         assert repository_count == 1
+
+
+def test_json_init_never_prompts_and_emits_exact_create_commands(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    git_repo = committed_git_repo
+    paths = RepoPaths.discover(git_repo)
+    adapter, selected = _adapter(git_repo)
+    selected_interactivity: list[bool] = []
+
+    def select_mock(*_args, **kwargs):
+        selected_interactivity.append(kwargs["interactive"])
+        return selected
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo.parent / "machine-state"))
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "select_agent", select_mock)
+
+    result = cli_runner.invoke(cli, ["init", "--yes", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "create_commands": [
+            "borg create --name 'Theme Ci' --prd "
+            ".borg/prds/improvements/theme-ci.md"
+        ],
+        "initialized": True,
+        "repository_id": str(load_repository_config(paths).repository_id),
+        "score": 3.0,
+    }
+    assert selected_interactivity == [False]
+    assert paths.improvement_prds_dir.joinpath("theme-ci.md").is_file()
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert (
+            store.get_borg_by_name(
+                load_repository_config(paths).repository_id, "Theme Ci"
+            )
+            is None
+        )
+
+
+def test_first_interactive_init_presents_doors_and_creates_selected_theme(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    git_repo = committed_git_repo
+    paths = RepoPaths.discover(git_repo)
+    adapter, selected = _adapter(git_repo)
+    adapter.queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# CI Borg\n\nMake repository validation visible.",
+            }
+        )
+    )
+    selections: list[ApiAgentRole] = []
+
+    def select_mock(_config, role, _paths, **_kwargs):
+        selections.append(role)
+        return selected
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo.parent / "machine-state"))
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "select_agent", select_mock)
+
+    result = cli_runner.invoke(
+        cli,
+        ["init", "--yes"],
+        input="1\n\n\nn\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Initialized repository" in result.output
+    assert "1. Fix the repo" in result.output
+    assert "2. Improve an existing PRD" in result.output
+    assert "3. Brainstorm a new PRD" in result.output
+    assert "Make validation visible — predicted impact +0.125; effort S" in (
+        result.output
+    )
+    generated = paths.improvement_prds_dir / "theme-ci.md"
+    confirmed = paths.tracked_dir / "prds" / "Theme Ci.md"
+    assert generated.is_file()
+    assert confirmed.read_text(encoding="utf-8") == (
+        "# CI Borg\n\nMake repository validation visible.\n"
+    )
+    assert generated.read_text(encoding="utf-8").startswith(
+        "# Make validation visible\n"
+    )
+    assert selections == [ApiAgentRole.ANALYSIS, ApiAgentRole.PLANNING]
+    assert len(adapter.calls) == 5
