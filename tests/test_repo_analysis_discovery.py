@@ -252,3 +252,81 @@ def test_discovery_refuses_workspace_containing_repository(tmp_path: Path) -> No
         build_discovery_workspace(repo, tmp_path)
 
     assert marker.read_text(encoding="utf-8") == "# Keep me\n"
+
+
+def test_discovery_refuses_workspace_inside_repository(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    marker = repo / "README.md"
+    marker.write_text("# Keep me\n", encoding="utf-8")
+    workspace = repo / "analysis-workspace"
+
+    with pytest.raises(ValueError, match="must not be inside the repository root"):
+        build_discovery_workspace(repo, workspace)
+
+    assert marker.read_text(encoding="utf-8") == "# Keep me\n"
+    assert not workspace.exists()
+
+
+def test_discovery_rejects_file_replaced_by_symlink_before_copy(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    candidate = repo / "README.md"
+    candidate.write_text("safe", encoding="utf-8")
+    secret = tmp_path / "secret.md"
+    secret.write_text("SECRET", encoding="utf-8")
+    clock_calls = 0
+
+    def replace_candidate_on_copy() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 4:
+            candidate.unlink()
+            candidate.symlink_to(secret)
+        return 0.0
+
+    manifest = build_discovery_workspace(
+        repo,
+        workspace,
+        clock=replace_candidate_on_copy,
+    )
+
+    assert manifest.files == []
+    assert any(
+        omission.path == "README.md" and omission.reason == "symlink"
+        for omission in manifest.omitted
+    )
+    assert not (workspace / "files" / "README.md").exists()
+
+
+def test_discovery_rejects_file_replaced_before_copy(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    candidate = repo / "README.md"
+    candidate.write_text("safe", encoding="utf-8")
+    replacement = tmp_path / "replacement.md"
+    replacement.write_text("evil", encoding="utf-8")
+    clock_calls = 0
+
+    def replace_candidate_on_copy() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 4:
+            candidate.unlink()
+            replacement.rename(candidate)
+        return 0.0
+
+    manifest = build_discovery_workspace(
+        repo,
+        workspace,
+        clock=replace_candidate_on_copy,
+    )
+
+    assert manifest.files == []
+    assert any(
+        omission.path == "README.md"
+        and omission.reason == "changed_during_discovery"
+        for omission in manifest.omitted
+    )
+    assert not (workspace / "files" / "README.md").exists()

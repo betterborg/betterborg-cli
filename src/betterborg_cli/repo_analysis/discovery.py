@@ -6,6 +6,7 @@ import fnmatch
 import json
 import os
 import shutil
+import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
@@ -90,6 +91,8 @@ class _Candidate:
     rel_path: str
     category: str
     size_bytes: int
+    device: int
+    inode: int
 
 
 _REPOSITORY_WRAPPER_BASENAMES = frozenset(
@@ -323,14 +326,12 @@ def build_discovery_workspace(
         workspace_rel = _workspace_file_path(candidate.rel_path)
         output_path = workspace / workspace_rel
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with candidate.path.open("rb") as source:
-                data = source.read(copied)
-        except OSError:
+        data, read_error = _read_candidate(candidate, copied)
+        if read_error is not None:
             omitted.append(
                 DiscoveryOmission(
                     path=candidate.rel_path,
-                    reason="read_error",
+                    reason=read_error,
                     category=candidate.category,
                     size_bytes=candidate.size_bytes,
                 )
@@ -403,6 +404,8 @@ def _prepare_workspace(repo: Path, workspace: Path) -> None:
         raise ValueError("refusing to use filesystem root as analysis workspace")
     if workspace in repo.parents:
         raise ValueError("analysis workspace must not contain the repository root")
+    if repo in workspace.parents:
+        raise ValueError("analysis workspace must not be inside the repository root")
     if workspace.exists():
         if workspace.is_dir():
             shutil.rmtree(workspace)
@@ -460,18 +463,18 @@ def _collect_candidates(
                 break
             path = current_root / filename
             rel = _relative_posix(repo, path)
-            if path.is_symlink():
+            try:
+                file_stat = path.lstat()
+            except OSError:
+                omitted.append(DiscoveryOmission(path=rel, reason="stat_error"))
+                continue
+            if stat.S_ISLNK(file_stat.st_mode):
                 omitted.append(DiscoveryOmission(path=rel, reason="symlink"))
                 continue
             category = _allowed_category(rel)
             if category is None:
                 continue
-            try:
-                stat = path.stat()
-            except OSError:
-                omitted.append(DiscoveryOmission(path=rel, reason="stat_error"))
-                continue
-            if not path.is_file():
+            if not stat.S_ISREG(file_stat.st_mode):
                 omitted.append(
                     DiscoveryOmission(path=rel, reason="not_regular_file")
                 )
@@ -481,11 +484,47 @@ def _collect_candidates(
                     path=path,
                     rel_path=rel,
                     category=category,
-                    size_bytes=stat.st_size,
+                    size_bytes=file_stat.st_size,
+                    device=file_stat.st_dev,
+                    inode=file_stat.st_ino,
                 )
             )
 
     return candidates, omitted, deadline_exceeded
+
+
+def _read_candidate(candidate: _Candidate, byte_limit: int) -> tuple[bytes, str | None]:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate.path, flags)
+    except OSError:
+        return b"", "symlink" if _is_symlink(candidate.path) else "read_error"
+
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return b"", "not_regular_file"
+        if (opened_stat.st_dev, opened_stat.st_ino) != (
+            candidate.device,
+            candidate.inode,
+        ):
+            return b"", "changed_during_discovery"
+        if _is_symlink(candidate.path):
+            return b"", "symlink"
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            return source.read(byte_limit), None
+    except OSError:
+        return b"", "read_error"
+    finally:
+        os.close(descriptor)
+
+
+def _is_symlink(path: Path) -> bool:
+    try:
+        return stat.S_ISLNK(path.lstat().st_mode)
+    except OSError:
+        return False
 
 
 def _allowed_category(rel_path: str) -> str | None:
