@@ -58,7 +58,6 @@ def build_machine_report(
         "analysis_id": str(analysis.id),
         "repository_id": str(analysis.repository_id),
         "head_sha": analysis.head_sha,
-        "summary": analysis.summary,
         "primary_language": analysis.primary_language,
         "is_monorepo": analysis.is_monorepo,
         "score": analysis.overall_score,
@@ -229,6 +228,26 @@ def _validate_packages(
         for package in packages
     ):
         raise ValueError("report packages must belong to the supplied analysis")
+
+    persisted_packages = analysis.analysis_json.get("packages")
+    if not isinstance(persisted_packages, list) or any(
+        not isinstance(package, Mapping)
+        or not isinstance(package.get("path"), str)
+        for package in persisted_packages
+    ):
+        raise ValueError("analysis does not contain a valid persisted package list")
+
+    expected_paths = [package["path"] for package in persisted_packages]
+    if len(expected_paths) != len(set(expected_paths)):
+        raise ValueError("analysis contains duplicate persisted package paths")
+
+    supplied_paths = [package.package_path for package in packages]
+    if len(supplied_paths) != len(set(supplied_paths)):
+        raise ValueError("report packages must contain each package exactly once")
+    if set(supplied_paths) != set(expected_paths):
+        raise ValueError(
+            "report packages must match the complete persisted package list"
+        )
 
 
 def _mean_dimension_score(

@@ -53,6 +53,10 @@ def analysis() -> RepositoryAnalysis:
         score_delta=0.5,
         created_at=datetime(2026, 8, 24, tzinfo=UTC),
         analysis_json={
+            "packages": [
+                {"path": "packages/api"},
+                {"path": "packages/worker"},
+            ],
             "command_catalog": {
                 "commands": [{"stage": "test", "argv": ["make", "test"]}]
             },
@@ -171,6 +175,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     evidence = {
         "README.md": "# Example\n",
         "Makefile": "test:\n\tpython -m pytest\n",
+        "package.json": '{"scripts":{"test":"python -m pytest"}}\n',
         "pyproject.toml": "[project]\nname = 'example'\nversion = '1.0.0'\n",
         ".python-version": "3.11.9\n",
         ".env.example": "PACKAGE_TOKEN=\n",
@@ -203,7 +208,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
                 {
                     "stage": "test",
                     "argv": ["make", "test"],
-                    "source": "Makefile",
+                    "source": "package.json#scripts",
                     "uses_services": ["postgres"],
                     "required_secrets": ["PACKAGE_TOKEN"],
                 }
@@ -224,7 +229,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
             "prepare_commands": [
                 {
                     "argv": ["python", "-m", "pip", "install", "-e", "."],
-                    "source": "pyproject.toml",
+                    "source": "pyproject.toml/project",
                 }
             ],
             "materialize_commands": [
@@ -274,6 +279,9 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     assert persisted.analysis_json["service_dependencies"] == payload[
         "service_dependencies"
     ]
+    assert persisted.analysis_json["command_catalog"]["commands"][0][
+        "source"
+    ] == "package.json#scripts"
     assert {
         key: impact["status"] for key, impact in report["harness_impact"].items()
     } == {
@@ -350,7 +358,7 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
                 {
                     "stage": "test",
                     "argv": ["make", "test"],
-                    "source": "command.missing.yml",
+                    "source": "command.missing.yml#jobs",
                 }
             ],
         },
@@ -396,7 +404,7 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
         source in str(error.value)
         for source in (
             "not-discovered.yml",
-            "command.missing.yml",
+            "command.missing.yml#jobs",
             "missing.lock",
             "jdk.missing",
             "secrets.example",
@@ -491,6 +499,22 @@ def test_terminal_markdown_and_json_render_the_same_labeled_report(
     assert machine == report
 
 
+def test_machine_report_omits_analyzer_summary_claims(
+    analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
+) -> None:
+    claimed_analysis = replace(
+        analysis,
+        summary="This repository is fully reproducible and AI-ready.",
+    )
+
+    report = build_machine_report(claimed_analysis, packages)
+    rendered = render_json_report(report).lower()
+
+    assert "summary" not in report
+    assert "readiness" not in rendered
+    assert "reproducib" not in rendered
+
+
 def test_human_reports_sanitize_control_characters_and_escape_markdown(
     analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
 ) -> None:
@@ -520,6 +544,10 @@ def test_human_reports_sanitize_control_characters_and_escape_markdown(
     ]
     malicious_payload["service_dependencies"] = [
         {"name": "postgres\n## Service", "image": "bad|image"}
+    ]
+    malicious_payload["packages"] = [
+        {"path": "packages/evil|row\n## Forged"},
+        {"path": "packages/api"},
     ]
     malicious_analysis = replace(analysis, analysis_json=malicious_payload)
     malicious_packages = [
@@ -572,3 +600,17 @@ def test_report_rejects_packages_from_another_analysis(
 
     with pytest.raises(ValueError, match="belong to the supplied analysis"):
         build_machine_report(analysis, [*packages, wrong_package])
+
+
+def test_report_rejects_incomplete_package_breakdown(
+    analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
+) -> None:
+    with pytest.raises(ValueError, match="complete persisted package list"):
+        build_machine_report(analysis, packages[:1])
+
+
+def test_report_rejects_duplicate_package_rows(
+    analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
+) -> None:
+    with pytest.raises(ValueError, match="each package exactly once"):
+        build_machine_report(analysis, [packages[0], packages[0], packages[1]])

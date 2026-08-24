@@ -550,9 +550,13 @@ def _validate_harness_evidence(
                         _add_source(cited_paths, port)
 
     known_paths = {file.path for file in manifest.files}
-    unknown_paths = cited_paths - known_paths
-    if unknown_paths:
-        names = ", ".join(sorted(unknown_paths))
+    unknown_sources = {
+        source
+        for source in cited_paths
+        if not _source_is_in_manifest(source, known_paths)
+    }
+    if unknown_sources:
+        names = ", ".join(sorted(unknown_sources))
         raise AnalyzerError(
             f"Harness input cites evidence absent from manifest: {names}"
         )
@@ -561,6 +565,23 @@ def _validate_harness_evidence(
 def _add_source(paths: set[str], value: object) -> None:
     if isinstance(value, Mapping) and isinstance(value.get("source"), str):
         paths.add(value["source"])
+
+
+def _source_is_in_manifest(source: str, known_paths: set[str]) -> bool:
+    """Accept a discovered file or an anchored location within that file."""
+    if source in known_paths:
+        return True
+
+    path, marker, anchor = source.partition("#")
+    if marker and path in known_paths and anchor:
+        return True
+
+    for path in known_paths:
+        prefix = f"{path}/"
+        if source.startswith(prefix):
+            segments = source[len(prefix) :].split("/")
+            return all(segment not in ("", ".", "..") for segment in segments)
+    return False
 
 
 def resolve_analysis_model(
