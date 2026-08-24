@@ -149,6 +149,66 @@ def test_generates_one_prd_per_theme_with_exact_canonical_values(
     assert "**S**" not in docs_prd
 
 
+def test_dimension_changes_aggregate_same_dimension_and_overlap_effects(
+    git_repo: Path, analysis: RepositoryAnalysis
+) -> None:
+    analysis.analysis_json["recommendations"].extend(
+        [
+            {
+                "id": "rec-ci-independent",
+                "title": "Add an independent CI check",
+                "package_path": ".",
+                "dimension": "ci",
+                "manifest_evidence": ["independent.yml"],
+                "estimated_delta": 0.5,
+                "effort": "S",
+                "overlap_group": None,
+            },
+            {
+                "id": "rec-ci-overlap-large",
+                "title": "Add the stronger overlapping check",
+                "package_path": ".",
+                "dimension": "ci",
+                "manifest_evidence": ["stronger.yml"],
+                "estimated_delta": 0.75,
+                "effort": "S",
+                "overlap_group": "ci-gate",
+            },
+            {
+                "id": "rec-ci-overlap-small",
+                "title": "Add the weaker overlapping check",
+                "package_path": ".",
+                "dimension": "ci",
+                "manifest_evidence": ["weaker.yml"],
+                "estimated_delta": 0.25,
+                "effort": "S",
+                "overlap_group": "ci-gate",
+            },
+        ]
+    )
+    analysis.analysis_json["themes"][0]["recommendation_ids"].extend(
+        [
+            "rec-ci-independent",
+            "rec-ci-overlap-large",
+            "rec-ci-overlap-small",
+        ]
+    )
+    paths = RepoPaths.discover(git_repo)
+
+    generate_improvement_prds(
+        analysis,
+        paths,
+        {"ci-safety": "Sentinel", "docs": "Scribe"},
+    )
+
+    body = (paths.improvement_prds_dir / "ci-safety.md").read_text(
+        encoding="utf-8"
+    )
+    assert body.count("| `.` | `ci` |") == 1
+    assert "| `.` | `ci` | +3.25 | +1.0 |" in body
+    assert "**+0.125** repository score." in body
+
+
 @pytest.mark.parametrize(
     "symlink_path",
     [Path(".borg"), Path(".borg/prds"), Path(".borg/prds/improvements")],

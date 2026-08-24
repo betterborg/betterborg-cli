@@ -246,12 +246,11 @@ def _render_prd(
             "| --- | --- | ---: | ---: |",
         ]
     )
-    for scored in ranked.recommendations:
-        recommendation = scored.recommendation
+    for change in ranked.dimension_changes:
         lines.append(
-            f"| {markdown_code_span(recommendation.package_path, table_cell=True)} | "
-            f"{markdown_code_span(recommendation.dimension, table_cell=True)} | "
-            f"+{recommendation.estimated_delta} | +{scored.effective_delta} |"
+            f"| {markdown_code_span(change.package_path, table_cell=True)} | "
+            f"{markdown_code_span(change.dimension, table_cell=True)} | "
+            f"+{change.proposed_delta} | +{change.effective_delta} |"
         )
 
     lines.extend(
