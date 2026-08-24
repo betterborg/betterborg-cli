@@ -1,4 +1,4 @@
-"""Idempotent repository registration and initial analysis orchestration."""
+"""Repository registration and explicit analysis orchestration."""
 
 from __future__ import annotations
 
@@ -57,8 +57,20 @@ class RepositoryInitialization:
     improvement_prds: tuple[ImprovementPrd, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RepositoryReanalysis:
+    """Outcome of one explicit analysis of an initialized repository."""
+
+    repository: Repository
+    analysis: RepositoryAnalysis
+    previous_analysis: RepositoryAnalysis
+    score_path: Path
+    prompts: tuple[PromptGeneration, ...]
+    improvement_prds: tuple[ImprovementPrd, ...]
+
+
 class RepositoryService:
-    """Own repository identity and the initial generated analysis outputs."""
+    """Own repository identity and its generated analysis outputs."""
 
     def __init__(
         self,
@@ -99,14 +111,7 @@ class RepositoryService:
 
         self._write_score(analysis)
         prompt_runs = self._generate_missing_prompts(repository, analysis, agent)
-        failures = [run for run in prompt_runs if not run.ok]
-        if failures:
-            details = "; ".join(
-                f"{run.role}: {run.error or 'generation failed'}" for run in failures
-            )
-            raise RepositoryInitializationError(
-                f"repository prompt generation was incomplete: {details}"
-            )
+        _require_complete_prompts(prompt_runs)
 
         improvement_prds = generate_improvement_prds(
             analysis,
@@ -128,6 +133,66 @@ class RepositoryService:
             prompts=prompt_runs,
             improvement_prds=improvement_prds,
         )
+
+    def analyze(self) -> RepositoryReanalysis:
+        """Append an analysis and refresh outputs for an initialized repository."""
+        repository, config = self._registered_repository()
+        previous_analysis = self.store.get_prior_ready_analysis(repository.id)
+        if previous_analysis is None:
+            raise RepositoryInitializationError(
+                "repository initialization record has no persisted analysis"
+            )
+        agent = self._agent_factory(config)
+        analysis = run_analyzer(
+            repository,
+            self.store,
+            agent,
+            artifact_dir=self.paths.artifacts_dir / "analysis",
+        )
+
+        self._write_score(analysis)
+        prompt_runs = tuple(
+            generate_role_prompts(
+                repository,
+                analysis,
+                self.store,
+                agent,
+                artifact_dir=self.paths.artifacts_dir / "prompts",
+                roles=PROMPT_ROLES,
+            )
+        )
+        _require_complete_prompts(prompt_runs)
+
+        improvement_prds = generate_improvement_prds(
+            analysis,
+            self.paths,
+            _suggested_borg_names(analysis),
+        )
+        return RepositoryReanalysis(
+            repository=repository,
+            analysis=analysis,
+            previous_analysis=previous_analysis,
+            score_path=self.paths.score_report,
+            prompts=prompt_runs,
+            improvement_prds=improvement_prds,
+        )
+
+    def _registered_repository(self) -> tuple[Repository, RepositoryConfig]:
+        if not (self.paths.tracked_dir / CONFIG_FILENAME).is_file():
+            raise RepositoryInitializationError(
+                "repository is not initialized; run 'borg init' first"
+            )
+        config = load_repository_config(self.paths)
+        repository = self.store.get_repository(config.repository_id)
+        if repository is None or not self._is_initialized(repository):
+            raise RepositoryInitializationError(
+                "repository is not initialized; run 'borg init' first"
+            )
+        if repository.root != self.paths.root:
+            raise RepositoryInitializationError(
+                "tracked repository identity belongs to a different repository root"
+            )
+        return repository, config
 
     def _ensure_repository(self) -> tuple[Repository, RepositoryConfig]:
         config_path = self.paths.tracked_dir / CONFIG_FILENAME
@@ -228,6 +293,18 @@ def _default_branch(repository_root: Path) -> str:
     if not branch:
         raise RepositoryInitializationError("cannot determine the default Git branch")
     return branch
+
+
+def _require_complete_prompts(prompt_runs: tuple[PromptGeneration, ...]) -> None:
+    failures = [run for run in prompt_runs if not run.ok]
+    if not failures:
+        return
+    details = "; ".join(
+        f"{run.role}: {run.error or 'generation failed'}" for run in failures
+    )
+    raise RepositoryInitializationError(
+        f"repository prompt generation was incomplete: {details}"
+    )
 
 
 def _suggested_borg_names(
