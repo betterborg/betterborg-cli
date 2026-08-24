@@ -19,7 +19,10 @@ from betterborg_cli.agent_runtime.base import (
 )
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.agent_runtime.structured import validate_structured_result
-from betterborg_cli.repo_analysis.analyzer import resolve_analysis_model
+from betterborg_cli.repo_analysis.analyzer import (
+    AnalyzerError,
+    resolve_analysis_model,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     GeneratedPrompt,
@@ -123,6 +126,8 @@ def generate_role_prompts(
     _validate_persisted_inputs(repository, analysis, store)
     selected_roles = _validate_roles(roles)
     resolved_config = config or PromptManagerConfig()
+    if resolved_config.effort is not None and agent.name == "anthropic":
+        raise AnalyzerError("Anthropic does not support an effort override")
     model = resolve_analysis_model(agent, resolved_config.model)
     paths = RepoPaths.discover(repository.root)
     if paths.root != repository.root:
@@ -130,7 +135,7 @@ def generate_role_prompts(
 
     artifact_dir = Path(artifact_dir).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    paths.prompts_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_stable_prompt_directory(paths)
     prior_prompts = store.get_latest_generated_prompts(repository.id)
 
     def generate(role: str) -> PromptGeneration:
@@ -211,7 +216,7 @@ def _generate_one_role(
                 role=role,
                 body_md=body_md,
             )
-            _write_stable_prompt(prompt_path, body_md)
+            _write_stable_prompt(prompt_path, body_md, repository.root)
     except Exception as error:
         return PromptGeneration(
             role=role,
@@ -284,7 +289,30 @@ def _validate_roles(roles: Iterable[str] | None) -> tuple[str, ...]:
     return selected
 
 
-def _write_stable_prompt(path: Path, body_md: str) -> None:
+def _prepare_stable_prompt_directory(paths: RepoPaths) -> None:
+    prompt_directory = paths.prompts_dir
+    resolved = prompt_directory.resolve()
+    if not resolved.is_relative_to(paths.root):
+        raise ValueError(
+            f"stable prompt directory escapes repository: {prompt_directory}"
+        )
+    prompt_directory.mkdir(parents=True, exist_ok=True)
+    resolved = prompt_directory.resolve(strict=True)
+    if not resolved.is_relative_to(paths.root):
+        raise ValueError(
+            f"stable prompt directory escapes repository: {prompt_directory}"
+        )
+
+
+def _write_stable_prompt(
+    path: Path,
+    body_md: str,
+    repository_root: Path,
+) -> None:
+    resolved_directory = path.parent.resolve(strict=True)
+    if not resolved_directory.is_relative_to(repository_root):
+        raise ValueError(f"stable prompt path escapes repository: {path}")
+    path = resolved_directory / path.name
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         temporary.write_text(body_md, encoding="utf-8")

@@ -11,6 +11,8 @@ from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
+    AnalyzerError,
+    PromptManagerConfig,
     generate_role_prompts,
     prompts_manager,
 )
@@ -141,6 +143,77 @@ def test_generates_all_role_metadata_at_stable_paths(git_repo: Path) -> None:
         assert '"overall_score": 3' in spec.user_prompt
         assert "Prior" not in spec.user_prompt
         assert spec.allowed_tools == ("list_files", "read_file", "search_text")
+
+
+@pytest.mark.parametrize("symlink_path", [Path(".borg"), Path(".borg/prompts")])
+def test_stable_prompt_directory_cannot_escape_repository_through_symlink(
+    git_repo: Path,
+    symlink_path: Path,
+) -> None:
+    repository = Repository(root=git_repo)
+    outside = git_repo.parent / f"{git_repo.name}-outside"
+    outside.mkdir()
+    link = git_repo / symlink_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    adapter, selected = _selected_adapter(
+        git_repo,
+        {"coding": "# Coding agent\n\nComplete repository-specific coding guidance."},
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(ValueError, match="prompt directory escapes repository"):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+            )
+
+        assert adapter.calls == []
+        assert store.get_latest_generated_prompts(repository.id) == {}
+        assert list(outside.iterdir()) == []
+
+
+def test_prompt_manager_rejects_effort_for_anthropic_before_adapter_call(
+    git_repo: Path,
+) -> None:
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="anthropic")
+    _role_keyed_responses(
+        adapter,
+        {"coding": "# Coding agent\n\nComplete repository-specific coding guidance."},
+    )
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(
+            AnalyzerError, match="Anthropic does not support an effort override"
+        ):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                config=PromptManagerConfig(effort="high"),
+                roles=("coding",),
+            )
+
+        assert adapter.calls == []
+        assert store.get_latest_generated_prompts(repository.id) == {}
 
 
 def test_partial_failure_preserves_score_then_reanalysis_refreshes_prompts(
