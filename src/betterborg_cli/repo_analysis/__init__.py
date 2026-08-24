@@ -1,5 +1,11 @@
 """Repository analysis foundations."""
 
+from betterborg_cli.repo_analysis.analyzer import (
+    ANALYZER_OUTPUT_SCHEMA,
+    AnalyzerConfig,
+    AnalyzerError,
+    run_analyzer,
+)
 from betterborg_cli.repo_analysis.discovery import (
     DiscoveryFile,
     DiscoveryLimits,
@@ -29,6 +35,9 @@ from betterborg_cli.repo_analysis.scoring import (
 )
 
 __all__ = [
+    "ANALYZER_OUTPUT_SCHEMA",
+    "AnalyzerConfig",
+    "AnalyzerError",
     "DiscoveryFile",
     "DiscoveryLimits",
     "DiscoveryManifest",
@@ -49,6 +58,7 @@ __all__ = [
     "compute_repo_overall_score",
     "discovery_limits_from_mapping",
     "rank_recommendation_themes",
+    "run_analyzer",
     "score_repository",
     "validate_recommendation",
     "validate_recommendation_theme",

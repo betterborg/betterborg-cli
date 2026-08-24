@@ -13,7 +13,14 @@ from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
-from betterborg_cli.store.models import Operation, Repository, utcnow
+from betterborg_cli.store.models import (
+    GeneratedPrompt,
+    Operation,
+    Repository,
+    RepositoryAnalysis,
+    RepositoryPackage,
+    utcnow,
+)
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 
@@ -167,6 +174,201 @@ class SqliteStore:
             for row in rows
         ]
 
+    def append_analysis(
+        self,
+        analysis: RepositoryAnalysis,
+        packages: list[RepositoryPackage],
+    ) -> None:
+        """Atomically append one successful analysis and all package rows."""
+        if not packages:
+            raise ValueError("an analysis must contain at least one package")
+        if any(
+            package.repository_id != analysis.repository_id
+            or package.analysis_id != analysis.id
+            for package in packages
+        ):
+            raise ValueError("analysis packages must belong to the appended analysis")
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO repository_analyses(
+                    id, repository_id, head_sha, summary, primary_language,
+                    is_monorepo, overall_score, analysis_json,
+                    prior_analysis_id, score_delta, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(analysis.id),
+                    str(analysis.repository_id),
+                    analysis.head_sha,
+                    analysis.summary,
+                    analysis.primary_language,
+                    int(analysis.is_monorepo),
+                    analysis.overall_score,
+                    _encode_json(analysis.analysis_json),
+                    str(analysis.prior_analysis_id)
+                    if analysis.prior_analysis_id is not None
+                    else None,
+                    analysis.score_delta,
+                    analysis.created_at.isoformat(),
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO repository_packages(
+                    id, repository_id, analysis_id, package_path,
+                    package_name, primary_language, rubric_json, overall_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(package.id),
+                        str(package.repository_id),
+                        str(package.analysis_id),
+                        package.package_path,
+                        package.package_name,
+                        package.primary_language,
+                        _encode_json(package.rubric),
+                        package.overall_score,
+                    )
+                    for package in packages
+                ],
+            )
+
+    def get_analysis(self, analysis_id: UUID) -> RepositoryAnalysis | None:
+        """Return one immutable analysis by ID."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM repository_analyses WHERE id = ?",
+                (str(analysis_id),),
+            ).fetchone()
+        return _row_to_analysis(row) if row is not None else None
+
+    def list_analyses(self, repository_id: UUID) -> list[RepositoryAnalysis]:
+        """Return a repository's successful analyses in append order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM repository_analyses
+                WHERE repository_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(repository_id),),
+            ).fetchall()
+        return [_row_to_analysis(row) for row in rows]
+
+    def get_prior_ready_analysis(
+        self,
+        repository_id: UUID,
+        *,
+        before_analysis_id: UUID | None = None,
+    ) -> RepositoryAnalysis | None:
+        """Return the latest successful analysis, optionally before one run."""
+        if before_analysis_id is not None:
+            with self.locked_connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT prior.*
+                    FROM repository_analyses AS current
+                    JOIN repository_analyses AS prior
+                      ON prior.id = current.prior_analysis_id
+                     AND prior.repository_id = current.repository_id
+                    WHERE current.id = ? AND current.repository_id = ?
+                    """,
+                    (str(before_analysis_id), str(repository_id)),
+                ).fetchone()
+            return _row_to_analysis(row) if row is not None else None
+
+        query = """
+            SELECT candidate.*
+            FROM repository_analyses AS candidate
+            WHERE candidate.repository_id = ?
+        """
+        parameters: list[str] = [str(repository_id)]
+        query += " ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1"
+        with self.locked_connection() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return _row_to_analysis(row) if row is not None else None
+
+    def list_packages(self, analysis_id: UUID) -> list[RepositoryPackage]:
+        """Return package rows for one analysis in stable path order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM repository_packages
+                WHERE analysis_id = ?
+                ORDER BY package_path
+                """,
+                (str(analysis_id),),
+            ).fetchall()
+        return [_row_to_package(row) for row in rows]
+
+    def append_generated_prompt(
+        self,
+        *,
+        repository_id: UUID,
+        analysis_id: UUID,
+        role: str,
+        body_md: str,
+    ) -> GeneratedPrompt:
+        """Append and return the next prompt version for a repository role."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) AS version
+                FROM generated_prompts
+                WHERE repository_id = ? AND role = ?
+                """,
+                (str(repository_id), role),
+            ).fetchone()
+            prompt = GeneratedPrompt(
+                repository_id=repository_id,
+                analysis_id=analysis_id,
+                role=role,
+                version=row["version"] + 1,
+                body_md=body_md,
+            )
+            connection.execute(
+                """
+                INSERT INTO generated_prompts(
+                    id, repository_id, analysis_id, role, version,
+                    body_md, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(prompt.id),
+                    str(prompt.repository_id),
+                    str(prompt.analysis_id),
+                    prompt.role,
+                    prompt.version,
+                    prompt.body_md,
+                    prompt.generated_at.isoformat(),
+                ),
+            )
+        return prompt
+
+    def get_latest_generated_prompts(
+        self, repository_id: UUID
+    ) -> dict[str, GeneratedPrompt]:
+        """Return the highest prompt version present for each role."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT prompt.*
+                FROM generated_prompts AS prompt
+                WHERE prompt.repository_id = ?
+                  AND prompt.version = (
+                      SELECT MAX(candidate.version)
+                      FROM generated_prompts AS candidate
+                      WHERE candidate.repository_id = prompt.repository_id
+                        AND candidate.role = prompt.role
+                  )
+                ORDER BY prompt.role
+                """,
+                (str(repository_id),),
+            ).fetchall()
+        return {row["role"]: _row_to_generated_prompt(row) for row in rows}
+
     def applied_migrations(self) -> tuple[int, ...]:
         """Return applied migration versions in ascending order."""
         with self.locked_connection() as connection:
@@ -232,3 +434,52 @@ class SqliteStore:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
             raise
+
+
+def _encode_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _row_to_analysis(row: sqlite3.Row) -> RepositoryAnalysis:
+    return RepositoryAnalysis(
+        id=UUID(row["id"]),
+        repository_id=UUID(row["repository_id"]),
+        head_sha=row["head_sha"],
+        summary=row["summary"],
+        primary_language=row["primary_language"],
+        is_monorepo=bool(row["is_monorepo"]),
+        overall_score=row["overall_score"],
+        analysis_json=json.loads(row["analysis_json"]),
+        prior_analysis_id=(
+            UUID(row["prior_analysis_id"])
+            if row["prior_analysis_id"] is not None
+            else None
+        ),
+        score_delta=row["score_delta"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_package(row: sqlite3.Row) -> RepositoryPackage:
+    return RepositoryPackage(
+        id=UUID(row["id"]),
+        repository_id=UUID(row["repository_id"]),
+        analysis_id=UUID(row["analysis_id"]),
+        package_path=row["package_path"],
+        package_name=row["package_name"],
+        primary_language=row["primary_language"],
+        rubric=json.loads(row["rubric_json"]),
+        overall_score=row["overall_score"],
+    )
+
+
+def _row_to_generated_prompt(row: sqlite3.Row) -> GeneratedPrompt:
+    return GeneratedPrompt(
+        id=UUID(row["id"]),
+        repository_id=UUID(row["repository_id"]),
+        analysis_id=UUID(row["analysis_id"]),
+        role=row["role"],
+        version=row["version"],
+        body_md=row["body_md"],
+        generated_at=datetime.fromisoformat(row["generated_at"]),
+    )
