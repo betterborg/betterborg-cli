@@ -166,7 +166,7 @@ class OpenAIAdapter:
     """Run a schema-shaped, contained multi-turn OpenAI agent."""
 
     role: ApiAgentRole | str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     workspace_trusted: bool = False
     transport: OpenAITransport = field(default_factory=UrllibOpenAITransport)
     max_output_tokens: int = 8192

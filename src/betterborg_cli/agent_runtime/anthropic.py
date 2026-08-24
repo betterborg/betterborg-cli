@@ -167,7 +167,7 @@ class AnthropicAdapter:
     """Run a schema-shaped, contained multi-turn Anthropic agent."""
 
     role: ApiAgentRole | str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     workspace_trusted: bool = False
     transport: AnthropicTransport = field(default_factory=UrllibAnthropicTransport)
     max_tokens: int = 8192

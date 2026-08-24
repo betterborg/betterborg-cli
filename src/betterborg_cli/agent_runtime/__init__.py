@@ -50,6 +50,11 @@ from betterborg_cli.agent_runtime.retry import (
     retry_outcome_to_result,
     run_with_transient_retry,
 )
+from betterborg_cli.agent_runtime.selection import (
+    AgentSelectionError,
+    SelectedAgent,
+    select_agent,
+)
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     extract_json,
@@ -69,6 +74,7 @@ __all__ = [
     "AgentCapabilities",
     "AgentResult",
     "AgentRunSpec",
+    "AgentSelectionError",
     "AgentStatus",
     "AgentUsage",
     "AnthropicAdapter",
@@ -93,6 +99,7 @@ __all__ = [
     "RetryOutcome",
     "StructuredResultError",
     "SearchMatch",
+    "SelectedAgent",
     "ToolGrantError",
     "UrllibAnthropicTransport",
     "UrllibOpenAITransport",
@@ -105,5 +112,6 @@ __all__ = [
     "run_streamed",
     "run_with_transient_retry",
     "select_api_tool_names",
+    "select_agent",
     "validate_structured_result",
 ]
