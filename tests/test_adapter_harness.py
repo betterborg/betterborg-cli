@@ -31,7 +31,7 @@ class FakeApiTransport:
 
     responses: list[QueuedResponse]
     payloads: list[dict[str, Any]] = field(default_factory=list)
-    api_keys: list[str] = field(default_factory=list)
+    api_keys: list[str] = field(default_factory=list, repr=False)
 
     def create_message(
         self,
@@ -275,7 +275,7 @@ class ApiAdapterHarness:
         role: ApiAgentRole,
         *,
         transport: FakeApiTransport,
-        api_key: str = "key",
+        api_key: str | None = "key",
         workspace_trusted: bool = False,
         **options: Any,
     ) -> AgentAdapter:

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
+from test_adapter_harness import (
+    FakeApiTransport,
+    openai_function_call,
+    openai_response,
+)
 
 from betterborg_cli.agent_runtime import (
     AgentRunSpec,
@@ -209,6 +215,90 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
     assert not spawned
 
 
+def test_run_rejects_a_cwd_from_a_different_repository_before_trust_or_spawn(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    other_repo = tmp_path / "other"
+    other_repo.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(other_repo)], check=True)
+    selected = select_agent(
+        _config(coding=AgentChoice(adapter="codex")),
+        ApiAgentRole.CODING,
+        RepoPaths.discover(git_repo),
+        interactive=True,
+        credentials={},
+        executable_lookup=lambda _binary: "/bin/codex",
+        trust_requirement=lambda *_args, **_kwargs: pytest.fail("unexpected trust"),
+    )
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+
+    with pytest.raises(AgentSelectionError, match="different repository"):
+        selected.run(_spec(other_repo))
+
+
+def test_run_accepts_a_managed_linked_worktree_and_trusts_that_workspace(
+    git_repo: Path,
+) -> None:
+    marker = git_repo / "tracked.txt"
+    marker.write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", marker.name], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "test"],
+        check=True,
+    )
+    paths = RepoPaths.discover(git_repo)
+    worktree = paths.worktrees_dir / "task"
+    worktree.parent.mkdir(parents=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(git_repo),
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            str(worktree),
+            "HEAD",
+        ],
+        check=True,
+    )
+    trusted: list[Path] = []
+    transport = FakeApiTransport(
+        [
+            openai_response(
+                [
+                    openai_function_call(
+                        "submit_result",
+                        {"status": "completed", "version": "worktree"},
+                        call_id="submit",
+                    )
+                ]
+            )
+        ]
+    )
+    selected = select_agent(
+        _config(review=AgentChoice(adapter="openai")),
+        ApiAgentRole.REVIEW,
+        paths,
+        interactive=False,
+        credentials={"OPENAI_API_KEY": "key"},
+        trust_requirement=lambda run_paths, **_kwargs: trusted.append(
+            run_paths.root
+        ),
+    )
+    assert isinstance(selected.adapter, OpenAIAdapter)
+    selected.adapter.transport = transport
+
+    result = selected.run(_spec(worktree))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert trusted == [worktree.resolve()]
+
+
 def test_pre_cancelled_native_run_does_not_request_trust_or_spawn(
     git_repo: Path,
 ) -> None:
@@ -233,43 +323,6 @@ def test_pre_cancelled_native_run_does_not_request_trust_or_spawn(
     assert result.attempts == 0
 
 
-class _OpenAITransport:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.keys: list[str] = []
-        self.payloads: list[Mapping[str, Any]] = []
-
-    def create_response(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        api_key: str,
-        cancel: object = None,
-    ) -> Mapping[str, Any]:
-        self.events.append("request")
-        self.keys.append(api_key)
-        self.payloads.append(payload)
-        return {
-            "id": "response",
-            "object": "response",
-            "status": "completed",
-            "model": "resolved-openai-model",
-            "output": [
-                {
-                    "type": "function_call",
-                    "id": "call",
-                    "call_id": "submit",
-                    "name": "submit_result",
-                    "arguments": json.dumps(
-                        {"status": "completed", "version": "api"}
-                    ),
-                    "status": "completed",
-                }
-            ],
-            "usage": {"input_tokens": 7, "output_tokens": 3},
-        }
-
-
 def test_api_execution_discloses_host_capability_and_trusts_before_request(
     git_repo: Path,
 ) -> None:
@@ -283,7 +336,22 @@ def test_api_execution_discloses_host_capability_and_trusts_before_request(
         credentials={"OPENAI_API_KEY": secret},
         trust_requirement=lambda _paths, **_kwargs: events.append("trust"),
     )
-    transport = _OpenAITransport(events)
+    def respond(_cancel: CancellationToken | None) -> Mapping[str, Any]:
+        events.append("request")
+        return openai_response(
+            [
+                openai_function_call(
+                    "submit_result",
+                    {"status": "completed", "version": "api"},
+                    call_id="submit",
+                )
+            ],
+            model="resolved-openai-model",
+            input_tokens=7,
+            output_tokens=3,
+        )
+
+    transport = FakeApiTransport([respond])
     assert isinstance(selected.adapter, OpenAIAdapter)
     selected.adapter.transport = transport
 
@@ -292,7 +360,7 @@ def test_api_execution_discloses_host_capability_and_trusts_before_request(
     assert selected.capabilities.host_capable
     assert selected.capabilities.tool_allowlist
     assert events == ["trust", "request"]
-    assert transport.keys == [secret]
+    assert transport.api_keys == [secret]
     assert transport.payloads[0]["model"] == "review-model"
     assert transport.payloads[0]["reasoning"] == {"effort": "low"}
     assert result.status == AgentStatus.COMPLETED

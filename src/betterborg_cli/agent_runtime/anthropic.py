@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import re
 import urllib.error
 import urllib.request
@@ -203,9 +202,7 @@ class AnthropicAdapter:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        key = self.api_key or spec.env.get("ANTHROPIC_API_KEY") or os.environ.get(
-            "ANTHROPIC_API_KEY"
-        )
+        key = self.api_key
         runtime = ApiRunContext(
             spec,
             _PROVIDER,

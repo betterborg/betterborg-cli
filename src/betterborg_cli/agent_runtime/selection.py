@@ -7,6 +7,7 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from betterborg_cli.agent_runtime.anthropic import AnthropicAdapter
@@ -24,7 +25,11 @@ from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.openai import OpenAIAdapter
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentChoice, RepositoryConfig
-from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
+from betterborg_cli.workspace_trust import (
+    TrustStore,
+    WorkspaceIdentity,
+    require_workspace_trust,
+)
 
 _NATIVE_ADAPTERS = ("claude", "codex")
 _API_ADAPTERS = ("anthropic", "openai")
@@ -94,9 +99,10 @@ class SelectedAgent:
         if cancel is not None and cancel.is_set():
             return self.adapter.run(resolved_spec, cancel=cancel)
 
+        run_paths = self._bound_run_paths(resolved_spec.cwd)
         if self.capabilities.host_capable:
             self.trust_requirement(
-                self.paths,
+                run_paths,
                 store=self.trust_store,
                 explicit=self.trust_explicit,
                 interactive=self.interactive,
@@ -106,6 +112,29 @@ class SelectedAgent:
                 self.adapter.workspace_trusted = True
 
         return self.adapter.run(resolved_spec, cancel=cancel)
+
+    def _bound_run_paths(self, cwd: Path) -> RepoPaths:
+        """Resolve a run cwd that belongs to the selected repository."""
+        try:
+            run_paths = RepoPaths.discover(cwd)
+            selected_identity = WorkspaceIdentity.discover(self.paths)
+            run_identity = WorkspaceIdentity.discover(run_paths)
+        except ValueError as error:
+            raise AgentSelectionError(
+                f"Agent run cwd is not a usable Git workspace: {cwd}"
+            ) from error
+
+        same_workspace = run_paths.root == self.paths.root
+        managed_worktree = (
+            run_paths.root.is_relative_to(self.paths.worktrees_dir.resolve())
+            and run_identity.git_common_dir == selected_identity.git_common_dir
+        )
+        if not same_workspace and not managed_worktree:
+            raise AgentSelectionError(
+                "Agent run cwd belongs to a different repository: "
+                f"{run_paths.root} (selected {self.paths.root})"
+            )
+        return run_paths
 
 
 def select_agent(
