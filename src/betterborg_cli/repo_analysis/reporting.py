@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from betterborg_cli.repo_analysis.scoring import DIMENSIONS
@@ -28,6 +29,7 @@ _NON_DETERMINISM_LABEL = (
     "Analyzer output is non-deterministic and may vary between runs."
 )
 _MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]<>#+!|")
+_ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def build_machine_report(
@@ -316,6 +318,7 @@ def _harness_impact(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             detail_key="services",
             singular="service dependency",
             plural="service dependencies",
+            transform=_service_record,
         ),
     }
 
@@ -360,12 +363,14 @@ def _environment_impact(payload: Mapping[str, Any]) -> dict[str, Any]:
         return {
             **_unknown_impact("No reliable environment inputs were persisted."),
             **dict.fromkeys(fields, []),
+            "source": None,
         }
     environment = payload["environment"]
     if not isinstance(environment, Mapping):
         return {
             **_unknown_impact("The persisted environment inputs were incomplete."),
             **dict.fromkeys(fields, []),
+            "source": None,
         }
     details = {
         key: [dict(item) if isinstance(item, Mapping) else item for item in value]
@@ -377,6 +382,7 @@ def _environment_impact(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         **_count_impact(count, "environment input", "environment inputs"),
         **details,
+        "source": environment.get("source"),
     }
 
 
@@ -387,6 +393,7 @@ def _list_impact(
     detail_key: str,
     singular: str,
     plural: str,
+    transform: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if key not in payload:
         return {
@@ -399,7 +406,11 @@ def _list_impact(
             **_unknown_impact(f"The persisted {plural} were incomplete."),
             detail_key: [],
         }
-    records = [dict(value) for value in values if isinstance(value, Mapping)]
+    records = [
+        transform(value) if transform is not None else dict(value)
+        for value in values
+        if isinstance(value, Mapping)
+    ]
     return {
         **_count_impact(len(records), singular, plural),
         detail_key: records,
@@ -436,6 +447,8 @@ def _impact_details(key: str, impact: Mapping[str, Any]) -> list[str]:
         details = [
             f"Environment file: {path}" for path in impact.get("files", [])
         ]
+        if impact.get("source") is not None:
+            details.append(f"Environment source: {impact['source']}")
         details.extend(
             f"Toolchain: {_describe_toolchain(toolchain)}"
             for toolchain in impact.get("toolchains", [])
@@ -522,9 +535,52 @@ def _describe_service(service: Mapping[str, Any]) -> str:
             qualifiers.append(f"ports: {', '.join(rendered_ports)}")
     _append_qualifier(qualifiers, "compose service", service.get("compose_service"))
     _append_qualifier(qualifiers, "URL environment", service.get("url_env"))
+    _append_values(qualifiers, "environment", service.get("env"))
     _append_qualifier(qualifiers, "source", service.get("source"))
     suffix = f" ({'; '.join(qualifiers)})" if qualifiers else ""
     return f"{service.get('name', 'unnamed')}{suffix}"
+
+
+def _service_record(service: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose service environment variable names without literal values."""
+    record = dict(service)
+    if not _is_environment_variable(record.get("url_env")):
+        record.pop("url_env", None)
+    raw_ports = record.get("ports")
+    if isinstance(raw_ports, list):
+        record["ports"] = [
+            _service_port_record(port)
+            for port in raw_ports
+            if isinstance(port, Mapping)
+        ]
+    raw_environment = record.pop("env", None)
+    if isinstance(raw_environment, Mapping):
+        names = raw_environment.keys()
+    elif isinstance(raw_environment, list):
+        names = raw_environment
+    else:
+        names = ()
+    safe_names = sorted(
+        {
+            name
+            for name in names
+            if _is_environment_variable(name)
+        }
+    )
+    if safe_names:
+        record["env"] = safe_names
+    return record
+
+
+def _service_port_record(port: Mapping[str, Any]) -> dict[str, Any]:
+    record = dict(port)
+    if not _is_environment_variable(record.get("env")):
+        record.pop("env", None)
+    return record
+
+
+def _is_environment_variable(value: object) -> bool:
+    return isinstance(value, str) and _ENVIRONMENT_VARIABLE.fullmatch(value) is not None
 
 
 def _append_qualifier(values: list[str], label: str, value: object) -> None:

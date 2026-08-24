@@ -12,7 +12,15 @@ from uuid import UUID
 import pytest
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.repo_analysis.analyzer import AnalyzerError, run_analyzer
+from betterborg_cli.agent_runtime.structured import (
+    StructuredResultError,
+    validate_structured_result,
+)
+from betterborg_cli.repo_analysis.analyzer import (
+    ANALYZER_OUTPUT_SCHEMA,
+    AnalyzerError,
+    run_analyzer,
+)
 from betterborg_cli.repo_analysis.reporting import (
     build_machine_report,
     render_json_report,
@@ -58,10 +66,16 @@ def analysis() -> RepositoryAnalysis:
                 {"path": "packages/worker"},
             ],
             "command_catalog": {
-                "commands": [{"stage": "test", "argv": ["make", "test"]}]
+                "source": "Makefile",
+                "commands": [{"stage": "test", "argv": ["make", "test"]}],
             },
             "required_secrets": [
-                {"name": "PACKAGE_TOKEN", "used_by": ["test"], "scope": "build"}
+                {
+                    "name": "PACKAGE_TOKEN",
+                    "used_by": ["test"],
+                    "scope": "build",
+                    "source": ".env.example",
+                }
             ],
             "service_dependencies": [],
             "themes": [
@@ -164,6 +178,7 @@ def test_harness_impact_distinguishes_unknown_from_detected_and_not_detected(
         "package_managers": [],
         "prepare_commands": [],
         "materialize_commands": [],
+        "source": None,
     }
     assert impact["secrets"]["status"] == "detected"
     assert impact["services"]["status"] == "not_detected"
@@ -254,6 +269,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
                 "image": "postgres:16",
                 "port": 5432,
                 "source": "docker-compose.yml",
+                "env": ["POSTGRES_PASSWORD"],
             }
         ],
     }
@@ -310,6 +326,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     assert [service["name"] for service in impact["services"]["services"]] == [
         "postgres"
     ]
+    assert impact["services"]["services"][0]["env"] == ["POSTGRES_PASSWORD"]
 
     terminal = render_terminal_report(report)
     markdown = render_markdown_report(report)
@@ -467,7 +484,188 @@ def test_materialize_command_alone_is_a_valid_environment_input(
         "package_managers": [],
         "prepare_commands": [],
         "materialize_commands": [materialize],
+        "source": None,
     }
+
+
+def test_package_manager_alone_is_a_valid_cited_environment_input(
+    git_repo: Path,
+) -> None:
+    (git_repo / "pyproject.toml").write_text(
+        "[project]\nname = 'example'\nversion = '1.0.0'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(git_repo), "add", "pyproject.toml"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small Python application using the pip package manager.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "environment": {
+            "source": "pyproject.toml",
+            "package_managers": ["pip"],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        persisted = run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+        environment = build_machine_report(
+            persisted, store.list_packages(persisted.id)
+        )["harness_impact"]["environment"]
+
+    assert environment == {
+        "status": "detected",
+        "label": "Detected",
+        "summary": "1 environment input persisted for harness use.",
+        "files": [],
+        "toolchains": [],
+        "package_managers": ["pip"],
+        "prepare_commands": [],
+        "materialize_commands": [],
+        "source": "pyproject.toml",
+    }
+
+
+def test_analyzer_rejects_uncited_harness_detections(git_repo: Path) -> None:
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small application with uncited Harness detections.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "commands": [{"stage": "test", "argv": ["make", "test"]}]
+        },
+        "environment": {
+            "toolchains": [{"name": "python"}],
+            "package_managers": ["pip"],
+            "prepare_commands": [{"argv": ["python", "-m", "pip", "install"]}],
+        },
+        "required_secrets": [
+            {"name": "TOKEN", "used_by": ["test"], "scope": "build"}
+        ],
+        "service_dependencies": [
+            {"name": "postgres", "ports": [{"port": 5432}]}
+        ],
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="lacks bounded evidence") as error:
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []
+
+    assert all(
+        claim in str(error.value)
+        for claim in (
+            "command",
+            "environment package manager",
+            "environment prepare_command",
+            "environment toolchain",
+            "required secret",
+            "service",
+            "service port",
+        )
+    )
+
+
+def test_machine_report_never_exposes_service_environment_values(
+    analysis: RepositoryAnalysis, packages: list[RepositoryPackage]
+) -> None:
+    payload = dict(analysis.analysis_json)
+    payload["service_dependencies"] = [
+        {
+            "name": "postgres",
+            "source": "docker-compose.yml",
+            "url_env": "literal-url-value",
+            "ports": [{"port": 5432, "env": "literal-port-value"}],
+            "env": {
+                "POSTGRES_PASSWORD": "actual-value",
+                "POSTGRES_USER": "app-user",
+            },
+        }
+    ]
+    legacy_analysis = replace(analysis, analysis_json=payload)
+
+    report = build_machine_report(legacy_analysis, packages)
+    rendered = render_json_report(report)
+
+    assert report["harness_impact"]["services"]["services"][0]["env"] == [
+        "POSTGRES_PASSWORD",
+        "POSTGRES_USER",
+    ]
+    assert "actual-value" not in rendered
+    assert "app-user" not in rendered
+    assert "literal-url-value" not in rendered
+    assert "literal-port-value" not in rendered
+
+    unsafe_analyzer_payload = {
+        "summary": "A small application with an unsafe service environment.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "service_dependencies": [
+            {
+                "name": "postgres",
+                "source": "docker-compose.yml",
+                "env": {"POSTGRES_PASSWORD": "actual-value"},
+            }
+        ],
+    }
+    with pytest.raises(
+        StructuredResultError, match=r"service_dependencies\[0\]\.env"
+    ):
+        validate_structured_result(unsafe_analyzer_payload, ANALYZER_OUTPUT_SCHEMA)
 
 
 def test_terminal_markdown_and_json_render_the_same_labeled_report(

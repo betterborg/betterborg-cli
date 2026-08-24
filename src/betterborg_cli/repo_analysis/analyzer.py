@@ -107,6 +107,10 @@ _SECRET_REQUIREMENT_SCHEMA: dict[str, Any] = {
         "description": {"type": "string"},
     },
 }
+_ENVIRONMENT_VARIABLE_NAME_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
+}
 _SERVICE_PORT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -114,7 +118,7 @@ _SERVICE_PORT_SCHEMA: dict[str, Any] = {
     "properties": {
         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
         "protocol": {"type": "string", "enum": ["tcp", "udp"]},
-        "env": {"type": "string", "minLength": 1},
+        "env": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
         "source": {"type": "string", "minLength": 1},
     },
 }
@@ -132,10 +136,11 @@ _SERVICE_DEPENDENCY_SCHEMA: dict[str, Any] = {
         },
         "source": {"type": "string", "minLength": 1},
         "compose_service": {"type": "string", "minLength": 1},
-        "url_env": {"type": "string", "minLength": 1},
+        "url_env": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
         "env": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
+            "type": "array",
+            "uniqueItems": True,
+            "items": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
         },
     },
 }
@@ -172,11 +177,13 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
     "anyOf": [
         {"required": ["files"]},
         {"required": ["toolchains"]},
+        {"required": ["package_managers"]},
         {"required": ["prepare_commands"]},
         {"required": ["materialize_commands"]},
     ],
     "properties": {
         "version": {"type": "integer", "const": 1},
+        "source": {"type": "string", "minLength": 1},
         "files": {
             "type": "array",
             "minItems": 1,
@@ -284,10 +291,11 @@ Open analysis_input.json first and inspect only files listed in its files array.
 Score every package on the eight required dimensions. Every recommendation must
 cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
-rationale. When bounded evidence is reliable, report the command catalog,
-environment inputs, required secret names (never values), and service
-dependencies; omit an optional category when evidence is insufficient. Return
-only the JSON object required by the supplied schema.
+rationale. Every reported Harness command, environment input, required secret,
+and service must cite a manifest path in its source field or inherit a source
+from its containing catalog/environment/service. Service env contains variable
+names only, never values. Omit an optional category when bounded evidence is
+insufficient. Return only the JSON object required by the supplied schema.
 """
 _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
@@ -515,27 +523,45 @@ def _persist_payload(
 def _validate_harness_evidence(
     payload: Mapping[str, Any], manifest: DiscoveryManifest
 ) -> None:
-    """Reject Harness claims that cite files outside bounded discovery."""
+    """Require every Harness claim to cite bounded discovery evidence."""
     cited_paths: set[str] = set()
+    uncited_claims: set[str] = set()
 
     catalog = payload.get("command_catalog")
     if isinstance(catalog, Mapping):
         _add_source(cited_paths, catalog)
+        catalog_source = _source(catalog)
         commands = catalog.get("commands")
         if isinstance(commands, list):
             for command in commands:
                 _add_source(cited_paths, command)
+                if _source(command) is None and catalog_source is None:
+                    uncited_claims.add("command")
 
     environment = payload.get("environment")
     if isinstance(environment, Mapping):
+        _add_source(cited_paths, environment)
         files = environment.get("files")
+        environment_sources = {_source(environment)}
         if isinstance(files, list):
-            cited_paths.update(path for path in files if isinstance(path, str))
+            file_sources = {path for path in files if isinstance(path, str)}
+            cited_paths.update(file_sources)
+            environment_sources.update(file_sources)
+        environment_sources.discard(None)
         for key in ("toolchains", "prepare_commands", "materialize_commands"):
             records = environment.get(key)
             if isinstance(records, list):
                 for record in records:
                     _add_source(cited_paths, record)
+                    if _source(record) is None and not environment_sources:
+                        uncited_claims.add(f"environment {key[:-1]}")
+        package_managers = environment.get("package_managers")
+        if (
+            isinstance(package_managers, list)
+            and package_managers
+            and not environment_sources
+        ):
+            uncited_claims.add("environment package manager")
 
     for key in ("required_secrets", "service_dependencies"):
         records = payload.get(key)
@@ -543,11 +569,21 @@ def _validate_harness_evidence(
             continue
         for record in records:
             _add_source(cited_paths, record)
+            record_source = _source(record)
+            if record_source is None:
+                claim = "required secret" if key == "required_secrets" else "service"
+                uncited_claims.add(claim)
             if key == "service_dependencies" and isinstance(record, Mapping):
                 ports = record.get("ports")
                 if isinstance(ports, list):
                     for port in ports:
                         _add_source(cited_paths, port)
+                        if _source(port) is None and record_source is None:
+                            uncited_claims.add("service port")
+
+    if uncited_claims:
+        names = ", ".join(sorted(uncited_claims))
+        raise AnalyzerError(f"Harness input lacks bounded evidence for: {names}")
 
     known_paths = {file.path for file in manifest.files}
     unknown_sources = {
@@ -563,8 +599,14 @@ def _validate_harness_evidence(
 
 
 def _add_source(paths: set[str], value: object) -> None:
+    if (source := _source(value)) is not None:
+        paths.add(source)
+
+
+def _source(value: object) -> str | None:
     if isinstance(value, Mapping) and isinstance(value.get("source"), str):
-        paths.add(value["source"])
+        return value["source"]
+    return None
 
 
 def _source_is_in_manifest(source: str, known_paths: set[str]) -> bool:
