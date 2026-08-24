@@ -276,8 +276,24 @@ def test_source_must_be_nonempty_local_markdown_before_creating_a_borg(
     assert store.get_borg_by_name(repository.id, "Invalid") is None
 
 
-@pytest.mark.parametrize("name", ["../escape", "nested/name", "CON", "bad\\name"])
-def test_borg_name_cannot_escape_the_tracked_prd_directory(
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape",
+        "nested/name",
+        "CON",
+        "bad\\name",
+        "bad\x00name",
+        "bad<name",
+        "bad>name",
+        "bad:name",
+        'bad"name',
+        "bad|name",
+        "bad?name",
+        "bad*name",
+    ],
+)
+def test_invalid_borg_name_is_rejected_before_creating_records(
     repository_store,
     name: str,
 ) -> None:
@@ -291,6 +307,8 @@ def test_borg_name_cannot_escape_the_tracked_prd_directory(
 
     with pytest.raises(ValueError, match="filename"):
         session.run(name)
+
+    assert store.get_borg_by_name(repository.id, name) is None
 
 
 def test_confirmed_prd_does_not_overwrite_a_racing_destination(

@@ -74,6 +74,7 @@ _WINDOWS_RESERVED_BASENAMES = {
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
 }
+_WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 
 Prompt: TypeAlias = Callable[[str], str | None]
 Confirm: TypeAlias = Callable[[str, bool], bool]
@@ -341,6 +342,12 @@ def _validate_borg_name(name: str) -> None:
         raise ValueError("Borg name must not be empty")
     if name != name.strip() or "\n" in name or "\r" in name:
         raise ValueError("Borg name must be a single trimmed line")
+    if any(
+        ord(character) < 32
+        or character in _WINDOWS_FORBIDDEN_FILENAME_CHARACTERS
+        for character in name
+    ):
+        raise ValueError("Borg name must be a portable filename stem")
     path = Path(name)
     windows_path = PureWindowsPath(name)
     if (
