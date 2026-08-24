@@ -47,6 +47,7 @@ class NativeInvocation:
     stdin_text: str
     load_payload: Callable[[], NativePayload]
     before_attempt: Callable[[], None] | None = None
+    accept_payload_on_nonzero_exit: bool = False
 
 
 class NativeCliAdapter:
@@ -143,12 +144,19 @@ class NativeCliAdapter:
             attempt_usage.append(self._extract_usage(spec.log_path))
             return exit_code
 
+        def classify_transient_error(exit_code: int) -> str | None:
+            if (
+                exit_code != 0
+                and invocation.accept_payload_on_nonzero_exit
+                and invocation.load_payload().payload is not None
+            ):
+                return None
+            return self._classify_transient_error(spec.log_path, exit_code)
+
         try:
             outcome = run_with_transient_retry(
                 run_once,
-                lambda exit_code: self._classify_transient_error(
-                    spec.log_path, exit_code
-                ),
+                classify_transient_error,
                 cancel=cancel,
                 backoff_seconds=self.transient_backoff_seconds,
                 max_attempts=self.transient_max_attempts,
@@ -179,7 +187,12 @@ class NativeCliAdapter:
                 exit_code=outcome.exit_code,
                 error=f"transient retry exhausted: {outcome.transient_reason}",
             )
-        if outcome.exit_code != 0:
+        extracted = (
+            invocation.load_payload()
+            if outcome.exit_code == 0 or invocation.accept_payload_on_nonzero_exit
+            else NativePayload()
+        )
+        if outcome.exit_code != 0 and extracted.payload is None:
             return self._result(
                 spec,
                 start,
@@ -190,7 +203,6 @@ class NativeCliAdapter:
                 attempts=outcome.attempts,
             )
 
-        extracted = invocation.load_payload()
         if extracted.payload is None:
             return self._result(
                 spec,

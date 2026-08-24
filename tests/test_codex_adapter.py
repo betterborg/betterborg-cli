@@ -148,8 +148,8 @@ def test_native_command_validates_and_persists_result_metadata(
     assert result.billing_mode == BillingMode.SUBSCRIPTION
     assert result.artifacts == (artifact,)
     assert result.usage == AgentUsage(
-        tokens_input=32,
-        tokens_output=8,
+        tokens_input=15,
+        tokens_output=10,
         tokens_cache_read=17,
         tokens_cache_write=10,
         num_turns=2,
@@ -234,9 +234,6 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
                 ),
                 encoding="utf-8",
             )
-            _write_invocation_result(
-                command, {"status": "completed", "version": "transient"}
-            )
             return 1
         log_path.write_text(
             _usage_event(300, 50, 30, 15, 8), encoding="utf-8"
@@ -255,8 +252,8 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert result.usage == AgentUsage(
-        tokens_input=400,
-        tokens_output=40,
+        tokens_input=325,
+        tokens_output=60,
         tokens_cache_read=75,
         tokens_cache_write=15,
         num_turns=2,
@@ -340,7 +337,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
     assert "transient retry exhausted" in (result.error or "")
 
 
-def test_nonzero_exit_with_valid_result_fails(tmp_path: Path) -> None:
+def test_nonzero_exit_with_fresh_valid_result_completes(tmp_path: Path) -> None:
     def runner(
         command: Sequence[str],
         _cwd: Path,
@@ -358,8 +355,203 @@ def test_nonzero_exit_with_valid_result_fails(tmp_path: Path) -> None:
     spec = codex_spec(tmp_path)
     result = CodexAdapter(ApiAgentRole.MERGE, proc_runner=runner).run(spec)
 
+    assert result.status == AgentStatus.COMPLETED
+    assert result.exit_code == 2
+    assert result.payload == {"status": "completed", "version": "nonzero"}
+    assert result.error is None
+    assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
+
+
+def test_nonzero_exit_with_invalid_result_still_fails(tmp_path: Path) -> None:
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        log_path.write_text("Codex exited after a partial result\n", encoding="utf-8")
+        _write_invocation_result(command, {"status": "completed"})
+        return 2
+
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.MERGE, proc_runner=runner).run(spec)
+
     assert result.status == AgentStatus.FAILED
     assert result.exit_code == 2
     assert result.payload is None
-    assert "Codex exited 2" in (result.error or "")
+    assert "missing required property 'version'" in (result.error or "")
+    assert not spec.result_path.exists()
+
+
+def test_valid_result_prevents_transient_retry_despite_nonzero_exit(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        log_path.write_text(
+            '{"type":"error","message":"status 503: overloaded"}\n',
+            encoding="utf-8",
+        )
+        _write_invocation_result(
+            command, {"status": "completed", "version": "fresh"}
+        )
+        return 1
+
+    result = CodexAdapter(
+        ApiAgentRole.REVIEW,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+    ).run(codex_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 1
+    assert result.exit_code == 1
+    assert calls == 1
+
+
+def test_optional_schema_fields_are_normalized_for_strict_transport(
+    tmp_path: Path,
+) -> None:
+    captured_schema: dict[str, Any] = {}
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+            "status": {"const": "completed"},
+            "summary": {
+                "type": "string",
+                "minLength": 3,
+                "pattern": "^[a-z]+$",
+            },
+            "comment": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
+        log_path.write_text("ok\n", encoding="utf-8")
+        _write_invocation_result(
+            command,
+            {"status": "completed", "summary": None, "comment": None},
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, schema=schema)
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert captured_schema == {
+        "type": "object",
+        "required": ["status", "summary", "comment"],
+        "properties": {
+            "status": {"const": "completed"},
+            "summary": {"type": ["string", "null"]},
+            "comment": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    }
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "comment": None}
+    assert schema["properties"]["summary"]["type"] == "string"
+
+
+def test_unrepresentable_strict_schema_falls_back_to_prompt_and_local_validation(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    schema = {
+        "type": "object",
+        "required": ["status", "details"],
+        "properties": {
+            "status": {"const": "completed"},
+            "details": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "additionalProperties": False,
+    }
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        captured["command"] = list(command)
+        captured["stdin"] = stdin_text
+        log_path.write_text("ok\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "details": {"owner": "borg"}}
+        )
+        return 0
+
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(
+        codex_spec(tmp_path, schema=schema)
+    )
+
+    assert "--output-schema" not in captured["command"]
+    assert json.dumps(schema, indent=2, sort_keys=True) in captured["stdin"]
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {
+        "status": "completed",
+        "details": {"owner": "borg"},
+    }
+
+
+def test_constraints_removed_from_transport_remain_authoritative_locally(
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["status", "summary"],
+        "properties": {
+            "status": {"const": "completed"},
+            "summary": {"type": "string", "pattern": "^[a-z]+$"},
+        },
+        "additionalProperties": False,
+    }
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        log_path.write_text("ok\n", encoding="utf-8")
+        _write_invocation_result(
+            command, {"status": "completed", "summary": "not valid"}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, schema=schema)
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.FAILED
+    assert "string does not match pattern" in (result.error or "")
     assert not spec.result_path.exists()
