@@ -360,6 +360,40 @@ def test_theme_key_resolution_is_portable(theme_id: str, expected: str) -> None:
     assert resolve_theme_key(theme_id) == expected
 
 
+@pytest.mark.parametrize(
+    "theme_id",
+    [
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    ],
+)
+def test_theme_key_resolution_disambiguates_windows_device_names(
+    theme_id: str,
+) -> None:
+    assert resolve_theme_key(theme_id) == f"{theme_id.casefold()}-theme"
+
+
+def test_generates_prd_for_windows_reserved_theme_id(
+    git_repo: Path, analysis: RepositoryAnalysis
+) -> None:
+    analysis.analysis_json["themes"] = [analysis.analysis_json["themes"][0]]
+    analysis.analysis_json["themes"][0]["id"] = "CON"
+    paths = RepoPaths.discover(git_repo)
+
+    documents = generate_improvement_prds(
+        analysis,
+        paths,
+        {"con-theme": "Sentinel"},
+    )
+
+    assert [document.path.name for document in documents] == ["con-theme.md"]
+    assert (paths.improvement_prds_dir / "con-theme.md").is_file()
+
+
 def test_theme_key_resolution_rejects_empty_and_colliding_keys(
     git_repo: Path, analysis: RepositoryAnalysis
 ) -> None:

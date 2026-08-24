@@ -26,6 +26,14 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import RepositoryAnalysis, SqliteStore
 
 _THEME_KEY_PARTS = re.compile(r"[^a-z0-9]+")
+_WINDOWS_RESERVED_BASENAMES = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 _THEME_FIELDS = (
     "id",
     "title",
@@ -55,6 +63,8 @@ def resolve_theme_key(theme_id: str) -> str:
     key = _THEME_KEY_PARTS.sub("-", ascii_id.casefold()).strip("-")
     if not key:
         raise ValueError(f"theme ID {theme_id!r} does not resolve to a filename key")
+    if key in _WINDOWS_RESERVED_BASENAMES:
+        key = f"{key}-theme"
     return key
 
 
