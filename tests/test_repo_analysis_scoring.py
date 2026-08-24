@@ -13,6 +13,7 @@ from betterborg_cli.repo_analysis.discovery import (
 )
 from betterborg_cli.repo_analysis.scoring import (
     DIMENSIONS,
+    WEIGHTS,
     compute_overall_score,
     compute_repo_overall_score,
     rank_recommendation_themes,
@@ -105,6 +106,29 @@ def test_canonical_scoring_clamps_dimension_scores_and_penalizes_missing() -> No
     ) == 3.0
 
 
+def test_weight_policy_drives_package_score_and_normalized_impact(
+    rubric: dict[str, dict[str, object]],
+    recommendation_payload: dict[str, object],
+    theme_payload: dict[str, object],
+    manifest: DiscoveryManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(WEIGHTS, "ci", 3.0)
+    for cell in rubric.values():
+        cell["score"] = 0
+    rubric["ci"]["score"] = 4
+
+    recommendation = validate_recommendation(recommendation_payload, manifest)
+    result = rank_recommendation_themes(
+        {".": rubric},
+        [recommendation],
+        [validate_recommendation_theme(theme_payload)],
+    )[0]
+
+    assert compute_overall_score(rubric) == pytest.approx(12.0 / 10.0)
+    assert result.normalized_impact == pytest.approx(3.0 / 10.0)
+
+
 @pytest.mark.parametrize("fixture_name", ["recommendation_payload", "theme_payload"])
 def test_schemas_require_explicit_labeled_effort(
     fixture_name: str,
@@ -174,6 +198,37 @@ def test_overlapping_recommendations_contribute_only_largest_delta(
     )[0]
 
     assert result.normalized_impact == pytest.approx(1.5 / 8.0)
+
+
+def test_overlap_labels_cannot_collide_with_independent_recommendation_keys(
+    rubric: dict[str, dict[str, object]],
+    recommendation_payload: dict[str, object],
+    theme_payload: dict[str, object],
+    manifest: DiscoveryManifest,
+) -> None:
+    rubric["ci"]["score"] = 0
+    independent_payload = deepcopy(recommendation_payload)
+    independent_payload.update({"id": "alpha", "estimated_delta": 1.0})
+    labeled_payload = deepcopy(recommendation_payload)
+    labeled_payload.update(
+        {
+            "id": "beta",
+            "estimated_delta": 2.0,
+            "overlap_group": "recommendation:alpha",
+        }
+    )
+    theme_payload["recommendation_ids"] = ["alpha", "beta"]
+
+    result = rank_recommendation_themes(
+        {".": rubric},
+        [
+            validate_recommendation(independent_payload, manifest),
+            validate_recommendation(labeled_payload, manifest),
+        ],
+        [validate_recommendation_theme(theme_payload)],
+    )[0]
+
+    assert result.normalized_impact == pytest.approx(3.0 / 8.0)
 
 
 def test_monorepo_impact_divides_by_dimensions_and_package_count(

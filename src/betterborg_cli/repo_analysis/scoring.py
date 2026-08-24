@@ -19,7 +19,7 @@ DIMENSIONS = (
     "type_discipline",
     "deployment",
 )
-WEIGHTS = dict.fromkeys(DIMENSIONS, 1.0)
+WEIGHTS: dict[str, float] = dict.fromkeys(DIMENSIONS, 1.0)
 EFFORT_COST = {"S": 1.0, "M": 2.0, "L": 3.0}
 
 RECOMMENDATION_SCHEMA: dict[str, Any] = {
@@ -145,9 +145,16 @@ class RankedRecommendationTheme:
 
 
 def compute_overall_score(rubric: Mapping[str, Mapping[str, object]]) -> float:
-    """Return the equal-weight mean across all eight canonical dimensions."""
-    return sum(_dimension_score(rubric, dimension) for dimension in DIMENSIONS) / len(
-        DIMENSIONS
+    """Return the policy-weighted mean across all eight canonical dimensions."""
+    divisor = sum(WEIGHTS.values())
+    return (
+        sum(
+            _dimension_score(rubric, dimension) * weight
+            for dimension, weight in WEIGHTS.items()
+        )
+        / divisor
+        if divisor
+        else 0.0
     )
 
 
@@ -264,7 +271,7 @@ def rank_recommendation_themes(
         )
         dimension_points = _theme_dimension_points(scored, package_rubrics)
         normalized_impact = dimension_points / (
-            len(DIMENSIONS) * len(package_rubrics)
+            sum(WEIGHTS.values()) * len(package_rubrics)
         )
         ranked.append(
             RankedRecommendationTheme(
@@ -326,12 +333,17 @@ def _theme_dimension_points(
     scored: Sequence[ScoredRecommendation],
     package_rubrics: Mapping[str, Mapping[str, Mapping[str, object]]],
 ) -> float:
-    grouped: dict[tuple[str, str], dict[str, float]] = {}
+    grouped: dict[tuple[str, str], dict[tuple[str, str], float]] = {}
     for result in scored:
         recommendation = result.recommendation
         target = (recommendation.package_path, recommendation.dimension)
-        # A null group is independent, so its recommendation ID is its key.
-        group = recommendation.overlap_group or f"recommendation:{recommendation.id}"
+        # Tag both namespaces so a user-provided overlap label cannot collide
+        # with the generated key for an independent recommendation.
+        group = (
+            ("overlap", recommendation.overlap_group)
+            if recommendation.overlap_group is not None
+            else ("recommendation", recommendation.id)
+        )
         grouped.setdefault(target, {})[group] = max(
             result.effective_delta,
             grouped.get(target, {}).get(group, 0.0),
@@ -340,5 +352,5 @@ def _theme_dimension_points(
     total = 0.0
     for (package_path, dimension), groups in grouped.items():
         current = _dimension_score(package_rubrics[package_path], dimension)
-        total += min(sum(groups.values()), 5.0 - current)
+        total += min(sum(groups.values()), 5.0 - current) * WEIGHTS[dimension]
     return total
