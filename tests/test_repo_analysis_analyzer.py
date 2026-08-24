@@ -14,13 +14,15 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.base import AgentCapabilities
 from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.selection import SelectedAgent, select_agent
 from betterborg_cli.repo_analysis import (
     DIMENSIONS,
+    AnalyzerConfig,
     AnalyzerError,
     run_analyzer,
 )
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import AgentChoices, RepositoryConfig
 from betterborg_cli.store import Repository, SqliteStore
 
 
@@ -252,6 +254,44 @@ def test_analyzer_resolves_the_anthropic_default_model(git_repo: Path) -> None:
         )
 
     assert adapter.calls[0].model == "claude-opus-4-8"
+
+
+def test_analyzer_rejects_effort_for_default_selected_anthropic(
+    git_repo: Path,
+) -> None:
+    _commit_repository(git_repo)
+    repository = Repository(root=git_repo)
+    selected = select_agent(
+        RepositoryConfig(
+            version=1,
+            repository_id=repository.id,
+            default_branch="main",
+            agents=AgentChoices(),
+        ),
+        ApiAgentRole.ANALYSIS,
+        RepoPaths.discover(git_repo),
+        interactive=False,
+        credentials={"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"},
+    )
+    adapter = MockAdapter(name="anthropic").queue(MockResponse(payload=_payload()))
+    selected.adapter = adapter
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+
+        with pytest.raises(
+            AnalyzerError, match="Anthropic does not support an effort override"
+        ):
+            run_analyzer(
+                repository,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                config=AnalyzerConfig(effort="high"),
+            )
+
+        assert adapter.calls == []
+        assert store.list_analyses(repository.id) == []
 
 
 def test_native_analyzer_fails_closed_before_spawning(

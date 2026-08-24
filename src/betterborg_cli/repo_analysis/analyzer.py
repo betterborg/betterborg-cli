@@ -163,6 +163,8 @@ def run_analyzer(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     head_sha = _git_head(repository.root)
     resolved_config = config or AnalyzerConfig()
+    if resolved_config.effort is not None and agent.name == "anthropic":
+        raise AnalyzerError("Anthropic does not support an effort override")
 
     if workspace_dir is None:
         with tempfile.TemporaryDirectory(prefix="betterborg-analysis-") as temporary:
