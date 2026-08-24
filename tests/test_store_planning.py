@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,8 @@ def test_compare_and_set_rejects_stale_writers_across_all_states(
     second = SqliteStore.open(database)
     try:
         current = borg
+        original_snapshot = second.get_borg(borg.id)
+        assert original_snapshot == current
         targets = [*list(BorgState)[1:], BorgState.DRAFT]
         for target in targets:
             stale_snapshot = second.get_borg(borg.id)
@@ -152,6 +155,16 @@ def test_compare_and_set_rejects_stale_writers_across_all_states(
                     expected_version=stale_snapshot.state_version,
                     new_state=BorgState.BLOCKED,
                 )
+
+        assert current.state is original_snapshot.state
+        assert current.state_version > original_snapshot.state_version
+        with pytest.raises(StaleBorgStateError, match="state changed"):
+            second.compare_and_set_borg_state(
+                borg.id,
+                expected_state=original_snapshot.state,
+                expected_version=original_snapshot.state_version,
+                new_state=BorgState.BLOCKED,
+            )
     finally:
         first.close()
         second.close()
@@ -160,3 +173,109 @@ def test_compare_and_set_rejects_stale_writers_across_all_states(
         persisted = reopened.get_borg(borg.id)
         assert persisted == current
         assert persisted.state_version == len(BorgState)
+
+
+@pytest.mark.parametrize(
+    "history_kind",
+    ["completed attempt", "answered question", "finding", "change request"],
+)
+@pytest.mark.parametrize("statement", ["UPDATE", "DELETE", "REPLACE"])
+def test_planning_history_rejects_raw_mutation_deletion_and_replacement(
+    tmp_path: Path, history_kind: str, statement: str
+) -> None:
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="AppendOnlyPlanner")
+    attempt = PlanningAttempt(
+        borg_id=borg.id,
+        phase="tech_review",
+        round=1,
+        adapter="mock",
+        model="test-model",
+    )
+    question = PlanningQuestion(
+        borg_id=borg.id,
+        attempt_id=attempt.id,
+        round=1,
+        questions=[{"id": "scope", "question": "Which platforms?"}],
+    )
+    finding = PlanningFinding(
+        borg_id=borg.id,
+        attempt_id=attempt.id,
+        round=1,
+        severity="major",
+        message="The platform scope is unclear.",
+    )
+    change_request = PlanChangeRequest(
+        borg_id=borg.id,
+        round=1,
+        note="Clarify the platform scope.",
+    )
+
+    with SqliteStore.open(tmp_path / "state.sqlite3") as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_planning_attempt(attempt)
+        completed_attempt = store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result={"status": "request_changes"},
+        )
+        store.append_planning_question(question)
+        answered_question = store.answer_planning_question(
+            question.id,
+            [{"q_id": "scope", "answer": "All desktop platforms."}],
+        )
+        store.append_planning_finding(finding)
+        store.append_plan_change_request(change_request)
+
+        table, column, record_id, read_history, expected_history = {
+            "completed attempt": (
+                "planning_attempts",
+                "summary",
+                completed_attempt.id,
+                store.list_planning_attempts,
+                [completed_attempt],
+            ),
+            "answered question": (
+                "planning_questions",
+                "questions_json",
+                answered_question.id,
+                store.list_planning_questions,
+                [answered_question],
+            ),
+            "finding": (
+                "planning_findings",
+                "message",
+                finding.id,
+                store.list_planning_findings,
+                [finding],
+            ),
+            "change request": (
+                "plan_change_requests",
+                "note",
+                change_request.id,
+                store.list_plan_change_requests,
+                [change_request],
+            ),
+        }[history_kind]
+
+        sql, parameters = {
+            "UPDATE": (
+                f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                ("changed", str(record_id)),
+            ),
+            "DELETE": (
+                f"DELETE FROM {table} WHERE id = ?",
+                (str(record_id),),
+            ),
+            "REPLACE": (
+                f"INSERT OR REPLACE INTO {table} SELECT * FROM {table} WHERE id = ?",
+                (str(record_id),),
+            ),
+        }[statement]
+
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            with store.transaction() as connection:
+                connection.execute(sql, parameters)
+
+        assert read_history(borg.id) == expected_history
