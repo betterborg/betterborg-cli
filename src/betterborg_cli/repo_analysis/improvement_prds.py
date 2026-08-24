@@ -146,7 +146,35 @@ def generate_improvement_prds(
                 "improvement PRD directory escapes repository: "
                 f"{paths.improvement_prds_dir}"
             ) from error
+    _remove_obsolete_prds(
+        paths.improvement_prds_dir,
+        {document.path.name for document in documents},
+        root=paths.root,
+    )
     return documents
+
+
+def _remove_obsolete_prds(
+    directory: Path,
+    current_names: set[str],
+    *,
+    root: Path,
+) -> None:
+    """Remove generated Markdown that is absent from the refreshed theme set."""
+    if not directory.exists():
+        return
+    resolved_directory = directory.resolve(strict=True)
+    if not resolved_directory.is_relative_to(root):
+        raise ValueError(
+            f"improvement PRD directory escapes repository: {directory}"
+        )
+    for entry in resolved_directory.iterdir():
+        if (
+            entry.name not in current_names
+            and entry.suffix.casefold() == ".md"
+            and (entry.is_file() or entry.is_symlink())
+        ):
+            entry.unlink()
 
 
 def _ranked_themes(payload: Mapping[str, Any]) -> list[RankedRecommendationTheme]:

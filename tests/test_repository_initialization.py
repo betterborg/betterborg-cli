@@ -17,13 +17,20 @@ from betterborg_cli.cli import cli
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import load_repository_config
-from betterborg_cli.store import Borg, PrdSession, SqliteStore
+from betterborg_cli.store import (
+    Borg,
+    PrdSession,
+    RepositoryAnalysis,
+    RepositoryPackage,
+    SqliteStore,
+)
 
 
 def _analysis_payload(
     *,
     score: int = 3,
     recommendation_title: str = "Document the CI checks",
+    theme_id: str = "theme-ci",
     theme_title: str = "Make validation visible",
 ) -> dict[str, object]:
     return {
@@ -58,7 +65,7 @@ def _analysis_payload(
         ],
         "themes": [
             {
-                "id": "theme-ci",
+                "id": theme_id,
                 "title": theme_title,
                 "recommendation_ids": ["rec-ci"],
                 "effort": "S",
@@ -307,6 +314,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         _analysis_payload(
             score=4,
             recommendation_title="Automate the CI checks",
+            theme_id="theme-automation",
             theme_title="Automate validation",
         ),
         prompt_prefix="Refreshed ",
@@ -320,7 +328,8 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     )
     assert load_repository_config(paths).repository_id == config.repository_id
     assert confirmed_path.read_text(encoding="utf-8") == confirmed_body
-    assert paths.improvement_prds_dir.joinpath("theme-ci.md").read_text(
+    assert not paths.improvement_prds_dir.joinpath("theme-ci.md").exists()
+    assert paths.improvement_prds_dir.joinpath("theme-automation.md").read_text(
         encoding="utf-8"
     ).startswith("# Automate validation\n")
     score_report = paths.score_report.read_text(encoding="utf-8")
@@ -392,6 +401,90 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
         "score": 2.0,
     }
     assert selected_interactivity == [False, False]
+
+
+def test_analyze_reports_the_predecessor_linked_during_persistence(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    git_repo = committed_git_repo
+    paths = RepoPaths.discover(git_repo)
+    adapter, selected = _adapter(git_repo)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo.parent / "machine-state"))
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: selected)
+
+    initialized = cli_runner.invoke(cli, ["init", "--yes", "--json"])
+    assert initialized.exit_code == 0, initialized.output
+    config = load_repository_config(paths)
+
+    def persist_intervening_analysis(_spec) -> dict[str, object]:
+        payload = _analysis_payload(score=4)
+        package_payload = payload["packages"][0]
+        assert isinstance(package_payload, dict)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as other_store:
+            prior = other_store.get_prior_ready_analysis(config.repository_id)
+            assert prior is not None
+            analysis = RepositoryAnalysis(
+                repository_id=config.repository_id,
+                head_sha=prior.head_sha,
+                summary="An intervening concurrent analysis.",
+                primary_language="python",
+                is_monorepo=False,
+                overall_score=4,
+                analysis_json=payload,
+                prior_analysis_id=prior.id,
+                score_delta=1,
+            )
+            package = RepositoryPackage(
+                repository_id=config.repository_id,
+                analysis_id=analysis.id,
+                package_path=".",
+                package_name="root",
+                primary_language="python",
+                rubric=package_payload["rubric"],
+                overall_score=4,
+            )
+            other_store.append_analysis(analysis, [package])
+        return _analysis_payload(score=2)
+
+    adapter.queue(MockResponse(dynamic=persist_intervening_analysis))
+
+    def prompt_response(spec):
+        role = next(
+            role for role in PROMPT_ROLES if f".{role}." in spec.result_path.name
+        )
+        return {
+            "body_md": (
+                f"# Concurrent {role.title()} agent\n\n"
+                f"Complete repository-specific {role} instructions."
+            )
+        }
+
+    for _role in PROMPT_ROLES:
+        adapter.queue(MockResponse(dynamic=prompt_response))
+
+    result = cli_runner.invoke(cli, ["analyze", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["score"] == 2
+    assert payload["previous_score"] == 4
+    assert payload["delta"] == -2
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        current = next(
+            analysis
+            for analysis in store.list_analyses(config.repository_id)
+            if str(analysis.id) == payload["analysis_id"]
+        )
+        previous = store.get_prior_ready_analysis(
+            config.repository_id,
+            before_analysis_id=current.id,
+        )
+        assert previous is not None
+        assert previous.overall_score == payload["previous_score"]
+        assert current.score_delta == payload["delta"]
 
 
 def test_analyze_rejects_an_uninitialized_repository(

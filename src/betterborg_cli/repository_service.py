@@ -137,8 +137,7 @@ class RepositoryService:
     def analyze(self) -> RepositoryReanalysis:
         """Append an analysis and refresh outputs for an initialized repository."""
         repository, config = self._registered_repository()
-        previous_analysis = self.store.get_prior_ready_analysis(repository.id)
-        if previous_analysis is None:
+        if self.store.get_prior_ready_analysis(repository.id) is None:
             raise RepositoryInitializationError(
                 "repository initialization record has no persisted analysis"
             )
@@ -149,6 +148,14 @@ class RepositoryService:
             agent,
             artifact_dir=self.paths.artifacts_dir / "analysis",
         )
+        previous_analysis = self.store.get_prior_ready_analysis(
+            repository.id,
+            before_analysis_id=analysis.id,
+        )
+        if previous_analysis is None or analysis.score_delta is None:
+            raise RepositoryInitializationError(
+                "explicit analysis has no persisted predecessor"
+            )
 
         self._write_score(analysis)
         prompt_runs = tuple(
