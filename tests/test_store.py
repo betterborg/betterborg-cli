@@ -31,7 +31,7 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
         with store.transaction():
             store.add_repository(repository)
             store.append_operation(operation)
-        assert store.applied_migrations() == (1, 2, 3, 4, 5, 6)
+        assert store.applied_migrations() == (1, 2, 3, 4, 5, 6, 7)
         with store.locked_connection() as connection:
             applied_at = connection.execute(
                 "SELECT applied_at FROM schema_version WHERE version = 1"
@@ -50,7 +50,7 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6)
+        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7)
         reopened_repository = reopened.get_repository(repository.id)
         reopened_operations = reopened.list_operations(repository.id)
         assert reopened_repository == repository
@@ -190,7 +190,7 @@ def test_borg_and_prd_session_history_survive_reopen(tmp_path: Path) -> None:
         assert "body_md" not in session_columns
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6)
+        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7)
         assert reopened.get_borg(borg.id) == borg
         assert reopened.get_borg_by_name(repository.id, "Ada") == borg
         assert reopened.get_prd_session(session.id) == session

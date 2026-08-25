@@ -69,6 +69,15 @@ class ExecutionRunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ExecutionAttemptStatus(str, Enum):
+    """Lifecycle state for one host-execution attempt."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class TaskRuntimeStatus(str, Enum):
     """Durable scheduling state for one generated task."""
 
@@ -726,7 +735,7 @@ class TaskClaim:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentAttempt:
-    """Immutable result of preparing or materializing an execution environment."""
+    """Immutable record of one environment preparation or materialization."""
 
     run_id: UUID
     claim_id: UUID
@@ -734,14 +743,14 @@ class EnvironmentAttempt:
     kind: str
     attempt_number: int
     fingerprint: str
-    status: AgentStatus
+    status: ExecutionAttemptStatus | AgentStatus
     commands: list[list[str]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str | None = None
     duration_seconds: float | None = None
     id: UUID = field(default_factory=uuid4)
     started_at: datetime = field(default_factory=utcnow)
-    finished_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime | None = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
         for name in ("id", "run_id", "claim_id", "task_id"):
@@ -752,8 +761,13 @@ class EnvironmentAttempt:
                 raise ValueError(f"environment attempt {name} must not be empty")
         if self.attempt_number < 1:
             raise ValueError("environment attempt number must be positive")
-        if not isinstance(self.status, AgentStatus):
-            raise TypeError("environment attempt status must be an AgentStatus")
+        if not isinstance(self.status, ExecutionAttemptStatus | AgentStatus):
+            raise TypeError(
+                "environment attempt status must be an ExecutionAttemptStatus"
+            )
+        object.__setattr__(
+            self, "status", ExecutionAttemptStatus(self.status.value)
+        )
         if self.duration_seconds is not None and self.duration_seconds < 0:
             raise ValueError("environment attempt duration must not be negative")
         if any(
@@ -762,14 +776,21 @@ class EnvironmentAttempt:
         ):
             raise ValueError("environment attempt commands must contain non-empty argv")
         _validate_utc(self.started_at)
-        _validate_utc(self.finished_at)
-        if self.finished_at < self.started_at:
+        if (self.status is ExecutionAttemptStatus.RUNNING) != (
+            self.finished_at is None
+        ):
+            raise ValueError(
+                "only a running environment attempt has no finish timestamp"
+            )
+        if self.finished_at is not None:
+            _validate_utc(self.finished_at)
+        if self.finished_at is not None and self.finished_at < self.started_at:
             raise ValueError("environment attempt cannot finish before it starts")
 
 
 @dataclass(frozen=True, slots=True)
 class AgentAttempt:
-    """Immutable, billing-aware result of one execution-agent invocation."""
+    """Immutable, billing-aware record of one execution-agent invocation."""
 
     run_id: UUID
     claim_id: UUID
@@ -779,7 +800,7 @@ class AgentAttempt:
     adapter: str
     model: str
     billing_mode: BillingMode
-    status: AgentStatus
+    status: ExecutionAttemptStatus | AgentStatus
     log_path: str
     review_round: int = 0
     result_path: str | None = None
@@ -789,7 +810,7 @@ class AgentAttempt:
     usage: AgentUsage | None = None
     id: UUID = field(default_factory=uuid4)
     started_at: datetime = field(default_factory=utcnow)
-    finished_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime | None = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
         for name in ("id", "run_id", "claim_id", "task_id"):
@@ -804,15 +825,23 @@ class AgentAttempt:
             raise ValueError("agent attempt review round must not be negative")
         if not isinstance(self.billing_mode, BillingMode):
             raise TypeError("agent attempt billing mode must be a BillingMode")
-        if not isinstance(self.status, AgentStatus):
-            raise TypeError("agent attempt status must be an AgentStatus")
+        if not isinstance(self.status, ExecutionAttemptStatus | AgentStatus):
+            raise TypeError("agent attempt status must be an ExecutionAttemptStatus")
+        object.__setattr__(
+            self, "status", ExecutionAttemptStatus(self.status.value)
+        )
         if self.duration_seconds is not None and self.duration_seconds < 0:
             raise ValueError("agent attempt duration must not be negative")
         if self.usage is not None and not isinstance(self.usage, AgentUsage):
             raise TypeError("agent attempt usage must be an AgentUsage")
         _validate_utc(self.started_at)
-        _validate_utc(self.finished_at)
-        if self.finished_at < self.started_at:
+        if (self.status is ExecutionAttemptStatus.RUNNING) != (
+            self.finished_at is None
+        ):
+            raise ValueError("only a running agent attempt has no finish timestamp")
+        if self.finished_at is not None:
+            _validate_utc(self.finished_at)
+        if self.finished_at is not None and self.finished_at < self.started_at:
             raise ValueError("agent attempt cannot finish before it starts")
 
 

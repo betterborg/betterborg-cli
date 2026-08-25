@@ -1,4 +1,4 @@
-"""Contracts for migration-006 host-execution ownership state."""
+"""Contracts for durable host-execution ownership state."""
 
 import hashlib
 import sqlite3
@@ -16,6 +16,7 @@ from betterborg_cli.store import (
     Borg,
     ComposeResource,
     EnvironmentAttempt,
+    ExecutionAttemptStatus,
     ExecutionEvent,
     ExecutionOwnershipError,
     ExecutionRun,
@@ -258,7 +259,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6)
+        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7)
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime
@@ -561,7 +562,7 @@ def test_claims_only_select_dependency_ready_tasks(tmp_path: Path) -> None:
         assert second.task_id == consumer.id
 
 
-def test_expiry_preserves_attempts_and_blocks_reclaim_until_compose_cleanup(
+def test_expiry_closes_open_attempt_and_blocks_reclaim_until_compose_cleanup(
     tmp_path: Path, approved_task_generation
 ) -> None:
     database, borg, generation, task = _execution_fixture(
@@ -603,12 +604,10 @@ def test_expiry_preserves_attempts_and_blocks_reclaim_until_compose_cleanup(
             adapter="codex",
             model="test-model",
             billing_mode=BillingMode.SUBSCRIPTION,
-            status=AgentStatus.COMPLETED,
+            status=ExecutionAttemptStatus.RUNNING,
             log_path="artifacts/coding.log",
-            result_path="artifacts/coding.json",
-            summary="Checkpoint preserved.",
             started_at=now + timedelta(seconds=10),
-            finished_at=now + timedelta(seconds=20),
+            finished_at=None,
         )
         resource = ComposeResource(
             run_id=acquisition.run_id,
@@ -642,7 +641,11 @@ def test_expiry_preserves_attempts_and_blocks_reclaim_until_compose_cleanup(
         assert interrupted is not None
         assert interrupted.status is ExecutionRunStatus.CANCELLED
         assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.CODING
-        assert store.list_agent_attempts(task.id) == [attempt]
+        persisted_attempts = store.list_agent_attempts(task.id)
+        assert len(persisted_attempts) == 1
+        assert persisted_attempts[0].status is ExecutionAttemptStatus.CANCELLED
+        assert persisted_attempts[0].finished_at == now + timedelta(minutes=7)
+        assert persisted_attempts[0].duration_seconds == 410
         assert store.list_task_claims(acquisition.run_id)[0].released_at is None
 
         replacement = store.acquire_execution_run(
@@ -693,8 +696,173 @@ def test_expiry_preserves_attempts_and_blocks_reclaim_until_compose_cleanup(
             "task.claimed",
             "task.interrupted",
             "task.phase_transitioned",
+            "agent.attempt_interrupted",
             "compose.cleanup_completed",
         } <= kinds
+
+
+def test_interruption_closes_open_environment_and_agent_attempts(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert claim is not None
+        environment = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:open-environment",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now + timedelta(seconds=5),
+            finished_at=None,
+        )
+        agent = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.SUBSCRIPTION,
+            status=ExecutionAttemptStatus.RUNNING,
+            log_path="artifacts/coding.log",
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+        store.append_environment_attempt(environment)
+        store.append_agent_attempt(agent)
+
+        interrupted_at = now + timedelta(seconds=30)
+        assert (
+            store.interrupt_execution_run(
+                acquisition.run_id,
+                acquisition.owner_token,
+                reason="operator requested stop",
+                now=interrupted_at,
+            )
+            == []
+        )
+
+        closed_environment = store.list_environment_attempts(task.id)
+        closed_agent = store.list_agent_attempts(task.id)
+        assert len(closed_environment) == len(closed_agent) == 1
+        assert closed_environment[0].status is ExecutionAttemptStatus.CANCELLED
+        assert closed_environment[0].finished_at == interrupted_at
+        assert closed_environment[0].duration_seconds == 25
+        assert closed_agent[0].status is ExecutionAttemptStatus.CANCELLED
+        assert closed_agent[0].finished_at == interrupted_at
+        assert closed_agent[0].duration_seconds == 20
+
+        attempt_events = {
+            (event.kind, event.attempt_id)
+            for event in store.list_execution_events(acquisition.run_id)
+            if event.attempt_id is not None
+        }
+        assert attempt_events == {
+            ("environment.attempt_interrupted", environment.id),
+            ("agent.attempt_interrupted", agent.id),
+        }
+        with pytest.raises(ExecutionOwnershipError, match="ownership ended"):
+            store.append_agent_attempt(agent)
+
+
+def test_cleanup_confirmation_does_not_cover_later_project_resources(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert claim is not None
+        first = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name="borg-shared-project",
+            resource_type="network",
+            resource_name="borg-shared-project_default",
+            created_at=now,
+        )
+        store.add_compose_resource(first)
+        assert store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            first.project_name,
+            now=now + timedelta(seconds=1),
+        ) == [first]
+
+        later = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name=first.project_name,
+            resource_type="volume",
+            resource_name="borg-shared-project_data",
+            created_at=now + timedelta(milliseconds=500),
+        )
+        store.add_compose_resource(later)
+        assert store.interrupt_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            now=now + timedelta(seconds=2),
+        ) == [later]
+        assert store.list_task_claims(acquisition.run_id)[0].released_at is None
+
+        assert store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            first.project_name,
+            now=now + timedelta(seconds=3),
+        ) == [first, later]
+        assert store.list_stale_compose_resources(acquisition.run_id) == []
+        assert store.list_task_claims(acquisition.run_id)[0].released_at == (
+            now + timedelta(seconds=3)
+        )
+        cleanup_events = [
+            event
+            for event in store.list_execution_events(acquisition.run_id)
+            if event.kind == "compose.cleanup_completed"
+        ]
+        assert [event.payload["resource_ids"] for event in cleanup_events] == [
+            [str(first.id)],
+            [str(later.id)],
+        ]
 
 
 def test_interruption_preserves_completed_task_and_guards_phase_ownership(

@@ -15,13 +15,14 @@ from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
-from betterborg_cli.agent_runtime.base import AgentStatus, AgentUsage, BillingMode
+from betterborg_cli.agent_runtime.base import AgentUsage, BillingMode
 from betterborg_cli.store.models import (
     AgentAttempt,
     Borg,
     BorgState,
     ComposeResource,
     EnvironmentAttempt,
+    ExecutionAttemptStatus,
     ExecutionEvent,
     ExecutionRun,
     ExecutionRunAcquisition,
@@ -1576,22 +1577,26 @@ class SqliteStore:
             ).fetchall()
             if not resources:
                 raise KeyError("Compose project identity not found")
-            recorded = connection.execute(
-                """
-                SELECT 1 FROM execution_events
-                WHERE run_id = ? AND task_id = ?
-                  AND kind = 'compose.cleanup_completed'
-                  AND json_extract(payload_json, '$.project_name') = ?
-                """,
-                (str(run_id), str(task_id), project_name),
-            ).fetchone()
-            if recorded is None:
+            pending = [
+                row
+                for row in resources
+                if not self._compose_resource_cleanup_confirmed(
+                    connection,
+                    run_id=run_id,
+                    task_id=task_id,
+                    resource_id=UUID(row["id"]),
+                )
+            ]
+            if pending:
                 self._insert_execution_event(
                     connection,
                     run_id=run_id,
                     task_id=task_id,
                     kind="compose.cleanup_completed",
-                    payload={"project_name": project_name},
+                    payload={
+                        "project_name": project_name,
+                        "resource_ids": [row["id"] for row in pending],
+                    },
                     created_at=cleaned_at,
                 )
             claim_ids = {UUID(row["claim_id"]) for row in resources}
@@ -1646,10 +1651,12 @@ class SqliteStore:
         payload: dict[str, object],
         created_at: datetime,
         task_id: UUID | None = None,
+        attempt_id: UUID | None = None,
     ) -> None:
         event = ExecutionEvent(
             run_id=run_id,
             task_id=task_id,
+            attempt_id=attempt_id,
             kind=kind,
             payload=payload,
             created_at=created_at,
@@ -1658,12 +1665,13 @@ class SqliteStore:
             """
             INSERT INTO execution_events(
                 id, run_id, task_id, attempt_id, kind, payload_json, created_at
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(event.id),
                 str(run_id),
                 str(task_id) if task_id else None,
+                str(attempt_id) if attempt_id else None,
                 kind,
                 _encode_json(payload),
                 created_at.isoformat(),
@@ -1710,6 +1718,12 @@ class SqliteStore:
         )
         if cursor.rowcount != 1:
             return
+        self._interrupt_open_attempts(
+            connection,
+            run_id=UUID(run["id"]),
+            now=now,
+            reason=reason,
+        )
         claims = connection.execute(
             """
             SELECT id, task_id FROM task_claims
@@ -1751,6 +1765,42 @@ class SqliteStore:
             payload={"reason": reason},
             created_at=now,
         )
+
+    def _interrupt_open_attempts(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        for table, event_kind in (
+            ("environment_attempts", "environment.attempt_interrupted"),
+            ("agent_attempts", "agent.attempt_interrupted"),
+        ):
+            attempts = connection.execute(
+                f"""
+                SELECT id, task_id FROM {table} AS attempt
+                WHERE run_id = ? AND status = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM execution_events AS event
+                      WHERE event.attempt_id = attempt.id
+                        AND event.kind = ?
+                  )
+                ORDER BY started_at, id
+                """,
+                (str(run_id), event_kind),
+            ).fetchall()
+            for attempt in attempts:
+                self._insert_execution_event(
+                    connection,
+                    run_id=run_id,
+                    task_id=UUID(attempt["task_id"]),
+                    attempt_id=UUID(attempt["id"]),
+                    kind=event_kind,
+                    payload={"reason": reason},
+                    created_at=now,
+                )
 
     def _release_reconciled_claim(
         self,
@@ -1858,16 +1908,39 @@ class SqliteStore:
             FROM compose_resources AS resource
             WHERE resource.claim_id = ?
               AND NOT EXISTS (
-                  SELECT 1 FROM execution_events AS event
+                  SELECT 1
+                  FROM execution_events AS event,
+                       json_each(event.payload_json, '$.resource_ids') AS cleaned
                   WHERE event.run_id = resource.run_id
                     AND event.task_id = resource.task_id
                     AND event.kind = 'compose.cleanup_completed'
-                    AND json_extract(event.payload_json, '$.project_name') =
-                        resource.project_name
+                    AND cleaned.value = resource.id
               )
             LIMIT 1
             """,
             (str(claim_id),),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _compose_resource_cleanup_confirmed(
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        task_id: UUID,
+        resource_id: UUID,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM execution_events AS event,
+                 json_each(event.payload_json, '$.resource_ids') AS cleaned
+            WHERE event.run_id = ? AND event.task_id = ?
+              AND event.kind = 'compose.cleanup_completed'
+              AND cleaned.value = ?
+            LIMIT 1
+            """,
+            (str(run_id), str(task_id), str(resource_id)),
         ).fetchone()
         return row is not None
 
@@ -1885,12 +1958,13 @@ class SqliteStore:
             WHERE run.status != 'running'
               {filters}
               AND NOT EXISTS (
-                  SELECT 1 FROM execution_events AS event
+                  SELECT 1
+                  FROM execution_events AS event,
+                       json_each(event.payload_json, '$.resource_ids') AS cleaned
                   WHERE event.run_id = resource.run_id
                     AND event.task_id = resource.task_id
                     AND event.kind = 'compose.cleanup_completed'
-                    AND json_extract(event.payload_json, '$.project_name') =
-                        resource.project_name
+                    AND cleaned.value = resource.id
               )
             ORDER BY resource.project_name, resource.created_at, resource.id
             """,
@@ -2040,8 +2114,9 @@ class SqliteStore:
         return row is not None
 
     def append_environment_attempt(self, attempt: EnvironmentAttempt) -> None:
-        """Append one immutable environment preparation/materialization result."""
+        """Append one immutable environment preparation/materialization attempt."""
         with self.transaction() as connection:
+            self._require_open_attempt_ownership(connection, attempt)
             connection.execute(
                 """
                 INSERT INTO environment_attempts(
@@ -2068,7 +2143,11 @@ class SqliteStore:
                     attempt.error,
                     attempt.duration_seconds,
                     attempt.started_at.isoformat(),
-                    attempt.finished_at.isoformat(),
+                    (
+                        attempt.finished_at.isoformat()
+                        if attempt.finished_at is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -2077,17 +2156,27 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM environment_attempts
-                WHERE task_id = ?
-                ORDER BY started_at, id
+                SELECT environment_attempts.*,
+                       interruption.created_at AS interrupted_at
+                FROM environment_attempts
+                LEFT JOIN (
+                    SELECT attempt_id, MIN(created_at) AS created_at
+                    FROM execution_events
+                    WHERE kind = 'environment.attempt_interrupted'
+                    GROUP BY attempt_id
+                ) AS interruption
+                  ON interruption.attempt_id = environment_attempts.id
+                WHERE environment_attempts.task_id = ?
+                ORDER BY environment_attempts.started_at, environment_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_environment_attempt(row) for row in rows]
 
     def append_agent_attempt(self, attempt: AgentAttempt) -> None:
-        """Append one immutable, billing-aware agent result."""
+        """Append one immutable, billing-aware agent attempt."""
         with self.transaction() as connection:
+            self._require_open_attempt_ownership(connection, attempt)
             connection.execute(
                 """
                 INSERT INTO agent_attempts(
@@ -2130,7 +2219,11 @@ class SqliteStore:
                     attempt.usage.tokens_cache_write if attempt.usage else None,
                     attempt.usage.num_turns if attempt.usage else None,
                     attempt.started_at.isoformat(),
-                    attempt.finished_at.isoformat(),
+                    (
+                        attempt.finished_at.isoformat()
+                        if attempt.finished_at is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -2139,13 +2232,47 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM agent_attempts
-                WHERE task_id = ?
-                ORDER BY started_at, id
+                SELECT agent_attempts.*,
+                       interruption.created_at AS interrupted_at
+                FROM agent_attempts
+                LEFT JOIN (
+                    SELECT attempt_id, MIN(created_at) AS created_at
+                    FROM execution_events
+                    WHERE kind = 'agent.attempt_interrupted'
+                    GROUP BY attempt_id
+                ) AS interruption
+                  ON interruption.attempt_id = agent_attempts.id
+                WHERE agent_attempts.task_id = ?
+                ORDER BY agent_attempts.started_at, agent_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_agent_attempt(row) for row in rows]
+
+    @staticmethod
+    def _require_open_attempt_ownership(
+        connection: sqlite3.Connection,
+        attempt: EnvironmentAttempt | AgentAttempt,
+    ) -> None:
+        if attempt.status is not ExecutionAttemptStatus.RUNNING:
+            return
+        owner = connection.execute(
+            """
+            SELECT 1
+            FROM execution_runs AS run
+            JOIN task_claims AS claim
+              ON claim.run_id = run.id
+             AND claim.id = ?
+             AND claim.task_id = ?
+             AND claim.released_at IS NULL
+            WHERE run.id = ? AND run.status = 'running'
+            """,
+            (str(attempt.claim_id), str(attempt.task_id), str(attempt.run_id)),
+        ).fetchone()
+        if owner is None:
+            raise ExecutionOwnershipError(
+                "cannot open an attempt after execution ownership ended"
+            )
 
     def append_execution_event(self, event: ExecutionEvent) -> None:
         """Append one durable execution event."""
@@ -2763,6 +2890,7 @@ def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
 
 
 def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
+    status, finished_at, duration_seconds = _project_attempt_lifecycle(row)
     return EnvironmentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -2771,7 +2899,7 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
         kind=row["kind"],
         attempt_number=row["attempt_number"],
         fingerprint=row["fingerprint"],
-        status=AgentStatus(row["status"]),
+        status=status,
         commands=json.loads(row["commands_json"]),
         result=(
             json.loads(row["result_json"])
@@ -2779,13 +2907,14 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
             else None
         ),
         error=row["error"],
-        duration_seconds=row["duration_seconds"],
+        duration_seconds=duration_seconds,
         started_at=datetime.fromisoformat(row["started_at"]),
-        finished_at=datetime.fromisoformat(row["finished_at"]),
+        finished_at=finished_at,
     )
 
 
 def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
+    status, finished_at, duration_seconds = _project_attempt_lifecycle(row)
     return AgentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -2797,7 +2926,7 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         adapter=row["adapter"],
         model=row["model"],
         billing_mode=BillingMode(row["billing_mode"]),
-        status=AgentStatus(row["status"]),
+        status=status,
         log_path=row["log_path"],
         result_path=row["result_path"],
         result=(
@@ -2806,11 +2935,34 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
             else None
         ),
         summary=row["summary"],
-        duration_seconds=row["duration_seconds"],
+        duration_seconds=duration_seconds,
         usage=_row_to_agent_usage(row),
         started_at=datetime.fromisoformat(row["started_at"]),
-        finished_at=datetime.fromisoformat(row["finished_at"]),
+        finished_at=finished_at,
     )
+
+
+def _project_attempt_lifecycle(
+    row: sqlite3.Row,
+) -> tuple[ExecutionAttemptStatus, datetime | None, float | None]:
+    status = ExecutionAttemptStatus(row["status"])
+    finished_at = (
+        datetime.fromisoformat(row["finished_at"])
+        if row["finished_at"] is not None
+        else None
+    )
+    duration_seconds = row["duration_seconds"]
+    interrupted_at = (
+        row["interrupted_at"] if "interrupted_at" in row.keys() else None
+    )
+    if status is ExecutionAttemptStatus.RUNNING and interrupted_at is not None:
+        status = ExecutionAttemptStatus.CANCELLED
+        finished_at = datetime.fromisoformat(interrupted_at)
+        if duration_seconds is None:
+            duration_seconds = (
+                finished_at - datetime.fromisoformat(row["started_at"])
+            ).total_seconds()
+    return status, finished_at, duration_seconds
 
 
 def _row_to_agent_usage(row: sqlite3.Row) -> AgentUsage | None:
