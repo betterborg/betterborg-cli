@@ -24,6 +24,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.planning.plan_contracts import PlanValidationError, validate_plan
 from betterborg_cli.planning.worktree import materialize_planning_worktree
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
@@ -397,6 +398,19 @@ class ArchitectLoop:
                 )
                 self._answer_question_round(borg, question)
                 continue
+
+            try:
+                validate_plan(payload, self.repository.root)
+            except PlanValidationError as error:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=payload,
+                    summary=f"invalid plan contract: {error}",
+                )
+                raise ArchitectError(
+                    f"Architect plan failed deterministic validation: {error}"
+                ) from error
 
             with self.store.transaction():
                 completed = self.store.complete_planning_attempt(

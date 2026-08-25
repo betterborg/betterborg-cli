@@ -583,6 +583,39 @@ def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
         assert len(adapter.calls) == 3
 
 
+def test_invalid_plan_contract_fails_before_tech_review(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=invalid_plan))
+    database = committed_git_repo.parent / "architect-invalid-plan.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "invalid-plan"
+        )
+
+        with pytest.raises(ArchitectError, match="deterministic validation"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert store.get_borg(borg.id).state is BorgState.ARCHITECT_WORKING
+        plan_attempt = store.list_planning_attempts(borg.id)[-1]
+        assert plan_attempt.status is PlanningAttemptStatus.FAILED
+        assert plan_attempt.result == invalid_plan
+        assert "expected number 01" in plan_attempt.summary
+
+
 def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:
     return InteractiveIO(
         prompt=lambda _message: next(answers, None),
@@ -610,9 +643,9 @@ def _plan() -> dict[str, object]:
                 ),
                 "files_touched": [
                     {
-                        "path": ".github/workflows/release.yml",
+                        "path": "CHANGELOG.md",
                         "role": "new",
-                        "description": "Builds release artifacts.",
+                        "description": "Documents the release workflow.",
                     }
                 ],
                 "test_strategy": (
