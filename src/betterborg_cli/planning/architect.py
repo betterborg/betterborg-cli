@@ -340,15 +340,6 @@ class ArchitectLoop:
                 self._complete_attempt(attempt, payload, "ready to plan")
                 continue
 
-            if question_round >= ARCHITECT_QUESTION_ROUND_CAP:
-                self._complete_attempt(
-                    attempt,
-                    payload,
-                    "forced to plan after "
-                    f"{ARCHITECT_QUESTION_ROUND_CAP} question rounds",
-                )
-                continue
-
             question = PlanningQuestion(
                 borg_id=self.borg_id,
                 attempt_id=attempt.id,

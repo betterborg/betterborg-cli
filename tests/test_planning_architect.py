@@ -93,6 +93,80 @@ def test_answers_product_questions_inline_and_persists_plan(
         assert attempts[-1].result == _plan()
 
 
+def test_answers_final_question_round_before_forcing_plan(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    prompts: list[str] = []
+    answers = iter(
+        [
+            "Small internal teams.",
+            "Linux and macOS.",
+            "Use the stable channel.",
+        ]
+    )
+    adapter = MockAdapter(name="openai")
+    for question in (
+        "Which users are in scope?",
+        "Which platforms are required?",
+        "Which release channel should be the default?",
+    ):
+        adapter.queue(
+            MockResponse(
+                payload={
+                    "decision": "ask_more",
+                    "questions": [{"id": "q1", "question": question}],
+                }
+            )
+        )
+
+    def plan_after_final_answer(spec):
+        questions = json.loads(
+            (
+                spec.cwd / ".borg/state/planning/context/questions.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert [item["answers"] for item in questions] == [
+            [{"q_id": "q1", "answer": "Small internal teams."}],
+            [{"q_id": "q1", "answer": "Linux and macOS."}],
+            [{"q_id": "q1", "answer": "Use the stable channel."}],
+        ]
+        return _plan()
+
+    adapter.queue(MockResponse(dynamic=plan_after_final_answer))
+    database = committed_git_repo.parent / "architect-final-question.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "final-question"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda message: prompts.append(message) or next(answers, None),
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+        ).run()
+
+        assert result.plan == _plan()
+        assert prompts == [
+            "Which users are in scope?",
+            "Which platforms are required?",
+            "Which release channel should be the default?",
+        ]
+        assert len(adapter.calls) == 4
+        assert "question round 3 of 3" in adapter.calls[2].user_prompt
+        questions = store.list_planning_questions(borg.id)
+        assert len(questions) == 3
+        assert questions[-1].answers == [
+            {"q_id": "q1", "answer": "Use the stable channel."}
+        ]
+
+
 def test_resumes_a_stored_question_before_invoking_the_agent(
     committed_git_repo: Path,
     persist_planning_context,
