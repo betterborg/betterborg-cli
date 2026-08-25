@@ -50,6 +50,7 @@ class HostCommand:
     stage: str
     argv: tuple[str, ...]
     cwd: str
+    evidence: str = "analyzer command catalog"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +87,7 @@ class HostPreflightPlan:
     required_secret_names: tuple[str, ...]
     compose_files: tuple[Path, ...]
     services: tuple[HostService, ...]
+    compose_profiles: tuple[str, ...] = ()
 
 
 HostPreflightResult = HostPreflightPlan | HostPreflightBlock
@@ -154,7 +156,7 @@ class HostPreflight:
         required_secrets = self._required_secrets(
             plan, available_secret_names, failures
         )
-        compose_files, services = self._services(
+        compose_files, compose_profiles, services = self._services(
             plan,
             external_urls or {},
             executables,
@@ -173,6 +175,7 @@ class HostPreflight:
             required_secret_names=tuple(required_secrets),
             compose_files=tuple(compose_files),
             services=tuple(services),
+            compose_profiles=tuple(compose_profiles),
         )
 
     def _commands(
@@ -189,6 +192,9 @@ class HostPreflight:
                 if isinstance(catalog, Mapping)
                 else [],
                 "command",
+                _evidence(catalog, "analyzer command catalog")
+                if isinstance(catalog, Mapping)
+                else "analyzer command catalog",
             ),
             (
                 "prepare",
@@ -196,6 +202,9 @@ class HostPreflight:
                 if isinstance(environment, Mapping)
                 else [],
                 "environment",
+                _evidence(environment, "analyzer environment")
+                if isinstance(environment, Mapping)
+                else "analyzer environment",
             ),
             (
                 "materialize",
@@ -203,11 +212,14 @@ class HostPreflight:
                 if isinstance(environment, Mapping)
                 else [],
                 "environment",
+                _evidence(environment, "analyzer environment")
+                if isinstance(environment, Mapping)
+                else "analyzer environment",
             ),
         )
 
         validated_groups: list[list[HostCommand]] = []
-        for group, records, default_stage in groups:
+        for group, records, default_stage, group_evidence in groups:
             commands: list[HostCommand] = []
             for index, record in enumerate(records):
                 argv = record.get("argv")
@@ -251,6 +263,7 @@ class HostPreflight:
                             resolved.relative_to(self.repository_root).as_posix()
                             or "."
                         ),
+                        evidence=_evidence(record, group_evidence),
                     )
                 )
             validated_groups.append(commands)
@@ -292,27 +305,42 @@ class HostPreflight:
         commands: Sequence[HostCommand],
         failures: list[HostPreflightFailure],
     ) -> list[HostExecutable]:
-        requested: dict[tuple[str, str], tuple[str | None, str]] = {}
+        requested: dict[tuple[str, str], tuple[str | None, list[str]]] = {}
+
+        def add_request(
+            name: str, cwd: str, version: str | None, evidence: str
+        ) -> None:
+            current_version, evidence_values = requested.get(
+                (name, cwd), (None, [])
+            )
+            requested[(name, cwd)] = (
+                version if version is not None else current_version,
+                _unique_strings((*evidence_values, evidence)),
+            )
+
         for command in commands:
             executable_cwd = command.cwd if "/" in command.argv[0] else "."
-            requested.setdefault(
-                (command.argv[0], executable_cwd),
-                (None, f"command stage {command.stage}"),
+            add_request(
+                command.argv[0], executable_cwd, None, command.evidence
             )
 
         environment = plan.get("environment")
         toolchains: list[Mapping[str, Any]] = []
         if isinstance(environment, Mapping):
             for manager in environment.get("package_managers") or ():
-                requested.setdefault(
-                    (str(manager), "."),
-                    (None, _evidence(environment, "environment")),
+                add_request(
+                    str(manager),
+                    ".",
+                    None,
+                    _evidence(environment, "environment"),
                 )
             toolchains = _mappings(environment.get("toolchains"))
             for toolchain in toolchains:
                 name = toolchain.get("name")
                 if isinstance(name, str) and name:
-                    requested[(name, ".")] = (
+                    add_request(
+                        name,
+                        ".",
                         toolchain.get("version")
                         if isinstance(toolchain.get("version"), str)
                         else None,
@@ -322,7 +350,8 @@ class HostPreflight:
                     )
 
         resolved_tools: list[HostExecutable] = []
-        for (name, cwd), (version, evidence) in requested.items():
+        for (name, cwd), (version, evidence_values) in requested.items():
+            evidence = _join_evidence(evidence_values)
             path = self._resolve_executable(name, cwd=cwd)
             if path is None:
                 failures.append(
@@ -413,7 +442,7 @@ class HostPreflight:
                     )
                 )
                 continue
-            output = self._version_output(by_name[name].path)
+            output = self._version_output(name, by_name[name].path)
             if output is None or not _contains_version(output, version):
                 observed = (
                     output.strip().splitlines()[0] if output else "no version output"
@@ -464,19 +493,26 @@ class HostPreflight:
             if isinstance(plan.get("command_catalog"), Mapping)
             else None
         )
-        referenced = {
-            name
-            for record in command_records
-            for name in record.get("required_secrets") or ()
-            if isinstance(name, str)
-        }
-        for name in sorted(referenced - by_name.keys()):
+        catalog = plan.get("command_catalog")
+        catalog_evidence = (
+            _evidence(catalog, "analyzer command catalog")
+            if isinstance(catalog, Mapping)
+            else "analyzer command catalog"
+        )
+        referenced: dict[str, list[str]] = {}
+        for record in command_records:
+            for name in record.get("required_secrets") or ():
+                if isinstance(name, str):
+                    referenced.setdefault(name, []).append(
+                        _evidence(record, catalog_evidence)
+                    )
+        for name in sorted(referenced.keys() - by_name.keys()):
             failures.append(
                 HostPreflightFailure(
                     requirement=(
                         f"command references undeclared required secret: {name}"
                     ),
-                    evidence="analyzer command catalog",
+                    evidence=_join_evidence(referenced[name]),
                     guidance=(
                         "Declare the secret by name in required_secrets and "
                         "rerun analysis."
@@ -505,19 +541,25 @@ class HostPreflight:
         external_urls: Mapping[str, str],
         executables: list[HostExecutable],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[Path], list[HostService]]:
+    ) -> tuple[list[Path], list[str], list[HostService]]:
         catalog = plan.get("command_catalog")
         command_records = (
             _mappings(catalog.get("commands")) if isinstance(catalog, Mapping) else []
         )
-        selected = {
-            name
-            for record in command_records
-            for name in record.get("uses_services") or ()
-            if isinstance(name, str)
-        }
+        catalog_evidence = (
+            _evidence(catalog, "analyzer command catalog")
+            if isinstance(catalog, Mapping)
+            else "analyzer command catalog"
+        )
+        selected: dict[str, list[str]] = {}
+        for record in command_records:
+            for name in record.get("uses_services") or ():
+                if isinstance(name, str):
+                    selected.setdefault(name, []).append(
+                        _evidence(record, catalog_evidence)
+                    )
         if not selected:
-            return [], []
+            return [], [], []
 
         by_name: dict[str, list[Mapping[str, Any]]] = {}
         for record in _mappings(plan.get("service_dependencies")):
@@ -536,7 +578,15 @@ class HostPreflight:
                             "selected service must resolve to exactly one "
                             f"analyzer dependency: {name}"
                         ),
-                        evidence="analyzer command uses_services",
+                        evidence=_join_evidence(
+                            (
+                                *selected[name],
+                                *(
+                                    _evidence(item, "analyzer service dependency")
+                                    for item in matches
+                                ),
+                            )
+                        ),
                         guidance=(
                             "Declare one evidence-backed service dependency with "
                             "this exact name and rerun analysis."
@@ -617,8 +667,11 @@ class HostPreflight:
                 )
 
         compose_files: list[Path] = []
+        compose_profiles: list[str] = []
         if compose_selected:
-            compose_files = self._validate_compose(plan, compose_selected, failures)
+            compose_files, compose_profiles = self._validate_compose(
+                plan, compose_selected, failures
+            )
             docker = next((tool for tool in executables if tool.name == "docker"), None)
             if docker is None:
                 docker_path = self._resolve_executable("docker")
@@ -656,14 +709,14 @@ class HostPreflight:
                         ),
                     )
                 )
-        return compose_files, services
+        return compose_files, compose_profiles, services
 
     def _validate_compose(
         self,
         plan: Mapping[str, Any],
         selected: Sequence[tuple[str, Mapping[str, Any]]],
         failures: list[HostPreflightFailure],
-    ) -> list[Path]:
+    ) -> tuple[list[Path], list[str]]:
         compose = plan.get("compose")
         if not isinstance(compose, Mapping):
             failures.append(
@@ -680,12 +733,13 @@ class HostPreflight:
                     ),
                 )
             )
-            return []
+            return [], []
         file_records = _mappings(compose.get("files"))
         primary_file = compose.get("file")
         declared_paths = [record.get("path") for record in file_records]
         if (
-            isinstance(primary_file, str)
+            file_records
+            and isinstance(primary_file, str)
             and primary_file
             and primary_file not in declared_paths
         ):
@@ -702,40 +756,42 @@ class HostPreflight:
                     ),
                 )
             )
-        paths: list[Path] = []
-        for compose_service, service in selected:
-            matches = [
-                record
-                for record in file_records
-                if compose_service in (record.get("services") or ())
+        if not file_records and isinstance(primary_file, str) and primary_file:
+            file_records = [
+                {
+                    "path": primary_file,
+                    "source": _evidence(compose, primary_file),
+                }
             ]
-            if len(matches) != 1:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"Compose service {compose_service!r} must appear in "
-                            "exactly one compose.files service list"
-                        ),
-                        evidence=_evidence(
-                            service, _evidence(compose, "analyzer Compose metadata")
-                        ),
-                        guidance=(
-                            "Record the exact Compose file and its services in "
-                            "analyzer metadata, then retry."
-                        ),
-                    )
+        if not file_records:
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "Compose metadata must declare at least one exact file for "
+                        "selected Compose services"
+                    ),
+                    evidence=_evidence(compose, "analyzer Compose metadata"),
+                    guidance=(
+                        "Record compose.file or the ordered compose.files stack and "
+                        "rerun analysis."
+                    ),
                 )
-                continue
-            value = matches[0].get("path")
+            )
+            return [], _compose_profiles(compose, failures)
+
+        paths: list[Path] = []
+        for record in file_records:
+            value = record.get("path")
             resolved = self._repository_path(value)
             if resolved is None or not resolved.is_file():
                 failures.append(
                     HostPreflightFailure(
                         requirement=(
-                            f"Compose file must exist inside the repository: {value!r}"
+                            "Compose file must exist inside the repository: "
+                            f"{value!r}"
                         ),
                         evidence=_evidence(
-                            matches[0], _evidence(compose, "analyzer Compose metadata")
+                            record, _evidence(compose, "analyzer Compose metadata")
                         ),
                         guidance=(
                             "Restore the Compose file or rerun analysis with "
@@ -745,7 +801,33 @@ class HostPreflight:
                 )
                 continue
             paths.append(resolved)
-        return _unique_paths(paths)
+
+        service_lists = [
+            record.get("services") for record in file_records if "services" in record
+        ]
+        for compose_service, service in selected:
+            if len(service_lists) == len(file_records) and not any(
+                compose_service in services
+                for services in service_lists
+                if isinstance(services, Sequence)
+                and not isinstance(services, str | bytes)
+            ):
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            f"Compose service {compose_service!r} must appear in at "
+                            "least one declared compose.files service list"
+                        ),
+                        evidence=_evidence(
+                            service, _evidence(compose, "analyzer Compose metadata")
+                        ),
+                        guidance=(
+                            "Correct the selected service or its Compose service "
+                            "metadata, then rerun analysis."
+                        ),
+                    )
+                )
+        return paths, _compose_profiles(compose, failures)
 
     def _repository_path(
         self, value: object, *, require_directory: bool = False
@@ -769,23 +851,28 @@ class HostPreflight:
 
     def _resolve_executable(self, name: str, *, cwd: str = ".") -> Path | None:
         if "/" in name or "\\" in name:
-            candidate = (
-                self.repository_root / PurePosixPath(cwd) / PurePosixPath(name)
-            ).resolve()
+            candidate = self.repository_root / PurePosixPath(cwd) / PurePosixPath(name)
+            resolved = candidate.resolve()
             if (
-                candidate.is_relative_to(self.repository_root)
-                and candidate.is_file()
-                and os.access(candidate, os.X_OK)
+                resolved.is_relative_to(self.repository_root)
+                and resolved.is_file()
+                and os.access(resolved, os.X_OK)
             ):
-                return candidate
+                return Path(os.path.abspath(candidate))
             return None
         found = self._find_executable(name, self._environment.get("PATH"))
-        return Path(found).resolve() if found else None
+        return Path(os.path.abspath(found)) if found else None
 
-    def _version_output(self, path: Path) -> str | None:
+    def _version_output(self, name: str, path: Path) -> str | None:
+        if name == "go":
+            arguments = ("version",)
+        elif name == "java":
+            arguments = ("-version",)
+        else:
+            arguments = ("--version",)
         try:
             result = self._run(
-                [str(path), "--version"],
+                [str(path), *arguments],
                 cwd=self.repository_root,
                 env=self._probe_environment(),
                 check=False,
@@ -852,10 +939,42 @@ def _unique_paths(paths: Sequence[Path]) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
+def _unique_strings(values: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _join_evidence(values: Sequence[str]) -> str:
+    return ", ".join(_unique_strings(values))
+
+
+def _compose_profiles(
+    compose: Mapping[str, Any], failures: list[HostPreflightFailure]
+) -> list[str]:
+    value = compose.get("profiles")
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        failures.append(
+            HostPreflightFailure(
+                requirement="Compose profiles must be non-empty names",
+                evidence=_evidence(compose, "analyzer Compose metadata"),
+                guidance="Correct the Compose profiles and rerun analysis.",
+            )
+        )
+        return []
+    return list(value)
+
+
 def _contains_version(output: str, version: str) -> bool:
     normalized = version.removeprefix("v")
     return (
-        re.search(rf"(?<![0-9A-Za-z])v?{re.escape(normalized)}(?![0-9A-Za-z])", output)
+        re.search(
+            rf"(?<![0-9A-Za-z])(?:v|go)?{re.escape(normalized)}"
+            r"(?![0-9A-Za-z])",
+            output,
+        )
         is not None
     )
 

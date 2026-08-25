@@ -236,6 +236,76 @@ def test_toolchain_version_must_match_repository_evidence_and_host(
     assert "observed: example 3.12.1" in result.reason
 
 
+def test_version_probe_preserves_shim_dispatch_path(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "shim-bin"
+    binary_dir.mkdir()
+    dispatcher = _executable(
+        binary_dir,
+        "runtime-manager",
+        (
+            "test \"${0##*/} $1\" = 'python3 --version' "
+            "&& echo 'Python 3.13.7'"
+        ),
+    )
+    shim = binary_dir / "python3"
+    shim.symlink_to(dispatcher.name)
+    (committed_git_repo / ".python-version").write_text(
+        "3.13.7\n", encoding="utf-8"
+    )
+    plan = {
+        "environment": {
+            "files": [".python-version"],
+            "toolchains": [
+                {
+                    "name": "python3",
+                    "version": "3.13.7",
+                    "source": ".python-version",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.executables[0].path == shim
+    assert result.executables[0].path.is_symlink()
+
+
+def test_go_version_probe_uses_supported_command_and_output(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "go-bin"
+    binary_dir.mkdir()
+    _executable(
+        binary_dir,
+        "go",
+        "test \"$1\" = version && echo 'go version go1.24.2 linux/amd64'",
+    )
+    (committed_git_repo / "go.mod").write_text(
+        "module example.test/project\n\ngo 1.24.2\n", encoding="utf-8"
+    )
+    plan = {
+        "environment": {
+            "files": ["go.mod"],
+            "toolchains": [
+                {"name": "go", "version": "1.24.2", "source": "go.mod"}
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.executables[0].version == "1.24.2"
+
+
 def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
     committed_git_repo: Path,
 ) -> None:
@@ -264,6 +334,34 @@ def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
     assert len(result.failures) == 1
     assert "version evidence file must exist" in result.reason
     assert "missing.version" in result.reason
+
+
+def test_command_derived_failures_retain_exact_source_evidence(
+    committed_git_repo: Path,
+) -> None:
+    source = "pyproject.toml#tool.pytest.ini_options"
+    plan = {
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime", "-m", "pytest"],
+                    "source": source,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                    "uses_services": ["database"],
+                }
+            ]
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert len(result.failures) == 3
+    assert all(failure.evidence == source for failure in result.failures)
+    assert "host executable is required: missing-runtime" in result.reason
+    assert "undeclared required secret: PACKAGE_TOKEN" in result.reason
+    assert "exactly one analyzer dependency: database" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -379,6 +477,120 @@ def test_missing_compose_metadata_and_plugin_block_before_claim(
     assert "Compose metadata is required" in result.reason
     assert "Docker Compose plugin must be available" in result.reason
     assert "compose.yml#postgres" in result.reason
+
+
+def test_preserves_ordered_compose_stack_and_active_profiles(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "compose-stack-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "available-command", "exit 0")
+    _executable(
+        binary_dir,
+        "docker",
+        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
+    )
+    for name in ("compose.yml", "compose.test.yml", "compose.fragment.yml"):
+        (committed_git_repo / name).write_text(
+            "services:\n  postgres:\n    image: postgres:16\n",
+            encoding="utf-8",
+        )
+    plan = {
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["available-command"],
+                    "uses_services": ["database"],
+                    "source": "pyproject.toml#test",
+                }
+            ]
+        },
+        "compose": {
+            "file": "compose.yml",
+            "files": [
+                {
+                    "path": "compose.yml",
+                    "services": ["postgres"],
+                    "source": "compose.yml",
+                },
+                {
+                    "path": "compose.test.yml",
+                    "profiles": ["test"],
+                    "services": ["postgres"],
+                    "source": "compose.test.yml",
+                },
+                {
+                    "path": "compose.fragment.yml",
+                    "source": "compose.fragment.yml",
+                },
+            ],
+            "profiles": ["test", "integration"],
+            "source": "compose.yml",
+        },
+        "service_dependencies": [
+            {
+                "name": "database",
+                "compose_service": "postgres",
+                "source": "compose.yml#services.postgres",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.compose_files == (
+        committed_git_repo / "compose.yml",
+        committed_git_repo / "compose.test.yml",
+        committed_git_repo / "compose.fragment.yml",
+    )
+    assert result.compose_profiles == ("test", "integration")
+
+
+def test_accepts_singular_compose_file_without_service_index(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "single-compose-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "available-command", "exit 0")
+    _executable(
+        binary_dir,
+        "docker",
+        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
+    )
+    compose_file = committed_git_repo / "compose.yml"
+    compose_file.write_text(
+        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
+    )
+    plan = {
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["available-command"],
+                    "uses_services": ["database"],
+                }
+            ]
+        },
+        "compose": {"file": "compose.yml", "source": "compose.yml"},
+        "service_dependencies": [
+            {
+                "name": "database",
+                "compose_service": "postgres",
+                "source": "compose.yml#services.postgres",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.compose_files == (compose_file,)
 
 
 def test_unused_service_does_not_require_docker_or_external_url(
