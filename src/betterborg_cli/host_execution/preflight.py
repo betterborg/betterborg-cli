@@ -977,10 +977,19 @@ def _contains_version(output: str, version: str) -> bool:
 def _valid_external_url(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
+    if any(character.isspace() or not character.isprintable() for character in value):
+        return False
     try:
         parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
     except ValueError:
         return False
-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme)) and bool(
-        parsed.netloc
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    return (
+        bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme))
+        and bool(parsed.netloc)
+        and bool(hostname)
+        and "\\" not in parsed.netloc
+        and (port is not None or not authority.endswith(":"))
     )

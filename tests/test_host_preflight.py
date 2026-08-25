@@ -6,12 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
     HostPreflight,
     HostPreflightBlock,
     HostPreflightPlan,
 )
+from betterborg_cli.repo_analysis import DIMENSIONS, run_analyzer
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.store import Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
 
@@ -450,6 +453,24 @@ def test_command_derived_failures_retain_exact_source_evidence(
                 "url_env": "DEPENDENCY_URL",
                 "source": "app.toml#dependency",
             },
+            {"DEPENDENCY_URL": "https://exa mple.test/api"},
+            "requires an absolute service URL in DEPENDENCY_URL",
+        ),
+        (
+            {
+                "name": "dependency",
+                "url_env": "DEPENDENCY_URL",
+                "source": "app.toml#dependency",
+            },
+            {"DEPENDENCY_URL": "https://example.test:not-a-port/api"},
+            "requires an absolute service URL in DEPENDENCY_URL",
+        ),
+        (
+            {
+                "name": "dependency",
+                "url_env": "DEPENDENCY_URL",
+                "source": "app.toml#dependency",
+            },
             {"DEPENDENCY_URL": "localhost:9000"},
             "requires an absolute service URL in DEPENDENCY_URL",
         ),
@@ -558,16 +579,36 @@ def test_preserves_ordered_compose_stack_and_active_profiles(
             "services:\n  postgres:\n    image: postgres:16\n",
             encoding="utf-8",
         )
-    plan = {
+    analyzer_payload = {
+        "summary": "A repository with a multi-file Compose service stack.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": {
+                    dimension: {
+                        "score": 3,
+                        "evidence": f"README.md describes {dimension}",
+                    }
+                    for dimension in DIMENSIONS
+                },
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
         "command_catalog": {
             "commands": [
                 {
                     "stage": "test",
                     "argv": ["available-command"],
                     "uses_services": ["database"],
-                    "source": "pyproject.toml#test",
+                    "source": "README.md#test",
                 }
-            ]
+            ],
+            "source": "README.md",
         },
         "compose": {
             "file": "compose.yml",
@@ -600,9 +641,22 @@ def test_preserves_ordered_compose_stack_and_active_profiles(
         ],
     }
 
+    repository = Repository(root=committed_git_repo)
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=analyzer_payload)
+    )
+    with SqliteStore.open(committed_git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=committed_git_repo / "artifacts",
+        )
+
     result = _preflight(
         committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
+    ).validate(analysis.analysis_json)
 
     assert isinstance(result, HostPreflightPlan)
     assert result.compose_files == (

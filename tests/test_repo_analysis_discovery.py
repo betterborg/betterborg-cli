@@ -186,6 +186,24 @@ def test_discovery_copies_only_allowlisted_evidence(tmp_path: Path) -> None:
     assert "files/.env" not in workspace_files
 
 
+def test_discovery_includes_compose_spec_file_names(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    compose_files = {
+        "compose.yml",
+        "compose.yaml",
+        "compose.test.yml",
+        "compose.integration.yaml",
+    }
+    for name in compose_files:
+        (repo / name).write_text("services: {}\n", encoding="utf-8")
+
+    manifest = build_discovery_workspace(repo, workspace)
+
+    assert {file.path for file in manifest.files} == compose_files
+    assert {file.category for file in manifest.files} == {"config"}
+
+
 def test_discovery_stops_on_monotonic_deadline(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     workspace = tmp_path / "analysis-workspace"
