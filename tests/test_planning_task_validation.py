@@ -334,6 +334,90 @@ def test_repository_contract_must_be_owned_by_its_writing_repository() -> None:
     )
 
 
+def test_every_repository_written_by_a_phase_requires_task_coverage() -> None:
+    plan = {
+        "repositories": [{"id": "a"}, {"id": "b"}],
+        "phases": [
+            {
+                "name": "01-both",
+                "repositories": ["a", "b"],
+                "deliverables": ["Both outputs"],
+                "contracts": [],
+                "acceptance_criteria": ["Both work"],
+                "files_touched": [
+                    {"path": "a.py", "role": "new", "repo": "a"},
+                    {"path": "b.py", "role": "new", "repo": "b"},
+                ],
+                "test_strategy": "Test both.",
+                "dependencies_on": [],
+            }
+        ],
+    }
+    task = _task(
+        uuid4(),
+        stage="01-both",
+        stem="01-build-a",
+        position=1,
+        refs=_required_refs(plan, "01-both"),
+        repository="a",
+    )
+
+    findings = task_graph_findings(plan, [task], [])
+
+    assert any(
+        finding.rule == "task.repository.uncovered"
+        and finding.dependency_refs
+        == ("stage", "01-both", "repository", "b")
+        for finding in findings
+    )
+
+    repository_b_file = next(
+        element.ref
+        for element in build_plan_element_catalog(plan)
+        if element.kind == "file" and element.repository == "b"
+    )
+    second_task = _task(
+        task.generation_id,
+        stage="01-both",
+        stem="02-build-b",
+        position=2,
+        refs=[repository_b_file],
+        repository="b",
+    )
+    validate_task_graph(plan, [task, second_task], [])
+
+
+def test_task_records_from_different_generations_are_rejected() -> None:
+    plan = _plan()
+    first_generation = uuid4()
+    foundation_refs = _required_refs(plan, "01-foundation")
+    first = _task(
+        first_generation,
+        stage="01-foundation",
+        stem="01-first",
+        position=1,
+        refs=foundation_refs[:2],
+    )
+    second = _task(
+        uuid4(),
+        stage="01-foundation",
+        stem="02-second",
+        position=2,
+        refs=foundation_refs[2:],
+    )
+    consumer = _task(
+        first_generation,
+        stage="02-consumer",
+        stem="01-build",
+        position=3,
+        refs=_required_refs(plan, "02-consumer"),
+    )
+
+    findings = task_graph_findings(plan, [first, second, consumer], [])
+
+    assert _rules(findings) == {"task.generation.mismatch"}
+
+
 def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
     plan, tasks, dependencies = _valid_graph()
     foundation = tasks[0]
@@ -566,3 +650,38 @@ def test_deterministic_repairs_must_strictly_reduce_stable_findings() -> None:
         validate_task_repair_progress([missing, dangling], [missing, dangling])
     with pytest.raises(NonProgressingTaskRepairError):
         validate_task_repair_progress([missing], [introduced])
+
+
+def test_removing_one_of_repeated_duplicate_refs_counts_as_repair_progress() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    repeated_ref = tasks[0].task["plan_refs"][0]
+    tasks[0].task["plan_refs"].extend([repeated_ref, repeated_ref])
+    previous = task_graph_findings(plan, tasks, dependencies)
+    tasks[0].task["plan_refs"].pop()
+    repaired = task_graph_findings(plan, tasks, dependencies)
+
+    assert sum(
+        finding.rule == "task.traceability.duplicate_ref" for finding in previous
+    ) == 2
+    assert sum(
+        finding.rule == "task.traceability.duplicate_ref" for finding in repaired
+    ) == 1
+    validate_task_repair_progress(previous, repaired)
+
+
+def test_removing_one_of_repeated_dependency_edges_counts_as_progress() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    previous = task_graph_findings(
+        plan,
+        tasks,
+        [*dependencies, dependencies[0], dependencies[0]],
+    )
+    repaired = task_graph_findings(
+        plan,
+        tasks,
+        [*dependencies, dependencies[0]],
+    )
+
+    assert sum(finding.rule == "task.dependency.duplicate" for finding in previous) == 2
+    assert sum(finding.rule == "task.dependency.duplicate" for finding in repaired) == 1
+    validate_task_repair_progress(previous, repaired)

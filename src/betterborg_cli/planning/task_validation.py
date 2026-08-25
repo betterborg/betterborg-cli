@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -228,6 +229,18 @@ def task_graph_findings(
     logical_ids: dict[tuple[str, str], TaskRecord] = {}
     task_refs: dict[str, TaskRecord] = {}
     owners: dict[str, list[TaskRecord]] = {}
+    covered_repositories_by_phase: dict[str, set[str]] = {
+        phase_name: set() for phase_name in phase_names
+    }
+
+    if len({task.generation_id for task in task_rows}) > 1:
+        findings.append(
+            TaskGraphFinding(
+                rule="task.generation.mismatch",
+                message="task records do not belong to one generation",
+                task_refs=tuple(sorted(task.task_ref for task in task_rows)),
+            )
+        )
 
     for task in task_rows:
         duplicate_id = tasks_by_id.get(task.id)
@@ -290,6 +303,10 @@ def task_graph_findings(
         task_repository_invalid = (
             repository_missing or repository_unknown or phase_repository_conflict
         )
+        if not task_repository_invalid and isinstance(task_repository, str):
+            covered_repositories_by_phase.setdefault(task.stage, set()).add(
+                task_repository
+            )
 
         plan_refs = task.task.get("plan_refs")
         if not isinstance(plan_refs, list) or not plan_refs:
@@ -356,6 +373,24 @@ def task_graph_findings(
                 )
                 continue
             owners.setdefault(plan_ref, []).append(task)
+
+    for phase_name, phase_repositories in repositories_by_phase.items():
+        uncovered_repositories = (
+            phase_repositories - covered_repositories_by_phase[phase_name]
+        )
+        for repository in sorted(uncovered_repositories):
+            findings.append(
+                TaskGraphFinding(
+                    rule="task.repository.uncovered",
+                    message="approved-plan stage repository has no task coverage",
+                    dependency_refs=(
+                        "stage",
+                        phase_name,
+                        "repository",
+                        repository,
+                    ),
+                )
+            )
 
     for element in catalog:
         if not element.required:
@@ -493,16 +528,15 @@ def validate_task_repair_progress(
     repaired: Iterable[TaskGraphFinding],
 ) -> None:
     """Require a repair to remove findings without introducing replacements."""
-    previous_identities = {finding.identity for finding in previous}
-    repaired_identities = {finding.identity for finding in repaired}
+    previous_identities = Counter(finding.identity for finding in previous)
+    repaired_identities = Counter(finding.identity for finding in repaired)
     introduced = repaired_identities - previous_identities
-    remaining = repaired_identities & previous_identities
-    if introduced or not remaining < previous_identities:
-        removed = previous_identities - remaining
+    removed = previous_identities - repaired_identities
+    if introduced or not removed:
         raise NonProgressingTaskRepairError(
             "task repair did not strictly reduce deterministic findings without "
             "introducing new findings "
-            f"(removed={len(removed)}, introduced={len(introduced)})"
+            f"(removed={removed.total()}, introduced={introduced.total()})"
         )
 
 
