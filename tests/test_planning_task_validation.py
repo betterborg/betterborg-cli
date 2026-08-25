@@ -545,6 +545,12 @@ def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
             assert context["batch_id"] == str(initial.batch.id)
             assert context["findings"][0]["severity"] == "major"
             assert "narrower scope" in context["findings"][0]["message"]
+            task_ref = context["findings"][0]["task_ref"]
+            referenced_task = next(
+                task for task in context["tasks"] if task["task_ref"] == task_ref
+            )
+            assert referenced_task["task"]["title"] == initial.tasks[0].title
+            assert f"[{task_ref}]" in spec.user_prompt
             assert "Supervisor findings" in spec.user_prompt
             return revised_payload
 
@@ -641,6 +647,54 @@ def test_supervisor_rejects_nonprogressing_pm_revisions(
                 pm_agent=pm,
                 approved_plan=plan,
             ).run()
+        assert len(pm.calls) == 3
+
+
+def test_supervisor_rejects_order_only_pm_revisions(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    payload = _pm_payload(plan)
+    reordered = _pm_payload(plan)
+    reordered["tasks"].reverse()
+    for task in reordered["tasks"]:
+        task["plan_refs"].reverse()
+        task["scope"].reverse()
+        task["dependencies"].reverse()
+    database = committed_git_repo.parent / "supervisor-order-no-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-order-no-progress"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(MockResponse(payload=payload)),
+            approved_plan=plan,
+        ).run()
+        pm = MockAdapter(name="openai")
+        for _ in range(3):
+            pm.queue(MockResponse(payload=reordered))
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+
+        with pytest.raises(
+            SupervisorError, match="exhausted revision retries.*no semantic progress"
+        ):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+            ).run()
+
+        assert len(store.list_task_batches(borg.id)) == 1
         assert len(pm.calls) == 3
 
 

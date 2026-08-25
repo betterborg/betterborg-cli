@@ -19,6 +19,7 @@ from betterborg_cli.planning.pm import (
     ProjectManagerError,
     ProjectManagerLoop,
     approved_plan_digest,
+    task_batch_semantic_digest,
 )
 from betterborg_cli.planning.task_validation import (
     TaskGraphValidationError,
@@ -480,13 +481,42 @@ class SupervisorLoop:
             ),
             None,
         )
-        if (
-            previous is not None
-            and previous.request.get("batch_digest") == batch.digest
+        if previous is None:
+            return
+        previous_batch_id = previous.request.get("batch_id")
+        previous_batch = next(
+            (
+                candidate
+                for candidate in self.store.list_task_batches(self.borg_id)
+                if str(candidate.id) == previous_batch_id
+            ),
+            None,
+        )
+        if previous_batch is None:
+            raise SupervisorError("rejected Supervisor batch is no longer available")
+        if task_batch_semantic_digest(
+            [task.task for task in self._tasks_for_batch(batch)]
+        ) == task_batch_semantic_digest(
+            [task.task for task in self._tasks_for_batch(previous_batch)]
         ):
             raise SupervisorError(
                 "Project Manager revision made no progress against the rejected batch"
             )
+
+    def _tasks_for_batch(self, batch: TaskBatch) -> tuple[TaskRecord, ...]:
+        generation = next(
+            (
+                candidate
+                for candidate in reversed(
+                    self.store.list_task_generations(self.borg_id)
+                )
+                if candidate.batch_id == batch.id
+            ),
+            None,
+        )
+        if generation is None:
+            raise SupervisorError(f"task batch {batch.id} has no durable generation")
+        return tuple(self.store.list_task_records(generation.id))
 
     def _terminal_result(
         self, approval: PlanApproval

@@ -171,6 +171,29 @@ def approved_plan_digest(plan: Mapping[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def task_batch_semantic_digest(tasks: Sequence[Mapping[str, Any]]) -> str:
+    """Return an order-insensitive digest of a batch's task content."""
+
+    def canonicalize(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: canonicalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            items = [canonicalize(item) for item in value]
+            return sorted(
+                items,
+                key=lambda item: json.dumps(
+                    item,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+            )
+        return value
+
+    canonical_tasks = canonicalize(list(tasks))
+    return approved_plan_digest({"tasks": canonical_tasks})
+
+
 class ProjectManagerLoop:
     """Generate and persist a complete task batch for one approved plan."""
 
@@ -263,7 +286,8 @@ class ProjectManagerLoop:
                 ],
                 "summary": base_batch.summary,
                 "tasks": [
-                    task.task for task in self._tasks_for_batch(base_batch)
+                    {"task_ref": task.task_ref, "task": task.task}
+                    for task in self._tasks_for_batch(base_batch)
                 ],
             }
         while True:
@@ -305,9 +329,11 @@ class ProjectManagerLoop:
             generation, batch, tasks, dependencies = self._materialize_graph(
                 approval, attempt, payload
             )
-            if base_batch is not None and [task.task for task in tasks] == [
-                task.task for task in self._tasks_for_batch(base_batch)
-            ]:
+            if base_batch is not None and task_batch_semantic_digest(
+                [task.task for task in tasks]
+            ) == task_batch_semantic_digest(
+                [task.task for task in self._tasks_for_batch(base_batch)]
+            ):
                 summary = (
                     "Project Manager revision made no semantic progress against "
                     f"task batch {base_batch.id}"
@@ -469,7 +495,9 @@ class ProjectManagerLoop:
         if not findings:
             return "Revise the complete prior task batch without dropping coverage."
         return "Supervisor findings: " + "; ".join(
-            f"{finding.severity}: {finding.message}"
+            f"{finding.severity}"
+            + (f" [{finding.task_ref}]" if finding.task_ref else "")
+            + f": {finding.message}"
             + (f" ({finding.suggestion})" if finding.suggestion else "")
             for finding in findings
         )
@@ -683,4 +711,5 @@ __all__ = [
     "ProjectManagerLoop",
     "ProjectManagerResult",
     "approved_plan_digest",
+    "task_batch_semantic_digest",
 ]

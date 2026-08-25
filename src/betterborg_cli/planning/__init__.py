@@ -23,6 +23,7 @@ from betterborg_cli.planning.pm import (
     ProjectManagerLoop,
     ProjectManagerResult,
     approved_plan_digest,
+    task_batch_semantic_digest,
 )
 from betterborg_cli.planning.supervisor import (
     SUPERVISOR_REVIEW_SCHEMA,
@@ -89,6 +90,7 @@ __all__ = [
     "PlanValidationError",
     "build_plan_element_catalog",
     "approved_plan_digest",
+    "task_batch_semantic_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
     "task_graph_findings",
