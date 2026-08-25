@@ -6,7 +6,9 @@ import json
 import multiprocessing
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -15,13 +17,17 @@ from uuid import UUID, uuid4
 import pytest
 
 from betterborg_cli.host_execution import (
+    ComposeStackError,
     EnvironmentMaterializationError,
     HostCommand,
+    HostComposeManager,
     HostEnvironmentManager,
     HostPreflightPlan,
     HostSecret,
+    HostService,
     HostWorktreeManager,
     package_manager_cache_environment,
+    service_url_environment,
 )
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
@@ -66,6 +72,13 @@ class ExecutionPreflightFixture:
             cache_root=self.cache_root,
             preparation_root=self.preparation_root,
             environment={"PATH": os.environ["PATH"]},
+        )
+
+    def compose_manager(self, runner) -> HostComposeManager:
+        return HostComposeManager(
+            self.repository,
+            environment={"PATH": os.environ["PATH"]},
+            command_runner=runner,
         )
 
 
@@ -563,6 +576,177 @@ def test_command_failure_blocks_before_coding(execution_preflight_fixture) -> No
     assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
 
 
+def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture(task_count=2)
+    runner = _FakeComposeRunner()
+    plan = _compose_plan(fixture.repository)
+    with SqliteStore.open(fixture.database) as store:
+        claims = (fixture.claim(store), fixture.claim(store))
+
+    def start(claim: TaskClaim):
+        with SqliteStore.open(fixture.database) as store:
+            return fixture.compose_manager(runner).start_claimed_stack(
+                store, plan, claim, fixture.owner_token
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stacks = tuple(executor.map(start, claims))
+
+    first, second = stacks
+    assert first is not None and second is not None
+    assert first.project_name != second.project_name
+    assert first.network_name != second.network_name
+    assert runner.active == {first.project_name, second.project_name}
+    assert first.environment == {
+        "DATABASE_URL": "postgres://postgres:5432/postgres",
+        "SEARCH_URL": "https://search.example.test/api",
+    }
+    assert runner.started_services[first.project_name] == ("postgres",)
+    assert runner.started_services[second.project_name] == ("postgres",)
+
+    with SqliteStore.open(fixture.database) as store:
+        resources = [
+            store.list_compose_resources(claim.task_id) for claim in claims
+        ]
+        assert [
+            {resource.resource_type for resource in owned}
+            for owned in resources
+        ] == [{"project", "network"}, {"project", "network"}]
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, first, claims[0], fixture.owner_token
+        )
+        first_events = {
+            event.kind
+            for event in store.list_execution_events(fixture.run_id)
+            if event.task_id == claims[0].task_id
+        }
+
+    assert runner.active == {second.project_name}
+    assert {
+        "compose.starting",
+        "compose.ready",
+        "compose.stopping",
+        "compose.stopped",
+    } <= first_events
+
+    with SqliteStore.open(fixture.database) as store:
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, second, claims[1], fixture.owner_token
+        )
+    assert runner.active == set()
+
+
+def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    plan = _compose_plan(fixture.repository)
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, plan, claim, fixture.owner_token
+        )
+        assert stack is not None
+        artifact = stack.worktree / "completed-work.txt"
+        artifact.write_text("preserved\n", encoding="utf-8")
+        expired_run = store.get_execution_run(fixture.run_id)
+        assert expired_run is not None
+        expired_at = expired_run.lease_expires_at + timedelta(seconds=1)
+        stale = store.reconcile_expired_execution_runs(now=expired_at)
+        replacement = store.acquire_execution_run(
+            expired_run.borg_id,
+            expired_run.generation_id,
+            lease_duration=timedelta(hours=1),
+            now=expired_at,
+        )
+        assert replacement.owner_token is not None
+        assert store.claim_dependency_ready_task(
+            replacement.run_id,
+            replacement.owner_token,
+            lease_duration=timedelta(minutes=30),
+            now=expired_at,
+        ) is None
+
+        runner.fail_down.add(stack.project_name)
+        failed = fixture.compose_manager(runner).cleanup_stale_projects(store, stale)
+        runtime = store.get_task_runtime(claim.task_id)
+        persisted_claim = store.list_task_claims(fixture.run_id)[0]
+
+        assert len(failed) == 1 and failed[0].stopped is False
+        assert failed[0].project_name == stack.project_name
+        assert failed[0].command == runner.down_commands[-1]
+        assert runtime is not None and runtime.state_reason is not None
+        assert stack.project_name in runtime.state_reason
+        assert "docker compose" in runtime.state_reason
+        assert persisted_claim.released_at is None
+        assert store.list_stale_compose_resources(fixture.run_id) == stale
+
+        runner.fail_down.clear()
+        succeeded = fixture.compose_manager(runner).cleanup_stale_projects(
+            store, store.list_stale_compose_resources(fixture.run_id)
+        )
+        reclaimed = store.claim_dependency_ready_task(
+            replacement.run_id,
+            replacement.owner_token,
+            lease_duration=timedelta(minutes=30),
+            now=expired_at + timedelta(seconds=1),
+        )
+
+    assert len(succeeded) == 1 and succeeded[0].stopped is True
+    assert succeeded[0].command == failed[0].command
+    assert reclaimed is not None and reclaimed.task_id == claim.task_id
+    assert artifact.read_text(encoding="utf-8") == "preserved\n"
+
+
+def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    plan = _compose_plan(fixture.repository)
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        expected_project = (
+            f"borg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
+        )
+        runner.fail_up.add(expected_project)
+
+        with pytest.raises(ComposeStackError, match="did not become healthy"):
+            fixture.compose_manager(runner).start_claimed_stack(
+                store, plan, claim, fixture.owner_token
+            )
+
+        runtime = store.get_task_runtime(claim.task_id)
+        events = {
+            event.kind for event in store.list_execution_events(fixture.run_id)
+        }
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert runner.active == set()
+    assert runner.down_commands[-1][3] == expected_project
+    assert {"compose.starting", "compose.stopping", "compose.stopped"} <= events
+    assert "compose.ready" not in events
+
+
+def test_external_service_urls_do_not_create_compose_inputs() -> None:
+    services = (
+        HostService(
+            name="search",
+            kind="external",
+            evidence="fixture",
+            url_env="SEARCH_URL",
+            url="https://search.example.test/api",
+        ),
+    )
+
+    assert service_url_environment(services) == {
+        "SEARCH_URL": "https://search.example.test/api"
+    }
+
+
 def _task_record(
     generation: TaskGeneration, borg: Borg, position: int
 ) -> TaskRecord:
@@ -628,6 +812,72 @@ def _plan(
         package_managers=("pip",),
         secret_requirements=secrets,
     )
+
+
+def _compose_plan(repository: Path) -> HostPreflightPlan:
+    return HostPreflightPlan(
+        repository_root=repository,
+        commands=(),
+        prepare_commands=(),
+        materialize_commands=(),
+        environment_files=(repository / "package.lock",),
+        executables=(),
+        required_secret_names=(),
+        # The fake runner does not parse YAML; this tracked file exercises the
+        # validated primary-checkout to task-worktree path mapping.
+        compose_files=(repository / "package.lock",),
+        services=(
+            HostService(
+                name="database",
+                kind="compose",
+                evidence="fixture",
+                compose_service="postgres",
+                url_env="DATABASE_URL",
+                port=5432,
+            ),
+            HostService(
+                name="search",
+                kind="external",
+                evidence="fixture",
+                url_env="SEARCH_URL",
+                url="https://search.example.test/api",
+            ),
+        ),
+        compose_profiles=("test",),
+    )
+
+
+class _FakeComposeRunner:
+    def __init__(self) -> None:
+        self.active: set[str] = set()
+        self.started_services: dict[str, tuple[str, ...]] = {}
+        self.down_commands: list[tuple[str, ...]] = []
+        self.fail_up: set[str] = set()
+        self.fail_down: set[str] = set()
+        self._lock = threading.Lock()
+
+    def __call__(self, argv, **kwargs):
+        command = tuple(argv)
+        project = command[command.index("--project-name") + 1]
+        with self._lock:
+            if "up" in command:
+                if project in self.fail_up:
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "service postgres is unhealthy"
+                    )
+                services = command[command.index("--remove-orphans") + 1 :]
+                self.active.add(project)
+                self.started_services[project] = services
+                return subprocess.CompletedProcess(argv, 0, "healthy\n", "")
+            if "down" in command:
+                self.down_commands.append(command)
+                if project in self.fail_down:
+                    return subprocess.CompletedProcess(
+                        argv, 9, "", "simulated teardown failure"
+                    )
+                self.active.discard(project)
+                return subprocess.CompletedProcess(argv, 0, "stopped\n", "")
+        return subprocess.CompletedProcess(argv, 2, "", "unexpected command")
 
 
 def _write_fake_package_manager(path: Path) -> None:

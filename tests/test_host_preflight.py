@@ -11,6 +11,7 @@ from betterborg_cli.host_execution import (
     HostPreflight,
     HostPreflightBlock,
     HostPreflightPlan,
+    service_url_environment,
 )
 from betterborg_cli.repo_analysis import DIMENSIONS, run_analyzer
 from betterborg_cli.repo_paths import RepoPaths
@@ -89,6 +90,8 @@ def _base_plan() -> dict[str, object]:
             {
                 "name": "database",
                 "compose_service": "postgres",
+                "url_env": "DATABASE_URL",
+                "port": 5432,
                 "source": "compose.yml#services.postgres",
             },
             {
@@ -169,7 +172,12 @@ def test_validates_complete_plan_and_ignores_unselected_service(
         ("database", "compose"),
         ("search", "external"),
     ]
+    assert result.services[0].url_targets == (("DATABASE_URL", 5432),)
     assert result.services[1].url == "https://search.example.test/api"
+    assert service_url_environment(result.services) == {
+        "DATABASE_URL": "postgres://postgres:5432/postgres",
+        "SEARCH_URL": "https://search.example.test/api",
+    }
 
 
 def test_preserves_prepare_and_materialize_command_phases(
@@ -485,16 +493,6 @@ def test_command_derived_failures_retain_exact_source_evidence(
             {"DEPENDENCY_URL": "https://["},
             "requires an absolute service URL in DEPENDENCY_URL",
         ),
-        (
-            {
-                "name": "dependency",
-                "compose_service": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://dependency.example.test"},
-            "ambiguous or inferred",
-        ),
     ],
 )
 def test_selected_service_must_be_explicit_and_external_url_supplied(
@@ -527,6 +525,41 @@ def test_selected_service_must_be_explicit_and_external_url_supplied(
     assert len(result.failures) == 1
     assert expected in result.reason
     assert "app.toml#dependency" in result.reason
+
+
+def test_compose_url_environment_requires_an_exact_service_port(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "compose-url-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
+    _executable(
+        binary_dir,
+        "docker",
+        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
+    )
+    (committed_git_repo / "package").mkdir()
+    (committed_git_repo / "runtime.version").write_text(
+        "3.11.9\n", encoding="utf-8"
+    )
+    (committed_git_repo / "compose.yml").write_text(
+        "services:\n  postgres:\n    image: postgres:16\n",
+        encoding="utf-8",
+    )
+    plan = _base_plan()
+    del plan["service_dependencies"][0]["port"]
+
+    result = _preflight(
+        committed_git_repo,
+        environment={"PATH": str(binary_dir)},
+    ).validate(
+        plan,
+        available_secret_names={"PACKAGE_TOKEN"},
+        external_urls={"SEARCH_URL": "https://search.example.test/api"},
+    )
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "DATABASE_URL requires an exact port" in result.reason
 
 
 def test_missing_compose_metadata_and_plugin_block_before_claim(

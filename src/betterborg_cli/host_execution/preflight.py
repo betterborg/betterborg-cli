@@ -71,6 +71,8 @@ class HostService:
     evidence: str
     compose_service: str | None = None
     url_env: str | None = None
+    port: int | None = None
+    url_targets: tuple[tuple[str, int], ...] = ()
     url: str | None = field(default=None, repr=False)
 
 
@@ -640,23 +642,26 @@ class HostPreflight:
             compose_service = service.get("compose_service")
             url_env = service.get("url_env")
             has_compose = isinstance(compose_service, str) and bool(compose_service)
-            has_external = isinstance(url_env, str) and bool(url_env)
-            if has_compose and has_external:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"selected service is ambiguous or inferred: {name}"
-                        ),
-                        evidence=evidence,
-                        guidance=(
-                            "Set exactly one of compose_service or url_env in "
-                            "analyzer evidence; preflight will not choose between "
-                            "runtime sources."
-                        ),
-                    )
-                )
-            elif has_compose:
+            has_url_env = isinstance(url_env, str) and bool(url_env)
+            if has_compose:
                 assert isinstance(compose_service, str)
+                url_targets = _compose_service_url_targets(service)
+                if has_url_env and not any(
+                    target_env == url_env for target_env, _port in url_targets
+                ):
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"Compose service {name!r} URL environment "
+                                f"{url_env} requires an exact port"
+                            ),
+                            evidence=evidence,
+                            guidance=(
+                                "Record the service port alongside url_env in "
+                                "analyzer evidence and rerun analysis."
+                            ),
+                        )
+                    )
                 compose_selected.append((compose_service, service))
                 services.append(
                     HostService(
@@ -664,9 +669,23 @@ class HostPreflight:
                         kind="compose",
                         evidence=evidence,
                         compose_service=compose_service,
+                        url_env=url_env if has_url_env else None,
+                        port=(
+                            next(
+                                (
+                                    port
+                                    for target_env, port in url_targets
+                                    if target_env == url_env
+                                ),
+                                None,
+                            )
+                            if has_url_env
+                            else None
+                        ),
+                        url_targets=url_targets,
                     )
                 )
-            elif has_external:
+            elif has_url_env:
                 assert isinstance(url_env, str)
                 url = external_urls.get(url_env) or self._environment.get(url_env)
                 if not _valid_external_url(url):
@@ -985,6 +1004,26 @@ def _string_sequence(value: object) -> bool:
         and bool(value)
         and all(isinstance(item, str) and item for item in value)
     )
+
+
+def _compose_service_url_targets(
+    service: Mapping[str, Any],
+) -> tuple[tuple[str, int], ...]:
+    targets: list[tuple[str, int]] = []
+    url_env = service.get("url_env")
+    port = service.get("port")
+    if isinstance(url_env, str) and _service_port(port):
+        targets.append((url_env, port))
+    for record in _mappings(service.get("ports")):
+        port_env = record.get("env")
+        port_value = record.get("port")
+        if isinstance(port_env, str) and _service_port(port_value):
+            targets.append((port_env, port_value))
+    return tuple(dict.fromkeys(targets))
+
+
+def _service_port(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 65535
 
 
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:
