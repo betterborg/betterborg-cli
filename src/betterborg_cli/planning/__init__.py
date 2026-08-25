@@ -24,6 +24,14 @@ from betterborg_cli.planning.pm import (
     ProjectManagerResult,
     approved_plan_digest,
 )
+from betterborg_cli.planning.supervisor import (
+    SUPERVISOR_REVIEW_SCHEMA,
+    SUPERVISOR_ROUND_CAP,
+    SupervisorCancelled,
+    SupervisorError,
+    SupervisorLoop,
+    SupervisorResult,
+)
 from betterborg_cli.planning.task_validation import (
     NonProgressingTaskRepairError,
     PlanElement,
@@ -63,6 +71,12 @@ __all__ = [
     "ProjectManagerError",
     "ProjectManagerLoop",
     "ProjectManagerResult",
+    "SUPERVISOR_REVIEW_SCHEMA",
+    "SUPERVISOR_ROUND_CAP",
+    "SupervisorCancelled",
+    "SupervisorError",
+    "SupervisorLoop",
+    "SupervisorResult",
     "TECH_LEAD_REVIEW_SCHEMA",
     "TECH_REVIEW_ROUND_CAP",
     "TechLeadCancelled",

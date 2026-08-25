@@ -243,11 +243,45 @@ class ProjectManagerLoop:
                 f"{borg.state.value!r}"
             )
 
+        base_batch = self._latest_batch(approval)
         annotated_plan = self._annotated_plan(plan)
+        if base_batch is not None:
+            annotated_plan["_betterborg_task_revision"] = {
+                "batch_digest": base_batch.digest,
+                "batch_id": str(base_batch.id),
+                "findings": [
+                    {
+                        "message": finding.message,
+                        "round": finding.round,
+                        "severity": finding.severity,
+                        "suggestion": finding.suggestion,
+                        "task_ref": finding.task_ref,
+                    }
+                    for finding in self.store.list_task_findings(
+                        self.borg_id, batch_id=base_batch.id
+                    )
+                ],
+                "summary": base_batch.summary,
+                "tasks": [
+                    task.task for task in self._tasks_for_batch(base_batch)
+                ],
+            }
         while True:
             if self.cancel is not None and self.cancel.is_set():
                 raise ProjectManagerCancelled("Project Manager run cancelled")
-            feedback = self._latest_failure_summary(approval)
+            self._require_retry_budget(approval, base_batch)
+            feedback = self._latest_feedback(approval, base_batch)
+            request_context = {
+                "plan_approval_id": str(approval.id),
+                "approved_plan_digest": approval.plan_digest,
+            }
+            if base_batch is not None:
+                request_context.update(
+                    {
+                        "base_batch_id": str(base_batch.id),
+                        "base_batch_digest": base_batch.digest,
+                    }
+                )
             try:
                 attempt, payload = self._turns.run(
                     phase=_PM_PHASE,
@@ -259,21 +293,38 @@ class ProjectManagerLoop:
                         annotated_plan, indent=2, sort_keys=True
                     ),
                     turn_name="task batch",
-                    request_context={
-                        "plan_approval_id": str(approval.id),
-                        "approved_plan_digest": approval.plan_digest,
-                    },
+                    request_context=request_context,
                 )
             except ProjectManagerCancelled:
                 raise
             except ProjectManagerError:
-                if self._retryable_contract_failure(approval):
+                if self._retryable_contract_failure(approval, base_batch):
                     continue
                 raise
 
             generation, batch, tasks, dependencies = self._materialize_graph(
                 approval, attempt, payload
             )
+            if base_batch is not None and [task.task for task in tasks] == [
+                task.task for task in self._tasks_for_batch(base_batch)
+            ]:
+                summary = (
+                    "Project Manager revision made no semantic progress against "
+                    f"task batch {base_batch.id}"
+                )
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=payload,
+                    summary=summary,
+                )
+                if len(self._attempts_for_cycle(approval, base_batch)) >= (
+                    PM_OUTPUT_RETRY_CAP
+                ):
+                    raise ProjectManagerError(
+                        "Project Manager exhausted revision retries: " + summary
+                    )
+                continue
             try:
                 validate_task_graph(plan, tasks, dependencies)
             except TaskGraphValidationError as error:
@@ -284,7 +335,9 @@ class ProjectManagerLoop:
                     result=payload,
                     summary=summary,
                 )
-                if len(self._attempts_for(approval)) >= PM_OUTPUT_RETRY_CAP:
+                if len(self._attempts_for_cycle(approval, base_batch)) >= (
+                    PM_OUTPUT_RETRY_CAP
+                ):
                     raise ProjectManagerError(
                         "Project Manager exhausted output retries: " + summary
                     ) from error
@@ -385,18 +438,61 @@ class ProjectManagerLoop:
             and item.request.get("approved_plan_digest") == approval.plan_digest
         ]
 
-    def _latest_failure_summary(self, approval: PlanApproval) -> str | None:
-        return next(
+    def _attempts_for_cycle(
+        self, approval: PlanApproval, base_batch: TaskBatch | None
+    ) -> list[PlanningAttempt]:
+        base_batch_id = str(base_batch.id) if base_batch is not None else None
+        return [
+            item
+            for item in self._attempts_for(approval)
+            if item.request.get("base_batch_id") == base_batch_id
+        ]
+
+    def _latest_feedback(
+        self, approval: PlanApproval, base_batch: TaskBatch | None
+    ) -> str | None:
+        failure = next(
             (
                 item.summary
-                for item in reversed(self._attempts_for(approval))
+                for item in reversed(self._attempts_for_cycle(approval, base_batch))
                 if item.status is PlanningAttemptStatus.FAILED and item.summary
             ),
             None,
         )
+        if failure is not None:
+            return failure
+        if base_batch is None:
+            return None
+        findings = self.store.list_task_findings(
+            self.borg_id, batch_id=base_batch.id
+        )
+        if not findings:
+            return "Revise the complete prior task batch without dropping coverage."
+        return "Supervisor findings: " + "; ".join(
+            f"{finding.severity}: {finding.message}"
+            + (f" ({finding.suggestion})" if finding.suggestion else "")
+            for finding in findings
+        )
 
-    def _retryable_contract_failure(self, approval: PlanApproval) -> bool:
-        attempts = self._attempts_for(approval)
+    def _require_retry_budget(
+        self, approval: PlanApproval, base_batch: TaskBatch | None
+    ) -> None:
+        attempts = self._attempts_for_cycle(approval, base_batch)
+        if len(attempts) < PM_OUTPUT_RETRY_CAP or not attempts:
+            return
+        latest = attempts[-1]
+        if latest.status is not PlanningAttemptStatus.FAILED:
+            return
+        kind = "revision" if base_batch is not None else "output"
+        raise ProjectManagerError(
+            f"Project Manager exhausted {kind} retries: "
+            + (latest.summary or "last attempt failed")
+        )
+
+    def _retryable_contract_failure(
+        self, approval: PlanApproval, base_batch: TaskBatch | None
+    ) -> bool:
+        attempts = self._attempts_for_cycle(approval, base_batch)
         if len(attempts) >= PM_OUTPUT_RETRY_CAP or not attempts:
             return False
         latest = attempts[-1]
@@ -407,6 +503,31 @@ class ProjectManagerLoop:
             or "unable to extract" in summary
             or "no parseable json" in summary
         )
+
+    def _latest_batch(self, approval: PlanApproval) -> TaskBatch | None:
+        return next(
+            (
+                item
+                for item in reversed(self.store.list_task_batches(self.borg_id))
+                if item.plan_approval_id == approval.id
+            ),
+            None,
+        )
+
+    def _tasks_for_batch(self, batch: TaskBatch) -> tuple[TaskRecord, ...]:
+        generation = next(
+            (
+                item
+                for item in reversed(self.store.list_task_generations(self.borg_id))
+                if item.batch_id == batch.id
+            ),
+            None,
+        )
+        if generation is None:
+            raise ProjectManagerError(
+                f"task batch {batch.id} has no durable generation"
+            )
+        return tuple(self.store.list_task_records(generation.id))
 
     def _materialize_graph(
         self,
@@ -512,6 +633,8 @@ class ProjectManagerLoop:
     def _terminal_result(
         self, approval: PlanApproval
     ) -> ProjectManagerResult | None:
+        if self._turns.current_borg().state is BorgState.PM_WORKING:
+            return None
         batch = next(
             (
                 item
