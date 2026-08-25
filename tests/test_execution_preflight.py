@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
@@ -74,7 +75,7 @@ class ExecutionPreflightFixture:
             environment={"PATH": os.environ["PATH"]},
         )
 
-    def compose_manager(self, runner) -> HostComposeManager:
+    def compose_manager(self, runner=None) -> HostComposeManager:
         return HostComposeManager(
             self.repository,
             environment={"PATH": os.environ["PATH"]},
@@ -94,6 +95,43 @@ def execution_preflight_fixture(tmp_path: Path):
         _git(repository, "config", "user.email", "tests@betterborg.dev")
         (repository / "README.md").write_text("# Fixture\n", encoding="utf-8")
         (repository / "package.lock").write_text("lock-v1\n", encoding="utf-8")
+        (repository / "ComposeFixture.Dockerfile").write_text(
+            "FROM scratch\n"
+            "COPY .dependencies/compose-fixture /compose-fixture\n"
+            'ENTRYPOINT ["/compose-fixture"]\n',
+            encoding="utf-8",
+        )
+        (repository / "compose.yml").write_text(
+            "services:\n"
+            "  healthy:\n"
+            "    build:\n"
+            "      context: .\n"
+            "      dockerfile: ComposeFixture.Dockerfile\n"
+            "    container_name: betterborg-fixed-collision\n"
+            "    depends_on:\n"
+            "      unused:\n"
+            "        condition: service_started\n"
+            "    healthcheck:\n"
+            "      test: [CMD, /compose-fixture, --health]\n"
+            "      interval: 200ms\n"
+            "      timeout: 1s\n"
+            "      retries: 20\n"
+            "    ports:\n"
+            '      - "127.0.0.1:39091:8080"\n'
+            "    networks: [fixture]\n"
+            "    volumes: [fixture-data:/data]\n"
+            "  unused:\n"
+            "    build:\n"
+            "      context: .\n"
+            "      dockerfile: ComposeFixture.Dockerfile\n"
+            "networks:\n"
+            "  fixture:\n"
+            "    name: betterborg-fixed-network\n"
+            "volumes:\n"
+            "  fixture-data:\n"
+            "    name: betterborg-fixed-volume\n",
+            encoding="utf-8",
+        )
         (repository / ".gitignore").write_text(
             ".dependencies/\n", encoding="utf-8"
         )
@@ -580,62 +618,98 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture(task_count=2)
-    runner = _FakeComposeRunner()
+    _prepare_compose_fixture(fixture)
     plan = _compose_plan(fixture.repository)
     with SqliteStore.open(fixture.database) as store:
         claims = (fixture.claim(store), fixture.claim(store))
 
     def start(claim: TaskClaim):
         with SqliteStore.open(fixture.database) as store:
-            return fixture.compose_manager(runner).start_claimed_stack(
+            return fixture.compose_manager(None).start_claimed_stack(
                 store, plan, claim, fixture.owner_token
             )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        stacks = tuple(executor.map(start, claims))
+    stacks = []
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(start, claim) for claim in claims]
+            errors = []
+            for future in futures:
+                try:
+                    stacks.append(future.result())
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                raise errors[0]
 
-    first, second = stacks
-    assert first is not None and second is not None
-    assert first.project_name != second.project_name
-    assert first.network_name != second.network_name
-    assert runner.active == {first.project_name, second.project_name}
-    assert first.environment == {
-        "DATABASE_URL": "postgres://postgres:5432/postgres",
-        "SEARCH_URL": "https://search.example.test/api",
-    }
-    assert runner.started_services[first.project_name] == ("postgres",)
-    assert runner.started_services[second.project_name] == ("postgres",)
-
-    with SqliteStore.open(fixture.database) as store:
-        resources = [
-            store.list_compose_resources(claim.task_id) for claim in claims
-        ]
-        assert [
-            {resource.resource_type for resource in owned}
-            for owned in resources
-        ] == [{"project", "network"}, {"project", "network"}]
-        fixture.compose_manager(runner).stop_claimed_stack(
-            store, first, claims[0], fixture.owner_token
+        first, second = stacks
+        assert first is not None and second is not None
+        assert first.project_name != second.project_name
+        assert first.network_name != second.network_name
+        assert first.environment["SERVICE_URL"] != second.environment["SERVICE_URL"]
+        assert _http_body(first.environment["SERVICE_URL"]) == "healthy\n"
+        assert _http_body(second.environment["SERVICE_URL"]) == "healthy\n"
+        assert first.environment["SEARCH_URL"] == (
+            "https://search.example.test/api"
         )
-        first_events = {
-            event.kind
-            for event in store.list_execution_events(fixture.run_id)
-            if event.task_id == claims[0].task_id
-        }
-
-    assert runner.active == {second.project_name}
-    assert {
-        "compose.starting",
-        "compose.ready",
-        "compose.stopping",
-        "compose.stopped",
-    } <= first_events
-
-    with SqliteStore.open(fixture.database) as store:
-        fixture.compose_manager(runner).stop_claimed_stack(
-            store, second, claims[1], fixture.owner_token
+        assert second.environment["SEARCH_URL"] == (
+            "https://search.example.test/api"
         )
-    assert runner.active == set()
+        for name in (*first.network_names, *second.network_names):
+            assert _docker_resource_names("network", name) == {name}
+        assert set(first.network_names).isdisjoint(second.network_names)
+        for stack in (first, second):
+            assert _compose_container_services(stack.project_name) == {"healthy"}
+
+        with SqliteStore.open(fixture.database) as store:
+            resources = [
+                store.list_compose_resources(claim.task_id) for claim in claims
+            ]
+            assert [
+                {resource.resource_type for resource in owned}
+                for owned in resources
+            ] == [{"project", "network"}, {"project", "network"}]
+            assert [
+                {
+                    resource.resource_name
+                    for resource in owned
+                    if resource.resource_type == "network"
+                }
+                for owned in resources
+            ] == [set(first.network_names), set(second.network_names)]
+            fixture.compose_manager(None).stop_claimed_stack(
+                store, first, claims[0], fixture.owner_token
+            )
+            first_events = {
+                event.kind
+                for event in store.list_execution_events(fixture.run_id)
+                if event.task_id == claims[0].task_id
+            }
+
+        assert _compose_container_services(first.project_name) == set()
+        assert _http_body(second.environment["SERVICE_URL"]) == "healthy\n"
+        assert _compose_container_services(second.project_name) == {"healthy"}
+        assert {
+            "compose.starting",
+            "compose.ready",
+            "compose.stopping",
+            "compose.stopped",
+        } <= first_events
+        starting = next(
+            event
+            for event in _execution_events(fixture)
+            if event.task_id == claims[1].task_id
+            and event.kind == "compose.starting"
+        )
+        assert "--no-deps" in starting.payload["command"]
+    finally:
+        for stack, claim in zip(stacks, claims, strict=False):
+            if stack is None or not _compose_container_services(stack.project_name):
+                continue
+            with SqliteStore.open(fixture.database) as store:
+                fixture.compose_manager(None).stop_claimed_stack(
+                    store, stack, claim, fixture.owner_token
+                )
 
 
 def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
@@ -823,17 +897,16 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
         environment_files=(repository / "package.lock",),
         executables=(),
         required_secret_names=(),
-        # The fake runner does not parse YAML; this tracked file exercises the
-        # validated primary-checkout to task-worktree path mapping.
-        compose_files=(repository / "package.lock",),
+        compose_files=(repository / "compose.yml",),
         services=(
             HostService(
-                name="database",
+                name="http-service",
                 kind="compose",
                 evidence="fixture",
-                compose_service="postgres",
-                url_env="DATABASE_URL",
-                port=5432,
+                compose_service="healthy",
+                url_env="SERVICE_URL",
+                port=8080,
+                url_targets=(("SERVICE_URL", 8080),),
             ),
             HostService(
                 name="search",
@@ -843,7 +916,7 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
                 url="https://search.example.test/api",
             ),
         ),
-        compose_profiles=("test",),
+        compose_profiles=(),
     )
 
 
@@ -860,15 +933,35 @@ class _FakeComposeRunner:
         command = tuple(argv)
         project = command[command.index("--project-name") + 1]
         with self._lock:
+            if "config" in command:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps(
+                        {
+                            "services": {
+                                "healthy": {"networks": {"default": None}},
+                                "unused": {"networks": {"default": None}},
+                            },
+                            "networks": {"default": {}},
+                        }
+                    ),
+                    "",
+                )
             if "up" in command:
                 if project in self.fail_up:
                     return subprocess.CompletedProcess(
-                        argv, 1, "", "service postgres is unhealthy"
+                        argv, 1, "", "service healthy is unhealthy"
                     )
-                services = command[command.index("--remove-orphans") + 1 :]
+                services = command[command.index("--no-deps") + 1 :]
                 self.active.add(project)
                 self.started_services[project] = services
                 return subprocess.CompletedProcess(argv, 0, "healthy\n", "")
+            if "port" in command:
+                port = 41000 + sum(project.encode()) % 20000
+                return subprocess.CompletedProcess(
+                    argv, 0, f"127.0.0.1:{port}\n", ""
+                )
             if "down" in command:
                 self.down_commands.append(command)
                 if project in self.fail_down:
@@ -878,6 +971,96 @@ class _FakeComposeRunner:
                 self.active.discard(project)
                 return subprocess.CompletedProcess(argv, 0, "stopped\n", "")
         return subprocess.CompletedProcess(argv, 2, "", "unexpected command")
+
+
+_COMPOSE_FIXTURE_SOURCE = r"""
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(8080);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (argc == 2 && strcmp(argv[1], "--health") == 0) {
+        int probe = socket(AF_INET, SOCK_STREAM, 0);
+        int result = connect(probe, (struct sockaddr *)&address, sizeof(address));
+        close(probe);
+        return result == 0 ? 0 : 1;
+    }
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0) return 2;
+    if (listen(server, 16) != 0) return 3;
+    for (;;) {
+        int client = accept(server, 0, 0);
+        if (client < 0) continue;
+        char request[1024];
+        read(client, request, sizeof(request));
+        const char response[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n"
+            "Connection: close\r\n\r\nhealthy\n";
+        write(client, response, sizeof(response) - 1);
+        close(client);
+    }
+}
+"""
+
+
+def _prepare_compose_fixture(fixture: ExecutionPreflightFixture) -> None:
+    for worktree in fixture.worktree_paths:
+        output = worktree / ".dependencies/compose-fixture"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["gcc", "-static", "-Os", "-s", "-x", "c", "-o", str(output), "-"],
+            input=_COMPOSE_FIXTURE_SOURCE,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+
+
+def _http_body(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode("utf-8")
+
+
+def _docker_resource_names(kind: str, name: str) -> set[str]:
+    result = subprocess.run(
+        ["docker", kind, "inspect", name, "--format", "{{.Name}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.splitlines())
+
+
+def _compose_container_services(project_name: str) -> set[str]:
+    result = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+            "--format",
+            '{{.Label "com.docker.compose.service"}}',
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.splitlines()) - {""}
+
+
+def _execution_events(fixture: ExecutionPreflightFixture):
+    with SqliteStore.open(fixture.database) as store:
+        return store.list_execution_events(fixture.run_id)
 
 
 def _write_fake_package_manager(path: Path) -> None:

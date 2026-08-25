@@ -7,7 +7,7 @@ import os
 import shlex
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -53,6 +53,7 @@ class ComposeStack:
     task_id: UUID
     project_name: str
     network_name: str
+    network_names: tuple[str, ...]
     worktree: Path
     compose_files: tuple[Path, ...]
     profiles: tuple[str, ...]
@@ -108,7 +109,6 @@ class HostComposeManager:
         worktree = self._claimed_worktree(store, claim)
         files = self._worktree_compose_files(plan, worktree)
         project_name = compose_project_name(claim)
-        network_name = f"{project_name}_default"
         selected = tuple(
             dict.fromkeys(
                 service.compose_service
@@ -119,7 +119,20 @@ class HostComposeManager:
         if len(selected) != len(compose_services):
             raise ValueError("validated Compose services require exact service names")
 
-        environment = service_url_environment(plan.services)
+        try:
+            override, network_names = self._write_runtime_override(
+                project_name,
+                files,
+                plan.compose_profiles,
+                compose_services,
+                selected,
+                worktree,
+            )
+        except ComposeStackError as error:
+            self._block_task(store, claim, owner_token, str(error))
+            raise
+        files = (*files, override)
+        network_name = network_names[0]
         labels = {
             "betterborg.run_id": str(claim.run_id),
             "betterborg.claim_id": str(claim.id),
@@ -141,15 +154,18 @@ class HostComposeManager:
                 labels=labels,
                 created_at=created_at,
             ),
-            ComposeResource(
-                run_id=claim.run_id,
-                claim_id=claim.id,
-                task_id=claim.task_id,
-                project_name=project_name,
-                resource_type="network",
-                resource_name=network_name,
-                labels=labels,
-                created_at=created_at,
+            *(
+                ComposeResource(
+                    run_id=claim.run_id,
+                    claim_id=claim.id,
+                    task_id=claim.task_id,
+                    project_name=project_name,
+                    resource_type="network",
+                    resource_name=name,
+                    labels=labels,
+                    created_at=created_at,
+                )
+                for name in network_names
             ),
         )
         command = _compose_base(project_name, files, plan.compose_profiles) + (
@@ -157,6 +173,7 @@ class HostComposeManager:
             "--detach",
             "--wait",
             "--remove-orphans",
+            "--no-deps",
             *selected,
         )
         for resource in resources:
@@ -182,11 +199,12 @@ class HostComposeManager:
             task_id=claim.task_id,
             project_name=project_name,
             network_name=network_name,
+            network_names=network_names,
             worktree=worktree,
             compose_files=files,
             profiles=plan.compose_profiles,
             services=selected,
-            environment=environment,
+            environment={},
             resources=resources,
         )
         result = self._invoke(command, cwd=worktree)
@@ -202,6 +220,31 @@ class HostComposeManager:
                 command=command,
             )
 
+        try:
+            published_ports = self._published_ports(
+                project_name,
+                files,
+                plan.compose_profiles,
+                compose_services,
+                worktree,
+            )
+        except ComposeStackError as error:
+            self._block_task(store, claim, owner_token, str(error))
+            cleanup = self._stop_project(store, stack, command_owner=None)
+            message = str(error)
+            if cleanup.error is not None:
+                message = f"{message}; cleanup also failed: {cleanup.error}"
+            raise ComposeStackError(
+                message,
+                project_name=error.project_name,
+                command=error.command,
+            ) from error
+        environment = service_url_environment(
+            plan.services,
+            published_ports=published_ports,
+        )
+        stack = replace(stack, environment=environment)
+
         self._append_owned_event(
             store,
             claim,
@@ -212,11 +255,124 @@ class HostComposeManager:
             now=self._clock(),
             extra={
                 "network_name": network_name,
+                "network_names": list(network_names),
                 "services": list(selected),
                 "url_env_names": sorted(environment),
             },
         )
         return stack
+
+    def _write_runtime_override(
+        self,
+        project_name: str,
+        files: Sequence[Path],
+        profiles: Sequence[str],
+        compose_services: Sequence[HostService],
+        selected: Sequence[str],
+        worktree: Path,
+    ) -> tuple[Path, tuple[str, ...]]:
+        """Resolve topology and write a claim-local isolation override."""
+        config_command = _compose_base(project_name, files, profiles) + (
+            "config",
+            "--format",
+            "json",
+        )
+        result = self._invoke(config_command, cwd=worktree)
+        if result.returncode != 0:
+            raise ComposeStackError(
+                _command_error("Compose configuration could not be resolved", result),
+                project_name=project_name,
+                command=config_command,
+            )
+        try:
+            model = json.loads(result.stdout)
+            service_records = model["services"]
+            network_records = model.get("networks", {})
+            volume_records = model.get("volumes", {})
+            if not isinstance(service_records, Mapping):
+                raise TypeError
+            selected_records = {
+                name: service_records[name]
+                for name in selected
+                if isinstance(service_records.get(name), Mapping)
+            }
+            if len(selected_records) != len(selected):
+                raise KeyError
+            if any(record.get("network_mode") for record in selected_records.values()):
+                raise ValueError("host or service network_mode cannot be isolated")
+            if not isinstance(network_records, Mapping) or not isinstance(
+                volume_records, Mapping
+            ):
+                raise TypeError
+            # Compose creates every declared network even when --no-deps limits
+            # container startup, so every effective network must be claim-owned.
+            network_keys = tuple(str(key) for key in network_records) or ("default",)
+            volume_keys = tuple(str(key) for key in volume_records)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            detail = str(error) or "selected service topology is incomplete"
+            raise ComposeStackError(
+                f"Compose configuration cannot be isolated: {detail}",
+                project_name=project_name,
+                command=config_command,
+            ) from error
+
+        network_names = tuple(
+            _owned_resource_name(project_name, key) for key in network_keys
+        )
+        owned_networks = dict(zip(network_keys, network_names, strict=True))
+        owned_volumes = {
+            key: _owned_resource_name(project_name, f"volume-{key}")
+            for key in volume_keys
+        }
+        ports = _service_target_ports(compose_services)
+        override_text = _render_runtime_override(
+            selected,
+            ports,
+            owned_networks,
+            owned_volumes,
+        )
+        override_directory = self.repository_root / ".borg/state/compose" / project_name
+        override = override_directory / "compose.override.yml"
+        try:
+            override_directory.mkdir(parents=True, exist_ok=True)
+            override.write_text(override_text, encoding="utf-8")
+        except OSError as error:
+            raise ComposeStackError(
+                f"Compose isolation override could not be written: {error}",
+                project_name=project_name,
+                command=config_command,
+            ) from error
+        return override, network_names
+
+    def _published_ports(
+        self,
+        project_name: str,
+        files: Sequence[Path],
+        profiles: Sequence[str],
+        compose_services: Sequence[HostService],
+        worktree: Path,
+    ) -> dict[tuple[str, int], int]:
+        published: dict[tuple[str, int], int] = {}
+        for service_name, target in _service_target_ports(compose_services):
+            command = _compose_base(project_name, files, profiles) + (
+                "port",
+                service_name,
+                str(target),
+            )
+            result = self._invoke(command, cwd=worktree)
+            host_port = _parse_published_port(result.stdout)
+            if result.returncode != 0 or host_port is None:
+                raise ComposeStackError(
+                    _command_error(
+                        f"Compose published port for {service_name}:{target} "
+                        "could not be resolved",
+                        result,
+                    ),
+                    project_name=project_name,
+                    command=command,
+                )
+            published[(service_name, target)] = host_port
+        return published
 
     def stop_claimed_stack(
         self,
@@ -273,7 +429,7 @@ class HostComposeManager:
     ) -> ComposeCleanupResult:
         command = _compose_base(
             stack.project_name, stack.compose_files, stack.profiles
-        ) + ("down", "--volumes", "--remove-orphans")
+        ) + ("down", "--volumes", "--remove-orphans", "--rmi", "local")
         now = self._clock()
         if command_owner is None:
             store.append_execution_event(
@@ -446,16 +602,26 @@ def compose_project_name(claim: TaskClaim) -> str:
     )
 
 
-def service_url_environment(services: Sequence[HostService]) -> dict[str, str]:
+def service_url_environment(
+    services: Sequence[HostService],
+    *,
+    published_ports: Mapping[tuple[str, int], int] | None = None,
+) -> dict[str, str]:
     """Return only URL variables declared by the validated service plan."""
     environment: dict[str, str] = {}
     for service in services:
         if service.kind == "compose" and service.compose_service is not None:
             for env_name, port in service.url_targets:
+                published = (published_ports or {}).get(
+                    (service.compose_service, port)
+                )
+                if published is None:
+                    continue
                 environment[env_name] = _service_url(
                     env_name,
-                    service.compose_service,
-                    port,
+                    "127.0.0.1",
+                    published,
+                    target_port=port,
                 )
         if service.url_env is None:
             continue
@@ -465,15 +631,27 @@ def service_url_environment(services: Sequence[HostService]) -> dict[str, str]:
             if service.url is not None:
                 environment[service.url_env] = service.url
             elif service.port is not None and 0 < service.port <= 65535:
+                published = (published_ports or {}).get(
+                    (service.compose_service, service.port)
+                )
+                if published is None:
+                    continue
                 environment[service.url_env] = _service_url(
                     service.url_env,
-                    service.compose_service,
-                    service.port,
+                    "127.0.0.1",
+                    published,
+                    target_port=service.port,
                 )
     return environment
 
 
-def _service_url(env_name: str, service_name: str, port: int) -> str:
+def _service_url(
+    env_name: str,
+    service_name: str,
+    port: int,
+    *,
+    target_port: int | None = None,
+) -> str:
     key = f"{env_name} {service_name}".casefold()
     if "redis" in key:
         return f"redis://{service_name}:{port}/0"
@@ -483,9 +661,92 @@ def _service_url(env_name: str, service_name: str, port: int) -> str:
         return f"mysql://{service_name}:{port}/mysql"
     if "mongo" in key:
         return f"mongodb://{service_name}:{port}"
-    if "http" in key or port in {80, 3000, 8000, 8080}:
+    if "http" in key or target_port in {80, 3000, 8000, 8080}:
         return f"http://{service_name}:{port}"
     return f"tcp://{service_name}:{port}"
+
+
+def _service_target_ports(
+    services: Sequence[HostService],
+) -> tuple[tuple[str, int], ...]:
+    targets: list[tuple[str, int]] = []
+    for service in services:
+        if service.compose_service is None:
+            continue
+        targets.extend(
+            (service.compose_service, port) for _env_name, port in service.url_targets
+        )
+        if service.port is not None:
+            targets.append((service.compose_service, service.port))
+    return tuple(dict.fromkeys(targets))
+
+
+def _owned_resource_name(project_name: str, key: str) -> str:
+    return f"{project_name}_{key}"
+
+
+def _render_runtime_override(
+    services: Sequence[str],
+    ports: Sequence[tuple[str, int]],
+    networks: Mapping[str, str],
+    volumes: Mapping[str, str],
+) -> str:
+    by_service: dict[str, list[int]] = {name: [] for name in services}
+    for service, target in ports:
+        by_service[service].append(target)
+    lines = ["services:"]
+    for service in services:
+        lines.extend(
+            (
+                f"  {json.dumps(service)}:",
+                "    container_name: !reset null",
+            )
+        )
+        targets = tuple(dict.fromkeys(by_service[service]))
+        if not targets:
+            lines.append("    ports: !override []")
+            continue
+        lines.append("    ports: !override")
+        for target in targets:
+            lines.extend(
+                (
+                    f"      - target: {target}",
+                    '        published: "0"',
+                    '        host_ip: "0.0.0.0"',
+                    '        protocol: "tcp"',
+                )
+            )
+    if networks:
+        lines.append("networks:")
+        for key, name in networks.items():
+            lines.extend(
+                (
+                    f"  {json.dumps(key)}:",
+                    f"    name: {json.dumps(name)}",
+                    "    external: false",
+                )
+            )
+    if volumes:
+        lines.append("volumes:")
+        for key, name in volumes.items():
+            lines.extend(
+                (
+                    f"  {json.dumps(key)}:",
+                    f"    name: {json.dumps(name)}",
+                    "    external: false",
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _parse_published_port(output: str) -> int | None:
+    address = output.strip().splitlines()[0] if output.strip() else ""
+    _separator, _colon, port_text = address.rpartition(":")
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    return port if 0 < port <= 65535 else None
 
 
 def _compose_base(
@@ -542,6 +803,12 @@ def _stack_from_resources(
         task_id=first.task_id,
         project_name=first.project_name,
         network_name=network,
+        network_names=tuple(
+            resource.resource_name
+            for resource in resources
+            if resource.resource_type == "network"
+        )
+        or (network,),
         worktree=worktree,
         compose_files=files,
         profiles=profiles,

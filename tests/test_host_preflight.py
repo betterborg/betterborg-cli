@@ -175,7 +175,12 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     assert result.services[0].url_targets == (("DATABASE_URL", 5432),)
     assert result.services[1].url == "https://search.example.test/api"
     assert service_url_environment(result.services) == {
-        "DATABASE_URL": "postgres://postgres:5432/postgres",
+        "SEARCH_URL": "https://search.example.test/api",
+    }
+    assert service_url_environment(
+        result.services, published_ports={("postgres", 5432): 49152}
+    ) == {
+        "DATABASE_URL": "postgres://127.0.0.1:49152/postgres",
         "SEARCH_URL": "https://search.example.test/api",
     }
 
