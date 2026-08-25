@@ -616,6 +616,56 @@ def test_invalid_plan_contract_fails_before_tech_review(
         assert "expected number 01" in plan_attempt.summary
 
 
+def test_revalidates_a_durable_completed_plan_before_resuming(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    adapter = MockAdapter(name="openai")
+    database = committed_git_repo.parent / "architect-invalid-completed-plan.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, draft = persist_planning_context(
+            committed_git_repo, store, "invalid-completed-plan"
+        )
+        working = store.compare_and_set_borg_state(
+            draft.id,
+            expected_state=BorgState.DRAFT,
+            expected_version=0,
+            new_state=BorgState.ARCHITECT_WORKING,
+        )
+        attempt = PlanningAttempt(
+            borg_id=working.id,
+            phase="architect_plan",
+            round=1,
+            adapter="openai",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=invalid_plan,
+            summary=str(invalid_plan["title"]),
+        )
+
+        with pytest.raises(
+            ArchitectError,
+            match="Stored Architect plan failed deterministic validation",
+        ):
+            ArchitectLoop(
+                repository,
+                working,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert store.get_borg(working.id).state is BorgState.ARCHITECT_WORKING
+        assert len(adapter.calls) == 0
+
+
 def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:
     return InteractiveIO(
         prompt=lambda _message: next(answers, None),

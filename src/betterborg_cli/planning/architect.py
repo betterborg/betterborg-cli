@@ -629,7 +629,7 @@ class ArchitectLoop:
         )
 
     def _completed_plan(self) -> PlanningAttempt | None:
-        return next(
+        completed = next(
             (
                 item
                 for item in reversed(self._phase_attempts(_PLAN_PHASE))
@@ -638,6 +638,16 @@ class ArchitectLoop:
             ),
             None,
         )
+        if completed is None:
+            return None
+        try:
+            validate_plan(completed.result or {}, self.repository.root)
+        except PlanValidationError as error:
+            raise ArchitectError(
+                "Stored Architect plan failed deterministic validation: "
+                f"{error}"
+            ) from error
+        return completed
 
     def _latest_ambiguous_plan(self) -> PlanningAttempt | None:
         return next(

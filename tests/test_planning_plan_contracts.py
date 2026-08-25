@@ -115,6 +115,42 @@ def test_accepts_grounded_existing_and_new_paths(repository: Path) -> None:
             lambda plan: plan.update({"open_questions": ["Which platform?"]}),
             "open_questions",
         ),
+        (lambda plan: plan.update({"title": " \t"}), "title"),
+        (lambda plan: plan.update({"summary": "\n"}), "summary"),
+        (
+            lambda plan: plan.update({"overall_approach": " \n"}),
+            "overall_approach",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"title": " "}),
+            r"phases\[0\]\.title",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"goal": "\t"}),
+            r"phases\[0\]\.goal",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"technical_approach": "\n"}),
+            r"phases\[0\]\.technical_approach",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"test_strategy": " "}),
+            r"phases\[0\]\.test_strategy",
+        ),
+        (
+            lambda plan: plan["phases"][0].update(
+                {"acceptance_criteria": [" "]}
+            ),
+            r"acceptance_criteria\[0\]",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"deliverables": ["\t"]}),
+            r"deliverables\[0\]",
+        ),
+        (
+            lambda plan: plan.update({"open_questions": [" \n"]}),
+            r"open_questions\[0\]",
+        ),
     ],
 )
 def test_rejects_incomplete_plans(repository: Path, mutate, message: str) -> None:
@@ -158,6 +194,42 @@ def test_renders_portable_plan_markdown() -> None:
     assert "## Code pointers\n\n- `README.md` \u2014 Repository overview." in markdown
     assert markdown.endswith("\n")
     assert not markdown.endswith("\n\n")
+
+
+def test_renderer_flattens_and_escapes_model_controlled_markdown() -> None:
+    plan = _plan()
+    plan["title"] = "Release\n## Forged heading"
+    plan["summary"] = "Summary\n- forged item\x1b"
+    plan["phases"][0].update(
+        {
+            "title": "Use *safe* output",
+            "goal": "Goal\n# forged goal",
+            "files_touched": [
+                {
+                    "path": "docs/`release`.md",
+                    "role": "new",
+                    "description": "Docs\n- forged file",
+                }
+            ],
+            "acceptance_criteria": ["Works\n## forged criterion"],
+        }
+    )
+    plan["code_pointers"] = [
+        {"path": "docs/`guide`.md", "why": "Guide\n# forged pointer"}
+    ]
+
+    markdown = render_plan_markdown(plan)
+
+    assert markdown.startswith("# Release \\#\\# Forged heading\n\n")
+    assert "Summary - forged item" in markdown
+    assert "Use \\*safe\\* output" in markdown
+    assert "Goal \\# forged goal" in markdown
+    assert "- ``docs/`release`.md`` (new) — Docs - forged file" in markdown
+    assert "- ``docs/`guide`.md`` — Guide \\# forged pointer" in markdown
+    assert "Works \\#\\# forged criterion" in markdown
+    assert "\x1b" not in markdown
+    assert "\n## Forged heading" not in markdown
+    assert "\n# forged" not in markdown
 
 
 def test_renderer_tolerates_partial_legacy_plans() -> None:

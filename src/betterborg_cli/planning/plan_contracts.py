@@ -12,6 +12,10 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.repo_analysis.text_rendering import (
+    markdown_code_span,
+    markdown_text,
+)
 
 
 class PlanValidationError(ValueError):
@@ -48,6 +52,8 @@ def validate_plan(plan: Mapping[str, Any], repository_root: Path) -> None:
         validate_structured_result(plan, ARCHITECT_PLAN_SCHEMA)
     except StructuredResultError as error:
         raise PlanValidationError(f"plan does not match its schema: {error}") from error
+
+    _validate_completeness(plan)
 
     root = Path(repository_root).resolve()
     if not root.is_dir():
@@ -91,10 +97,67 @@ def validate_plan(plan: Mapping[str, Any], repository_root: Path) -> None:
     for pointer in plan.get("code_pointers", []):
         _validate_existing_path(root, pointer["path"], field="code pointer")
 
-    if _nonempty_strings(plan.get("open_questions")):
+    if plan.get("open_questions"):
         raise PlanValidationError(
             "plan is incomplete while open_questions remain unanswered"
         )
+
+
+def _validate_completeness(plan: Mapping[str, Any]) -> None:
+    """Reject schema-shaped values that contain no semantic content."""
+    for field in ("title", "summary", "overall_approach"):
+        _require_nonblank(plan[field], field)
+    _require_nonblank_items(plan.get("risks", []), "risks")
+    _require_nonblank_items(plan.get("open_questions", []), "open_questions")
+
+    for index, repository in enumerate(plan.get("repositories", [])):
+        _require_nonblank(repository["id"], f"repositories[{index}].id")
+
+    for phase_index, phase in enumerate(plan["phases"]):
+        prefix = f"phases[{phase_index}]"
+        for field in (
+            "name",
+            "title",
+            "goal",
+            "technical_approach",
+            "test_strategy",
+        ):
+            _require_nonblank(phase[field], f"{prefix}.{field}")
+        for field in (
+            "repositories",
+            "acceptance_criteria",
+            "dependencies_on",
+            "deliverables",
+            "constraints",
+            "risks",
+        ):
+            _require_nonblank_items(phase.get(field, []), f"{prefix}.{field}")
+
+        for file_index, entry in enumerate(phase["files_touched"]):
+            file_prefix = f"{prefix}.files_touched[{file_index}]"
+            _require_nonblank(entry["path"], f"{file_prefix}.path")
+            if "repo" in entry:
+                _require_nonblank(entry["repo"], f"{file_prefix}.repo")
+        for contract_index, contract in enumerate(phase.get("contracts", [])):
+            contract_prefix = f"{prefix}.contracts[{contract_index}]"
+            _require_nonblank(contract["spec"], f"{contract_prefix}.spec")
+            if "repo" in contract:
+                _require_nonblank(contract["repo"], f"{contract_prefix}.repo")
+
+    for index, pointer in enumerate(plan.get("code_pointers", [])):
+        prefix = f"code_pointers[{index}]"
+        _require_nonblank(pointer["path"], f"{prefix}.path")
+        _require_nonblank(pointer["why"], f"{prefix}.why")
+
+
+def _require_nonblank(value: str, field: str) -> None:
+    if not value.strip():
+        raise PlanValidationError(f"plan field {field} must not be blank")
+
+
+def _require_nonblank_items(values: Sequence[str], field: str) -> None:
+    for index, value in enumerate(values):
+        _require_nonblank(value, f"{field}[{index}]")
 
 
 def _validate_planned_path(root: Path, raw_path: str, role: str, *, phase: str) -> None:
@@ -148,13 +211,14 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
 
     title = _string(plan.get("title"))
     if title:
-        add(f"# {title}")
-    add(_string(plan.get("summary")))
+        add(f"# {markdown_text(title)}")
+    summary = _string(plan.get("summary"))
+    add(markdown_text(summary) if summary else "")
 
     approach = _string(plan.get("overall_approach"))
     if approach:
         add("## Overall approach")
-        add(approach)
+        add(markdown_text(approach))
 
     phases = plan.get("phases")
     if isinstance(phases, list) and phases:
@@ -172,7 +236,10 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
             if not path:
                 continue
             why = _string(pointer.get("why"))
-            pointer_lines.append(f"- `{path}` — {why}" if why else f"- `{path}`")
+            label = markdown_code_span(path)
+            pointer_lines.append(
+                f"- {label} — {markdown_text(why)}" if why else f"- {label}"
+            )
     if pointer_lines:
         add("## Code pointers")
         add("\n".join(pointer_lines))
@@ -188,15 +255,18 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
     blocks: list[str] = []
     name = _string(phase.get("name"))
     title = _string(phase.get("title"))
-    heading = " — ".join(item for item in (name, title) if item) or f"Phase {index}"
+    heading = (
+        " — ".join(markdown_text(item) for item in (name, title) if item)
+        or f"Phase {index}"
+    )
     blocks.append(f"### {heading}")
 
     goal = _string(phase.get("goal"))
     if goal:
-        blocks.append(f"**Goal:** {goal}")
+        blocks.append(f"**Goal:** {markdown_text(goal)}")
     approach = _string(phase.get("technical_approach"))
     if approach:
-        blocks.append(f"**Technical approach:** {approach}")
+        blocks.append(f"**Technical approach:** {markdown_text(approach)}")
 
     file_lines: list[str] = []
     files = phase.get("files_touched")
@@ -207,13 +277,13 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
             path = _string(entry.get("path"))
             if not path:
                 continue
-            label = f"`{path}`"
+            label = markdown_code_span(path)
             role = _string(entry.get("role"))
             description = _string(entry.get("description"))
             if role:
-                label += f" ({role})"
+                label += f" ({markdown_text(role)})"
             if description:
-                label += f" — {description}"
+                label += f" — {markdown_text(description)}"
             file_lines.append(f"- {label}")
     if file_lines:
         blocks.append("**Files touched:**\n" + "\n".join(file_lines))
@@ -228,13 +298,18 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
             if not spec:
                 continue
             kind = _string(contract.get("kind"))
-            contract_lines.append(f"- _{kind}_ — {spec}" if kind else f"- {spec}")
+            rendered_spec = markdown_text(spec)
+            contract_lines.append(
+                f"- _{markdown_text(kind)}_ — {rendered_spec}"
+                if kind
+                else f"- {rendered_spec}"
+            )
     if contract_lines:
         blocks.append("**Contracts:**\n" + "\n".join(contract_lines))
 
     strategy = _string(phase.get("test_strategy"))
     if strategy:
-        blocks.append(f"**Test strategy:** {strategy}")
+        blocks.append(f"**Test strategy:** {markdown_text(strategy)}")
     for label, key in (
         ("Acceptance criteria", "acceptance_criteria"),
         ("Deliverables", "deliverables"),
@@ -244,7 +319,10 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
     ):
         items = _nonempty_strings(phase.get(key))
         if items:
-            blocks.append(f"**{label}:**\n" + "\n".join(f"- {item}" for item in items))
+            blocks.append(
+                f"**{label}:**\n"
+                + "\n".join(f"- {markdown_text(item)}" for item in items)
+            )
     return blocks
 
 
@@ -252,7 +330,7 @@ def _add_string_list(add, heading: str, value: Any) -> None:
     items = _nonempty_strings(value)
     if items:
         add(heading)
-        add("\n".join(f"- {item}" for item in items))
+        add("\n".join(f"- {markdown_text(item)}" for item in items))
 
 
 def _string(value: Any) -> str:
