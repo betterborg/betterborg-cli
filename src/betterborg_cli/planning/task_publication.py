@@ -188,7 +188,10 @@ class TaskPublisher:
         return borg
 
     def _require_approved_handoff(self, borg: Borg, generation: TaskGeneration) -> None:
-        if borg.state is not BorgState.READY_TO_EXECUTE:
+        if borg.state not in {
+            BorgState.SUPERVISOR_WORKING,
+            BorgState.READY_TO_EXECUTE,
+        }:
             raise TaskPublicationError(
                 "only a Supervisor-approved task generation can be published"
             )
@@ -200,7 +203,10 @@ class TaskPublisher:
     def _has_approved_handoff(
         self, borg: Borg, generation: TaskGeneration
     ) -> bool:
-        if borg.state is not BorgState.READY_TO_EXECUTE:
+        if borg.state not in {
+            BorgState.SUPERVISOR_WORKING,
+            BorgState.READY_TO_EXECUTE,
+        }:
             return False
         return any(
             attempt.phase == "supervisor_review"

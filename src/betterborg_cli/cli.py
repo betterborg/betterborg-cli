@@ -432,9 +432,11 @@ def approve_plan(repository_path: Path, name: str) -> None:
 
             publication = None
             if borg.state is BorgState.READY_TO_EXECUTE:
-                publication = TaskPublisher(repository, store).current_task_files(
-                    borg.id
-                )
+                publication = TaskPublisher(repository, store).reconcile(borg.id)
+                if publication is None:
+                    raise RuntimeError(
+                        f"Borg {name!r} is ready to execute but has no current tasks"
+                    )
             elif borg.state is not BorgState.BLOCKED:
                 raise RuntimeError(
                     f"decomposition stopped in unexpected state {borg.state.value!r}"

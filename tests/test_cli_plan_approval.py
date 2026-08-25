@@ -13,6 +13,7 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import (
+    TaskPublisher,
     approved_plan_digest,
     build_plan_element_catalog,
 )
@@ -251,6 +252,76 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
+
+
+def test_plan_approve_resumes_publication_before_becoming_ready(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    configure_interactive_cli,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo, persist_planning_context, "resume-publication", plan
+    )
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
+    adapter.queue(MockResponse(payload=_review("approve")))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".resume-publication-state",
+    )
+    original_checkpoint = TaskPublisher._checkpoint
+
+    def interrupt_before_commit(self, point: str) -> None:
+        if point == "before_db_commit":
+            raise RuntimeError("publication interrupted before commit")
+        original_checkpoint(self, point)
+
+    monkeypatch.setattr(TaskPublisher, "_checkpoint", interrupt_before_commit)
+    interrupted = cli_runner.invoke(
+        cli, ["plan", "approve", "resume-publication", "--yes"]
+    )
+
+    assert interrupted.exit_code == 1
+    assert "borg plan approve resume-publication" in interrupted.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "resume-publication")
+        assert borg is not None
+        assert borg.state is BorgState.SUPERVISOR_WORKING
+        assert store.get_current_task_generation(borg.id) is None
+        generations = store.list_task_generations(borg.id)
+        assert len(generations) == 1
+        assert generations[0].status is TaskGenerationStatus.PREPARING
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
+
+    monkeypatch.setattr(TaskPublisher, "_checkpoint", original_checkpoint)
+    resumed = cli_runner.invoke(
+        cli, ["plan", "approve", "resume-publication", "--yes"]
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "ready to execute" in resumed.output
+    assert len(adapter.calls) == 2
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "resume-publication")
+        assert borg is not None
+        assert borg.state is BorgState.READY_TO_EXECUTE
+        current = store.get_current_task_generation(borg.id)
+        assert current is not None
+        assert current.status is TaskGenerationStatus.CURRENT
+        assert len(store.list_task_generations(borg.id)) == 1
         assert len(store.list_plan_approvals(borg.id)) == 1
         assert len(store.list_task_batches(borg.id)) == 1
 
