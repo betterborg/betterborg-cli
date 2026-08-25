@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -941,15 +943,47 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_task_generation(row) for row in rows]
 
-    def promote_task_generation(
-        self, generation_id: UUID, *, durable_digest: str | None = None
+    def _promote_published_task_generation(
+        self, generation_id: UUID, *, durable_root: Path
     ) -> TaskGeneration:
-        """Atomically make a durably published preparing generation current.
+        """Commit publication after ``TaskPublisher`` crosses its durable seam.
 
-        The caller must supply the digest it verified after filesystem rename and
-        destination-parent fsync. This keeps ordinary store callers from making a
-        preparing-only generation executable without crossing that boundary.
+        This is deliberately not a public store operation: a digest already held
+        in SQLite cannot prove publication. The store independently verifies and
+        fsyncs the final tree before opening the current-generation transaction;
+        ``TaskPublisher`` remains the sole production caller and has already
+        crossed the stricter stage-and-rename boundaries when it invokes this.
         """
+        generation = self.get_task_generation(generation_id)
+        if generation is None:
+            raise KeyError(f"task generation {generation_id} not found")
+        borg = self.get_borg(generation.borg_id)
+        if borg is None:
+            raise ValueError("task generation Borg not found")
+        repository = self.get_repository(borg.repository_id)
+        if repository is None:
+            raise ValueError("task generation repository not found")
+        expected_root = (
+            repository.root / ".borg" / "tasks" / borg.name / str(generation.id)
+        )
+        if durable_root != expected_root:
+            raise ValueError("durable task generation path does not match SQLite")
+        records = self.list_task_records(generation.id)
+        if not records:
+            raise ValueError("durable task generation has no task records")
+        expected_files = {
+            Path(record.stage) / f"{record.stem}.md": record.digest
+            for record in records
+        }
+        if len(expected_files) != len(records) or any(
+            relative.is_absolute() or ".." in relative.parts
+            for relative in expected_files
+        ):
+            raise ValueError("durable task generation contains an unsafe path")
+        _verify_and_fsync_task_tree(
+            repository.root, durable_root, expected_files
+        )
+
         promoted_at = utcnow()
         with self.transaction() as connection:
             row = connection.execute(
@@ -958,10 +992,6 @@ class SqliteStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"task generation {generation_id} not found")
-            if durable_digest != row["digest"]:
-                raise ValueError(
-                    "task generation requires matching durable publication proof"
-                )
             if row["status"] != TaskGenerationStatus.PREPARING.value:
                 raise ValueError("only a preparing task generation can become current")
             connection.execute(
@@ -1368,6 +1398,72 @@ def _row_to_task_finding(row: sqlite3.Row) -> TaskFinding:
         task_ref=row["task_ref"],
         created_at=datetime.fromisoformat(row["created_at"]),
     )
+
+
+def _verify_and_fsync_task_tree(
+    repository_root: Path,
+    durable_root: Path,
+    expected_files: dict[Path, str],
+) -> None:
+    candidate = repository_root
+    for component in durable_root.relative_to(repository_root).parts:
+        candidate /= component
+        if candidate.is_symlink():
+            raise ValueError(f"durable task publication path is a symlink: {candidate}")
+    if not durable_root.is_dir():
+        raise ValueError("durable task generation tree is missing")
+
+    actual_files: set[Path] = set()
+    actual_directories: set[Path] = set()
+    for path in durable_root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"durable task generation contains a symlink: {path}")
+        relative = path.relative_to(durable_root)
+        if path.is_file():
+            actual_files.add(relative)
+        elif path.is_dir():
+            actual_directories.add(relative)
+        else:
+            raise ValueError(f"durable task generation contains a non-file: {path}")
+    expected_directories = {
+        parent
+        for relative in expected_files
+        for parent in relative.parents
+        if parent != Path(".")
+    }
+    if (
+        actual_files != set(expected_files)
+        or actual_directories != expected_directories
+    ):
+        raise ValueError("durable task generation layout does not match SQLite")
+
+    for relative, expected_digest in expected_files.items():
+        path = durable_root / relative
+        with path.open("rb") as task_file:
+            body = task_file.read()
+            actual_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+            if actual_digest != expected_digest:
+                raise ValueError(
+                    f"durable task file {relative.as_posix()} digest does not "
+                    "match SQLite"
+                )
+            os.fsync(task_file.fileno())
+    for directory in sorted(
+        (durable_root / relative for relative in expected_directories),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        _fsync_store_directory(directory)
+    _fsync_store_directory(durable_root)
+    _fsync_store_directory(durable_root.parent)
+
+
+def _fsync_store_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _row_to_task_generation(row: sqlite3.Row) -> TaskGeneration:

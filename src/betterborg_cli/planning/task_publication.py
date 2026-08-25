@@ -129,8 +129,8 @@ class TaskPublisher:
         self._require_git_trackable(publication.files)
         self._checkpoint("before_db_commit")
         try:
-            generation = self.store.promote_task_generation(
-                generation.id, durable_digest=generation.digest
+            generation = self.store._promote_published_task_generation(
+                generation.id, durable_root=destination
             )
         except (KeyError, ValueError) as error:
             raise TaskPublicationError(str(error)) from error
@@ -154,10 +154,22 @@ class TaskPublisher:
         return publication
 
     def reconcile(self, borg_id: UUID) -> TaskPublication | None:
-        """Verify the current generation, then clean noncurrent managed trees."""
+        """Resume approved publication before cleaning noncurrent managed trees."""
         borg = self.store.get_borg(borg_id)
         if borg is None:
             raise TaskPublicationError(f"Borg {borg_id} not found")
+        approved_preparing = [
+            generation
+            for generation in self.store.list_task_generations(borg_id)
+            if generation.status is TaskGenerationStatus.PREPARING
+            and self._has_approved_handoff(borg, generation)
+        ]
+        if len(approved_preparing) > 1:
+            raise TaskPublicationError(
+                f"Borg {borg.name!r} has multiple approved preparing generations"
+            )
+        if approved_preparing:
+            return self.publish(approved_preparing[0].id)
         current = self.store.get_current_task_generation(borg_id)
         if current is None:
             return None
@@ -180,7 +192,17 @@ class TaskPublisher:
             raise TaskPublicationError(
                 "only a Supervisor-approved task generation can be published"
             )
-        approved = any(
+        if not self._has_approved_handoff(borg, generation):
+            raise TaskPublicationError(
+                "task generation has no completed Supervisor approval"
+            )
+
+    def _has_approved_handoff(
+        self, borg: Borg, generation: TaskGeneration
+    ) -> bool:
+        if borg.state is not BorgState.TASKS_APPROVAL_PENDING:
+            return False
+        return any(
             attempt.phase == "supervisor_review"
             and attempt.status is PlanningAttemptStatus.COMPLETED
             and (attempt.result or {}).get("decision") == "approve"
@@ -188,10 +210,6 @@ class TaskPublisher:
             and attempt.request.get("batch_id") == str(generation.batch_id)
             for attempt in self.store.list_planning_attempts(borg.id)
         )
-        if not approved:
-            raise TaskPublicationError(
-                "task generation has no completed Supervisor approval"
-            )
 
     def _expected_files(
         self, borg: Borg, generation: TaskGeneration

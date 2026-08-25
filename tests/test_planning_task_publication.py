@@ -281,8 +281,9 @@ def test_reopens_and_resumes_every_publication_boundary(
             assert current == prior_current
 
     with SqliteStore.open(database) as reopened:
-        resumed = TaskPublisher(repository, reopened).publish(replacement.id)
+        resumed = TaskPublisher(repository, reopened).reconcile(borg.id)
 
+        assert resumed is not None
         assert resumed.generation.status is TaskGenerationStatus.CURRENT
         assert reopened.get_current_task_generation(borg.id) == resumed.generation
         assert [item.task.stem for item in resumed.files] == ["02-replacement"]
@@ -296,3 +297,34 @@ def test_reopens_and_resumes_every_publication_boundary(
         assert reopened.get_task_generation(prior.id).status is (
             TaskGenerationStatus.SUPERSEDED
         )
+
+
+def test_reconcile_resumes_interrupted_first_publication(
+    committed_git_repo: Path,
+) -> None:
+    database = committed_git_repo.parent / "reconcile-first.sqlite3"
+    repository, borg, approval = _publication_context(committed_git_repo, database)
+    with SqliteStore.open(database) as store:
+        generation = _add_approved_generation(
+            store, borg, approval, stem="01-first", round_number=1
+        )
+
+        def fail_after_rename(point: str) -> None:
+            if point == "after_rename":
+                raise InjectedPublicationFailure(point)
+
+        with pytest.raises(InjectedPublicationFailure, match="after_rename"):
+            TaskPublisher(
+                repository, store, failure_injector=fail_after_rename
+            ).publish(generation.id)
+
+        assert store.get_current_task_generation(borg.id) is None
+
+    with SqliteStore.open(database) as reopened:
+        resumed = TaskPublisher(repository, reopened).reconcile(borg.id)
+
+        assert resumed is not None
+        assert resumed.generation.id == generation.id
+        assert resumed.generation.status is TaskGenerationStatus.CURRENT
+        assert reopened.get_current_task_generation(borg.id) == resumed.generation
+        assert [item.task.stem for item in resumed.files] == ["01-first"]
