@@ -8,11 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
-    AgentRunSpec,
-    AgentStatus,
     CancellationToken,
 )
 from betterborg_cli.agent_runtime.selection import (
@@ -20,12 +17,11 @@ from betterborg_cli.agent_runtime.selection import (
     SelectedAgent,
     resolve_agent_model,
 )
-from betterborg_cli.agent_runtime.structured import (
-    StructuredResultError,
-    validate_structured_result,
+from betterborg_cli.planning.plan_contracts import PlanValidationError
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    require_read_only_agent,
 )
-from betterborg_cli.planning.plan_contracts import PlanValidationError, validate_plan
-from betterborg_cli.planning.worktree import materialize_planning_worktree
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -234,24 +230,9 @@ class ArchitectLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
-        if store.get_repository(repository.id) != repository:
-            raise ValueError("repository must already be present in the supplied store")
-        if borg.repository_id != repository.id or store.get_borg(borg.id) != borg:
-            raise ValueError(
-                "Borg must already belong to the supplied repository and store"
-            )
-        if not (
-            agent.capabilities.tool_allowlist
-            or agent.capabilities.read_only_sandbox
-        ):
-            raise ArchitectError(
-                f"adapter {agent.name!r} cannot enforce the Architect "
-                "read-only execution boundary"
-            )
-        if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
-            raise ArchitectError(
-                f"host-capable adapter {agent.name!r} must be wrapped by SelectedAgent"
-            )
+        require_read_only_agent(
+            agent, role="Architect", error_factory=ArchitectError
+        )
         try:
             resolved_model = resolve_agent_model(agent, model)
         except AgentSelectionError as error:
@@ -272,10 +253,24 @@ class ArchitectLoop:
         self.cancel = cancel
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
+        self._turns = DurablePlanningTurns(
+            repository,
+            borg,
+            store,
+            agent,
+            role="Architect",
+            model=resolved_model,
+            artifact_dir=self.artifact_dir,
+            error_factory=ArchitectError,
+            cancelled_error_factory=ArchitectCancelled,
+            cancel=cancel,
+            dirty_borg_documents=dirty_borg_documents,
+            worktrees_root=worktrees_root,
+        )
 
     def run(self) -> ArchitectResult:
         """Continue from durable history until a plan is ready for Tech Lead review."""
-        borg = self._current_borg()
+        borg = self._turns.current_borg()
         completed_plan = self._completed_plan()
         if completed_plan is not None:
             return ArchitectResult(
@@ -283,7 +278,7 @@ class ArchitectLoop:
             )
 
         if borg.state is BorgState.DRAFT:
-            borg = self._transition(borg, BorgState.ARCHITECT_WORKING)
+            borg = self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
         elif borg.state not in {
             BorgState.ARCHITECT_WORKING,
             BorgState.ARCHITECT_AWAITING_ANSWERS,
@@ -301,7 +296,7 @@ class ArchitectLoop:
             if self.cancel is not None and self.cancel.is_set():
                 raise ArchitectCancelled("Architect run cancelled")
 
-            question_attempts = self._phase_attempts(_QUESTIONS_PHASE)
+            question_attempts = self._turns.attempts(_QUESTIONS_PHASE)
             completed_questions = [
                 attempt
                 for attempt in question_attempts
@@ -319,7 +314,7 @@ class ArchitectLoop:
             question_round = len(completed_questions) + 1
             attempt, payload = self._run_turn(
                 phase=_QUESTIONS_PHASE,
-                round_number=self._next_attempt_round(_QUESTIONS_PHASE),
+                round_number=self._turns.next_round(_QUESTIONS_PHASE),
                 schema=ARCHITECT_QUESTIONS_SCHEMA,
                 system_prompt=_QUESTIONS_SYSTEM_PROMPT,
                 user_prompt=(
@@ -358,7 +353,7 @@ class ArchitectLoop:
             completed = self._completed_plan()
             if completed is not None:
                 return ArchitectResult(
-                    borg=self._current_borg(),
+                    borg=self._turns.current_borg(),
                     plan=completed.result or {},
                     attempt=completed,
                 )
@@ -369,7 +364,7 @@ class ArchitectLoop:
             )
             attempt, payload = self._run_turn(
                 phase=_PLAN_PHASE,
-                round_number=self._next_attempt_round(_PLAN_PHASE),
+                round_number=self._turns.next_round(_PLAN_PHASE),
                 schema=ARCHITECT_PLAN_SCHEMA,
                 system_prompt=_PLAN_SYSTEM_PROMPT,
                 user_prompt=(
@@ -392,7 +387,7 @@ class ArchitectLoop:
                 ),
             )
             open_questions = self._plan_open_questions(payload)
-            borg = self._current_borg()
+            borg = self._turns.current_borg()
             if open_questions:
                 question = PlanningQuestion(
                     borg_id=self.borg_id,
@@ -429,7 +424,7 @@ class ArchitectLoop:
                     result=payload,
                     summary=str(payload["title"]),
                 )
-                borg = self._transition(borg, BorgState.TECH_REVIEW_WORKING)
+                borg = self._turns.transition(borg, BorgState.TECH_REVIEW_WORKING)
             return ArchitectResult(borg=borg, plan=payload, attempt=completed)
 
     def _run_turn(
@@ -442,136 +437,14 @@ class ArchitectLoop:
         user_prompt: str,
         current_plan: str | None = None,
     ) -> tuple[PlanningAttempt, dict[str, Any]]:
-        running = next(
-            (
-                item
-                for item in reversed(self._phase_attempts(phase))
-                if item.status is PlanningAttemptStatus.RUNNING
-            ),
-            None,
+        return self._turns.run(
+            phase=phase,
+            round_number=round_number,
+            schema=schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            current_plan=current_plan,
         )
-        if running is not None:
-            recovered = self._recover_payload(running, schema)
-            if recovered is not None:
-                return running, recovered
-            refreshed = next(
-                item
-                for item in self._phase_attempts(phase)
-                if item.id == running.id
-            )
-            if refreshed.status is not PlanningAttemptStatus.RUNNING:
-                return self._run_turn(
-                    phase=phase,
-                    round_number=refreshed.round + 1,
-                    schema=schema,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    current_plan=current_plan,
-                )
-            attempt = running
-        else:
-            attempt = PlanningAttempt(
-                borg_id=self.borg_id,
-                phase=phase,
-                round=round_number,
-                adapter=self.agent.name,
-                model=self.model,
-                request={"result_path": "pending"},
-            )
-            result_path = self._result_path(attempt)
-            attempt = PlanningAttempt(
-                id=attempt.id,
-                borg_id=attempt.borg_id,
-                phase=attempt.phase,
-                round=attempt.round,
-                adapter=attempt.adapter,
-                model=attempt.model,
-                request={"result_path": str(result_path)},
-                started_at=attempt.started_at,
-            )
-            self.store.append_planning_attempt(attempt)
-
-        result_path = self._result_path(attempt)
-        log_path = result_path.with_suffix(".log")
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with materialize_planning_worktree(
-                self.repository,
-                self._current_borg(),
-                self.store,
-                current_plan=current_plan,
-                dirty_borg_documents=self.dirty_borg_documents,
-                worktrees_root=self.worktrees_root,
-            ) as worktree:
-                spec = AgentRunSpec(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    schema=schema,
-                    cwd=worktree,
-                    model=self.model,
-                    allowed_tools=READ_ONLY_API_TOOLS,
-                    log_path=log_path,
-                    result_path=result_path,
-                )
-                result = self.agent.run(spec, cancel=self.cancel)
-        except Exception as error:
-            raise ArchitectError(f"Architect {phase} turn crashed: {error}") from error
-
-        if result.status is AgentStatus.CANCELLED:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.CANCELLED,
-                summary=result.error,
-            )
-            raise ArchitectCancelled(result.error or "Architect run cancelled")
-        if result.status is not AgentStatus.COMPLETED or result.payload is None:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.FAILED,
-                result=result.payload,
-                summary=result.error,
-            )
-            raise ArchitectError(
-                result.error or f"Architect {phase} returned {result.status.value}"
-            )
-        try:
-            validate_structured_result(result.payload, schema)
-        except StructuredResultError as error:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.FAILED,
-                result=result.payload,
-                summary=f"invalid structured result: {error}",
-            )
-            raise ArchitectError(
-                f"Architect {phase} returned an invalid structured result: {error}"
-            ) from error
-        return attempt, result.payload
-
-    def _recover_payload(
-        self, attempt: PlanningAttempt, schema: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        result_path = self._result_path(attempt)
-        try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-            validate_structured_result(payload, schema)
-        except FileNotFoundError:
-            return None
-        except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-            StructuredResultError,
-        ) as error:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.FAILED,
-                summary=f"unusable interrupted result: {error}",
-            )
-            return None
-        if not isinstance(payload, dict):
-            return None
-        return payload
 
     def _store_question_turn(
         self,
@@ -588,7 +461,9 @@ class ArchitectLoop:
                 summary=f"asked {len(question.questions)} product question(s)",
             )
             self.store.append_planning_question(question)
-            return self._transition(borg, BorgState.ARCHITECT_AWAITING_ANSWERS)
+            return self._turns.transition(
+                borg, BorgState.ARCHITECT_AWAITING_ANSWERS
+            )
 
     def _store_plan_question_turn(
         self,
@@ -605,7 +480,9 @@ class ArchitectLoop:
                 summary=f"plan has {len(question.questions)} open question(s)",
             )
             self.store.append_planning_question(question)
-            return self._transition(borg, BorgState.ARCHITECT_AWAITING_ANSWERS)
+            return self._turns.transition(
+                borg, BorgState.ARCHITECT_AWAITING_ANSWERS
+            )
 
     def _answer_question_round(self, borg: Borg, question: PlanningQuestion) -> Borg:
         answers: list[dict[str, object]] = []
@@ -626,7 +503,7 @@ class ArchitectLoop:
 
         with self.store.transaction():
             self.store.answer_planning_question(question.id, answers)
-            return self._transition(borg, BorgState.ARCHITECT_WORKING)
+            return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
 
     def _complete_attempt(
         self, attempt: PlanningAttempt, payload: dict[str, Any], summary: str
@@ -675,20 +552,13 @@ class ArchitectLoop:
 
     def _validate_plan_in_snapshot(self, plan: dict[str, Any]) -> None:
         """Validate against the same committed-only view exposed to Architect."""
-        with materialize_planning_worktree(
-            self.repository,
-            self._current_borg(),
-            self.store,
-            dirty_borg_documents=self.dirty_borg_documents,
-            worktrees_root=self.worktrees_root,
-        ) as worktree:
-            validate_plan(plan, worktree)
+        self._turns.validate_plan(plan)
 
     def _latest_plan(self) -> PlanningAttempt | None:
         return next(
             (
                 item
-                for item in reversed(self._phase_attempts(_PLAN_PHASE))
+                for item in reversed(self._turns.attempts(_PLAN_PHASE))
                 if item.status is PlanningAttemptStatus.COMPLETED
                 and item.result is not None
             ),
@@ -705,17 +575,6 @@ class ArchitectLoop:
             None,
         )
 
-    def _phase_attempts(self, phase: str) -> list[PlanningAttempt]:
-        return [
-            item
-            for item in self.store.list_planning_attempts(self.borg_id)
-            if item.phase == phase
-        ]
-
-    def _next_attempt_round(self, phase: str) -> int:
-        attempts = self._phase_attempts(phase)
-        return max((attempt.round for attempt in attempts), default=0) + 1
-
     def _next_question_round(self) -> int:
         questions = self.store.list_planning_questions(self.borg_id)
         return max((question.round for question in questions), default=0) + 1
@@ -727,28 +586,6 @@ class ArchitectLoop:
             for question in (result or {}).get("open_questions", [])
             if isinstance(question, str) and question.strip()
         ]
-
-    def _current_borg(self) -> Borg:
-        borg = self.store.get_borg(self.borg_id)
-        if borg is None:
-            raise ArchitectError(f"Borg {self.borg_id} no longer exists")
-        return borg
-
-    def _transition(self, borg: Borg, state: BorgState) -> Borg:
-        if borg.state is state:
-            return borg
-        return self.store.compare_and_set_borg_state(
-            borg.id,
-            expected_state=borg.state,
-            expected_version=borg.state_version,
-            new_state=state,
-        )
-
-    def _result_path(self, attempt: PlanningAttempt) -> Path:
-        stored = attempt.request.get("result_path")
-        if isinstance(stored, str) and stored != "pending":
-            return Path(stored)
-        return self.artifact_dir / f"{attempt.id}.json"
 
     @staticmethod
     def _validate_question_payload(
