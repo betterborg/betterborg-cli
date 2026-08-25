@@ -25,6 +25,8 @@ from betterborg_cli.store.models import utcnow
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
 
+_COMPOSE_ENVIRONMENT_NAMES = ("PATH", "PATHEXT", "SYSTEMROOT", "LANG", "LC_ALL")
+
 
 class ComposeStackError(RuntimeError):
     """A Compose project could not become ready or stop exactly."""
@@ -86,7 +88,12 @@ class HostComposeManager:
         clock: Clock = utcnow,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._environment = dict(os.environ if environment is None else environment)
+        source_environment = os.environ if environment is None else environment
+        self._environment = {
+            name: source_environment[name]
+            for name in _COMPOSE_ENVIRONMENT_NAMES
+            if name in source_environment
+        }
         self._run = command_runner or subprocess.run
         self._clock = clock
 
@@ -357,11 +364,13 @@ class HostComposeManager:
         profiles: Sequence[str],
         compose_services: Sequence[HostService],
         worktree: Path,
-    ) -> dict[tuple[str, int], int]:
-        published: dict[tuple[str, int], int] = {}
-        for service_name, target in _service_target_ports(compose_services):
+    ) -> dict[tuple[str, int, str], int]:
+        published: dict[tuple[str, int, str], int] = {}
+        for service_name, target, protocol in _service_target_ports(compose_services):
             command = _compose_base(project_name, files, profiles) + (
                 "port",
+                "--protocol",
+                protocol,
                 service_name,
                 str(target),
             )
@@ -377,7 +386,7 @@ class HostComposeManager:
                     project_name=project_name,
                     command=command,
                 )
-            published[(service_name, target)] = host_port
+            published[(service_name, target, protocol)] = host_port
         return published
 
     def stop_claimed_stack(
@@ -465,7 +474,7 @@ class HostComposeManager:
         result = self._invoke(command, cwd=stack.worktree)
         if result.returncode != 0:
             error = _command_error("Compose teardown failed", result)
-            store.record_compose_cleanup_failure(
+            failure_recorded = store.record_compose_cleanup_failure(
                 stack.run_id,
                 stack.task_id,
                 stack.project_name,
@@ -473,6 +482,14 @@ class HostComposeManager:
                 error=error,
                 now=self._clock(),
             )
+            if not failure_recorded:
+                return ComposeCleanupResult(
+                    stack.run_id,
+                    stack.task_id,
+                    stack.project_name,
+                    command,
+                    True,
+                )
             return ComposeCleanupResult(
                 stack.run_id,
                 stack.task_id,
@@ -611,15 +628,19 @@ def compose_project_name(claim: TaskClaim) -> str:
 def service_url_environment(
     services: Sequence[HostService],
     *,
-    published_ports: Mapping[tuple[str, int], int] | None = None,
+    published_ports: Mapping[tuple[str, int] | tuple[str, int, str], int]
+    | None = None,
 ) -> dict[str, str]:
     """Return only URL variables declared by the validated service plan."""
     environment: dict[str, str] = {}
     for service in services:
         if service.kind == "compose" and service.compose_service is not None:
-            for env_name, port in service.url_targets:
-                published = (published_ports or {}).get(
-                    (service.compose_service, port)
+            for env_name, port, protocol in service.url_targets:
+                published = _published_port(
+                    published_ports,
+                    service.compose_service,
+                    port,
+                    protocol,
                 )
                 if published is None:
                     continue
@@ -628,6 +649,7 @@ def service_url_environment(
                     "127.0.0.1",
                     published,
                     target_port=port,
+                    protocol=protocol,
                 )
         if service.url_env is None:
             continue
@@ -637,18 +659,44 @@ def service_url_environment(
             if service.url is not None:
                 environment[service.url_env] = service.url
             elif service.port is not None and 0 < service.port <= 65535:
-                published = (published_ports or {}).get(
-                    (service.compose_service, service.port)
+                protocol = next(
+                    (
+                        target_protocol
+                        for target_env, target_port, target_protocol in (
+                            service.url_targets
+                        )
+                        if target_env == service.url_env
+                        and target_port == service.port
+                    ),
+                    "tcp",
                 )
-                if published is None:
-                    continue
-                environment[service.url_env] = _service_url(
-                    service.url_env,
-                    "127.0.0.1",
-                    published,
-                    target_port=service.port,
+                published = _published_port(
+                    published_ports,
+                    service.compose_service,
+                    service.port,
+                    protocol,
                 )
+                if published is not None:
+                    environment[service.url_env] = _service_url(
+                        service.url_env,
+                        "127.0.0.1",
+                        published,
+                        target_port=service.port,
+                        protocol=protocol,
+                    )
     return environment
+
+
+def _published_port(
+    published_ports: Mapping[tuple[str, int] | tuple[str, int, str], int] | None,
+    service: str,
+    port: int,
+    protocol: str,
+) -> int | None:
+    published = (published_ports or {}).get((service, port, protocol))
+    if published is None and protocol == "tcp":
+        published = (published_ports or {}).get((service, port))
+    return published
 
 
 def _service_url(
@@ -657,7 +705,10 @@ def _service_url(
     port: int,
     *,
     target_port: int | None = None,
+    protocol: str = "tcp",
 ) -> str:
+    if protocol == "udp":
+        return f"udp://{service_name}:{port}"
     key = f"{env_name} {service_name}".casefold()
     if "redis" in key:
         return f"redis://{service_name}:{port}/0"
@@ -674,16 +725,25 @@ def _service_url(
 
 def _service_target_ports(
     services: Sequence[HostService],
-) -> tuple[tuple[str, int], ...]:
-    targets: list[tuple[str, int]] = []
+) -> tuple[tuple[str, int, str], ...]:
+    targets: list[tuple[str, int, str]] = []
     for service in services:
         if service.compose_service is None:
             continue
         targets.extend(
-            (service.compose_service, port) for _env_name, port in service.url_targets
+            (service.compose_service, port, protocol)
+            for _env_name, port, protocol in service.url_targets
         )
         if service.port is not None:
-            targets.append((service.compose_service, service.port))
+            protocol = next(
+                (
+                    target_protocol
+                    for _env_name, target_port, target_protocol in service.url_targets
+                    if target_port == service.port
+                ),
+                "tcp",
+            )
+            targets.append((service.compose_service, service.port, protocol))
     return tuple(dict.fromkeys(targets))
 
 
@@ -724,13 +784,13 @@ def _volume_read_only(volume: Mapping[object, object]) -> bool:
 
 def _render_runtime_override(
     services: Sequence[str],
-    ports: Sequence[tuple[str, int]],
+    ports: Sequence[tuple[str, int, str]],
     networks: Mapping[str, str],
     volumes: Mapping[str, str],
 ) -> str:
-    by_service: dict[str, list[int]] = {name: [] for name in services}
-    for service, target in ports:
-        by_service[service].append(target)
+    by_service: dict[str, list[tuple[int, str]]] = {name: [] for name in services}
+    for service, target, protocol in ports:
+        by_service[service].append((target, protocol))
     lines = ["services:"]
     for service in services:
         lines.extend(
@@ -744,13 +804,13 @@ def _render_runtime_override(
             lines.append("    ports: !override []")
             continue
         lines.append("    ports: !override")
-        for target in targets:
+        for target, protocol in targets:
             lines.extend(
                 (
                     f"      - target: {target}",
                     '        published: "0"',
-                    '        host_ip: "0.0.0.0"',
-                    '        protocol: "tcp"',
+                    '        host_ip: "127.0.0.1"',
+                    f"        protocol: {json.dumps(protocol)}",
                 )
             )
     if networks:

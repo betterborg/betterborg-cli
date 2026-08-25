@@ -72,7 +72,7 @@ class HostService:
     compose_service: str | None = None
     url_env: str | None = None
     port: int | None = None
-    url_targets: tuple[tuple[str, int], ...] = ()
+    url_targets: tuple[tuple[str, int, Literal["tcp", "udp"]], ...] = ()
     url: str | None = field(default=None, repr=False)
 
 
@@ -647,7 +647,8 @@ class HostPreflight:
                 assert isinstance(compose_service, str)
                 url_targets = _compose_service_url_targets(service)
                 if has_url_env and not any(
-                    target_env == url_env for target_env, _port in url_targets
+                    target_env == url_env
+                    for target_env, _port, _protocol in url_targets
                 ):
                     failures.append(
                         HostPreflightFailure(
@@ -674,7 +675,7 @@ class HostPreflight:
                             next(
                                 (
                                     port
-                                    for target_env, port in url_targets
+                                    for target_env, port, _protocol in url_targets
                                     if target_env == url_env
                                 ),
                                 None,
@@ -1008,32 +1009,42 @@ def _string_sequence(value: object) -> bool:
 
 def _compose_service_url_targets(
     service: Mapping[str, Any],
-) -> tuple[tuple[str, int], ...]:
-    targets: list[tuple[str, int]] = []
+) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
+    targets: list[tuple[str, int, Literal["tcp", "udp"]]] = []
     url_env = service.get("url_env")
     port = service.get("port")
+    protocol: Literal["tcp", "udp"] = "tcp"
     port_records = _mappings(service.get("ports"))
     if not _service_port(port):
-        port = next(
+        first_port = next(
             (
-                record.get("port")
+                record
                 for record in port_records
                 if _service_port(record.get("port"))
             ),
             None,
         )
+        if first_port is not None:
+            port = first_port.get("port")
+            protocol = _service_protocol(first_port.get("protocol"))
     if isinstance(url_env, str) and _service_port(port):
-        targets.append((url_env, port))
+        targets.append((url_env, port, protocol))
     for record in port_records:
         port_env = record.get("env")
         port_value = record.get("port")
         if isinstance(port_env, str) and _service_port(port_value):
-            targets.append((port_env, port_value))
+            targets.append(
+                (port_env, port_value, _service_protocol(record.get("protocol")))
+            )
     return tuple(dict.fromkeys(targets))
 
 
 def _service_port(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 65535
+
+
+def _service_protocol(value: object) -> Literal["tcp", "udp"]:
+    return "udp" if value == "udp" else "tcp"
 
 
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:

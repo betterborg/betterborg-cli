@@ -172,13 +172,13 @@ def test_validates_complete_plan_and_ignores_unselected_service(
         ("database", "compose"),
         ("search", "external"),
     ]
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432),)
+    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "tcp"),)
     assert result.services[1].url == "https://search.example.test/api"
     assert service_url_environment(result.services) == {
         "SEARCH_URL": "https://search.example.test/api",
     }
     assert service_url_environment(
-        result.services, published_ports={("postgres", 5432): 49152}
+        result.services, published_ports={("postgres", 5432, "tcp"): 49152}
     ) == {
         "DATABASE_URL": "postgres://127.0.0.1:49152/postgres",
         "SEARCH_URL": "https://search.example.test/api",
@@ -592,7 +592,7 @@ def test_compose_url_environment_uses_first_declared_port(
     database = dependencies[0]
     assert isinstance(database, dict)
     del database["port"]
-    database["ports"] = [{"port": 5432}]
+    database["ports"] = [{"port": 5432, "protocol": "udp"}]
 
     result = _preflight(
         committed_git_repo,
@@ -605,10 +605,10 @@ def test_compose_url_environment_uses_first_declared_port(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.services[0].port == 5432
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432),)
+    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
     assert service_url_environment(
-        result.services, published_ports={("postgres", 5432): 49152}
-    )["DATABASE_URL"] == "postgres://127.0.0.1:49152/postgres"
+        result.services, published_ports={("postgres", 5432, "udp"): 49152}
+    )["DATABASE_URL"] == "udp://127.0.0.1:49152"
 
 
 def test_missing_compose_metadata_and_plugin_block_before_claim(

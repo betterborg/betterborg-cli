@@ -1689,8 +1689,8 @@ class SqliteStore:
         command: Iterable[str],
         error: str,
         now: datetime | None = None,
-    ) -> None:
-        """Persist an exact failed teardown while leaving reclaim gated."""
+    ) -> bool:
+        """Persist a failed teardown only while its project remains pending."""
         failed_at = _execution_time(now)
         command_payload = list(command)
         if not project_name.strip() or not command_payload or not error.strip():
@@ -1698,14 +1698,36 @@ class SqliteStore:
         with self.transaction() as connection:
             resource = connection.execute(
                 """
-                SELECT 1 FROM compose_resources
-                WHERE run_id = ? AND task_id = ? AND project_name = ?
+                SELECT resource.id
+                FROM compose_resources AS resource
+                WHERE resource.run_id = ?
+                  AND resource.task_id = ?
+                  AND resource.project_name = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM execution_events AS event,
+                           json_each(event.payload_json, '$.resource_ids') AS cleaned
+                      WHERE event.run_id = resource.run_id
+                        AND event.task_id = resource.task_id
+                        AND event.kind = 'compose.cleanup_completed'
+                        AND cleaned.value = resource.id
+                  )
                 LIMIT 1
                 """,
                 (str(run_id), str(task_id), project_name),
             ).fetchone()
             if resource is None:
-                raise KeyError("Compose project identity not found")
+                known = connection.execute(
+                    """
+                    SELECT 1 FROM compose_resources
+                    WHERE run_id = ? AND task_id = ? AND project_name = ?
+                    LIMIT 1
+                    """,
+                    (str(run_id), str(task_id), project_name),
+                ).fetchone()
+                if known is None:
+                    raise KeyError("Compose project identity not found")
+                return False
             runtime = connection.execute(
                 "SELECT status FROM task_runtimes WHERE task_id = ?",
                 (str(task_id),),
@@ -1737,6 +1759,7 @@ class SqliteStore:
                 """,
                 (reason, failed_at.isoformat(), str(task_id)),
             )
+            return True
 
     @staticmethod
     def _insert_execution_run(

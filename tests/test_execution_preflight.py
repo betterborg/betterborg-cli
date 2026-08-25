@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -623,9 +623,18 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
     with SqliteStore.open(fixture.database) as store:
         claims = (fixture.claim(store), fixture.claim(store))
 
+    compose_results: list[subprocess.CompletedProcess[str]] = []
+    results_lock = threading.Lock()
+
+    def run_compose(*args, **kwargs):
+        result = subprocess.run(*args, **kwargs)
+        with results_lock:
+            compose_results.append(result)
+        return result
+
     def start(claim: TaskClaim):
         with SqliteStore.open(fixture.database) as store:
-            return fixture.compose_manager(None).start_claimed_stack(
+            return fixture.compose_manager(run_compose).start_claimed_stack(
                 store, plan, claim, fixture.owner_token
             )
 
@@ -640,6 +649,38 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
                 except BaseException as error:
                     errors.append(error)
             if errors:
+                loopback_failures = [
+                    result
+                    for result in compose_results
+                    if result.returncode != 0
+                    and "Unable to enable LOOPBACK FILTERING" in result.stderr
+                    and "iptables" in result.stderr
+                ]
+                if len(loopback_failures) == len(errors):
+                    # Docker Engine protects loopback-only publications with a
+                    # raw-table firewall rule.  This constrained test kernel
+                    # lacks that table, so the only safe runtime behavior here
+                    # is to reject startup without widening the binding.
+                    overrides = sorted(
+                        (fixture.repository / ".borg/state/compose").glob(
+                            "*/compose.override.yml"
+                        )
+                    )
+                    assert len(overrides) == 2
+                    for override in overrides:
+                        text = override.read_text(encoding="utf-8")
+                        assert 'host_ip: "127.0.0.1"' in text
+                        assert 'host_ip: "0.0.0.0"' not in text
+                        assert _compose_container_services(
+                            override.parent.name
+                        ) == set()
+                    with SqliteStore.open(fixture.database) as store:
+                        assert all(
+                            store.get_task_runtime(claim.task_id).status
+                            is TaskRuntimeStatus.BLOCKED
+                            for claim in claims
+                        )
+                    return
                 raise errors[0]
 
         first, second = stacks
@@ -660,6 +701,9 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
         assert set(first.network_names).isdisjoint(second.network_names)
         for stack in (first, second):
             assert _compose_container_services(stack.project_name) == {"healthy"}
+            assert _compose_published_host_ips(stack.project_name) == {
+                "127.0.0.1"
+            }
 
         with SqliteStore.open(fixture.database) as store:
             resources = [
@@ -775,6 +819,118 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
     assert succeeded[0].command == failed[0].command
     assert reclaimed is not None and reclaimed.task_id == claim.task_id
     assert artifact.read_text(encoding="utf-8") == "preserved\n"
+
+
+def test_replayed_cleanup_failure_does_not_block_reclaimed_task(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    plan = _compose_plan(fixture.repository)
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, plan, claim, fixture.owner_token
+        )
+        assert stack is not None
+        expired_run = store.get_execution_run(fixture.run_id)
+        assert expired_run is not None
+        expired_at = expired_run.lease_expires_at + timedelta(seconds=1)
+        stale = store.reconcile_expired_execution_runs(now=expired_at)
+        replacement = store.acquire_execution_run(
+            expired_run.borg_id,
+            expired_run.generation_id,
+            lease_duration=timedelta(hours=1),
+            now=expired_at,
+        )
+        assert replacement.owner_token is not None
+
+        cleaned = fixture.compose_manager(runner).cleanup_stale_projects(store, stale)
+        reclaimed = store.claim_dependency_ready_task(
+            replacement.run_id,
+            replacement.owner_token,
+            lease_duration=timedelta(minutes=30),
+            now=expired_at + timedelta(seconds=1),
+        )
+        assert reclaimed is not None
+
+        runner.fail_down.add(stack.project_name)
+        replayed = fixture.compose_manager(runner).cleanup_stale_projects(store, stale)
+        runtime = store.get_task_runtime(claim.task_id)
+        failure_events = [
+            event
+            for event in store.list_execution_events(fixture.run_id)
+            if event.kind == "compose.cleanup_failed"
+        ]
+
+    assert len(cleaned) == 1 and cleaned[0].stopped is True
+    assert len(replayed) == 1 and replayed[0].stopped is True
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CLAIMED
+    assert failure_events == []
+
+
+def test_compose_subprocess_environment_excludes_host_credentials(
+    execution_preflight_fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    monkeypatch.setenv("BETTERBORG_UNRELATED_TOKEN", "host-secret")
+    manager = HostComposeManager(fixture.repository, command_runner=runner)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = manager.start_claimed_stack(
+            store, _compose_plan(fixture.repository), claim, fixture.owner_token
+        )
+        assert stack is not None
+        manager.stop_claimed_stack(store, stack, claim, fixture.owner_token)
+
+    assert runner.environments
+    assert all("PATH" in environment for environment in runner.environments)
+    assert all(
+        "BETTERBORG_UNRELATED_TOKEN" not in environment
+        for environment in runner.environments
+    )
+
+
+def test_udp_compose_endpoint_preserves_protocol_and_loopback_binding(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    plan = replace(
+        _compose_plan(fixture.repository),
+        services=(
+            HostService(
+                name="dns-service",
+                kind="compose",
+                evidence="fixture",
+                compose_service="healthy",
+                url_env="DNS_URL",
+                port=5353,
+                url_targets=(("DNS_URL", 5353, "udp"),),
+            ),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, plan, claim, fixture.owner_token
+        )
+        assert stack is not None
+        override = stack.compose_files[-1].read_text(encoding="utf-8")
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, stack, claim, fixture.owner_token
+        )
+
+    assert stack.environment["DNS_URL"].startswith("udp://127.0.0.1:")
+    assert 'host_ip: "127.0.0.1"' in override
+    assert 'protocol: "udp"' in override
+    assert "--protocol" in runner.port_commands[-1]
+    protocol_index = runner.port_commands[-1].index("--protocol")
+    assert runner.port_commands[-1][protocol_index + 1] == "udp"
 
 
 def test_writable_compose_bind_mount_blocks_before_start(
@@ -938,7 +1094,7 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
                 compose_service="healthy",
                 url_env="SERVICE_URL",
                 port=8080,
-                url_targets=(("SERVICE_URL", 8080),),
+                url_targets=(("SERVICE_URL", 8080, "tcp"),),
             ),
             HostService(
                 name="search",
@@ -957,6 +1113,8 @@ class _FakeComposeRunner:
         self.active: set[str] = set()
         self.started_services: dict[str, tuple[str, ...]] = {}
         self.down_commands: list[tuple[str, ...]] = []
+        self.port_commands: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
         self.config_services: dict[str, dict[str, object]] = {
@@ -969,6 +1127,7 @@ class _FakeComposeRunner:
         command = tuple(argv)
         project = command[command.index("--project-name") + 1]
         with self._lock:
+            self.environments.append(dict(kwargs["env"]))
             if "config" in command:
                 return subprocess.CompletedProcess(
                     argv,
@@ -991,6 +1150,7 @@ class _FakeComposeRunner:
                 self.started_services[project] = services
                 return subprocess.CompletedProcess(argv, 0, "healthy\n", "")
             if "port" in command:
+                self.port_commands.append(command)
                 port = 41000 + sum(project.encode()) % 20000
                 return subprocess.CompletedProcess(
                     argv, 0, f"127.0.0.1:{port}\n", ""
@@ -1089,6 +1249,37 @@ def _compose_container_services(project_name: str) -> set[str]:
         text=True,
     )
     return set(result.stdout.splitlines()) - {""}
+
+
+def _compose_published_host_ips(project_name: str) -> set[str]:
+    containers = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+            "--format",
+            "{{.ID}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    inspected = subprocess.run(
+        ["docker", "container", "inspect", *containers],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    records = json.loads(inspected.stdout)
+    return {
+        binding["HostIp"]
+        for record in records
+        for bindings in record["NetworkSettings"]["Ports"].values()
+        if bindings is not None
+        for binding in bindings
+    }
 
 
 def _execution_events(fixture: ExecutionPreflightFixture):
