@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from importlib import resources
@@ -18,6 +18,7 @@ from betterborg_cli.store.models import (
     BorgState,
     GeneratedPrompt,
     Operation,
+    PlanApproval,
     PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
@@ -28,6 +29,13 @@ from betterborg_cli.store.models import (
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
+    TaskBatch,
+    TaskComplexity,
+    TaskDependency,
+    TaskFinding,
+    TaskGeneration,
+    TaskGenerationStatus,
+    TaskRecord,
     utcnow,
 )
 
@@ -686,6 +694,315 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_plan_change_request(row) for row in rows]
 
+    def append_plan_approval(self, approval: PlanApproval) -> None:
+        """Append one immutable, digest-bound plan approval."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO plan_approvals(
+                    id, borg_id, attempt_id, plan_digest, manifest_json,
+                    approved_by, approved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(approval.id),
+                    str(approval.borg_id),
+                    str(approval.attempt_id)
+                    if approval.attempt_id is not None
+                    else None,
+                    approval.plan_digest,
+                    _encode_json(approval.manifest),
+                    approval.approved_by,
+                    approval.approved_at.isoformat(),
+                ),
+            )
+
+    def list_plan_approvals(self, borg_id: UUID) -> list[PlanApproval]:
+        """Return a Borg's plan approvals in stable approval order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM plan_approvals
+                WHERE borg_id = ?
+                ORDER BY approved_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_plan_approval(row) for row in rows]
+
+    def append_task_batch(self, batch: TaskBatch) -> None:
+        """Append one immutable task-decomposition batch."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_batches(
+                    id, borg_id, plan_approval_id, attempt_id, round, summary,
+                    manifest_json, digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(batch.id),
+                    str(batch.borg_id),
+                    str(batch.plan_approval_id),
+                    str(batch.attempt_id) if batch.attempt_id is not None else None,
+                    batch.round,
+                    batch.summary,
+                    _encode_json(batch.manifest),
+                    batch.digest,
+                    batch.created_at.isoformat(),
+                ),
+            )
+
+    def list_task_batches(self, borg_id: UUID) -> list[TaskBatch]:
+        """Return a Borg's immutable task batches in append order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM task_batches
+                WHERE borg_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_task_batch(row) for row in rows]
+
+    def append_task_finding(self, finding: TaskFinding) -> None:
+        """Append one immutable supervisor finding for a task batch."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_findings(
+                    id, borg_id, batch_id, attempt_id, round, severity,
+                    message, suggestion, task_ref, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(finding.id),
+                    str(finding.borg_id),
+                    str(finding.batch_id),
+                    str(finding.attempt_id)
+                    if finding.attempt_id is not None
+                    else None,
+                    finding.round,
+                    finding.severity,
+                    finding.message,
+                    finding.suggestion,
+                    finding.task_ref,
+                    finding.created_at.isoformat(),
+                ),
+            )
+
+    def list_task_findings(
+        self, borg_id: UUID, *, batch_id: UUID | None = None
+    ) -> list[TaskFinding]:
+        """Return immutable task findings, optionally limited to one batch."""
+        query = "SELECT * FROM task_findings WHERE borg_id = ?"
+        parameters = [str(borg_id)]
+        if batch_id is not None:
+            query += " AND batch_id = ?"
+            parameters.append(str(batch_id))
+        query += " ORDER BY created_at, id"
+        with self.locked_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_row_to_task_finding(row) for row in rows]
+
+    def add_task_generation(
+        self,
+        generation: TaskGeneration,
+        tasks: Iterable[TaskRecord] = (),
+        dependencies: Iterable[TaskDependency] = (),
+    ) -> None:
+        """Atomically persist a generation and its immutable task graph rows."""
+        if generation.status is not TaskGenerationStatus.PREPARING:
+            raise ValueError("new task generations must start in preparing status")
+        task_rows = list(tasks)
+        dependency_rows = list(dependencies)
+        if any(
+            task.generation_id != generation.id or task.borg_id != generation.borg_id
+            for task in task_rows
+        ):
+            raise ValueError("task records must belong to the added generation")
+        task_ids = {task.id for task in task_rows}
+        if len(task_ids) != len(task_rows):
+            raise ValueError("task record IDs must be unique within a generation")
+        if any(
+            dependency.generation_id != generation.id
+            or dependency.task_id not in task_ids
+            or dependency.depends_on_task_id not in task_ids
+            for dependency in dependency_rows
+        ):
+            raise ValueError(
+                "task dependencies must connect records in the added generation"
+            )
+
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_generations(
+                    id, borg_id, plan_approval_id, batch_id, status,
+                    manifest_json, digest, created_at, current_at, superseded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(generation.id),
+                    str(generation.borg_id),
+                    str(generation.plan_approval_id),
+                    str(generation.batch_id),
+                    generation.status.value,
+                    _encode_json(generation.manifest),
+                    generation.digest,
+                    generation.created_at.isoformat(),
+                    generation.current_at.isoformat()
+                    if generation.current_at is not None
+                    else None,
+                    generation.superseded_at.isoformat()
+                    if generation.superseded_at is not None
+                    else None,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO task_records(
+                    id, generation_id, borg_id, task_ref, stage, stem,
+                    position, title, complexity, task_json, manifest_json,
+                    digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(task.id),
+                        str(task.generation_id),
+                        str(task.borg_id),
+                        task.task_ref,
+                        task.stage,
+                        task.stem,
+                        task.position,
+                        task.title,
+                        task.complexity.value,
+                        _encode_json(task.task),
+                        _encode_json(task.manifest),
+                        task.digest,
+                        task.created_at.isoformat(),
+                    )
+                    for task in task_rows
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO task_dependencies(
+                    id, generation_id, task_id, depends_on_task_id, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(dependency.id),
+                        str(dependency.generation_id),
+                        str(dependency.task_id),
+                        str(dependency.depends_on_task_id),
+                        dependency.created_at.isoformat(),
+                    )
+                    for dependency in dependency_rows
+                ],
+            )
+
+    def get_task_generation(
+        self, generation_id: UUID
+    ) -> TaskGeneration | None:
+        """Return one task generation by ID, if it exists."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_generations WHERE id = ?",
+                (str(generation_id),),
+            ).fetchone()
+        return _row_to_task_generation(row) if row is not None else None
+
+    def get_current_task_generation(self, borg_id: UUID) -> TaskGeneration | None:
+        """Return the sole SQLite-current generation for a Borg, if present."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM task_generations
+                WHERE borg_id = ? AND status = 'current'
+                """,
+                (str(borg_id),),
+            ).fetchone()
+        return _row_to_task_generation(row) if row is not None else None
+
+    def list_task_generations(self, borg_id: UUID) -> list[TaskGeneration]:
+        """Return every generation without hiding superseded history."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM task_generations
+                WHERE borg_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_task_generation(row) for row in rows]
+
+    def promote_task_generation(self, generation_id: UUID) -> TaskGeneration:
+        """Atomically make a preparing generation current and supersede its peer."""
+        promoted_at = utcnow()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_generations WHERE id = ?",
+                (str(generation_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task generation {generation_id} not found")
+            if row["status"] != TaskGenerationStatus.PREPARING.value:
+                raise ValueError("only a preparing task generation can become current")
+            connection.execute(
+                """
+                UPDATE task_generations
+                SET status = 'superseded', superseded_at = ?
+                WHERE borg_id = ? AND status = 'current'
+                """,
+                (promoted_at.isoformat(), row["borg_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE task_generations
+                SET status = 'current', current_at = ?
+                WHERE id = ? AND status = 'preparing'
+                """,
+                (promoted_at.isoformat(), str(generation_id)),
+            )
+            promoted = connection.execute(
+                "SELECT * FROM task_generations WHERE id = ?",
+                (str(generation_id),),
+            ).fetchone()
+        return _row_to_task_generation(promoted)
+
+    def list_task_records(self, generation_id: UUID) -> list[TaskRecord]:
+        """Return immutable task metadata in generation position order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM task_records
+                WHERE generation_id = ?
+                ORDER BY position, id
+                """,
+                (str(generation_id),),
+            ).fetchall()
+        return [_row_to_task_record(row) for row in rows]
+
+    def list_task_dependencies(
+        self, generation_id: UUID
+    ) -> list[TaskDependency]:
+        """Return immutable dependency edges for one generation."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM task_dependencies
+                WHERE generation_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(generation_id),),
+            ).fetchall()
+        return [_row_to_task_dependency(row) for row in rows]
+
     def add_prd_session(self, session: PrdSession) -> None:
         """Persist a PRD session that points to tracked Markdown."""
         with self.transaction() as connection:
@@ -991,5 +1308,103 @@ def _row_to_plan_change_request(row: sqlite3.Row) -> PlanChangeRequest:
         round=row["round"],
         note=row["note"],
         decided_by=row["decided_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_plan_approval(row: sqlite3.Row) -> PlanApproval:
+    return PlanApproval(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        attempt_id=(
+            UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
+        ),
+        plan_digest=row["plan_digest"],
+        manifest=json.loads(row["manifest_json"]),
+        approved_by=row["approved_by"],
+        approved_at=datetime.fromisoformat(row["approved_at"]),
+    )
+
+
+def _row_to_task_batch(row: sqlite3.Row) -> TaskBatch:
+    return TaskBatch(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        plan_approval_id=UUID(row["plan_approval_id"]),
+        attempt_id=(
+            UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
+        ),
+        round=row["round"],
+        summary=row["summary"],
+        manifest=json.loads(row["manifest_json"]),
+        digest=row["digest"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_task_finding(row: sqlite3.Row) -> TaskFinding:
+    return TaskFinding(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        batch_id=UUID(row["batch_id"]),
+        attempt_id=(
+            UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
+        ),
+        round=row["round"],
+        severity=row["severity"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        task_ref=row["task_ref"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_task_generation(row: sqlite3.Row) -> TaskGeneration:
+    return TaskGeneration(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        plan_approval_id=UUID(row["plan_approval_id"]),
+        batch_id=UUID(row["batch_id"]),
+        status=TaskGenerationStatus(row["status"]),
+        manifest=json.loads(row["manifest_json"]),
+        digest=row["digest"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        current_at=(
+            datetime.fromisoformat(row["current_at"])
+            if row["current_at"] is not None
+            else None
+        ),
+        superseded_at=(
+            datetime.fromisoformat(row["superseded_at"])
+            if row["superseded_at"] is not None
+            else None
+        ),
+    )
+
+
+def _row_to_task_record(row: sqlite3.Row) -> TaskRecord:
+    return TaskRecord(
+        id=UUID(row["id"]),
+        generation_id=UUID(row["generation_id"]),
+        borg_id=UUID(row["borg_id"]),
+        task_ref=row["task_ref"],
+        stage=row["stage"],
+        stem=row["stem"],
+        position=row["position"],
+        title=row["title"],
+        complexity=TaskComplexity(row["complexity"]),
+        task=json.loads(row["task_json"]),
+        manifest=json.loads(row["manifest_json"]),
+        digest=row["digest"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_task_dependency(row: sqlite3.Row) -> TaskDependency:
+    return TaskDependency(
+        id=UUID(row["id"]),
+        generation_id=UUID(row["generation_id"]),
+        task_id=UUID(row["task_id"]),
+        depends_on_task_id=UUID(row["depends_on_task_id"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )

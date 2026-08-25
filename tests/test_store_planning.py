@@ -94,7 +94,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         applied_at = store.applied_migrations()
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == applied_at == (1, 2, 3, 4)
+        assert reopened.applied_migrations() == applied_at == (1, 2, 3, 4, 5)
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg
         assert reopened.list_planning_attempts(borg.id) == [
