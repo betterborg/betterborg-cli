@@ -37,6 +37,16 @@ class RepoPaths:
         return self.tracked_dir / "prds" / "improvements"
 
     @property
+    def tasks_dir(self) -> Path:
+        """Return the tracked root for immutable published task generations."""
+        return self.tracked_dir / "tasks"
+
+    @property
+    def task_staging_dir(self) -> Path:
+        """Return the ignored same-repository task publication staging root."""
+        return self.state_dir / "task-staging"
+
+    @property
     def score_report(self) -> Path:
         """Return the tracked repository score report path."""
         return self.tracked_dir / "score.md"

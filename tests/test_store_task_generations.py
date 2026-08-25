@@ -106,7 +106,9 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         )
 
         assert store.get_current_task_generation(borg.id) is None
-        first_current = store.promote_task_generation(first_generation.id)
+        first_current = store.promote_task_generation(
+            first_generation.id, durable_digest=first_generation.digest
+        )
         assert first_current.status is TaskGenerationStatus.CURRENT
         assert first_current.current_at is not None
 
@@ -134,7 +136,9 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         store.add_task_generation(second_generation, [replacement])
         assert store.get_current_task_generation(borg.id) == first_current
 
-        second_current = store.promote_task_generation(second_generation.id)
+        second_current = store.promote_task_generation(
+            second_generation.id, durable_digest=second_generation.digest
+        )
         generations = store.list_task_generations(borg.id)
         first_superseded = generations[0]
         assert first_superseded.status is TaskGenerationStatus.SUPERSEDED
@@ -204,7 +208,11 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
         store.append_plan_approval(approval)
         store.append_task_batch(batch)
         store.add_task_generation(generation, [first, second], [dependency])
-        current = store.promote_task_generation(generation.id)
+        with pytest.raises(ValueError, match="durable publication proof"):
+            store.promote_task_generation(generation.id)
+        current = store.promote_task_generation(
+            generation.id, durable_digest=generation.digest
+        )
 
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             with store.transaction() as connection:
@@ -245,7 +253,9 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
                     ),
                 )
         with pytest.raises(ValueError, match="only a preparing"):
-            store.promote_task_generation(generation.id)
+            store.promote_task_generation(
+                generation.id, durable_digest=generation.digest
+            )
 
         next_batch = TaskBatch(
             borg_id=borg.id,

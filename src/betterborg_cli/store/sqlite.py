@@ -941,8 +941,15 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_task_generation(row) for row in rows]
 
-    def promote_task_generation(self, generation_id: UUID) -> TaskGeneration:
-        """Atomically make a preparing generation current and supersede its peer."""
+    def promote_task_generation(
+        self, generation_id: UUID, *, durable_digest: str | None = None
+    ) -> TaskGeneration:
+        """Atomically make a durably published preparing generation current.
+
+        The caller must supply the digest it verified after filesystem rename and
+        destination-parent fsync. This keeps ordinary store callers from making a
+        preparing-only generation executable without crossing that boundary.
+        """
         promoted_at = utcnow()
         with self.transaction() as connection:
             row = connection.execute(
@@ -951,6 +958,10 @@ class SqliteStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"task generation {generation_id} not found")
+            if durable_digest != row["digest"]:
+                raise ValueError(
+                    "task generation requires matching durable publication proof"
+                )
             if row["status"] != TaskGenerationStatus.PREPARING.value:
                 raise ValueError("only a preparing task generation can become current")
             connection.execute(

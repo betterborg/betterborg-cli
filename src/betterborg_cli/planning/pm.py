@@ -17,6 +17,10 @@ from betterborg_cli.agent_runtime.selection import (
     SelectedAgent,
     resolve_agent_model,
 )
+from betterborg_cli.planning.task_render import (
+    render_task_markdown,
+    task_markdown_digest,
+)
 from betterborg_cli.planning.task_validation import (
     TaskGraphValidationError,
     build_plan_element_catalog,
@@ -575,7 +579,7 @@ class ProjectManagerLoop:
         for position, raw_task in enumerate(payload["tasks"], start=1):
             task = dict(raw_task)
             task_id = uuid4()
-            digest = approved_plan_digest(task)
+            digest = task_markdown_digest(render_task_markdown(task))
             record = TaskRecord(
                 id=task_id,
                 generation_id=generation_id,
@@ -588,13 +592,20 @@ class ProjectManagerLoop:
                 complexity=TaskComplexity(task["estimate_complexity"]),
                 digest=digest,
                 task=task,
-                manifest={"approved_plan_digest": approval.plan_digest},
+                manifest={
+                    "approved_plan_digest": approval.plan_digest,
+                    "task.md": digest,
+                },
             )
             tasks.append(record)
             logical_tasks[f"{record.stage}/{record.stem}"] = record
             task_manifest.append(
                 {
                     "digest": digest,
+                    "path": (
+                        f".borg/tasks/{self._turns.current_borg().name}/"
+                        f"{generation_id}/{record.stage}/{record.stem}.md"
+                    ),
                     "position": position,
                     "task_ref": record.task_ref,
                 }

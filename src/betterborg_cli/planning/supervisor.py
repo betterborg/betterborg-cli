@@ -21,6 +21,10 @@ from betterborg_cli.planning.pm import (
     approved_plan_digest,
     task_batch_semantic_digest,
 )
+from betterborg_cli.planning.task_publication import (
+    TaskPublicationError,
+    TaskPublisher,
+)
 from betterborg_cli.planning.task_validation import (
     TaskGraphValidationError,
     validate_task_graph,
@@ -292,9 +296,19 @@ class SupervisorLoop:
                 )
                 for finding in findings:
                     self.store.append_task_finding(finding)
-                if decision == "approve":
-                    generation = self.store.promote_task_generation(generation.id)
                 borg = self._turns.transition(borg, next_state)
+
+            if decision == "approve":
+                try:
+                    generation = (
+                        TaskPublisher(self.repository, self.store)
+                        .publish(generation.id)
+                        .generation
+                    )
+                except TaskPublicationError as error:
+                    raise SupervisorError(
+                        f"approved task publication failed: {error}"
+                    ) from error
 
             if next_state is not BorgState.PM_WORKING:
                 return SupervisorResult(
@@ -570,6 +584,20 @@ class SupervisorLoop:
         )
         if batch is None or generation is None:
             return None
+        if (
+            borg.state is BorgState.TASKS_APPROVAL_PENDING
+            and generation.status is TaskGenerationStatus.PREPARING
+        ):
+            try:
+                generation = (
+                    TaskPublisher(self.repository, self.store)
+                    .publish(generation.id)
+                    .generation
+                )
+            except TaskPublicationError as error:
+                raise SupervisorError(
+                    f"approved task publication failed: {error}"
+                ) from error
         if (
             borg.state is BorgState.TASKS_APPROVAL_PENDING
             and self.store.get_current_task_generation(self.borg_id) != generation
