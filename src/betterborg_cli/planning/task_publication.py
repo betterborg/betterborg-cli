@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +16,11 @@ from betterborg_cli.planning.task_render import (
 )
 from betterborg_cli.prd_session import validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
+from betterborg_cli.repository_files import (
+    RepositoryGitVisibilityError,
+    RepositoryPathError,
+    require_git_trackable,
+)
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -371,27 +375,10 @@ class TaskPublisher:
         self, files: tuple[PublishedTaskFile, ...]
     ) -> None:
         for published in files:
-            relative = published.path.relative_to(self.paths.root)
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(self.paths.root),
-                    "check-ignore",
-                    "--quiet",
-                    "--",
-                    relative.as_posix(),
-                ],
-                check=False,
-            )
-            if result.returncode == 0:
-                raise TaskPublicationError(
-                    f"published task path is Git-ignored: {relative.as_posix()}"
-                )
-            if result.returncode != 1:
-                raise TaskPublicationError(
-                    f"could not check Git visibility for {relative.as_posix()}"
-                )
+            try:
+                require_git_trackable(published.path, root=self.paths.root)
+            except (RepositoryGitVisibilityError, RepositoryPathError) as error:
+                raise TaskPublicationError(str(error)) from error
 
     def _mkdir_durable(self, path: Path) -> None:
         missing: list[Path] = []

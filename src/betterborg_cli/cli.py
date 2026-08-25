@@ -4,7 +4,6 @@ import hashlib
 import json
 import re
 import shlex
-import subprocess
 from functools import wraps
 from pathlib import Path
 
@@ -33,7 +32,10 @@ from betterborg_cli.planning import (
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
-from betterborg_cli.repository_files import publish_repository_text
+from betterborg_cli.repository_files import (
+    publish_repository_text,
+    require_git_trackable,
+)
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
     Borg,
@@ -522,7 +524,7 @@ def _bind_plan_approval(
         else:
             if existing != body:
                 raise ValueError(f"approved plan Markdown drifted: {relative_path}")
-        _require_git_trackable(paths.root, relative_path)
+        require_git_trackable(relative_path, root=paths.root)
         return approval, plan_path
 
     if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
@@ -531,7 +533,7 @@ def _bind_plan_approval(
             f"{borg.state.value!r}; a plan must be awaiting approval"
         )
     publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
-    _require_git_trackable(paths.root, relative_path)
+    require_git_trackable(relative_path, root=paths.root)
     approval = PlanApproval(
         borg_id=borg.id,
         attempt_id=plan_attempt.id,
@@ -552,18 +554,6 @@ def _bind_plan_approval(
             new_state=BorgState.PM_WORKING,
         )
     return approval, plan_path
-
-
-def _require_git_trackable(root: Path, relative_path: Path) -> None:
-    ignored = subprocess.run(
-        ["git", "-C", str(root), "check-ignore", "--quiet", "--", str(relative_path)],
-        check=False,
-    )
-    if ignored.returncode == 0:
-        raise ValueError(f"approved plan path is ignored by Git: {relative_path}")
-    if ignored.returncode not in {0, 1}:
-        raise RuntimeError("could not verify approved plan Git tracking status")
-
 
 @plan.command(name="change")
 @click.argument("name")
