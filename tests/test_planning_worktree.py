@@ -14,7 +14,6 @@ from betterborg_cli.planning import (
     materialize_planning_worktree,
 )
 from betterborg_cli.repo_analysis import (
-    DIMENSIONS,
     build_machine_report,
     render_markdown_report,
 )
@@ -26,18 +25,18 @@ from betterborg_cli.store import (
     PlanningQuestion,
     PrdSession,
     Repository,
-    RepositoryAnalysis,
-    RepositoryPackage,
     SqliteStore,
 )
 
 
 def test_materializes_detached_planning_context_without_touching_primary(
     committed_git_repo: Path,
+    write_repository_config,
+    persist_repository_analysis,
 ) -> None:
     repository = Repository(root=committed_git_repo)
     borg = Borg(repository_id=repository.id, name="safe-planning")
-    _write_config(committed_git_repo, repository)
+    write_repository_config(committed_git_repo, repository)
     prd_path = Path(".borg/prds/safe-planning.md")
     (committed_git_repo / prd_path).parent.mkdir(parents=True)
     (committed_git_repo / prd_path).write_text(
@@ -68,7 +67,7 @@ def test_materializes_detached_planning_context_without_touching_primary(
                 prd_path=prd_path,
             )
         )
-        analysis, packages = _persist_analysis(store, repository)
+        analysis, packages = persist_repository_analysis(store, repository)
         prompts = {
             role: store.append_generated_prompt(
                 repository_id=repository.id,
@@ -196,11 +195,11 @@ def test_materializes_detached_planning_context_without_touching_primary(
 
 
 def test_rejects_dirty_source_outside_borg_documents(
-    committed_git_repo: Path,
+    committed_git_repo: Path, write_repository_config
 ) -> None:
     repository = Repository(root=committed_git_repo)
     borg = Borg(repository_id=repository.id, name="contained-planning")
-    _write_config(committed_git_repo, repository)
+    write_repository_config(committed_git_repo, repository)
     (committed_git_repo / "dirty-source.py").write_text(
         "DIRTY = True\n", encoding="utf-8"
     )
@@ -224,7 +223,9 @@ def test_rejects_dirty_source_outside_borg_documents(
 
 
 def test_surfaces_worktree_removal_failure(
-    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
 ) -> None:
     database = committed_git_repo.parent / f"{committed_git_repo.name}-cleanup.db"
     original_run_git = worktree_module._run_git
@@ -240,7 +241,7 @@ def test_surfaces_worktree_removal_failure(
 
     materialized_path: Path | None = None
     with SqliteStore.open(database) as store:
-        repository, borg = _persist_planning_context(
+        repository, borg = persist_planning_context(
             committed_git_repo, store, "cleanup-failure"
         )
         try:
@@ -270,7 +271,9 @@ def test_surfaces_worktree_removal_failure(
 
 
 def test_preserves_caller_error_when_worktree_removal_also_fails(
-    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
 ) -> None:
     database = committed_git_repo.parent / f"{committed_git_repo.name}-body-error.db"
     original_run_git = worktree_module._run_git
@@ -283,7 +286,7 @@ def test_preserves_caller_error_when_worktree_removal_also_fails(
     materialized_path: Path | None = None
     caller_error = OSError("architect validation failed")
     with SqliteStore.open(database) as store:
-        repository, borg = _persist_planning_context(
+        repository, borg = persist_planning_context(
             committed_git_repo, store, "caller-failure"
         )
         try:
@@ -312,73 +315,6 @@ def test_preserves_caller_error_when_worktree_removal_also_fails(
                     "--force",
                     str(materialized_path),
                 )
-
-
-def _write_config(root: Path, repository: Repository) -> None:
-    (root / ".borg").mkdir()
-    (root / ".borg/config.toml").write_text(
-        "version = 1\n\n"
-        "[repository]\n"
-        f'id = "{repository.id}"\n'
-        'default_branch = "main"\n',
-        encoding="utf-8",
-    )
-
-
-def _persist_planning_context(
-    root: Path, store: SqliteStore, name: str
-) -> tuple[Repository, Borg]:
-    repository = Repository(root=root)
-    borg = Borg(repository_id=repository.id, name=name)
-    _write_config(root, repository)
-    prd_path = Path(".borg/prds") / f"{name}.md"
-    (root / prd_path).parent.mkdir(parents=True)
-    (root / prd_path).write_text(f"# {name}\n", encoding="utf-8")
-    store.add_repository(repository)
-    store.add_borg(borg)
-    store.add_prd_session(
-        PrdSession(
-            repository_id=repository.id,
-            borg_id=borg.id,
-            prd_path=prd_path,
-        )
-    )
-    _persist_analysis(store, repository)
-    return repository, borg
-
-
-def _persist_analysis(
-    store: SqliteStore, repository: Repository
-) -> tuple[RepositoryAnalysis, list[RepositoryPackage]]:
-    head_sha = _git(repository.root, "rev-parse", "HEAD").strip()
-    analysis = RepositoryAnalysis(
-        repository_id=repository.id,
-        head_sha=head_sha,
-        summary="A compact test repository.",
-        primary_language="Python",
-        is_monorepo=False,
-        overall_score=4.0,
-        analysis_json={
-            "packages": [{"path": "."}],
-            "themes": [],
-            "command_catalog": {"commands": []},
-            "environment": {"files": []},
-            "required_secrets": [],
-            "service_dependencies": [],
-        },
-    )
-    package = RepositoryPackage(
-        repository_id=repository.id,
-        analysis_id=analysis.id,
-        package_path=".",
-        package_name="test-repository",
-        primary_language="Python",
-        rubric={dimension: {"score": 4} for dimension in DIMENSIONS},
-        overall_score=4.0,
-    )
-    packages = [package]
-    store.append_analysis(analysis, packages)
-    return analysis, packages
 
 
 def _git(root: Path, *arguments: str) -> str:

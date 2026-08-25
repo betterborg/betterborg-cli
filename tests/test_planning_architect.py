@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -12,23 +11,18 @@ import pytest
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.store import (
-    Borg,
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningQuestion,
-    PrdSession,
-    Repository,
-    RepositoryAnalysis,
-    RepositoryPackage,
     SqliteStore,
 )
 
 
 def test_answers_product_questions_inline_and_persists_plan(
     committed_git_repo: Path,
+    persist_planning_context,
 ) -> None:
     answers = iter(["Linux and macOS in the first release."])
     output: list[str] = []
@@ -63,7 +57,9 @@ def test_answers_product_questions_inline_and_persists_plan(
 
     database = committed_git_repo.parent / "architect-inline.sqlite3"
     with SqliteStore.open(database) as store:
-        repository, borg = _planning_context(committed_git_repo, store, "inline")
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "inline"
+        )
         result = ArchitectLoop(
             repository,
             borg,
@@ -99,6 +95,7 @@ def test_answers_product_questions_inline_and_persists_plan(
 
 def test_resumes_a_stored_question_before_invoking_the_agent(
     committed_git_repo: Path,
+    persist_planning_context,
 ) -> None:
     prompts: list[str] = []
     adapter = MockAdapter(name="openai").queue(
@@ -112,7 +109,9 @@ def test_resumes_a_stored_question_before_invoking_the_agent(
     database = committed_git_repo.parent / "architect-question-resume.sqlite3"
 
     with SqliteStore.open(database) as store:
-        repository, draft = _planning_context(committed_git_repo, store, "resume")
+        repository, draft = persist_planning_context(
+            committed_git_repo, store, "resume"
+        )
         working = store.compare_and_set_borg_state(
             draft.id,
             expected_state=BorgState.DRAFT,
@@ -168,6 +167,7 @@ def test_resumes_a_stored_question_before_invoking_the_agent(
 def test_recovers_provider_completed_plan_without_duplicate_invocation_or_cost(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
 ) -> None:
     adapter = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
@@ -176,7 +176,9 @@ def test_recovers_provider_completed_plan_without_duplicate_invocation_or_cost(
     database = committed_git_repo.parent / "architect-interrupted.sqlite3"
 
     with SqliteStore.open(database) as store:
-        repository, borg = _planning_context(committed_git_repo, store, "interrupted")
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "interrupted"
+        )
         loop = ArchitectLoop(repository, borg, store, adapter, io=_io(iter(()), []))
         original_complete = store.complete_planning_attempt
         interrupted = False
@@ -222,6 +224,7 @@ def test_recovers_provider_completed_plan_without_duplicate_invocation_or_cost(
 
 def test_plan_open_questions_are_answered_inline_before_replanning(
     committed_git_repo: Path,
+    persist_planning_context,
 ) -> None:
     ambiguous_plan = _plan()
     ambiguous_plan["open_questions"] = [
@@ -257,7 +260,7 @@ def test_plan_open_questions_are_answered_inline_before_replanning(
     database = committed_git_repo.parent / "architect-plan-question.sqlite3"
 
     with SqliteStore.open(database) as store:
-        repository, borg = _planning_context(
+        repository, borg = persist_planning_context(
             committed_git_repo, store, "plan-question"
         )
         with pytest.raises(ArchitectCancelled, match="awaiting answers"):
@@ -303,6 +306,7 @@ def test_plan_open_questions_are_answered_inline_before_replanning(
 
 def test_recovered_semantically_invalid_questions_are_failed_and_retryable(
     committed_git_repo: Path,
+    persist_planning_context,
 ) -> None:
     database = committed_git_repo.parent / "architect-invalid-resume.sqlite3"
     result_path = committed_git_repo.parent / "invalid-question-result.json"
@@ -315,7 +319,9 @@ def test_recovered_semantically_invalid_questions_are_failed_and_retryable(
     adapter.queue(MockResponse(payload=_plan()))
 
     with SqliteStore.open(database) as store:
-        repository, borg = _planning_context(committed_git_repo, store, "invalid")
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "invalid"
+        )
         interrupted = PlanningAttempt(
             borg_id=borg.id,
             phase="architect_questions",
@@ -366,6 +372,7 @@ def test_recovered_semantically_invalid_questions_are_failed_and_retryable(
 
 def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
     committed_git_repo: Path,
+    persist_planning_context,
 ) -> None:
     adapter = MockAdapter(name="openai").queue(
         MockResponse(
@@ -382,7 +389,9 @@ def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
     database = committed_git_repo.parent / "architect-failed-budget.sqlite3"
 
     with SqliteStore.open(database) as store:
-        repository, borg = _planning_context(committed_git_repo, store, "budget")
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "budget"
+        )
         for round_number, status in enumerate(
             (
                 PlanningAttemptStatus.CANCELLED,
@@ -437,74 +446,6 @@ def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:
         confirm=lambda _message, _default: False,
         write=output.append,
     )
-
-
-def _planning_context(
-    root: Path, store: SqliteStore, name: str
-) -> tuple[Repository, Borg]:
-    repository = Repository(root=root)
-    borg = Borg(repository_id=repository.id, name=name)
-    (root / ".borg/prds").mkdir(parents=True)
-    (root / ".borg/config.toml").write_text(
-        "version = 1\n\n"
-        "[repository]\n"
-        f'id = "{repository.id}"\n'
-        'default_branch = "main"\n',
-        encoding="utf-8",
-    )
-    prd_path = Path(f".borg/prds/{name}.md")
-    (root / prd_path).write_text(
-        "# Confirmed PRD\n\nBuild a tested release workflow.\n", encoding="utf-8"
-    )
-    store.add_repository(repository)
-    store.add_borg(borg)
-    store.add_prd_session(
-        PrdSession(
-            repository_id=repository.id,
-            borg_id=borg.id,
-            prd_path=prd_path,
-        )
-    )
-    head_sha = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    rubric = {
-        dimension: {"score": 3, "evidence": "README.md"} for dimension in DIMENSIONS
-    }
-    analysis = RepositoryAnalysis(
-        repository_id=repository.id,
-        head_sha=head_sha,
-        summary="A small test repository.",
-        primary_language="python",
-        is_monorepo=False,
-        overall_score=3,
-        analysis_json={
-            "packages": [{"path": "."}],
-            "themes": [],
-            "command_catalog": {"commands": []},
-            "environment": {"files": []},
-            "required_secrets": [],
-            "service_dependencies": [],
-        },
-    )
-    store.append_analysis(
-        analysis,
-        [
-            RepositoryPackage(
-                repository_id=repository.id,
-                analysis_id=analysis.id,
-                package_path=".",
-                package_name="root",
-                primary_language="python",
-                rubric=rubric,
-                overall_score=3,
-            )
-        ],
-    )
-    return repository, borg
 
 
 def _plan() -> dict[str, object]:
