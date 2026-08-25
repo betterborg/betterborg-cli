@@ -1585,6 +1585,7 @@ class SqliteStore:
             ).fetchall()
             if not resources:
                 raise KeyError("Compose project identity not found")
+            self._reconcile_expired_claims(connection, run_id, now=cleaned_at)
             pending = [
                 row
                 for row in resources

@@ -1149,6 +1149,131 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
         }
 
 
+def test_cleanup_reconciles_expired_claim_attempts_before_reclaim(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert claim is not None
+        environment = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:cleanup-expiry",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now + timedelta(seconds=5),
+            finished_at=None,
+        )
+        agent = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.SUBSCRIPTION,
+            status=ExecutionAttemptStatus.RUNNING,
+            log_path="artifacts/coding.log",
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+        store.append_environment_attempt(
+            environment,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
+        store.append_agent_attempt(
+            agent,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
+        resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name="borg-cleanup-after-expiry",
+            resource_type="project",
+            resource_name="borg-cleanup-after-expiry",
+            created_at=now + timedelta(seconds=15),
+        )
+        store.add_compose_resource(
+            resource,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=15),
+        )
+
+        cleaned_at = now + timedelta(minutes=2)
+        assert store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            resource.project_name,
+            now=cleaned_at,
+        ) == [resource]
+
+        persisted_claim = store.list_task_claims(acquisition.run_id)[0]
+        assert persisted_claim.released_at == cleaned_at
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.PENDING
+        assert store.list_stale_compose_resources(acquisition.run_id) == []
+
+        closed_environment = store.list_environment_attempts(task.id)[0]
+        closed_agent = store.list_agent_attempts(task.id)[0]
+        assert closed_environment.status is ExecutionAttemptStatus.CANCELLED
+        assert closed_environment.finished_at == cleaned_at
+        assert closed_environment.duration_seconds == 115
+        assert closed_agent.status is ExecutionAttemptStatus.CANCELLED
+        assert closed_agent.finished_at == cleaned_at
+        assert closed_agent.duration_seconds == 110
+
+        events = store.list_execution_events(acquisition.run_id)
+        claim_expired = [
+            event for event in events if event.kind == "task.claim_expired"
+        ]
+        assert len(claim_expired) == 1
+        assert claim_expired[0].payload == {"claim_id": str(claim.id)}
+        assert {
+            (event.kind, event.attempt_id)
+            for event in events
+            if event.attempt_id is not None
+        } == {
+            ("environment.attempt_interrupted", environment.id),
+            ("agent.attempt_interrupted", agent.id),
+        }
+
+        replacement = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=cleaned_at + timedelta(seconds=1),
+        )
+        assert replacement is not None
+        assert replacement.id != claim.id
+        assert replacement.task_id == task.id
+
+
 def test_attempts_cannot_open_without_live_run_and_claim_authority(
     tmp_path: Path, approved_task_generation
 ) -> None:
