@@ -10,7 +10,7 @@ from secrets import token_urlsafe
 from typing import Any
 from uuid import UUID, uuid4
 
-from betterborg_cli.agent_runtime.base import AgentStatus, BillingMode
+from betterborg_cli.agent_runtime.base import AgentStatus, AgentUsage, BillingMode
 
 _PROMPT_ROLES = frozenset({"coding", "review", "merge"})
 
@@ -760,12 +760,7 @@ class AgentAttempt:
     result: dict[str, Any] | None = None
     summary: str | None = None
     duration_seconds: float | None = None
-    cost_usd: float | None = None
-    tokens_input: int | None = None
-    tokens_output: int | None = None
-    tokens_cache_read: int | None = None
-    tokens_cache_write: int | None = None
-    num_turns: int | None = None
+    usage: AgentUsage | None = None
     id: UUID = field(default_factory=uuid4)
     started_at: datetime = field(default_factory=utcnow)
     finished_at: datetime = field(default_factory=utcnow)
@@ -785,18 +780,10 @@ class AgentAttempt:
             raise TypeError("agent attempt billing mode must be a BillingMode")
         if not isinstance(self.status, AgentStatus):
             raise TypeError("agent attempt status must be an AgentStatus")
-        for name in (
-            "duration_seconds",
-            "cost_usd",
-            "tokens_input",
-            "tokens_output",
-            "tokens_cache_read",
-            "tokens_cache_write",
-            "num_turns",
-        ):
-            value = getattr(self, name)
-            if value is not None and value < 0:
-                raise ValueError(f"agent attempt {name} must not be negative")
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("agent attempt duration must not be negative")
+        if self.usage is not None and not isinstance(self.usage, AgentUsage):
+            raise TypeError("agent attempt usage must be an AgentUsage")
         _validate_utc(self.started_at)
         _validate_utc(self.finished_at)
         if self.finished_at < self.started_at:

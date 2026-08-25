@@ -15,7 +15,7 @@ from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
-from betterborg_cli.agent_runtime.base import AgentStatus, BillingMode
+from betterborg_cli.agent_runtime.base import AgentStatus, AgentUsage, BillingMode
 from betterborg_cli.store.models import (
     AgentAttempt,
     Borg,
@@ -1298,12 +1298,12 @@ class SqliteStore:
                     ),
                     attempt.summary,
                     attempt.duration_seconds,
-                    attempt.cost_usd,
-                    attempt.tokens_input,
-                    attempt.tokens_output,
-                    attempt.tokens_cache_read,
-                    attempt.tokens_cache_write,
-                    attempt.num_turns,
+                    attempt.usage.cost_usd if attempt.usage else None,
+                    attempt.usage.tokens_input if attempt.usage else None,
+                    attempt.usage.tokens_output if attempt.usage else None,
+                    attempt.usage.tokens_cache_read if attempt.usage else None,
+                    attempt.usage.tokens_cache_write if attempt.usage else None,
+                    attempt.usage.num_turns if attempt.usage else None,
                     attempt.started_at.isoformat(),
                     attempt.finished_at.isoformat(),
                 ),
@@ -1967,15 +1967,24 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         ),
         summary=row["summary"],
         duration_seconds=row["duration_seconds"],
-        cost_usd=row["cost_usd"],
-        tokens_input=row["tokens_input"],
-        tokens_output=row["tokens_output"],
-        tokens_cache_read=row["tokens_cache_read"],
-        tokens_cache_write=row["tokens_cache_write"],
-        num_turns=row["num_turns"],
+        usage=_row_to_agent_usage(row),
         started_at=datetime.fromisoformat(row["started_at"]),
         finished_at=datetime.fromisoformat(row["finished_at"]),
     )
+
+
+def _row_to_agent_usage(row: sqlite3.Row) -> AgentUsage | None:
+    values = {
+        "cost_usd": row["cost_usd"],
+        "tokens_input": row["tokens_input"],
+        "tokens_output": row["tokens_output"],
+        "tokens_cache_read": row["tokens_cache_read"],
+        "tokens_cache_write": row["tokens_cache_write"],
+        "num_turns": row["num_turns"],
+    }
+    if all(value is None for value in values.values()):
+        return None
+    return AgentUsage(**values)
 
 
 def _row_to_execution_event(row: sqlite3.Row) -> ExecutionEvent:

@@ -1,13 +1,13 @@
 """Contracts for migration-006 host-execution ownership state."""
 
-import hashlib
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
-from betterborg_cli.agent_runtime import AgentStatus, BillingMode
+from betterborg_cli.agent_runtime import AgentStatus, AgentUsage, BillingMode
+from betterborg_cli.planning import render_task_markdown
 from betterborg_cli.store import (
     AgentAttempt,
     Borg,
@@ -18,20 +18,15 @@ from betterborg_cli.store import (
     PlanApproval,
     Repository,
     SqliteStore,
-    TaskBatch,
     TaskClaim,
-    TaskComplexity,
-    TaskGeneration,
-    TaskRecord,
     TaskRuntime,
     TaskRuntimeStatus,
 )
 from betterborg_cli.store.models import utcnow
 
 
-def _execution_fixture(tmp_path: Path) -> tuple[
-    Repository, Borg, PlanApproval, TaskBatch, TaskGeneration, TaskRecord
-]:
+def _execution_fixture(tmp_path: Path, approved_task_generation):
+    database = tmp_path / "state.sqlite3"
     repository = Repository(root=tmp_path / "repository")
     borg = Borg(repository_id=repository.id, name="Executor")
     approval = PlanApproval(
@@ -39,64 +34,53 @@ def _execution_fixture(tmp_path: Path) -> tuple[
         plan_digest="sha256:plan",
         manifest={"plan.md": "sha256:plan"},
     )
-    batch = TaskBatch(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        round=1,
-        digest="sha256:batch",
-        manifest={"tasks": ["foundation"]},
-    )
-    generation = TaskGeneration(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        batch_id=batch.id,
-        digest="sha256:generation",
-        manifest={"07-host-execution": ["foundation"]},
-    )
-    body = b"foundation"
-    digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
-    task = TaskRecord(
-        generation_id=generation.id,
-        borg_id=borg.id,
-        task_ref="foundation",
-        stage="07-host-execution",
-        stem="01-foundation",
-        position=1,
-        title="Build execution foundation",
-        complexity=TaskComplexity.MEDIUM,
-        digest=digest,
-        task={"acceptance_criteria": ["execution is durable"]},
-        manifest={"task.md": digest},
-    )
-    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
-    task_path = durable_root / task.stage / f"{task.stem}.md"
-    task_path.parent.mkdir(parents=True)
-    task_path.write_bytes(body)
-    return repository, borg, approval, batch, generation, task
+    body = {
+        "stage": "07-host-execution",
+        "stem": "01-foundation",
+        "title": "Build execution foundation",
+        "why": "Host execution needs durable ownership state.",
+        "scope": ["Store execution ownership records."],
+        "implementation_notes": [],
+        "acceptance_criteria": ["Execution state is durable."],
+        "tests": ["Reopen the disk store."],
+        "dependencies": [],
+        "out_of_scope": [],
+        "plan_refs": ["P1.deliverable.1"],
+        "estimate_complexity": "medium",
+    }
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_plan_approval(approval)
+        fixture = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=body,
+            round_number=1,
+            task_ref="foundation",
+        )
+        generation, task = fixture.generation, fixture.task
+        durable_root = (
+            repository.root / ".borg/tasks" / borg.name / str(generation.id)
+        )
+        task_path = durable_root / task.stage / f"{task.stem}.md"
+        task_path.parent.mkdir(parents=True)
+        task_path.write_text(render_task_markdown(body), encoding="utf-8")
+        store._promote_published_task_generation(
+            generation.id, durable_root=durable_root
+        )
+
+    return database, borg, generation, task
 
 
-def _store_execution_fixture(
-    store: SqliteStore,
-    fixture: tuple[
-        Repository, Borg, PlanApproval, TaskBatch, TaskGeneration, TaskRecord
-    ],
+def test_execution_ownership_records_round_trip_after_reopen(
+    tmp_path: Path, approved_task_generation
 ) -> None:
-    repository, borg, approval, batch, generation, task = fixture
-    store.add_repository(repository)
-    store.add_borg(borg)
-    store.append_plan_approval(approval)
-    store.append_task_batch(batch)
-    store.add_task_generation(generation, [task])
-    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
-    store._promote_published_task_generation(
-        generation.id, durable_root=durable_root
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
     )
-
-
-def test_execution_ownership_records_round_trip_after_reopen(tmp_path: Path) -> None:
-    database = tmp_path / "state.sqlite3"
-    fixture = _execution_fixture(tmp_path)
-    _, borg, _, _, generation, task = fixture
     started_at = utcnow()
     run = ExecutionRun(
         borg_id=borg.id,
@@ -152,11 +136,13 @@ def test_execution_ownership_records_round_trip_after_reopen(tmp_path: Path) -> 
         result={"verdict": "approved"},
         summary="Approved.",
         duration_seconds=3.0,
-        cost_usd=0.25,
-        tokens_input=100,
-        tokens_output=20,
-        tokens_cache_read=80,
-        num_turns=1,
+        usage=AgentUsage(
+            cost_usd=0.25,
+            tokens_input=100,
+            tokens_output=20,
+            tokens_cache_read=80,
+            num_turns=1,
+        ),
         started_at=started_at,
         finished_at=started_at + timedelta(seconds=3),
     )
@@ -178,7 +164,6 @@ def test_execution_ownership_records_round_trip_after_reopen(tmp_path: Path) -> 
     )
 
     with SqliteStore.open(database) as store:
-        _store_execution_fixture(store, fixture)
         store.add_execution_run(run)
         store.add_task_runtime(runtime)
         store.append_task_claim(claim)
@@ -206,10 +191,11 @@ def test_execution_ownership_records_round_trip_after_reopen(tmp_path: Path) -> 
 
 
 def test_live_run_claim_and_token_ownership_are_database_enforced(
-    tmp_path: Path,
+    tmp_path: Path, approved_task_generation
 ) -> None:
-    fixture = _execution_fixture(tmp_path)
-    _, borg, _, _, generation, task = fixture
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
     started_at = utcnow()
     run = ExecutionRun(
         borg_id=borg.id,
@@ -228,8 +214,7 @@ def test_live_run_claim_and_token_ownership_are_database_enforced(
     assert len(run.owner_token) >= 32
     assert len(claim.claim_token) >= 32
 
-    with SqliteStore.open(tmp_path / "state.sqlite3") as store:
-        _store_execution_fixture(store, fixture)
+    with SqliteStore.open(database) as store:
         store.add_execution_run(run)
         store.append_task_claim(claim)
 
@@ -286,11 +271,17 @@ def test_live_run_claim_and_token_ownership_are_database_enforced(
         ("compose_resources", "resource_name"),
     ],
 )
+@pytest.mark.parametrize("statement", ["UPDATE", "DELETE", "REPLACE"])
 def test_execution_history_and_resource_ownership_are_immutable(
-    tmp_path: Path, table: str, column: str
+    tmp_path: Path,
+    approved_task_generation,
+    table: str,
+    column: str,
+    statement: str,
 ) -> None:
-    fixture = _execution_fixture(tmp_path)
-    _, borg, _, _, generation, task = fixture
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
     started_at = utcnow()
     run = ExecutionRun(
         borg_id=borg.id,
@@ -346,8 +337,7 @@ def test_execution_history_and_resource_ownership_are_immutable(
         "compose_resources": compose,
     }
 
-    with SqliteStore.open(tmp_path / "state.sqlite3") as store:
-        _store_execution_fixture(store, fixture)
+    with SqliteStore.open(database) as store:
         store.add_execution_run(run)
         store.append_task_claim(claim)
         store.append_environment_attempt(environment)
@@ -355,9 +345,32 @@ def test_execution_history_and_resource_ownership_are_immutable(
         store.append_execution_event(event)
         store.add_compose_resource(compose)
 
-        with pytest.raises(sqlite3.IntegrityError, match="immutable|append-only"):
+        sql, parameters = {
+            "UPDATE": (
+                f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                ("changed", str(records[table].id)),
+            ),
+            "DELETE": (
+                f"DELETE FROM {table} WHERE id = ?",
+                (str(records[table].id),),
+            ),
+            "REPLACE": (
+                f"INSERT OR REPLACE INTO {table} "
+                f"SELECT * FROM {table} WHERE id = ?",
+                (str(records[table].id),),
+            ),
+        }[statement]
+
+        with pytest.raises(
+            sqlite3.IntegrityError, match="immutable|append-only|durable"
+        ):
             with store.transaction() as connection:
-                connection.execute(
-                    f"UPDATE {table} SET {column} = ? WHERE id = ?",
-                    ("changed", str(records[table].id)),
-                )
+                connection.execute(sql, parameters)
+
+        persisted_records = {
+            "environment_attempts": store.list_environment_attempts(task.id),
+            "agent_attempts": store.list_agent_attempts(task.id),
+            "execution_events": store.list_execution_events(run.id),
+            "compose_resources": store.list_compose_resources(task.id),
+        }
+        assert persisted_records[table] == [records[table]]
