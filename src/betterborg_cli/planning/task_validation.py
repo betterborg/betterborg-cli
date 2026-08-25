@@ -664,44 +664,63 @@ def _cycle_findings(
     tasks_by_id: Mapping[UUID, TaskRecord],
     dependencies_by_task: Mapping[UUID, list[UUID]],
 ) -> list[TaskGraphFinding]:
-    findings: list[TaskGraphFinding] = []
-    state: dict[UUID, int] = {}
+    finished: list[UUID] = []
+    visited: set[UUID] = set()
     for root_id in tasks_by_id:
-        if root_id in state:
+        if root_id in visited:
             continue
-        state[root_id] = 1
-        path = [root_id]
-        path_indexes = {root_id: 0}
+        visited.add(root_id)
         frames: list[tuple[UUID, int]] = [(root_id, 0)]
         while frames:
             task_id, dependency_index = frames[-1]
             dependencies = dependencies_by_task.get(task_id, [])
             if dependency_index >= len(dependencies):
                 frames.pop()
-                path_indexes.pop(task_id, None)
-                path.pop()
-                state[task_id] = 2
+                finished.append(task_id)
                 continue
             dependency_id = dependencies[dependency_index]
             frames[-1] = (task_id, dependency_index + 1)
-            dependency_state = state.get(dependency_id, 0)
-            if dependency_state == 0:
-                state[dependency_id] = 1
-                path_indexes[dependency_id] = len(path)
-                path.append(dependency_id)
+            if dependency_id not in visited:
+                visited.add(dependency_id)
                 frames.append((dependency_id, 0))
-            elif dependency_state == 1:
-                cycle = path[path_indexes[dependency_id] :]
-                findings.append(
-                    TaskGraphFinding(
-                        rule="task.dependency.cycle",
-                        message="task dependency graph contains a cycle",
-                        task_refs=tuple(
-                            sorted(tasks_by_id[item].task_ref for item in cycle)
-                        ),
-                    )
-                )
-    return findings
+
+    dependents_by_task: dict[UUID, list[UUID]] = {
+        task_id: [] for task_id in tasks_by_id
+    }
+    for task_id, dependencies in dependencies_by_task.items():
+        for dependency_id in dependencies:
+            dependents_by_task[dependency_id].append(task_id)
+
+    assigned: set[UUID] = set()
+    cyclic_components: list[tuple[str, ...]] = []
+    for root_id in reversed(finished):
+        if root_id in assigned:
+            continue
+        assigned.add(root_id)
+        component: list[UUID] = []
+        pending = [root_id]
+        while pending:
+            task_id = pending.pop()
+            component.append(task_id)
+            for dependent_id in dependents_by_task[task_id]:
+                if dependent_id not in assigned:
+                    assigned.add(dependent_id)
+                    pending.append(dependent_id)
+        if len(component) > 1 or component[0] in dependencies_by_task.get(
+            component[0], []
+        ):
+            cyclic_components.append(
+                tuple(sorted(tasks_by_id[item].task_ref for item in component))
+            )
+
+    return [
+        TaskGraphFinding(
+            rule="task.dependency.cycle",
+            message="task dependency graph contains a cycle",
+            task_refs=task_refs,
+        )
+        for task_refs in sorted(cyclic_components)
+    ]
 
 
 __all__ = [

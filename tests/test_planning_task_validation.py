@@ -600,6 +600,95 @@ def test_dependency_cycles_are_rejected_without_recursion() -> None:
     assert "task.dependency.phase_inversion" in _rules(error.value.findings)
 
 
+def test_cycle_identity_survives_generation_reconstruction_and_reordering() -> None:
+    plan = _plan()
+    plan["phases"].append(
+        {
+            "name": "03-final",
+            "deliverables": ["Final workflow"],
+            "contracts": [],
+            "acceptance_criteria": ["Workflow is finished"],
+            "files_touched": [],
+            "test_strategy": "Run end-to-end tests.",
+            "dependencies_on": ["02-consumer"],
+        }
+    )
+
+    def generation_findings(
+        generation_id: UUID, *, complete_final: bool, reverse_tasks: bool
+    ) -> tuple[TaskGraphFinding, ...]:
+        foundation = _task(
+            generation_id,
+            stage="01-foundation",
+            stem="01-build",
+            position=1,
+            refs=_required_refs(plan, "01-foundation"),
+        )
+        consumer = _task(
+            generation_id,
+            stage="02-consumer",
+            stem="01-build",
+            position=2,
+            refs=_required_refs(plan, "02-consumer"),
+        )
+        final_refs = _required_refs(plan, "03-final")
+        final = _task(
+            generation_id,
+            stage="03-final",
+            stem="01-build",
+            position=3,
+            refs=final_refs if complete_final else final_refs[1:],
+        )
+        dependencies = [
+            TaskDependency(
+                generation_id=generation_id,
+                task_id=final.id,
+                depends_on_task_id=consumer.id,
+            ),
+            TaskDependency(
+                generation_id=generation_id,
+                task_id=final.id,
+                depends_on_task_id=foundation.id,
+            ),
+            TaskDependency(
+                generation_id=generation_id,
+                task_id=consumer.id,
+                depends_on_task_id=foundation.id,
+            ),
+            TaskDependency(
+                generation_id=generation_id,
+                task_id=foundation.id,
+                depends_on_task_id=final.id,
+            ),
+        ]
+        tasks = [foundation, consumer, final]
+        if reverse_tasks:
+            tasks.reverse()
+        return task_graph_findings(plan, tasks, dependencies)
+
+    previous = generation_findings(
+        uuid4(), complete_final=False, reverse_tasks=True
+    )
+    repaired = generation_findings(
+        uuid4(), complete_final=True, reverse_tasks=False
+    )
+    previous_cycles = [
+        finding.identity
+        for finding in previous
+        if finding.rule == "task.dependency.cycle"
+    ]
+    repaired_cycles = [
+        finding.identity
+        for finding in repaired
+        if finding.rule == "task.dependency.cycle"
+    ]
+
+    assert previous_cycles == repaired_cycles == [
+        ("task.dependency.cycle", ("task-1", "task-2", "task-3"), (), ())
+    ]
+    validate_task_repair_progress(previous, repaired)
+
+
 @pytest.mark.parametrize(
     ("stage", "stem", "declared_complexity", "expected_rule"),
     [
