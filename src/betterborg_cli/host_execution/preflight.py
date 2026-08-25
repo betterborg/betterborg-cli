@@ -339,7 +339,7 @@ class HostPreflight:
                 name = toolchain.get("name")
                 if isinstance(name, str) and name:
                     add_request(
-                        name,
+                        _toolchain_executable_name(name),
                         ".",
                         toolchain.get("version")
                         if isinstance(toolchain.get("version"), str)
@@ -371,23 +371,14 @@ class HostPreflight:
         by_name = {tool.name: tool for tool in resolved_tools}
         for toolchain in toolchains:
             name = toolchain.get("name")
-            if not isinstance(name, str) or name not in by_name:
+            if not isinstance(name, str):
+                continue
+            executable_name = _toolchain_executable_name(name)
+            if executable_name not in by_name:
                 continue
             version = toolchain.get("version")
             evidence = _evidence(toolchain, "analyzer toolchain")
             if not isinstance(version, str) or not version.strip():
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"toolchain {name!r} requires exact version evidence"
-                        ),
-                        evidence=evidence,
-                        guidance=(
-                            "Pin the runtime version in a repository file and "
-                            "rerun analysis."
-                        ),
-                    )
-                )
                 continue
             cited_source = toolchain.get("source")
             if isinstance(cited_source, str) and cited_source:
@@ -442,7 +433,7 @@ class HostPreflight:
                     )
                 )
                 continue
-            output = self._version_output(name, by_name[name].path)
+            output = self._version_output(name, by_name[executable_name].path)
             if output is None or not _contains_version(output, version):
                 observed = (
                     output.strip().splitlines()[0] if output else "no version output"
@@ -913,6 +904,10 @@ class HostPreflight:
 
 def _which(name: str, path: str | None) -> str | None:
     return shutil.which(name, path=path)
+
+
+def _toolchain_executable_name(name: str) -> str:
+    return {"rust": "rustc"}.get(name, name)
 
 
 def _mappings(value: object) -> list[Mapping[str, Any]]:

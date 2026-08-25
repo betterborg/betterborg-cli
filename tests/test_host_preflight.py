@@ -306,6 +306,69 @@ def test_go_version_probe_uses_supported_command_and_output(
     assert result.executables[0].version == "1.24.2"
 
 
+@pytest.mark.parametrize(
+    "optional_version",
+    [{}, {"version": None}],
+    ids=["omitted", "null"],
+)
+def test_unpinned_toolchain_only_requires_available_executable(
+    committed_git_repo: Path,
+    optional_version: dict[str, None],
+) -> None:
+    binary_dir = committed_git_repo.parent / f"{committed_git_repo.name}-unpinned-bin"
+    binary_dir.mkdir()
+    executable = _executable(binary_dir, "python", "exit 7")
+    plan = {
+        "environment": {
+            "toolchains": [{"name": "python", **optional_version}],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.executables[0].name == "python"
+    assert result.executables[0].path == executable
+    assert result.executables[0].version is None
+
+
+def test_rust_toolchain_resolves_and_probes_rustc(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "rust-bin"
+    binary_dir.mkdir()
+    rustc = _executable(
+        binary_dir,
+        "rustc",
+        "test \"$1\" = --version && echo 'rustc 1.88.0 (example)'",
+    )
+    (committed_git_repo / "rust-toolchain.toml").write_text(
+        '[toolchain]\nchannel = "1.88.0"\n', encoding="utf-8"
+    )
+    plan = {
+        "environment": {
+            "toolchains": [
+                {
+                    "name": "rust",
+                    "version": "1.88.0",
+                    "source": "rust-toolchain.toml",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.executables[0].name == "rustc"
+    assert result.executables[0].path == rustc
+    assert result.executables[0].version == "1.88.0"
+
+
 def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
     committed_git_repo: Path,
 ) -> None:
