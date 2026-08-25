@@ -132,6 +132,43 @@ def test_does_not_ground_secondary_path_against_primary_repository(
 
 
 @pytest.mark.parametrize(
+    ("mutate", "entry"),
+    [
+        (
+            lambda plan: plan["phases"][0].update(
+                {"repositories": ["primary"]}
+            ),
+            "file",
+        ),
+        (
+            lambda plan: plan["phases"][0]["contracts"][0].update(
+                {"repo": "primary"}
+            ),
+            "contract",
+        ),
+    ],
+)
+def test_rejects_entry_ownership_outside_phase_repositories(
+    repository: Path, mutate, entry: str
+) -> None:
+    plan = _multi_repository_plan()
+    mutate(plan)
+    secondary = repository / "secondary"
+    secondary.mkdir()
+    (secondary / "README.md").write_text("# Secondary\n", encoding="utf-8")
+
+    with pytest.raises(
+        PlanValidationError,
+        match=rf"{entry}.*not listed in the phase repositories",
+    ):
+        validate_plan(
+            plan,
+            repository,
+            repository_roots={"primary": repository, "secondary": secondary},
+        )
+
+
+@pytest.mark.parametrize(
     ("mutate", "message"),
     [
         (
@@ -157,6 +194,12 @@ def test_does_not_ground_secondary_path_against_primary_repository(
         (
             lambda plan: plan["phases"][0].update({"repositories": ["unknown"]}),
             "not declared by the plan",
+        ),
+        (
+            lambda plan: plan["phases"][0].update(
+                {"repositories": ["secondary", "secondary"]}
+            ),
+            "repository more than once",
         ),
     ],
 )

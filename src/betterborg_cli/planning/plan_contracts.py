@@ -96,7 +96,12 @@ def validate_plan(
                     "earlier phase"
                 )
 
-        phase_repositories = set(phase.get("repositories", []))
+        phase_repository_ids = phase.get("repositories", [])
+        if len(phase_repository_ids) != len(set(phase_repository_ids)):
+            raise PlanValidationError(
+                f"phase {name!r} lists a repository more than once"
+            )
+        phase_repositories = set(phase_repository_ids)
         unknown_phase_repositories = phase_repositories - roots.keys()
         if unknown_phase_repositories:
             raise PlanValidationError(
@@ -110,6 +115,11 @@ def validate_plan(
             repository = _entry_repository_id(
                 entry,
                 roots,
+                field=f"phase {name!r} file {path!r}",
+            )
+            _validate_phase_repository(
+                repository,
+                phase_repositories,
                 field=f"phase {name!r} file {path!r}",
             )
             entry_root = _entry_repository_root(
@@ -136,9 +146,14 @@ def validate_plan(
             )
 
         for contract in phase.get("contracts", []):
-            _entry_repository_id(
+            repository = _entry_repository_id(
                 contract,
                 roots,
+                field=f"phase {name!r} contract",
+            )
+            _validate_phase_repository(
+                repository,
+                phase_repositories,
                 field=f"phase {name!r} contract",
             )
 
@@ -276,6 +291,19 @@ def _entry_repository_root(
             "root was provided for it"
         )
     return root
+
+
+def _validate_phase_repository(
+    repository: str | None,
+    phase_repositories: set[str],
+    *,
+    field: str,
+) -> None:
+    if phase_repositories and repository not in phase_repositories:
+        raise PlanValidationError(
+            f"{field} belongs to repository {repository!r}, which is not listed "
+            "in the phase repositories"
+        )
 
 
 def _validate_planned_path(
