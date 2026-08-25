@@ -363,7 +363,10 @@ class ArchitectLoop:
                     attempt=completed,
                 )
 
-            current_plan = self._latest_ambiguous_plan()
+            current_plan = self._latest_plan()
+            revision = current_plan is not None and not self._plan_open_questions(
+                current_plan.result
+            )
             attempt, payload = self._run_turn(
                 phase=_PLAN_PHASE,
                 round_number=self._next_attempt_round(_PLAN_PHASE),
@@ -374,6 +377,13 @@ class ArchitectLoop:
                     "relevant referenced context file, then emit the implementation "
                     "plan. Resolve every answered product question and leave "
                     "open_questions empty unless a genuine uncertainty remains."
+                    + (
+                        " Revise the current plan in place, addressing every "
+                        "persisted Tech Lead finding without regressing earlier "
+                        "corrections."
+                        if revision
+                        else ""
+                    )
                 ),
                 current_plan=(
                     json.dumps(current_plan.result, indent=2, sort_keys=True)
@@ -629,17 +639,31 @@ class ArchitectLoop:
         )
 
     def _completed_plan(self) -> PlanningAttempt | None:
-        completed = next(
+        attempts = self.store.list_planning_attempts(self.borg_id)
+        completed_index = next(
             (
-                item
-                for item in reversed(self._phase_attempts(_PLAN_PHASE))
-                if item.status is PlanningAttemptStatus.COMPLETED
-                and not self._plan_open_questions(item.result)
+                index
+                for index in range(len(attempts) - 1, -1, -1)
+                if attempts[index].phase == _PLAN_PHASE
+                and attempts[index].status is PlanningAttemptStatus.COMPLETED
+                and not self._plan_open_questions(attempts[index].result)
             ),
             None,
         )
-        if completed is None:
+        latest_review_index = next(
+            (
+                index
+                for index in range(len(attempts) - 1, -1, -1)
+                if attempts[index].phase == "tech_review"
+                and attempts[index].status is PlanningAttemptStatus.COMPLETED
+            ),
+            None,
+        )
+        if completed_index is None or (
+            latest_review_index is not None and latest_review_index > completed_index
+        ):
             return None
+        completed = attempts[completed_index]
         try:
             self._validate_plan_in_snapshot(completed.result or {})
         except PlanValidationError as error:
@@ -660,13 +684,13 @@ class ArchitectLoop:
         ) as worktree:
             validate_plan(plan, worktree)
 
-    def _latest_ambiguous_plan(self) -> PlanningAttempt | None:
+    def _latest_plan(self) -> PlanningAttempt | None:
         return next(
             (
                 item
                 for item in reversed(self._phase_attempts(_PLAN_PHASE))
                 if item.status is PlanningAttemptStatus.COMPLETED
-                and self._plan_open_questions(item.result)
+                and item.result is not None
             ),
             None,
         )

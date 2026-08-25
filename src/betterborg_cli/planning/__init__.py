@@ -15,6 +15,14 @@ from betterborg_cli.planning.plan_contracts import (
     validate_plan,
     validate_plan_json,
 )
+from betterborg_cli.planning.tech_lead import (
+    TECH_LEAD_REVIEW_SCHEMA,
+    TECH_REVIEW_ROUND_CAP,
+    TechLeadCancelled,
+    TechLeadError,
+    TechLeadLoop,
+    TechLeadResult,
+)
 from betterborg_cli.planning.worktree import (
     PlanningWorktreeError,
     materialize_planning_worktree,
@@ -28,6 +36,12 @@ __all__ = [
     "ArchitectError",
     "ArchitectLoop",
     "ArchitectResult",
+    "TECH_LEAD_REVIEW_SCHEMA",
+    "TECH_REVIEW_ROUND_CAP",
+    "TechLeadCancelled",
+    "TechLeadError",
+    "TechLeadLoop",
+    "TechLeadResult",
     "PlanningWorktreeError",
     "PlanValidationError",
     "materialize_planning_worktree",
