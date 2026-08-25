@@ -137,7 +137,7 @@ def test_dynamic_selected_agent_persists_append_only_history_and_prompts(
             artifact_dir=git_repo / "artifacts",
         )
 
-        assert store.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8)
+        assert store.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8, 9)
         assert len(observed_workspaces) == 2
         assert all(call.model == "gpt-5" for call in adapter.calls)
         assert all(

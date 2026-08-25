@@ -265,7 +265,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8)
+        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8, 9)
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime
@@ -1104,6 +1104,43 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
         )
         assert replacement_claim is not None
         assert replacement_claim.id != expired_claim.id
+        replacement_resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=replacement_claim.id,
+            task_id=task.id,
+            project_name=resource.project_name,
+            resource_type=resource.resource_type,
+            resource_name=resource.resource_name,
+            created_at=now + timedelta(minutes=2, seconds=3),
+        )
+        store.add_compose_resource(
+            replacement_resource,
+            acquisition.owner_token,
+            replacement_claim.claim_token,
+            now=now + timedelta(minutes=2, seconds=3),
+        )
+
+        store.renew_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=5),
+            now=now + timedelta(minutes=3, seconds=3),
+        )
+        claims = store.list_task_claims(acquisition.run_id)
+        assert claims[1].released_at is None
+        assert store.list_compose_resources(task.id) == [
+            resource,
+            replacement_resource,
+        ]
+
+        assert store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            resource.project_name,
+            now=now + timedelta(minutes=3, seconds=4),
+        ) == [resource, replacement_resource]
+        claims = store.list_task_claims(acquisition.run_id)
+        assert claims[1].released_at == now + timedelta(minutes=3, seconds=4)
         assert "task.claim_expired" in {
             event.kind
             for event in store.list_execution_events(acquisition.run_id)
@@ -1253,6 +1290,111 @@ def test_compose_resource_cannot_be_persisted_after_expiry_releases_claim(
                 now=now + timedelta(minutes=2),
             )
         assert stale_worker.list_compose_resources(task.id) == []
+
+
+def test_terminal_attempt_events_require_guarded_owned_transition(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert claim is not None
+        attempt = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:guarded-terminal-event",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now,
+            finished_at=None,
+        )
+        store.append_environment_attempt(
+            attempt,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now,
+        )
+
+        stale_terminal = ExecutionEvent(
+            run_id=acquisition.run_id,
+            task_id=task.id,
+            attempt_id=attempt.id,
+            kind="environment.attempt_finished",
+            payload={"status": "completed"},
+            created_at=now + timedelta(minutes=2),
+        )
+        wrong_kind = ExecutionEvent(
+            run_id=acquisition.run_id,
+            task_id=task.id,
+            attempt_id=attempt.id,
+            kind="agent.attempt_finished",
+            payload={"status": "completed"},
+            created_at=now + timedelta(seconds=10),
+        )
+        for event in (stale_terminal, wrong_kind):
+            with pytest.raises(
+                ValueError, match="require guarded completion"
+            ):
+                store.append_execution_event(event)
+
+        with pytest.raises(
+            sqlite3.IntegrityError, match="does not match attempt"
+        ):
+            with store.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO execution_events(
+                        id, run_id, task_id, attempt_id, kind,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(wrong_kind.id),
+                        str(wrong_kind.run_id),
+                        str(wrong_kind.task_id),
+                        str(wrong_kind.attempt_id),
+                        wrong_kind.kind,
+                        "{}",
+                        wrong_kind.created_at.isoformat(),
+                    ),
+                )
+
+        completed = store.complete_environment_attempt(
+            attempt.id,
+            acquisition.owner_token,
+            claim.claim_token,
+            status=ExecutionAttemptStatus.COMPLETED,
+            result={"exit_code": 0},
+            now=now + timedelta(seconds=20),
+        )
+        assert completed.status is ExecutionAttemptStatus.COMPLETED
+        attempt_events = [
+            event
+            for event in store.list_execution_events(acquisition.run_id)
+            if event.attempt_id == attempt.id
+        ]
+        assert [event.kind for event in attempt_events] == [
+            "environment.attempt_finished"
+        ]
 
 
 def test_open_attempts_finish_with_durable_results_and_usage(

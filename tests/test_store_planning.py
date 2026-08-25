@@ -103,6 +103,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
             6,
             7,
             8,
+            9,
         )
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg

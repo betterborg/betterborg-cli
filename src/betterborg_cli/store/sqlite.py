@@ -54,6 +54,14 @@ from betterborg_cli.store.models import (
 )
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
+_TERMINAL_ATTEMPT_EVENT_KINDS = frozenset(
+    {
+        "environment.attempt_finished",
+        "environment.attempt_interrupted",
+        "agent.attempt_finished",
+        "agent.attempt_interrupted",
+    }
+)
 
 
 class StaleBorgStateError(RuntimeError):
@@ -2531,6 +2539,10 @@ class SqliteStore:
 
     def append_execution_event(self, event: ExecutionEvent) -> None:
         """Append one durable execution event."""
+        if event.kind in _TERMINAL_ATTEMPT_EVENT_KINDS:
+            raise ValueError(
+                "terminal attempt lifecycle events require guarded completion"
+            )
         with self.transaction() as connection:
             connection.execute(
                 """
