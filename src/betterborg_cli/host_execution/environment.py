@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -13,6 +14,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+
+if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
+    import msvcrt
+else:  # pragma: no branch - exactly one platform lock implementation is loaded
+    import fcntl
 
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
@@ -54,19 +60,40 @@ class EnvironmentMaterialization:
     materialization_reused: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _EnvironmentDescriptor:
+    relative_path: Path
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _PathSnapshot:
+    kind: str
+    content: bytes | None = None
+    mode: int | None = None
+    link_target: str | None = None
+
+
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
 
 
 def environment_fingerprint(plan: HostPreflightPlan, worktree: Path) -> str:
     """Fingerprint analyzer inputs using their bytes in one exact worktree."""
+    descriptors = _environment_descriptors(plan, worktree)
+    return _fingerprint_descriptors(plan, descriptors)
+
+
+def _environment_descriptors(
+    plan: HostPreflightPlan, worktree: Path
+) -> tuple[_EnvironmentDescriptor, ...]:
     root = Path(worktree).resolve()
     if not root.is_dir():
         raise EnvironmentMaterializationError(
             f"task worktree does not exist: {root}"
         )
 
-    files: list[dict[str, str]] = []
+    descriptors: list[_EnvironmentDescriptor] = []
     for source in plan.environment_files:
         try:
             relative = source.relative_to(plan.repository_root)
@@ -86,12 +113,28 @@ def environment_fingerprint(plan: HostPreflightPlan, worktree: Path) -> str:
                 f"environment descriptor escapes task worktree: {relative}"
             )
         try:
-            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            content = resolved.read_bytes()
         except OSError as error:
             raise EnvironmentMaterializationError(
                 f"unable to read environment descriptor {relative}: {error}"
             ) from error
-        files.append({"path": relative.as_posix(), "sha256": digest})
+        descriptors.append(
+            _EnvironmentDescriptor(relative_path=relative, content=content)
+        )
+    return tuple(descriptors)
+
+
+def _fingerprint_descriptors(
+    plan: HostPreflightPlan,
+    descriptors: Sequence[_EnvironmentDescriptor],
+) -> str:
+    files = [
+        {
+            "path": descriptor.relative_path.as_posix(),
+            "sha256": hashlib.sha256(descriptor.content).hexdigest(),
+        }
+        for descriptor in descriptors
+    ]
 
     payload = {
         "contract": _CACHE_CONTRACT_VERSION,
@@ -292,7 +335,8 @@ class HostEnvironmentManager:
                 self._assert_no_tracked_changes(
                     worktree, "before environment materialization"
                 )
-            fingerprint = environment_fingerprint(plan, worktree)
+            descriptors = _environment_descriptors(plan, worktree)
+            fingerprint = _fingerprint_descriptors(plan, descriptors)
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
             command_environments = self._command_environments(
@@ -306,6 +350,7 @@ class HostEnvironmentManager:
                 fingerprint=fingerprint,
                 cache_path=cache_path,
                 source_worktree=worktree,
+                descriptors=descriptors,
                 command_environments=command_environments,
             )
             materialization_reused = self._materialize_worktree(
@@ -349,14 +394,14 @@ class HostEnvironmentManager:
         fingerprint: str,
         cache_path: Path,
         source_worktree: Path,
+        descriptors: Sequence[_EnvironmentDescriptor],
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
     ) -> bool:
         if not plan.prepare_commands:
             return False
-        lock = _preparation_lock(self.repository_root, fingerprint)
-        with lock:
+        with _preparation_lock(cache_path):
             marker = cache_path / ".betterborg-prepared"
             completed = store.find_completed_environment_attempt(
                 fingerprint, kind="prepare"
@@ -375,7 +420,9 @@ class HostEnvironmentManager:
                 commands=plan.prepare_commands,
                 worktree=None,
                 preparation_source=source_worktree,
+                preparation_descriptors=descriptors,
                 cache_path=cache_path,
+                completion_marker=marker,
                 command_environments=command_environments,
             )
             return False
@@ -394,10 +441,20 @@ class HostEnvironmentManager:
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
     ) -> bool:
-        if store.find_completed_environment_attempt(
-            fingerprint, kind="materialize", task_id=claim.task_id
-        ) is not None:
+        marker = self._materialization_marker(worktree)
+        if (
+            store.find_completed_environment_attempt(
+                fingerprint, kind="materialize", task_id=claim.task_id
+            )
+            is not None
+            and _prepared_marker_matches(marker, fingerprint)
+        ):
             return True
+
+        # A failed or intervening materialization may already have changed
+        # ignored checkout-local dependencies.  Invalidate the prior state
+        # before running so a later A -> B -> A transition cannot reuse A.
+        _invalidate_marker(marker)
 
         # Analyzer materialization is preferred.  Preparation is the safe
         # per-checkout fallback because outputs from the disposable preparation
@@ -412,6 +469,7 @@ class HostEnvironmentManager:
             commands=commands,
             worktree=worktree,
             cache_path=cache_path,
+            completion_marker=marker,
             command_environments=command_environments,
         )
         return False
@@ -431,6 +489,8 @@ class HostEnvironmentManager:
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
         preparation_source: Path | None = None,
+        preparation_descriptors: Sequence[_EnvironmentDescriptor] = (),
+        completion_marker: Path | None = None,
     ) -> None:
         prior = [
             attempt
@@ -487,16 +547,17 @@ class HostEnvironmentManager:
                             "preparation cannot use a caller-provided worktree"
                         )
                     with self._preparation_worktree(
-                        fingerprint, preparation_source
+                        fingerprint,
+                        preparation_source,
+                        preparation_descriptors,
                     ) as preparation_worktree:
                         results = self._run_commands(
                             commands,
                             worktree=preparation_worktree,
                             command_environments=command_environments,
                         )
-                    (cache_path / ".betterborg-prepared").write_text(
-                        f"{fingerprint}\n", encoding="utf-8"
-                    )
+                if completion_marker is not None:
+                    _write_marker(completion_marker, fingerprint)
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = _redact(str(error), mask_values)
@@ -630,7 +691,10 @@ class HostEnvironmentManager:
 
     @contextmanager
     def _preparation_worktree(
-        self, fingerprint: str, source_worktree: Path
+        self,
+        fingerprint: str,
+        source_worktree: Path,
+        descriptors: Sequence[_EnvironmentDescriptor],
     ) -> Iterator[Path]:
         identity = fingerprint.removeprefix("sha256:")
         path = self.preparation_root / identity
@@ -648,7 +712,8 @@ class HostEnvironmentManager:
 
         active_error: BaseException | None = None
         try:
-            yield path
+            with _descriptor_overlay(path, descriptors):
+                yield path
         except BaseException as error:
             active_error = error
             raise
@@ -713,6 +778,19 @@ class HostEnvironmentManager:
 
     def _cache_path(self, fingerprint: str) -> Path:
         return self.cache_root / fingerprint.removeprefix("sha256:")
+
+    def _materialization_marker(self, worktree: Path) -> Path:
+        marker = worktree / ".borg/state/environment-materialization"
+        parent = marker.parent.resolve()
+        if not parent.is_relative_to(worktree.resolve()):
+            raise EnvironmentMaterializationError(
+                "checkout-local environment marker escapes task worktree"
+            )
+        if not SafeGit(worktree).is_ignored(marker):
+            raise EnvironmentMaterializationError(
+                "checkout-local environment marker is not ignored by Git"
+            )
+        return marker
 
     def _validate_managed_paths(self) -> None:
         if self.preparation_root == self.repository_root or (
@@ -802,7 +880,135 @@ def _prepared_marker_matches(marker: Path, fingerprint: str) -> bool:
         return False
 
 
-def _preparation_lock(repository_root: Path, fingerprint: str) -> threading.Lock:
-    key = f"{repository_root.resolve()}::{fingerprint}"
+def _write_marker(marker: Path, fingerprint: str) -> None:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{fingerprint}\n", encoding="utf-8")
+    except OSError as error:
+        raise EnvironmentMaterializationError(
+            f"unable to record environment state marker {marker}: {error}"
+        ) from error
+
+
+def _invalidate_marker(marker: Path) -> None:
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as error:
+        raise EnvironmentMaterializationError(
+            f"unable to invalidate environment state marker {marker}: {error}"
+        ) from error
+
+
+@contextmanager
+def _preparation_lock(cache_path: Path) -> Iterator[None]:
+    key = str(cache_path.resolve())
     with _PREPARATION_LOCKS_GUARD:
-        return _PREPARATION_LOCKS.setdefault(key, threading.Lock())
+        process_lock = _PREPARATION_LOCKS.setdefault(key, threading.Lock())
+    with process_lock:
+        lock_path = cache_path / ".betterborg-preparation.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            _lock_file(lock_file)
+            try:
+                yield
+            finally:
+                _unlock_file(lock_file)
+
+
+def _lock_file(lock_file) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    else:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(lock_file) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _descriptor_overlay(
+    worktree: Path, descriptors: Sequence[_EnvironmentDescriptor]
+) -> Iterator[None]:
+    originals: list[tuple[Path, _PathSnapshot]] = []
+    try:
+        for descriptor in descriptors:
+            destination = worktree / descriptor.relative_path
+            parent = destination.parent.resolve()
+            if not parent.is_relative_to(worktree):
+                raise EnvironmentMaterializationError(
+                    "environment descriptor escapes preparation worktree: "
+                    f"{descriptor.relative_path}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            original = _snapshot_path(destination)
+            originals.append((destination, original))
+            _replace_with_regular_file(destination, descriptor.content)
+        yield
+    finally:
+        for destination, original in reversed(originals):
+            _restore_path(destination, original)
+
+
+def _snapshot_path(path: Path) -> _PathSnapshot:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return _PathSnapshot(kind="missing")
+    except OSError as error:
+        raise EnvironmentMaterializationError(
+            f"unable to inspect preparation descriptor {path}: {error}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        return _PathSnapshot(kind="symlink", link_target=os.readlink(path))
+    if stat.S_ISREG(metadata.st_mode):
+        return _PathSnapshot(
+            kind="file",
+            content=path.read_bytes(),
+            mode=stat.S_IMODE(metadata.st_mode),
+        )
+    raise EnvironmentMaterializationError(
+        f"preparation descriptor is not a file or symlink: {path}"
+    )
+
+
+def _replace_with_regular_file(path: Path, content: bytes) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        path.write_bytes(content)
+    except OSError as error:
+        raise EnvironmentMaterializationError(
+            f"unable to materialize preparation descriptor {path}: {error}"
+        ) from error
+
+
+def _restore_path(path: Path, snapshot: _PathSnapshot) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        if snapshot.kind == "file":
+            if snapshot.content is None or snapshot.mode is None:
+                raise AssertionError("regular-file snapshot is incomplete")
+            path.write_bytes(snapshot.content)
+            path.chmod(snapshot.mode)
+        elif snapshot.kind == "symlink":
+            if snapshot.link_target is None:
+                raise AssertionError("symlink snapshot is incomplete")
+            path.symlink_to(snapshot.link_target)
+    except OSError as error:
+        raise EnvironmentMaterializationError(
+            f"unable to restore preparation descriptor {path}: {error}"
+        ) from error

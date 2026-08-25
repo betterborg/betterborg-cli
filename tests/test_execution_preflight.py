@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import multiprocessing
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -304,8 +307,6 @@ def test_same_task_descriptor_change_rematerializes_before_sanity(
         (changed_worktree / "package.lock").write_text(
             "lock-v2\n", encoding="utf-8"
         )
-        _git(changed_worktree, "add", "package.lock")
-        _git(changed_worktree, "commit", "--quiet", "-m", "update lock")
 
         second = fixture.manager().materialize_claimed_task(
             store, plan, claim, fixture.owner_token
@@ -315,8 +316,95 @@ def test_same_task_descriptor_change_rematerializes_before_sanity(
     assert second.fingerprint != first.fingerprint
     assert second.preparation_reused is False
     assert _preparation_count(fixture.cache_root) == 2
+    assert (second.cache_path / "xdg/cache/prepared-lock").read_text() == (
+        "lock-v2\n"
+    )
     assert (changed_worktree / "README.md").read_text() == "coding work\n"
+    assert (changed_worktree / "package.lock").read_text() == "lock-v2\n"
     assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+
+
+def test_reverted_fingerprint_rematerializes_checkout_local_dependencies(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository)
+    worktree = fixture.worktree_paths[0]
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        first = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        assert (worktree / ".dependencies/materialized").read_text() == (
+            "lock-v1\n"
+        )
+
+        (worktree / "package.lock").write_text("lock-v2\n", encoding="utf-8")
+        second = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        assert second.fingerprint != first.fingerprint
+        assert (worktree / ".dependencies/materialized").read_text() == (
+            "lock-v2\n"
+        )
+
+        (worktree / "package.lock").write_text("lock-v1\n", encoding="utf-8")
+        reverted = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+
+    assert reverted.fingerprint == first.fingerprint
+    assert reverted.materialization_reused is False
+    assert (worktree / ".dependencies/materialized").read_text() == "lock-v1\n"
+    assert _materialization_count(fixture.cache_root) == 3
+
+
+def test_preparation_is_coordinated_across_processes(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture(task_count=2)
+    plan = _plan(fixture.repository, prepare_action="prepare-slow")
+    with SqliteStore.open(fixture.database) as store:
+        claims = (fixture.claim(store), fixture.claim(store))
+
+    context = multiprocessing.get_context("spawn")
+    start = fixture.preparation_root.with_name(
+        f"{fixture.preparation_root.name}-start"
+    )
+    result_paths = tuple(
+        fixture.preparation_root.with_name(
+            f"{fixture.preparation_root.name}-result-{index}"
+        )
+        for index in range(len(claims))
+    )
+    processes = [
+        context.Process(
+            target=_materialize_in_process,
+            args=(
+                fixture,
+                plan,
+                claim,
+                start,
+                result_path,
+            ),
+        )
+        for claim, result_path in zip(claims, result_paths, strict=True)
+    ]
+    for process in processes:
+        process.start()
+    start.touch()
+    for process in processes:
+        process.join(timeout=20)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    outcomes = [
+        json.loads(result_path.read_text(encoding="utf-8"))
+        for result_path in result_paths
+    ]
+    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
+    assert sorted(outcome[1] for outcome in outcomes) == [False, True]
+    assert _preparation_count(fixture.cache_root) == 1
 
 
 def test_environment_command_contaminating_primary_checkout_blocks_task(
@@ -549,15 +637,17 @@ def _write_fake_package_manager(path: Path) -> None:
         "action=$1\n"
         "mkdir -p \"$XDG_CACHE_HOME\"\n"
         "case \"$action\" in\n"
-        "  prepare)\n"
+        "  prepare|prepare-slow)\n"
+        "    if [ \"$action\" = prepare-slow ]; then sleep 0.5; fi\n"
         "    printf 'prepare\\n' >> \"$XDG_CACHE_HOME/preparations.log\"\n"
+        "    cp package.lock \"$XDG_CACHE_HOME/prepared-lock\"\n"
         "    mkdir -p .dependencies\n"
         "    printf 'local\\n' > .dependencies/prepared\n"
         "    ;;\n"
         "  materialize)\n"
         "    printf 'materialize\\n' >> \"$XDG_CACHE_HOME/materializations.log\"\n"
         "    mkdir -p .dependencies\n"
-        "    printf 'local\\n' > .dependencies/materialized\n"
+        "    cp package.lock .dependencies/materialized\n"
         "    ;;\n"
         "  tracked)\n"
         "    printf 'changed\\n' > README.md\n"
@@ -588,6 +678,32 @@ def _materialization_count(cache_root: Path) -> int:
         path.read_text(encoding="utf-8").count("materialize\n")
         for path in cache_root.rglob("materializations.log")
     )
+
+
+def _materialize_in_process(
+    fixture: ExecutionPreflightFixture,
+    plan: HostPreflightPlan,
+    claim: TaskClaim,
+    start: Path,
+    result_path: Path,
+) -> None:
+    try:
+        deadline = time.monotonic() + 10
+        while not start.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("concurrent preparation did not start")
+            time.sleep(0.01)
+        with SqliteStore.open(fixture.database) as store:
+            materialization = fixture.manager().materialize_claimed_task(
+                store,
+                plan,
+                claim,
+                fixture.owner_token,
+            )
+        outcome = ("ok", materialization.preparation_reused)
+    except BaseException as error:
+        outcome = ("error", repr(error))
+    result_path.write_text(json.dumps(outcome), encoding="utf-8")
 
 
 def _git(repository: Path, *arguments: str) -> str:
