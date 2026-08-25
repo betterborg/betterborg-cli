@@ -167,6 +167,34 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     assert result.services[1].url == "https://search.example.test/api"
 
 
+def test_preserves_prepare_and_materialize_command_phases(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "environment-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "prepare-environment", "exit 0")
+    _executable(binary_dir, "materialize-environment", "exit 0")
+    plan = {
+        "environment": {
+            "prepare_commands": [{"argv": ["prepare-environment"]}],
+            "materialize_commands": [{"argv": ["materialize-environment"]}],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.commands == ()
+    assert [command.argv for command in result.prepare_commands] == [
+        ("prepare-environment",)
+    ]
+    assert [command.argv for command in result.materialize_commands] == [
+        ("materialize-environment",)
+    ]
+
+
 def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     committed_git_repo: Path,
 ) -> None:
@@ -208,6 +236,36 @@ def test_toolchain_version_must_match_repository_evidence_and_host(
     assert "observed: example 3.12.1" in result.reason
 
 
+def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "cited-version-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
+    plan = {
+        "environment": {
+            "files": ["runtime.version"],
+            "toolchains": [
+                {
+                    "name": "example-runtime",
+                    "version": "3.11.9",
+                    "source": "missing.version",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert len(result.failures) == 1
+    assert "version evidence file must exist" in result.reason
+    assert "missing.version" in result.reason
+
+
 @pytest.mark.parametrize(
     ("service", "external_urls", "expected"),
     [
@@ -233,6 +291,25 @@ def test_toolchain_version_must_match_repository_evidence_and_host(
             },
             {"DEPENDENCY_URL": "localhost:9000"},
             "requires an absolute service URL in DEPENDENCY_URL",
+        ),
+        (
+            {
+                "name": "dependency",
+                "url_env": "DEPENDENCY_URL",
+                "source": "app.toml#dependency",
+            },
+            {"DEPENDENCY_URL": "https://["},
+            "requires an absolute service URL in DEPENDENCY_URL",
+        ),
+        (
+            {
+                "name": "dependency",
+                "compose_service": "dependency",
+                "url_env": "DEPENDENCY_URL",
+                "source": "app.toml#dependency",
+            },
+            {"DEPENDENCY_URL": "https://dependency.example.test"},
+            "ambiguous or inferred",
         ),
     ],
 )

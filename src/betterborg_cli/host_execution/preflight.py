@@ -79,6 +79,8 @@ class HostPreflightPlan:
 
     repository_root: Path
     commands: tuple[HostCommand, ...]
+    prepare_commands: tuple[HostCommand, ...]
+    materialize_commands: tuple[HostCommand, ...]
     environment_files: tuple[Path, ...]
     executables: tuple[HostExecutable, ...]
     required_secret_names: tuple[str, ...]
@@ -140,9 +142,15 @@ class HostPreflight:
 
         plan = analyzer_plan() if callable(analyzer_plan) else analyzer_plan
         failures: list[HostPreflightFailure] = []
-        commands = self._commands(plan, failures)
+        commands, prepare_commands, materialize_commands = self._commands(
+            plan, failures
+        )
         environment_files = self._environment_files(plan, failures)
-        executables = self._executables(plan, commands, failures)
+        executables = self._executables(
+            plan,
+            (*commands, *prepare_commands, *materialize_commands),
+            failures,
+        )
         required_secrets = self._required_secrets(
             plan, available_secret_names, failures
         )
@@ -158,6 +166,8 @@ class HostPreflight:
         return HostPreflightPlan(
             repository_root=self.repository_root,
             commands=tuple(commands),
+            prepare_commands=tuple(prepare_commands),
+            materialize_commands=tuple(materialize_commands),
             environment_files=tuple(environment_files),
             executables=tuple(executables),
             required_secret_names=tuple(required_secrets),
@@ -169,55 +179,83 @@ class HostPreflight:
         self,
         plan: Mapping[str, Any],
         failures: list[HostPreflightFailure],
-    ) -> list[HostCommand]:
-        records: list[Mapping[str, Any]] = []
+    ) -> tuple[list[HostCommand], list[HostCommand], list[HostCommand]]:
         catalog = plan.get("command_catalog")
-        if isinstance(catalog, Mapping):
-            records.extend(_mappings(catalog.get("commands")))
         environment = plan.get("environment")
-        if isinstance(environment, Mapping):
-            for key in ("prepare_commands", "materialize_commands"):
-                records.extend(_mappings(environment.get(key)))
+        groups = (
+            (
+                "catalog",
+                _mappings(catalog.get("commands"))
+                if isinstance(catalog, Mapping)
+                else [],
+                "command",
+            ),
+            (
+                "prepare",
+                _mappings(environment.get("prepare_commands"))
+                if isinstance(environment, Mapping)
+                else [],
+                "environment",
+            ),
+            (
+                "materialize",
+                _mappings(environment.get("materialize_commands"))
+                if isinstance(environment, Mapping)
+                else [],
+                "environment",
+            ),
+        )
 
-        commands: list[HostCommand] = []
-        for index, record in enumerate(records):
-            argv = record.get("argv")
-            if not _string_sequence(argv):
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=f"command {index + 1} must have a non-empty argv",
-                        evidence=_evidence(record, "analyzer command catalog"),
-                        guidance=(
-                            "Correct the analyzer command metadata and rerun analysis."
+        validated_groups: list[list[HostCommand]] = []
+        for group, records, default_stage in groups:
+            commands: list[HostCommand] = []
+            for index, record in enumerate(records):
+                argv = record.get("argv")
+                if not _string_sequence(argv):
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"{group} command {index + 1} must have a non-empty "
+                                "argv"
+                            ),
+                            evidence=_evidence(record, "analyzer command catalog"),
+                            guidance=(
+                                "Correct the analyzer command metadata and rerun "
+                                "analysis."
+                            ),
+                        )
+                    )
+                    continue
+                cwd = record.get("cwd", ".")
+                resolved = self._repository_path(cwd, require_directory=True)
+                if resolved is None:
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"{group} command cwd must be an existing "
+                                f"repo-relative directory: {cwd!r}"
+                            ),
+                            evidence=_evidence(record, "analyzer command catalog"),
+                            guidance=(
+                                "Create the directory or correct the command cwd in "
+                                "repository metadata."
+                            ),
+                        )
+                    )
+                    continue
+                commands.append(
+                    HostCommand(
+                        stage=str(record.get("stage", default_stage)),
+                        argv=tuple(argv),
+                        cwd=(
+                            resolved.relative_to(self.repository_root).as_posix()
+                            or "."
                         ),
                     )
                 )
-                continue
-            cwd = record.get("cwd", ".")
-            resolved = self._repository_path(cwd, require_directory=True)
-            if resolved is None:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            "command cwd must be an existing repo-relative "
-                            f"directory: {cwd!r}"
-                        ),
-                        evidence=_evidence(record, "analyzer command catalog"),
-                        guidance=(
-                            "Create the directory or correct the command cwd in "
-                            "repository metadata."
-                        ),
-                    )
-                )
-                continue
-            commands.append(
-                HostCommand(
-                    stage=str(record.get("stage", "environment")),
-                    argv=tuple(argv),
-                    cwd=resolved.relative_to(self.repository_root).as_posix() or ".",
-                )
-            )
-        return commands
+            validated_groups.append(commands)
+        catalog_commands, prepare_commands, materialize_commands = validated_groups
+        return catalog_commands, prepare_commands, materialize_commands
 
     def _environment_files(
         self,
@@ -322,10 +360,14 @@ class HostPreflight:
                     )
                 )
                 continue
-            source_values = [toolchain.get("source")]
-            if isinstance(environment, Mapping):
-                source_values.append(environment.get("source"))
+            cited_source = toolchain.get("source")
+            if isinstance(cited_source, str) and cited_source:
+                source_values = [cited_source]
+            elif isinstance(environment, Mapping):
+                source_values = [environment.get("source")]
                 source_values.extend(environment.get("files") or ())
+            else:
+                source_values = []
             source_paths = [
                 path
                 for value in source_values
@@ -506,7 +548,24 @@ class HostPreflight:
             evidence = _evidence(service, "analyzer service dependency")
             compose_service = service.get("compose_service")
             url_env = service.get("url_env")
-            if isinstance(compose_service, str) and compose_service:
+            has_compose = isinstance(compose_service, str) and bool(compose_service)
+            has_external = isinstance(url_env, str) and bool(url_env)
+            if has_compose and has_external:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            f"selected service is ambiguous or inferred: {name}"
+                        ),
+                        evidence=evidence,
+                        guidance=(
+                            "Set exactly one of compose_service or url_env in "
+                            "analyzer evidence; preflight will not choose between "
+                            "runtime sources."
+                        ),
+                    )
+                )
+            elif has_compose:
+                assert isinstance(compose_service, str)
                 compose_selected.append((compose_service, service))
                 services.append(
                     HostService(
@@ -514,10 +573,10 @@ class HostPreflight:
                         kind="compose",
                         evidence=evidence,
                         compose_service=compose_service,
-                        url_env=url_env if isinstance(url_env, str) else None,
                     )
                 )
-            elif isinstance(url_env, str) and url_env:
+            elif has_external:
+                assert isinstance(url_env, str)
                 url = external_urls.get(url_env) or self._environment.get(url_env)
                 if not _valid_external_url(url):
                     failures.append(
@@ -804,7 +863,10 @@ def _contains_version(output: str, version: str) -> bool:
 def _valid_external_url(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme)) and bool(
         parsed.netloc
     )
