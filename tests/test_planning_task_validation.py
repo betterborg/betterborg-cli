@@ -239,6 +239,43 @@ def test_task_from_unrelated_repository_cannot_own_phase_elements() -> None:
     assert "task.traceability.unowned" in rules
 
 
+def test_writing_repository_task_can_own_consumed_repository_contract() -> None:
+    plan = {
+        "repositories": [{"id": "primary"}, {"id": "secondary"}],
+        "phases": [
+            {
+                "name": "01-integration",
+                "repositories": ["primary"],
+                "deliverables": ["Integration"],
+                "contracts": [
+                    {
+                        "kind": "config",
+                        "spec": "secondary.enabled: bool",
+                        "repo": "secondary",
+                    }
+                ],
+                "acceptance_criteria": ["Integration works"],
+                "files_touched": [
+                    {"path": "integration.py", "role": "new", "repo": "primary"},
+                    {"path": "settings.py", "role": "read", "repo": "secondary"},
+                ],
+                "test_strategy": "Run integration tests.",
+                "dependencies_on": [],
+            }
+        ],
+    }
+    task = _task(
+        uuid4(),
+        stage="01-integration",
+        stem="01-build",
+        position=1,
+        refs=_required_refs(plan, "01-integration"),
+        repository="primary",
+    )
+
+    validate_task_graph(plan, [task], [])
+
+
 def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
     plan, tasks, dependencies = _valid_graph()
     foundation = tasks[0]

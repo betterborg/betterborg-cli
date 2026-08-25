@@ -321,14 +321,7 @@ def task_graph_findings(
                 continue
             seen_refs.add(plan_ref)
             element = elements_by_ref[plan_ref]
-            repository_conflict = (
-                task_repository_invalid
-                or (
-                    element.repository is not None
-                    and task_repository is not None
-                    and element.repository != task_repository
-                )
-            )
+            repository_conflict = task_repository_invalid
             if element.phase != task.stage or repository_conflict:
                 consumes_ancestor = (
                     not repository_conflict
