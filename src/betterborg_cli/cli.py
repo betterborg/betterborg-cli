@@ -22,11 +22,15 @@ from betterborg_cli.planning import (
     ArchitectLoop,
     SupervisorCancelled,
     SupervisorLoop,
+    TaskDigestDriftError,
+    TaskPublication,
     TaskPublisher,
     TechLeadCancelled,
     TechLeadLoop,
     approved_plan_digest,
     render_plan_markdown,
+    render_task_markdown,
+    task_markdown_digest,
     validate_plan,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
@@ -45,6 +49,7 @@ from betterborg_cli.store import (
     PlanningAttempt,
     PlanningAttemptStatus,
     SqliteStore,
+    TaskRecord,
 )
 from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
@@ -364,6 +369,145 @@ def show_plan(name: str, json_output: bool) -> None:
         click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
     else:
         click.echo(render_plan_markdown(stored_plan), nl=False)
+
+
+@cli.group()
+def task() -> None:
+    """Inspect the current executable tasks for a Borg."""
+
+
+@task.command(name="list")
+@click.argument("name")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit current task metadata as machine-readable JSON.",
+)
+def list_tasks(name: str, json_output: bool) -> None:
+    """List the complete SQLite-current task generation for a Borg."""
+    try:
+        paths, publication = _current_task_publication(name)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    tasks = [
+        _task_listing_item(paths, published.task, published.path)
+        for published in publication.files
+    ]
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "approved_plan_digest": publication.generation.manifest.get(
+                        "approved_plan_digest"
+                    ),
+                    "borg": name,
+                    "generation_digest": publication.generation.digest,
+                    "generation_id": str(publication.generation.id),
+                    "tasks": tasks,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return
+
+    click.echo(
+        f"Current task generation for Borg {name!r}: {publication.generation.id}"
+    )
+    for item in tasks:
+        click.echo(
+            f"{item['stage']}/{item['stem']} "
+            f"[{item['complexity']}] {item['title']}"
+        )
+        click.echo(f"  Task ref: {item['task_ref']}")
+        click.echo(f"  Markdown: {item['path']}")
+
+
+@task.command(name="show")
+@click.argument("name")
+@click.argument("task_ref")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit the stored task contract as machine-readable JSON.",
+)
+def show_task(name: str, task_ref: str, json_output: bool) -> None:
+    """Show one task from the complete SQLite-current generation."""
+    try:
+        paths, publication = _current_task_publication(name)
+        published = next(
+            (
+                item
+                for item in publication.files
+                if task_ref
+                in {item.task.task_ref, f"{item.task.stage}/{item.task.stem}"}
+            ),
+            None,
+        )
+        if published is None:
+            raise ValueError(
+                f"current task {task_ref!r} does not exist for Borg {name!r}"
+            )
+        body = published.path.read_bytes()
+        expected = render_task_markdown(published.task.task).encode("utf-8")
+        if body != expected or task_markdown_digest(body) != published.task.digest:
+            raise TaskDigestDriftError(
+                f"task file {published.task.stage}/{published.task.stem}.md "
+                "digest drifted"
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if json_output:
+        item = _task_listing_item(paths, published.task, published.path)
+        click.echo(
+            json.dumps(
+                {**item, "task": published.task.task},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        click.echo(body.decode("utf-8"), nl=False)
+
+
+def _current_task_publication(name: str) -> tuple[RepoPaths, TaskPublication]:
+    """Load and verify the sole current generation without reconciling state."""
+    paths = RepoPaths.discover()
+    config = load_repository_config(paths)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        repository = store.get_repository(config.repository_id)
+        if repository is None:
+            raise ValueError("repository is not initialized; run 'borg init' first")
+        borg = store.get_borg_by_name(repository.id, name)
+        if borg is None:
+            raise ValueError(
+                f"Borg {name!r} does not exist; run 'borg create {name}' first"
+            )
+        publication = TaskPublisher(repository, store).inspect_current_task_files(
+            borg.id
+        )
+    return paths, publication
+
+
+def _task_listing_item(
+    paths: RepoPaths, record: TaskRecord, path: Path
+) -> dict[str, object]:
+    """Return stable public metadata for one verified current task."""
+    return {
+        "complexity": record.complexity.value,
+        "dependencies": record.task.get("dependencies", []),
+        "digest": record.digest,
+        "path": path.relative_to(paths.root).as_posix(),
+        "position": record.position,
+        "stage": record.stage,
+        "stem": record.stem,
+        "task_ref": record.task_ref,
+        "title": record.title,
+    }
 
 
 @plan.command(name="approve")

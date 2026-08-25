@@ -147,15 +147,21 @@ class TaskPublisher:
 
     def current_task_files(self, borg_id: UUID) -> TaskPublication:
         """Return executable task files only after rechecking every digest."""
+        publication = self.inspect_current_task_files(borg_id)
+        self._cleanup_noncurrent(
+            self._borg(publication.generation), publication.generation.id
+        )
+        return publication
+
+    def inspect_current_task_files(self, borg_id: UUID) -> TaskPublication:
+        """Read the verified SQLite-current task files without reconciling state."""
         borg = self.store.get_borg(borg_id)
         if borg is None:
             raise TaskPublicationError(f"Borg {borg_id} not found")
         current = self.store.get_current_task_generation(borg_id)
         if current is None:
             raise TaskPublicationError(f"Borg {borg.name!r} has no current tasks")
-        publication = self._verify_current(borg, current)
-        self._cleanup_noncurrent(borg, current.id)
-        return publication
+        return self._verify_current(borg, current)
 
     def reconcile(self, borg_id: UUID) -> TaskPublication | None:
         """Resume approved publication before cleaning noncurrent managed trees."""
