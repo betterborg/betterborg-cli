@@ -1010,7 +1010,6 @@ def _string_sequence(value: object) -> bool:
 def _compose_service_url_targets(
     service: Mapping[str, Any],
 ) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
-    targets: list[tuple[str, int, Literal["tcp", "udp"]]] = []
     url_env = service.get("url_env")
     port = service.get("port")
     protocol: Literal["tcp", "udp"] = "tcp"
@@ -1028,15 +1027,8 @@ def _compose_service_url_targets(
             port = first_port.get("port")
             protocol = _service_protocol(first_port.get("protocol"))
     if isinstance(url_env, str) and _service_port(port):
-        targets.append((url_env, port, protocol))
-    for record in port_records:
-        port_env = record.get("env")
-        port_value = record.get("port")
-        if isinstance(port_env, str) and _service_port(port_value):
-            targets.append(
-                (port_env, port_value, _service_protocol(record.get("protocol")))
-            )
-    return tuple(dict.fromkeys(targets))
+        return ((url_env, port, protocol),)
+    return ()
 
 
 def _service_port(value: object) -> bool:

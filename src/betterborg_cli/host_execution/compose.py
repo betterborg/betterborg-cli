@@ -634,23 +634,6 @@ def service_url_environment(
     """Return only URL variables declared by the validated service plan."""
     environment: dict[str, str] = {}
     for service in services:
-        if service.kind == "compose" and service.compose_service is not None:
-            for env_name, port, protocol in service.url_targets:
-                published = _published_port(
-                    published_ports,
-                    service.compose_service,
-                    port,
-                    protocol,
-                )
-                if published is None:
-                    continue
-                environment[env_name] = _service_url(
-                    env_name,
-                    "127.0.0.1",
-                    published,
-                    target_port=port,
-                    protocol=protocol,
-                )
         if service.url_env is None:
             continue
         if service.kind == "external" and service.url is not None:

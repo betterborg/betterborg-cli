@@ -567,7 +567,7 @@ def test_compose_url_environment_requires_an_exact_service_port(
     assert "DATABASE_URL requires an exact port" in result.reason
 
 
-def test_compose_url_environment_uses_first_declared_port(
+def test_compose_url_environment_uses_first_port_without_promoting_port_env(
     committed_git_repo: Path,
 ) -> None:
     binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
@@ -592,7 +592,9 @@ def test_compose_url_environment_uses_first_declared_port(
     database = dependencies[0]
     assert isinstance(database, dict)
     del database["port"]
-    database["ports"] = [{"port": 5432, "protocol": "udp"}]
+    database["ports"] = [
+        {"port": 5432, "protocol": "udp", "env": "POSTGRES_PORT"}
+    ]
 
     result = _preflight(
         committed_git_repo,
@@ -608,7 +610,10 @@ def test_compose_url_environment_uses_first_declared_port(
     assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
     assert service_url_environment(
         result.services, published_ports={("postgres", 5432, "udp"): 49152}
-    )["DATABASE_URL"] == "udp://127.0.0.1:49152"
+    ) == {
+        "DATABASE_URL": "udp://127.0.0.1:49152",
+        "SEARCH_URL": "https://search.example.test/api",
+    }
 
 
 def test_missing_compose_metadata_and_plugin_block_before_claim(
