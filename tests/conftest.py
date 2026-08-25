@@ -1,5 +1,6 @@
 """Shared fixtures for BetterBorg CLI tests."""
 
+import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterator
@@ -13,6 +14,7 @@ from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime.mock import MockAdapter
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import DIMENSIONS
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
     PrdSession,
@@ -92,6 +94,22 @@ def persist_repository_analysis():
 def persist_planning_context():
     """Return the shared complete planning-context factory."""
     return _persist_planning_context
+
+
+@pytest.fixture
+def planning_cli_repository(persist_planning_context):
+    """Return a factory for a planning repository with CLI-visible state."""
+
+    def create(root: Path, name: str):
+        paths = RepoPaths.discover(root)
+        fixture_database = root.parent / f"{name}.sqlite3"
+        with SqliteStore.open(fixture_database) as store:
+            repository, _borg = persist_planning_context(root, store, name)
+        paths.state_dir.mkdir(parents=True)
+        shutil.copyfile(fixture_database, paths.state_dir / "borg.sqlite3")
+        return repository, paths
+
+    return create
 
 
 @pytest.fixture

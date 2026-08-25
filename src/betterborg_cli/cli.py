@@ -42,6 +42,7 @@ from betterborg_cli.store import (
     BorgState,
     PlanApproval,
     PlanChangeRequest,
+    PlanningAttempt,
     PlanningAttemptStatus,
     SqliteStore,
 )
@@ -354,27 +355,8 @@ def show_plan(name: str, json_output: bool) -> None:
                 raise ValueError(
                     f"Borg {name!r} does not exist; run 'borg create {name}' first"
                 )
-            attempt = next(
-                (
-                    item
-                    for item in reversed(store.list_planning_attempts(borg.id))
-                    if item.phase == "architect_plan"
-                    and item.status is PlanningAttemptStatus.COMPLETED
-                    and item.result is not None
-                ),
-                None,
-            )
-            if attempt is None:
-                raise ValueError(
-                    f"Borg {name!r} does not have a stored plan; "
-                    f"run 'borg plan start {name}' first"
-                )
+            attempt = _validated_current_plan_attempt(paths, store, borg)
             stored_plan = attempt.result
-            validate_plan(
-                stored_plan,
-                paths.root,
-                check_repository_state=False,
-            )
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
@@ -477,22 +459,8 @@ def _bind_plan_approval(
     borg: Borg,
 ) -> tuple[PlanApproval, Path]:
     """Bind or recover one approval for the latest exact Architect plan."""
-    plan_attempt = next(
-        (
-            item
-            for item in reversed(store.list_planning_attempts(borg.id))
-            if item.phase == "architect_plan"
-            and item.status is PlanningAttemptStatus.COMPLETED
-            and item.result is not None
-        ),
-        None,
-    )
-    if plan_attempt is None:
-        raise ValueError(
-            f"Borg {borg.name!r} does not have a complete plan to approve"
-        )
+    plan_attempt = _validated_current_plan_attempt(paths, store, borg)
     current_plan = plan_attempt.result
-    validate_plan(current_plan, paths.root, check_repository_state=False)
     digest = approved_plan_digest(current_plan)
     body = render_plan_markdown(current_plan)
     body_digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -554,6 +522,35 @@ def _bind_plan_approval(
             new_state=BorgState.PM_WORKING,
         )
     return approval, plan_path
+
+
+def _validated_current_plan_attempt(
+    paths: RepoPaths,
+    store: SqliteStore,
+    borg: Borg,
+) -> PlanningAttempt:
+    """Return the exact latest complete Architect plan exposed to operators."""
+    attempt = next(
+        (
+            item
+            for item in reversed(store.list_planning_attempts(borg.id))
+            if item.phase == "architect_plan"
+            and item.status is PlanningAttemptStatus.COMPLETED
+            and item.result is not None
+        ),
+        None,
+    )
+    if attempt is None:
+        raise ValueError(
+            f"Borg {borg.name!r} does not have a stored plan; "
+            f"run 'borg plan start {borg.name}' first"
+        )
+    validate_plan(
+        attempt.result,
+        paths.root,
+        check_repository_state=False,
+    )
+    return attempt
 
 @plan.command(name="change")
 @click.argument("name")

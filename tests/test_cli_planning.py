@@ -1,7 +1,6 @@
 """CLI contracts for starting and resuming terminal planning."""
 
 import json
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,7 +10,6 @@ from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     BorgState,
     PlanChangeRequest,
@@ -26,7 +24,7 @@ from betterborg_cli.store import (
 def test_plan_start_answers_inline_and_reaches_approval_pending(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
@@ -52,9 +50,7 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     prompts: list[str] = []
     outputs: list[str] = []
 
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "inline-plan"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "inline-plan")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -86,7 +82,7 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
 def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
@@ -102,9 +98,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
         )
     )
     answers: Iterator[str | None] = iter((None, "Repository maintainers."))
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "resume-plan"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "resume-plan")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -149,7 +143,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
 def test_plan_start_reports_review_cap_as_blocked(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_change_request_response,
     configure_interactive_cli,
@@ -165,9 +159,7 @@ def test_plan_start_reports_review_cap_as_blocked(
         tech_lead_change_request_response("Cover a partial rollback."),
     ):
         adapter.queue(MockResponse(payload=payload))
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "blocked-plan"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "blocked-plan")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -195,13 +187,11 @@ def test_plan_start_reports_review_cap_as_blocked(
 def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     monkeypatch,
 ) -> None:
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "show-plan"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "show-plan")
     plan = planning_plan_response()
     plan["phases"][0]["files_touched"].append(
         {
@@ -300,12 +290,10 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
 def test_plan_show_reports_when_no_plan_is_stored(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     monkeypatch,
 ) -> None:
-    repository, _paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "missing-plan"
-    )
+    repository, _paths = planning_cli_repository(committed_git_repo, "missing-plan")
     monkeypatch.chdir(repository.root)
 
     result = cli_runner.invoke(cli, ["plan", "show", "missing-plan"])
@@ -318,7 +306,7 @@ def test_plan_show_reports_when_no_plan_is_stored(
 def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_approval_response,
     tech_lead_change_request_response,
@@ -337,9 +325,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         tech_lead_approval_response(),
     ):
         adapter.queue(MockResponse(payload=payload))
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "change-plan"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "change-plan")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -441,7 +427,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
 def test_plan_change_rejects_empty_note_without_mutating_gate(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
@@ -453,9 +439,7 @@ def test_plan_change_rejects_empty_note_without_mutating_gate(
         tech_lead_approval_response(),
     ):
         adapter.queue(MockResponse(payload=payload))
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "empty-change"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "empty-change")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -489,7 +473,7 @@ def test_plan_change_rejects_empty_note_without_mutating_gate(
 def test_plan_change_runtime_failure_is_actionably_resumable(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
@@ -501,9 +485,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
         tech_lead_approval_response(),
     ):
         adapter.queue(MockResponse(payload=payload))
-    repository, paths = _planning_cli_repository(
-        committed_git_repo, persist_planning_context, "resume-change"
-    )
+    repository, paths = planning_cli_repository(committed_git_repo, "resume-change")
     configure_interactive_cli(
         repository.root,
         adapter,
@@ -572,16 +554,6 @@ def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> N
     assert "change" in result.output
     assert "question" not in result.output
     assert "answer" not in result.output
-
-
-def _planning_cli_repository(root: Path, persist_planning_context, name: str):
-    paths = RepoPaths.discover(root)
-    fixture_database = root.parent / f"{name}.sqlite3"
-    with SqliteStore.open(fixture_database) as store:
-        repository, _borg = persist_planning_context(root, store, name)
-    paths.state_dir.mkdir(parents=True)
-    shutil.copyfile(fixture_database, paths.state_dir / "borg.sqlite3")
-    return repository, paths
 
 
 def _planning_snapshot(store: SqliteStore, borg_id):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -18,7 +18,6 @@ from betterborg_cli.planning import (
     build_plan_element_catalog,
 )
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -30,14 +29,14 @@ from betterborg_cli.store import (
 
 def _seed_approval_pending(
     root: Path,
-    persist_planning_context,
+    planning_cli_repository,
     name: str,
     plan: dict,
 ):
-    paths = RepoPaths.discover(root)
-    fixture_database = root.parent / f"{name}.sqlite3"
-    with SqliteStore.open(fixture_database) as store:
-        repository, borg = persist_planning_context(root, store, name)
+    repository, paths = planning_cli_repository(root, name)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, name)
+        assert borg is not None
         attempt = PlanningAttempt(
             borg_id=borg.id,
             phase="architect_plan",
@@ -58,8 +57,6 @@ def _seed_approval_pending(
             expected_version=borg.state_version,
             new_state=BorgState.PLAN_APPROVAL_PENDING,
         )
-    paths.state_dir.mkdir(parents=True)
-    shutil.copyfile(fixture_database, paths.state_dir / "borg.sqlite3")
     return repository, attempt, paths
 
 
@@ -108,14 +105,14 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
 def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
     monkeypatch,
 ) -> None:
     plan = planning_plan_response()
     repository, plan_attempt, paths = _seed_approval_pending(
-        committed_git_repo, persist_planning_context, "approved-plan", plan
+        committed_git_repo, planning_cli_repository, "approved-plan", plan
     )
     adapter = MockAdapter(name="openai")
     adapter.queue(MockResponse(payload=_pm_tasks(plan)))
@@ -137,6 +134,10 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
         return adapter
 
     monkeypatch.setattr(cli_module, "select_agent", select)
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "approved-plan", "--json"])
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.output) == plan
 
     result = cli_runner.invoke(cli, ["plan", "approve", "approved-plan", "--yes"])
 
@@ -205,13 +206,13 @@ Extend the existing repository conventions and verify public behavior.
 def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
 ) -> None:
     plan = planning_plan_response()
     repository, _attempt, paths = _seed_approval_pending(
-        committed_git_repo, persist_planning_context, "resume-approval", plan
+        committed_git_repo, planning_cli_repository, "resume-approval", plan
     )
     adapter = MockAdapter(name="openai")
     adapter.queue(MockResponse(payload=_pm_tasks(plan)))
@@ -259,14 +260,14 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
 def test_plan_approve_resumes_publication_before_becoming_ready(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
     monkeypatch,
 ) -> None:
     plan = planning_plan_response()
     repository, _attempt, paths = _seed_approval_pending(
-        committed_git_repo, persist_planning_context, "resume-publication", plan
+        committed_git_repo, planning_cli_repository, "resume-publication", plan
     )
     adapter = MockAdapter(name="openai")
     adapter.queue(MockResponse(payload=_pm_tasks(plan)))
@@ -329,13 +330,13 @@ def test_plan_approve_resumes_publication_before_becoming_ready(
 def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    persist_planning_context,
+    planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
 ) -> None:
     plan = planning_plan_response()
     repository, _attempt, paths = _seed_approval_pending(
-        committed_git_repo, persist_planning_context, "blocked-tasks", plan
+        committed_git_repo, planning_cli_repository, "blocked-tasks", plan
     )
     adapter = MockAdapter(name="openai")
     for response in (
