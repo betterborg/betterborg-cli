@@ -105,10 +105,15 @@ class PrimaryCheckoutGuard:
         head = self._git_output(["rev-parse", "--verify", "HEAD"]).strip()
         branch = self._git_output(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
         return _CheckoutSnapshot(
+            # Runtime-owned paths are safe to ignore only while untracked.
+            # Once Git tracks a path, every modification is contamination.
             status=frozenset(
                 entry
                 for entry, paths in _status_entries(status)
-                if any(not self._ignored(path) for path in paths)
+                if not (
+                    entry.startswith("?? ")
+                    and all(self._ignored(path) for path in paths)
+                )
             ),
             head=head,
             branch=branch,

@@ -86,7 +86,18 @@ _GIT_REPOSITORY_ENVIRONMENT = frozenset(
 
 
 def _has_long_option(argument: str, option: str) -> bool:
-    return argument == option or argument.startswith(f"{option}=")
+    """Match a long option, including abbreviations Git may expand.
+
+    Git accepts unambiguous long-option prefixes such as ``--amen`` for
+    ``--amend``.  Safety checks must be conservative because whether a prefix
+    is unambiguous can vary between Git versions.
+    """
+    if not option.startswith("--"):
+        return argument == option or argument.startswith(f"{option}=")
+    candidate = argument.partition("=")[0]
+    return candidate != "--" and candidate.startswith("--") and option.startswith(
+        candidate
+    )
 
 
 def _has_short_option(argument: str, option: str) -> bool:
@@ -189,7 +200,9 @@ def assert_safe_git_args(arguments: Sequence[str]) -> None:
     if subcommand == "worktree":
         _assert_safe_worktree_args(arguments)
     if subcommand == "merge" and any(
-        argument in {"--abort", "--quit"} for argument in arguments[1:]
+        _has_long_option(argument, option)
+        for argument in arguments[1:]
+        for option in ("--abort", "--quit")
     ):
         raise UnsafeGitError("merge cleanup operations are blocked")
 
@@ -208,6 +221,7 @@ def _hardened_git_environment(
             result.pop(variable, None)
     result.update(
         {
+            "EDITOR": "true",
             "GIT_ASKPASS": "true",
             "GIT_CONFIG_COUNT": "4",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
@@ -218,9 +232,13 @@ def _hardened_git_environment(
             "GIT_CONFIG_VALUE_1": "false",
             "GIT_CONFIG_VALUE_2": "false",
             "GIT_CONFIG_VALUE_3": "false",
+            "GIT_EDITOR": "true",
+            "GIT_MERGE_AUTOEDIT": "no",
+            "GIT_SEQUENCE_EDITOR": "true",
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "never",
             "SSH_ASKPASS": "true",
+            "VISUAL": "true",
         }
     )
     return result

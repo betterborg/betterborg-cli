@@ -45,9 +45,13 @@ from betterborg_cli.store.models import TaskRuntimeStatus, utcnow
         ["rebase", "main"],
         ["branch", "-D", "task"],
         ["branch", "-df", "task"],
+        ["branch", "--del", "task"],
+        ["branch", "--forc", "task", "HEAD~1"],
         ["branch", "--move", "old", "new"],
         ["branch", "-mnew", "old"],
         ["commit", "--amend", "-m", "rewrite"],
+        ["commit", "--amen", "-m", "rewrite"],
+        ["merge", "--abo"],
         ["worktree", "remove", "--force", "elsewhere"],
         ["worktree", "add", "-Bproject/demo", "elsewhere", "HEAD~1"],
         ["fetch", "origin", "+main:refs/heads/project/demo"],
@@ -116,6 +120,35 @@ def test_safe_git_strips_repository_routing_environment(
     assert Path(result.stdout.strip()).resolve() == committed_git_repo
 
 
+@pytest.mark.parametrize("variable", ["GIT_EDITOR", "EDITOR"])
+def test_safe_git_does_not_run_user_configured_editors(
+    committed_git_repo: Path, tmp_path: Path, variable: str
+) -> None:
+    marker = tmp_path / f"{variable.lower()}-ran"
+    editor = tmp_path / f"{variable.lower()}-editor"
+    editor.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    editor.chmod(0o755)
+    tracked = committed_git_repo / "README.md"
+    tracked.write_text("staged change\n", encoding="utf-8")
+    _git(committed_git_repo, "add", "README.md")
+    original_head = _git(committed_git_repo, "rev-parse", "HEAD").strip()
+
+    result = SafeGit(committed_git_repo).run(
+        ["commit"],
+        check=False,
+        env={"PATH": os.environ["PATH"], variable: str(editor)},
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert _git(committed_git_repo, "rev-parse", "HEAD").strip() == original_head
+
+
 def test_primary_guard_detects_dirt_and_phase_contamination(
     committed_git_repo: Path,
 ) -> None:
@@ -166,6 +199,25 @@ def test_primary_guard_detects_rename_into_ignored_state_directory(
         PrimaryCheckoutGuard(committed_git_repo).assert_clean()
 
     assert "README.md -> .borg/state/README.md" in str(caught.value)
+
+
+def test_primary_guard_detects_tracked_change_in_ignored_state_directory(
+    committed_git_repo: Path,
+) -> None:
+    tracked = committed_git_repo / ".borg/state/tracked.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("original\n", encoding="utf-8")
+    _git(committed_git_repo, "add", "--force", ".borg/state/tracked.txt")
+    _git(committed_git_repo, "commit", "-m", "track managed state fixture")
+    guard = PrimaryCheckoutGuard(committed_git_repo)
+    guard.before_phase("07-host/task", "coding")
+
+    tracked.write_text("contaminated\n", encoding="utf-8")
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="tracked.txt"
+    ):
+        guard.after_phase("07-host/task", "coding")
 
 
 def test_primary_guard_does_not_parse_arrow_in_filename_as_rename(
