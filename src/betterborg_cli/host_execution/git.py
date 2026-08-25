@@ -57,6 +57,97 @@ _BLOCKED_COMBINATIONS = (
 _FETCH_LOCKS: dict[str, threading.Lock] = {}
 _FETCH_LOCKS_GUARD = threading.Lock()
 
+# Git treats these variables as an alternative to repository discovery from
+# ``cwd``.  They must not cross the SafeGit boundary: otherwise validation can
+# inspect the bound worktree while the subsequent command targets a caller-
+# selected repository, index, or object database.
+_GIT_REPOSITORY_ENVIRONMENT = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NAMESPACE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
+
+
+def _has_long_option(argument: str, option: str) -> bool:
+    return argument == option or argument.startswith(f"{option}=")
+
+
+def _has_short_option(argument: str, option: str) -> bool:
+    return (
+        argument.startswith("-")
+        and not argument.startswith("--")
+        and option in argument[1:]
+    )
+
+
+def _assert_safe_branch_args(arguments: Sequence[str]) -> None:
+    destructive_long = {"--copy", "--delete", "--force", "--move"}
+    destructive_short = frozenset("CDFMcdm")
+    if any(
+        any(_has_long_option(argument, option) for option in destructive_long)
+        or any(_has_short_option(argument, option) for option in destructive_short)
+        for argument in arguments[1:]
+    ):
+        raise UnsafeGitError("branch deletion, copying, or movement is blocked")
+
+
+def _assert_safe_fetch_args(arguments: Sequence[str]) -> None:
+    for argument in arguments[1:]:
+        if argument.startswith("+"):
+            raise UnsafeGitError("force-update fetch refspecs are blocked")
+        if _has_long_option(argument, "--refmap"):
+            refmap = argument.partition("=")[2]
+            if refmap.startswith("+"):
+                raise UnsafeGitError("force-update fetch refspecs are blocked")
+        if _has_long_option(argument, "--update-head-ok") or _has_short_option(
+            argument, "u"
+        ):
+            raise UnsafeGitError("fetch may not update the checked-out branch")
+        if any(
+            _has_long_option(argument, option)
+            for option in ("--prune", "--prune-tags")
+        ) or _has_short_option(argument, "p"):
+            raise UnsafeGitError("fetch ref deletion is blocked")
+
+
+def _assert_safe_worktree_args(arguments: Sequence[str]) -> None:
+    if len(arguments) < 2 or arguments[1] not in {"add", "list", "remove"}:
+        raise UnsafeGitError("only worktree add, list, and remove are allowed")
+    operation = arguments[1]
+    operation_args = arguments[2:]
+    if operation == "add" and any(
+        _has_long_option(argument, "--force")
+        or _has_short_option(argument, "B")
+        or _has_short_option(argument, "f")
+        for argument in operation_args
+    ):
+        raise UnsafeGitError("forced worktree branch movement is blocked")
+    if operation == "remove" and (
+        len(operation_args) != 1 or operation_args[0].startswith("-")
+    ):
+        raise UnsafeGitError("worktree removal requires exactly one path")
+    if operation == "list" and any(
+        argument not in {"--porcelain", "--verbose", "-v", "-z"}
+        for argument in operation_args
+    ):
+        raise UnsafeGitError("unsupported worktree list arguments")
+
 
 def assert_safe_git_args(arguments: Sequence[str]) -> None:
     """Reject destructive flags, discard commands, and unknown subcommands."""
@@ -66,9 +157,18 @@ def assert_safe_git_args(arguments: Sequence[str]) -> None:
         raise UnsafeGitError(
             f"Git subcommand not in allow-list: {arguments[0]!r}"
         )
-    blocked = next((flag for flag in _BLOCKED_FLAGS if flag in arguments), None)
+    blocked = next(
+        (
+            flag
+            for flag in _BLOCKED_FLAGS
+            if any(_has_long_option(argument, flag) for argument in arguments[1:])
+        ),
+        None,
+    )
     if blocked is not None:
         raise UnsafeGitError(f"blocked Git flag: {blocked!r}")
+    if any(_has_short_option(argument, "f") for argument in arguments[1:]):
+        raise UnsafeGitError("blocked Git flag: '-f'")
     for combination in _BLOCKED_COMBINATIONS:
         if tuple(arguments[: len(combination)]) == combination:
             raise UnsafeGitError(
@@ -81,11 +181,12 @@ def assert_safe_git_args(arguments: Sequence[str]) -> None:
         raise UnsafeGitError(
             f"only a single branch name is allowed for Git {subcommand}"
         )
-    if subcommand == "branch" and any(
-        argument.startswith(("-d", "-D", "-f", "-M"))
-        for argument in arguments[1:]
-    ):
-        raise UnsafeGitError("branch deletion or forced movement is blocked")
+    if subcommand == "branch":
+        _assert_safe_branch_args(arguments)
+    if subcommand == "fetch":
+        _assert_safe_fetch_args(arguments)
+    if subcommand == "worktree":
+        _assert_safe_worktree_args(arguments)
     if subcommand == "merge" and any(
         argument in {"--abort", "--quit"} for argument in arguments[1:]
     ):
@@ -97,6 +198,13 @@ def _hardened_git_environment(
 ) -> dict[str, str]:
     """Return an environment that cannot prompt or run repository hooks."""
     result = dict(environment) if environment is not None else dict(os.environ)
+    for variable in _GIT_REPOSITORY_ENVIRONMENT:
+        result.pop(variable, None)
+    for variable in tuple(result):
+        if variable == "GIT_CONFIG_COUNT" or variable.startswith(
+            ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+        ):
+            result.pop(variable, None)
     result.update(
         {
             "GIT_ASKPASS": "true",
@@ -163,14 +271,15 @@ class SafeGit:
     ) -> subprocess.CompletedProcess[str]:
         """Run one validated command without prompts or repository hooks."""
         assert_safe_git_args(arguments)
-        self.assert_exact_worktree_root()
+        run_environment = _hardened_git_environment(env)
+        self.assert_exact_worktree_root(env=run_environment)
         command = ["git", *arguments]
         options = {
             "cwd": str(self._cwd),
             "check": check,
             "capture_output": capture,
             "text": True,
-            "env": _hardened_git_environment(env),
+            "env": run_environment,
             "timeout": timeout,
         }
         if arguments[0] == "fetch":
@@ -178,7 +287,9 @@ class SafeGit:
                 return subprocess.run(command, **options)
         return subprocess.run(command, **options)
 
-    def assert_exact_worktree_root(self) -> None:
+    def assert_exact_worktree_root(
+        self, *, env: Mapping[str, str] | None = None
+    ) -> None:
         """Refuse parent-repository discovery from a nested directory."""
         try:
             result = subprocess.run(
@@ -188,7 +299,7 @@ class SafeGit:
                 capture_output=True,
                 text=True,
                 timeout=5,
-                env=_hardened_git_environment(),
+                env=_hardened_git_environment(env),
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise UnsafeGitError(

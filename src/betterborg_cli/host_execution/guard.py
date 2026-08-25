@@ -45,8 +45,16 @@ class PrimaryCheckoutGuard:
             )
 
     def before_phase(self, task_ref: str, phase: str) -> None:
+        snapshot = self._snapshot()
+        dirty = sorted(snapshot.status)
+        if dirty:
+            raise PrimaryCheckoutContaminationError(
+                self._message(
+                    f"{phase} for {task_ref}", "before it started", dirty
+                )
+            )
         with self._lock:
-            self._snapshots[(task_ref, phase)] = self._snapshot()
+            self._snapshots[(task_ref, phase)] = snapshot
 
     def after_phase(self, task_ref: str, phase: str) -> None:
         current = self._snapshot()
@@ -73,7 +81,7 @@ class PrimaryCheckoutGuard:
 
     @contextmanager
     def protect(self, task_ref: str, phase: str) -> Iterator[None]:
-        """Raise after a host phase if it changed the primary checkout."""
+        """Require clean entry and raise if a phase changes the checkout."""
         self.before_phase(task_ref, phase)
         active_error: BaseException | None = None
         try:

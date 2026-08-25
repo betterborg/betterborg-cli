@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import replace
@@ -44,8 +45,14 @@ from betterborg_cli.store.models import TaskRuntimeStatus, utcnow
         ["rebase", "main"],
         ["branch", "-D", "task"],
         ["branch", "-df", "task"],
+        ["branch", "--move", "old", "new"],
+        ["branch", "-mnew", "old"],
         ["commit", "--amend", "-m", "rewrite"],
         ["worktree", "remove", "--force", "elsewhere"],
+        ["worktree", "add", "-Bproject/demo", "elsewhere", "HEAD~1"],
+        ["fetch", "origin", "+main:refs/heads/project/demo"],
+        ["fetch", "--refmap=+refs/heads/*:refs/heads/*", "origin"],
+        ["fetch", "--update-head-ok", "origin", "main:main"],
     ],
 )
 def test_safe_git_rejects_destructive_operations(
@@ -64,6 +71,24 @@ def test_safe_git_rejects_parent_discovery_from_nested_path(
         SafeGit(nested).run(["status", "--porcelain"])
 
 
+def test_safe_git_strips_repository_routing_environment(
+    committed_git_repo: Path, tmp_path: Path
+) -> None:
+    other = tmp_path / "other"
+    _git(tmp_path, "init", "--quiet", str(other))
+
+    result = SafeGit(committed_git_repo).run(
+        ["rev-parse", "--show-toplevel"],
+        env={
+            "PATH": os.environ["PATH"],
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+        },
+    )
+
+    assert Path(result.stdout.strip()).resolve() == committed_git_repo
+
+
 def test_primary_guard_detects_dirt_and_phase_contamination(
     committed_git_repo: Path,
 ) -> None:
@@ -80,6 +105,25 @@ def test_primary_guard_detects_dirt_and_phase_contamination(
 
     with pytest.raises(PrimaryCheckoutContaminationError, match="before it started"):
         guard.assert_clean()
+
+
+def test_primary_guard_protect_rejects_dirty_phase_entry(
+    committed_git_repo: Path,
+) -> None:
+    (committed_git_repo / "README.md").write_text("changed once\n")
+    entered_phase = False
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="before it started"
+    ) as caught:
+        with PrimaryCheckoutGuard(committed_git_repo).protect(
+            "07-host/task", "coding"
+        ):
+            entered_phase = True
+            (committed_git_repo / "README.md").write_text("changed twice\n")
+
+    assert not entered_phase
+    assert "README.md" in str(caught.value)
 
 
 def test_primary_guard_detects_clean_commit_during_phase(
