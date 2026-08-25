@@ -1,8 +1,14 @@
 """Durable local state for BetterBorg workflows."""
 
 from betterborg_cli.store.models import (
+    AgentAttempt,
     Borg,
     BorgState,
+    ComposeResource,
+    EnvironmentAttempt,
+    ExecutionEvent,
+    ExecutionRun,
+    ExecutionRunStatus,
     GeneratedPrompt,
     Operation,
     PlanApproval,
@@ -17,18 +23,27 @@ from betterborg_cli.store.models import (
     RepositoryAnalysis,
     RepositoryPackage,
     TaskBatch,
+    TaskClaim,
     TaskComplexity,
     TaskDependency,
     TaskFinding,
     TaskGeneration,
     TaskGenerationStatus,
     TaskRecord,
+    TaskRuntime,
+    TaskRuntimeStatus,
 )
 from betterborg_cli.store.sqlite import SqliteStore, StaleBorgStateError
 
 __all__ = [
+    "AgentAttempt",
     "Borg",
     "BorgState",
+    "ComposeResource",
+    "EnvironmentAttempt",
+    "ExecutionEvent",
+    "ExecutionRun",
+    "ExecutionRunStatus",
     "GeneratedPrompt",
     "Operation",
     "PlanApproval",
@@ -45,10 +60,13 @@ __all__ = [
     "SqliteStore",
     "StaleBorgStateError",
     "TaskBatch",
+    "TaskClaim",
     "TaskComplexity",
     "TaskDependency",
     "TaskFinding",
     "TaskGeneration",
     "TaskGenerationStatus",
     "TaskRecord",
+    "TaskRuntime",
+    "TaskRuntimeStatus",
 ]

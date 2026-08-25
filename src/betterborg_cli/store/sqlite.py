@@ -15,9 +15,16 @@ from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
+from betterborg_cli.agent_runtime.base import AgentStatus, BillingMode
 from betterborg_cli.store.models import (
+    AgentAttempt,
     Borg,
     BorgState,
+    ComposeResource,
+    EnvironmentAttempt,
+    ExecutionEvent,
+    ExecutionRun,
+    ExecutionRunStatus,
     GeneratedPrompt,
     Operation,
     PlanApproval,
@@ -32,12 +39,15 @@ from betterborg_cli.store.models import (
     RepositoryAnalysis,
     RepositoryPackage,
     TaskBatch,
+    TaskClaim,
     TaskComplexity,
     TaskDependency,
     TaskFinding,
     TaskGeneration,
     TaskGenerationStatus,
     TaskRecord,
+    TaskRuntime,
+    TaskRuntimeStatus,
     utcnow,
 )
 
@@ -1044,6 +1054,343 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_task_dependency(row) for row in rows]
 
+    def add_execution_run(self, run: ExecutionRun) -> None:
+        """Persist a newly leased execution run."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_runs(
+                    id, borg_id, generation_id, owner_token, status, started_at,
+                    heartbeat_at, lease_expires_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run.id),
+                    str(run.borg_id),
+                    str(run.generation_id),
+                    run.owner_token,
+                    run.status.value,
+                    run.started_at.isoformat(),
+                    run.heartbeat_at.isoformat() if run.heartbeat_at else None,
+                    run.lease_expires_at.isoformat(),
+                    run.finished_at.isoformat() if run.finished_at else None,
+                ),
+            )
+
+    def get_execution_run(self, run_id: UUID) -> ExecutionRun | None:
+        """Return an execution run by ID."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE id = ?", (str(run_id),)
+            ).fetchone()
+        return _row_to_execution_run(row) if row is not None else None
+
+    def list_execution_runs(self, borg_id: UUID) -> list[ExecutionRun]:
+        """Return a Borg's execution runs in stable creation order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE borg_id = ?
+                ORDER BY started_at, id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+        return [_row_to_execution_run(row) for row in rows]
+
+    def execution_run_owned_by(self, run_id: UUID, owner_token: str) -> bool:
+        """Return whether ``owner_token`` owns ``run_id`` without exposing it."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM execution_runs
+                WHERE id = ? AND owner_token = ?
+                """,
+                (str(run_id), owner_token),
+            ).fetchone()
+        return row is not None
+
+    def add_task_runtime(self, runtime: TaskRuntime) -> None:
+        """Create the durable runtime projection for one generated task."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_runtimes(
+                    id, generation_id, task_id, status, resume_phase,
+                    review_round, state_reason, branch, worktree_path,
+                    last_run_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(runtime.id),
+                    str(runtime.generation_id),
+                    str(runtime.task_id),
+                    runtime.status.value,
+                    runtime.resume_phase,
+                    runtime.review_round,
+                    runtime.state_reason,
+                    runtime.branch,
+                    runtime.worktree_path,
+                    str(runtime.last_run_id) if runtime.last_run_id else None,
+                    runtime.created_at.isoformat(),
+                    runtime.updated_at.isoformat(),
+                ),
+            )
+
+    def get_task_runtime(self, task_id: UUID) -> TaskRuntime | None:
+        """Return the durable runtime projection for one task."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_runtimes WHERE task_id = ?", (str(task_id),)
+            ).fetchone()
+        return _row_to_task_runtime(row) if row is not None else None
+
+    def list_task_runtimes(self, generation_id: UUID) -> list[TaskRuntime]:
+        """Return runtime projections in generated-task order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT runtime.*
+                FROM task_runtimes AS runtime
+                JOIN task_records AS task ON task.id = runtime.task_id
+                WHERE runtime.generation_id = ?
+                ORDER BY task.position, runtime.id
+                """,
+                (str(generation_id),),
+            ).fetchall()
+        return [_row_to_task_runtime(row) for row in rows]
+
+    def append_task_claim(self, claim: TaskClaim) -> None:
+        """Persist a run's lease-backed claim on a generated task."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO task_claims(
+                    id, run_id, generation_id, task_id, claim_token,
+                    resume_phase, claimed_at, lease_expires_at, released_at
+                )
+                SELECT ?, run.id, run.generation_id, task.id, ?, ?, ?, ?, ?
+                FROM execution_runs AS run
+                JOIN task_records AS task
+                  ON task.generation_id = run.generation_id AND task.id = ?
+                WHERE run.id = ?
+                """,
+                (
+                    str(claim.id),
+                    claim.claim_token,
+                    claim.resume_phase,
+                    claim.claimed_at.isoformat(),
+                    claim.lease_expires_at.isoformat(),
+                    claim.released_at.isoformat() if claim.released_at else None,
+                    str(claim.task_id),
+                    str(claim.run_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("task claim run and task must share a generation")
+
+    def list_task_claims(self, run_id: UUID) -> list[TaskClaim]:
+        """Return a run's durable task claims in claim order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM task_claims
+                WHERE run_id = ?
+                ORDER BY claimed_at, id
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [_row_to_task_claim(row) for row in rows]
+
+    def task_claim_owned_by(self, claim_id: UUID, claim_token: str) -> bool:
+        """Return whether ``claim_token`` owns ``claim_id`` without exposing it."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM task_claims
+                WHERE id = ? AND claim_token = ?
+                """,
+                (str(claim_id), claim_token),
+            ).fetchone()
+        return row is not None
+
+    def append_environment_attempt(self, attempt: EnvironmentAttempt) -> None:
+        """Append one immutable environment preparation/materialization result."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO environment_attempts(
+                    id, run_id, claim_id, task_id, kind, attempt_number,
+                    fingerprint, status, commands_json, result_json, error,
+                    duration_seconds, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(attempt.id),
+                    str(attempt.run_id),
+                    str(attempt.claim_id),
+                    str(attempt.task_id),
+                    attempt.kind,
+                    attempt.attempt_number,
+                    attempt.fingerprint,
+                    attempt.status.value,
+                    _encode_json(attempt.commands),
+                    (
+                        _encode_json(attempt.result)
+                        if attempt.result is not None
+                        else None
+                    ),
+                    attempt.error,
+                    attempt.duration_seconds,
+                    attempt.started_at.isoformat(),
+                    attempt.finished_at.isoformat(),
+                ),
+            )
+
+    def list_environment_attempts(self, task_id: UUID) -> list[EnvironmentAttempt]:
+        """Return immutable environment attempts for one task."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM environment_attempts
+                WHERE task_id = ?
+                ORDER BY started_at, id
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return [_row_to_environment_attempt(row) for row in rows]
+
+    def append_agent_attempt(self, attempt: AgentAttempt) -> None:
+        """Append one immutable, billing-aware agent result."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_attempts(
+                    id, run_id, claim_id, task_id, phase, review_round,
+                    attempt_number, adapter, model, billing_mode, status,
+                    log_path, result_path, result_json, summary,
+                    duration_seconds, cost_usd, tokens_input, tokens_output,
+                    tokens_cache_read, tokens_cache_write, num_turns,
+                    started_at, finished_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    str(attempt.id),
+                    str(attempt.run_id),
+                    str(attempt.claim_id),
+                    str(attempt.task_id),
+                    attempt.phase,
+                    attempt.review_round,
+                    attempt.attempt_number,
+                    attempt.adapter,
+                    attempt.model,
+                    attempt.billing_mode.value,
+                    attempt.status.value,
+                    attempt.log_path,
+                    attempt.result_path,
+                    (
+                        _encode_json(attempt.result)
+                        if attempt.result is not None
+                        else None
+                    ),
+                    attempt.summary,
+                    attempt.duration_seconds,
+                    attempt.cost_usd,
+                    attempt.tokens_input,
+                    attempt.tokens_output,
+                    attempt.tokens_cache_read,
+                    attempt.tokens_cache_write,
+                    attempt.num_turns,
+                    attempt.started_at.isoformat(),
+                    attempt.finished_at.isoformat(),
+                ),
+            )
+
+    def list_agent_attempts(self, task_id: UUID) -> list[AgentAttempt]:
+        """Return immutable agent attempts for one task."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_attempts
+                WHERE task_id = ?
+                ORDER BY started_at, id
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return [_row_to_agent_attempt(row) for row in rows]
+
+    def append_execution_event(self, event: ExecutionEvent) -> None:
+        """Append one durable execution event."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_events(
+                    id, run_id, task_id, attempt_id, kind, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event.id),
+                    str(event.run_id),
+                    str(event.task_id) if event.task_id else None,
+                    str(event.attempt_id) if event.attempt_id else None,
+                    event.kind,
+                    _encode_json(event.payload),
+                    event.created_at.isoformat(),
+                ),
+            )
+
+    def list_execution_events(self, run_id: UUID) -> list[ExecutionEvent]:
+        """Return one run's events in stable append order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM execution_events
+                WHERE run_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [_row_to_execution_event(row) for row in rows]
+
+    def add_compose_resource(self, resource: ComposeResource) -> None:
+        """Persist one task-owned Compose resource identity."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO compose_resources(
+                    id, run_id, claim_id, task_id, project_name,
+                    resource_type, resource_name, labels_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(resource.id),
+                    str(resource.run_id),
+                    str(resource.claim_id),
+                    str(resource.task_id),
+                    resource.project_name,
+                    resource.resource_type,
+                    resource.resource_name,
+                    _encode_json(resource.labels),
+                    resource.created_at.isoformat(),
+                ),
+            )
+
+    def list_compose_resources(self, task_id: UUID) -> list[ComposeResource]:
+        """Return durable Compose resources owned by one task."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM compose_resources
+                WHERE task_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return [_row_to_compose_resource(row) for row in rows]
+
     def add_prd_session(self, session: PrdSession) -> None:
         """Persist a PRD session that points to tracked Markdown."""
         with self.transaction() as connection:
@@ -1513,5 +1860,147 @@ def _row_to_task_dependency(row: sqlite3.Row) -> TaskDependency:
         generation_id=UUID(row["generation_id"]),
         task_id=UUID(row["task_id"]),
         depends_on_task_id=UUID(row["depends_on_task_id"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_execution_run(row: sqlite3.Row) -> ExecutionRun:
+    return ExecutionRun(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        generation_id=UUID(row["generation_id"]),
+        owner_token=row["owner_token"],
+        status=ExecutionRunStatus(row["status"]),
+        started_at=datetime.fromisoformat(row["started_at"]),
+        heartbeat_at=(
+            datetime.fromisoformat(row["heartbeat_at"])
+            if row["heartbeat_at"] is not None
+            else None
+        ),
+        lease_expires_at=datetime.fromisoformat(row["lease_expires_at"]),
+        finished_at=(
+            datetime.fromisoformat(row["finished_at"])
+            if row["finished_at"] is not None
+            else None
+        ),
+    )
+
+
+def _row_to_task_runtime(row: sqlite3.Row) -> TaskRuntime:
+    return TaskRuntime(
+        id=UUID(row["id"]),
+        generation_id=UUID(row["generation_id"]),
+        task_id=UUID(row["task_id"]),
+        status=TaskRuntimeStatus(row["status"]),
+        resume_phase=row["resume_phase"],
+        review_round=row["review_round"],
+        state_reason=row["state_reason"],
+        branch=row["branch"],
+        worktree_path=row["worktree_path"],
+        last_run_id=(
+            UUID(row["last_run_id"]) if row["last_run_id"] is not None else None
+        ),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
+    return TaskClaim(
+        id=UUID(row["id"]),
+        run_id=UUID(row["run_id"]),
+        task_id=UUID(row["task_id"]),
+        claim_token=row["claim_token"],
+        resume_phase=row["resume_phase"],
+        claimed_at=datetime.fromisoformat(row["claimed_at"]),
+        lease_expires_at=datetime.fromisoformat(row["lease_expires_at"]),
+        released_at=(
+            datetime.fromisoformat(row["released_at"])
+            if row["released_at"] is not None
+            else None
+        ),
+    )
+
+
+def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
+    return EnvironmentAttempt(
+        id=UUID(row["id"]),
+        run_id=UUID(row["run_id"]),
+        claim_id=UUID(row["claim_id"]),
+        task_id=UUID(row["task_id"]),
+        kind=row["kind"],
+        attempt_number=row["attempt_number"],
+        fingerprint=row["fingerprint"],
+        status=AgentStatus(row["status"]),
+        commands=json.loads(row["commands_json"]),
+        result=(
+            json.loads(row["result_json"])
+            if row["result_json"] is not None
+            else None
+        ),
+        error=row["error"],
+        duration_seconds=row["duration_seconds"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        finished_at=datetime.fromisoformat(row["finished_at"]),
+    )
+
+
+def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
+    return AgentAttempt(
+        id=UUID(row["id"]),
+        run_id=UUID(row["run_id"]),
+        claim_id=UUID(row["claim_id"]),
+        task_id=UUID(row["task_id"]),
+        phase=row["phase"],
+        review_round=row["review_round"],
+        attempt_number=row["attempt_number"],
+        adapter=row["adapter"],
+        model=row["model"],
+        billing_mode=BillingMode(row["billing_mode"]),
+        status=AgentStatus(row["status"]),
+        log_path=row["log_path"],
+        result_path=row["result_path"],
+        result=(
+            json.loads(row["result_json"])
+            if row["result_json"] is not None
+            else None
+        ),
+        summary=row["summary"],
+        duration_seconds=row["duration_seconds"],
+        cost_usd=row["cost_usd"],
+        tokens_input=row["tokens_input"],
+        tokens_output=row["tokens_output"],
+        tokens_cache_read=row["tokens_cache_read"],
+        tokens_cache_write=row["tokens_cache_write"],
+        num_turns=row["num_turns"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        finished_at=datetime.fromisoformat(row["finished_at"]),
+    )
+
+
+def _row_to_execution_event(row: sqlite3.Row) -> ExecutionEvent:
+    return ExecutionEvent(
+        id=UUID(row["id"]),
+        run_id=UUID(row["run_id"]),
+        task_id=UUID(row["task_id"]) if row["task_id"] is not None else None,
+        attempt_id=(
+            UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
+        ),
+        kind=row["kind"],
+        payload=json.loads(row["payload_json"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_compose_resource(row: sqlite3.Row) -> ComposeResource:
+    return ComposeResource(
+        id=UUID(row["id"]),
+        run_id=UUID(row["run_id"]),
+        claim_id=UUID(row["claim_id"]),
+        task_id=UUID(row["task_id"]),
+        project_name=row["project_name"],
+        resource_type=row["resource_type"],
+        resource_name=row["resource_name"],
+        labels=json.loads(row["labels_json"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
