@@ -25,7 +25,12 @@ class PlanValidationError(ValueError):
 _PHASE_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
-def validate_plan_json(rendered_json: str, repository_root: Path) -> dict[str, Any]:
+def validate_plan_json(
+    rendered_json: str,
+    repository_root: Path,
+    *,
+    repository_roots: Mapping[str, Path] | None = None,
+) -> dict[str, Any]:
     """Parse and validate one strict JSON rendering of an Architect plan."""
     try:
         plan = json.loads(rendered_json)
@@ -33,16 +38,22 @@ def validate_plan_json(rendered_json: str, repository_root: Path) -> dict[str, A
         raise PlanValidationError(f"plan is not valid JSON: {error.msg}") from error
     if not isinstance(plan, dict):
         raise PlanValidationError("plan JSON must contain an object")
-    validate_plan(plan, repository_root)
+    validate_plan(plan, repository_root, repository_roots=repository_roots)
     return plan
 
 
-def validate_plan(plan: Mapping[str, Any], repository_root: Path) -> None:
+def validate_plan(
+    plan: Mapping[str, Any],
+    repository_root: Path,
+    *,
+    repository_roots: Mapping[str, Path] | None = None,
+) -> None:
     """Validate schema, sequencing, dependencies, paths, and completeness.
 
     The JSON schema owns field-level shape. These checks deliberately stay
     deterministic and repository-aware so malformed plans fail before a Tech
-    Lead agent is invoked.
+    Lead agent is invoked. ``repository_root`` grounds legacy and single-repo
+    plans; multi-repo plans must identify each checkout in ``repository_roots``.
     """
     # Imported lazily to keep the schema's existing public location while the
     # Architect module consumes this validator.
@@ -58,6 +69,7 @@ def validate_plan(plan: Mapping[str, Any], repository_root: Path) -> None:
     root = Path(repository_root).resolve()
     if not root.is_dir():
         raise PlanValidationError(f"repository root does not exist: {root}")
+    roots = _repository_roots(plan, root, repository_roots)
 
     phases = plan["phases"]
     phase_names = [phase["name"] for phase in phases]
@@ -84,15 +96,51 @@ def validate_plan(plan: Mapping[str, Any], repository_root: Path) -> None:
                     "earlier phase"
                 )
 
-        seen_paths: set[str] = set()
+        phase_repositories = set(phase.get("repositories", []))
+        unknown_phase_repositories = phase_repositories - roots.keys()
+        if unknown_phase_repositories:
+            raise PlanValidationError(
+                f"phase {name!r} names repositories not declared by the plan: "
+                f"{sorted(unknown_phase_repositories)!r}"
+            )
+
+        seen_paths: set[tuple[str | None, str]] = set()
         for entry in phase["files_touched"]:
             path = entry["path"]
-            if path in seen_paths:
-                raise PlanValidationError(
-                    f"phase {name!r} lists file path {path!r} more than once"
+            repository = _entry_repository_id(
+                entry,
+                roots,
+                field=f"phase {name!r} file {path!r}",
+            )
+            entry_root = _entry_repository_root(
+                repository,
+                roots,
+                field=f"phase {name!r} file {path!r}",
+            )
+            path_key = (repository, path)
+            if path_key in seen_paths:
+                repository_label = (
+                    f" in repository {repository!r}" if repository is not None else ""
                 )
-            seen_paths.add(path)
-            _validate_planned_path(root, path, entry["role"], phase=name)
+                raise PlanValidationError(
+                    f"phase {name!r} lists file path {path!r}{repository_label} "
+                    "more than once"
+                )
+            seen_paths.add(path_key)
+            _validate_planned_path(
+                entry_root,
+                path,
+                entry["role"],
+                phase=name,
+                repository=repository,
+            )
+
+        for contract in phase.get("contracts", []):
+            _entry_repository_id(
+                contract,
+                roots,
+                field=f"phase {name!r} contract",
+            )
 
     for pointer in plan.get("code_pointers", []):
         _validate_existing_path(root, pointer["path"], field="code pointer")
@@ -160,7 +208,84 @@ def _require_nonblank_items(values: Sequence[str], field: str) -> None:
         _require_nonblank(value, f"{field}[{index}]")
 
 
-def _validate_planned_path(root: Path, raw_path: str, role: str, *, phase: str) -> None:
+def _repository_roots(
+    plan: Mapping[str, Any],
+    primary_root: Path,
+    supplied_roots: Mapping[str, Path] | None,
+) -> dict[str | None, Path | None]:
+    repositories = plan.get("repositories", [])
+    repository_ids = [entry["id"] for entry in repositories]
+    if len(repository_ids) != len(set(repository_ids)):
+        raise PlanValidationError("plan lists a repository id more than once")
+
+    roots: dict[str | None, Path | None] = {
+        repository_id: None for repository_id in repository_ids
+    }
+    if not repository_ids:
+        roots[None] = primary_root
+    elif len(repository_ids) == 1:
+        roots[repository_ids[0]] = primary_root
+
+    for repository_id, raw_root in (supplied_roots or {}).items():
+        if repository_id not in repository_ids:
+            raise PlanValidationError(
+                f"repository root supplied for undeclared repository {repository_id!r}"
+            )
+        resolved = Path(raw_root).resolve()
+        if not resolved.is_dir():
+            raise PlanValidationError(
+                f"repository root for {repository_id!r} does not exist: {resolved}"
+            )
+        roots[repository_id] = resolved
+
+    return roots
+
+
+def _entry_repository_id(
+    entry: Mapping[str, Any],
+    roots: Mapping[str | None, Path | None],
+    *,
+    field: str,
+) -> str | None:
+    repository = entry.get("repo")
+    if repository is None:
+        if len(roots) != 1:
+            raise PlanValidationError(
+                f"{field} must name its repository when the plan spans multiple "
+                "repositories"
+            )
+        return next(iter(roots))
+    if repository not in roots:
+        raise PlanValidationError(
+            f"{field} names repository {repository!r}, which is not declared by "
+            "the plan"
+        )
+    return repository
+
+
+def _entry_repository_root(
+    repository: str | None,
+    roots: Mapping[str | None, Path | None],
+    *,
+    field: str,
+) -> Path:
+    root = roots[repository]
+    if root is None:
+        raise PlanValidationError(
+            f"{field} belongs to repository {repository!r}, but no repository "
+            "root was provided for it"
+        )
+    return root
+
+
+def _validate_planned_path(
+    root: Path,
+    raw_path: str,
+    role: str,
+    *,
+    phase: str,
+    repository: str | None,
+) -> None:
     candidate = _repository_path(root, raw_path, field=f"phase {phase!r} file")
     if role == "new":
         if candidate.exists():
@@ -169,8 +294,12 @@ def _validate_planned_path(root: Path, raw_path: str, role: str, *, phase: str) 
             )
         return
     if not candidate.is_file():
+        repository_label = (
+            f" in repository {repository!r}" if repository is not None else ""
+        )
         raise PlanValidationError(
-            f"phase {phase!r} {role} path {raw_path!r} is not a repository file"
+            f"phase {phase!r} {role} path {raw_path!r}{repository_label} is not "
+            "a repository file"
         )
 
 
@@ -220,6 +349,24 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
         add("## Overall approach")
         add(markdown_text(approach))
 
+    repository_lines: list[str] = []
+    repositories = plan.get("repositories")
+    if isinstance(repositories, list):
+        for repository in repositories:
+            if not isinstance(repository, Mapping):
+                continue
+            repository_id = _string(repository.get("id"))
+            if not repository_id:
+                continue
+            label = markdown_code_span(repository_id)
+            role = _string(repository.get("role"))
+            if role:
+                label += f" ({markdown_text(role)})"
+            repository_lines.append(f"- {label}")
+    if repository_lines:
+        add("## Repositories")
+        add("\n".join(repository_lines))
+
     phases = plan.get("phases")
     if isinstance(phases, list) and phases:
         add("## Phases")
@@ -268,6 +415,13 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
     if approach:
         blocks.append(f"**Technical approach:** {markdown_text(approach)}")
 
+    repositories = _nonempty_strings(phase.get("repositories"))
+    if repositories:
+        blocks.append(
+            "**Repositories:**\n"
+            + "\n".join(f"- {markdown_code_span(item)}" for item in repositories)
+        )
+
     file_lines: list[str] = []
     files = phase.get("files_touched")
     if isinstance(files, list):
@@ -279,9 +433,15 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
                 continue
             label = markdown_code_span(path)
             role = _string(entry.get("role"))
+            repository = _string(entry.get("repo"))
             description = _string(entry.get("description"))
+            attributes = []
             if role:
-                label += f" ({markdown_text(role)})"
+                attributes.append(markdown_text(role))
+            if repository:
+                attributes.append(f"repo: {markdown_code_span(repository)}")
+            if attributes:
+                label += f" ({'; '.join(attributes)})"
             if description:
                 label += f" — {markdown_text(description)}"
             file_lines.append(f"- {label}")
@@ -298,12 +458,16 @@ def _phase_blocks(phase: Any, index: int) -> list[str]:
             if not spec:
                 continue
             kind = _string(contract.get("kind"))
+            repository = _string(contract.get("repo"))
             rendered_spec = markdown_text(spec)
-            contract_lines.append(
+            label = (
                 f"- _{markdown_text(kind)}_ — {rendered_spec}"
                 if kind
                 else f"- {rendered_spec}"
             )
+            if repository:
+                label += f" (repo: {markdown_code_span(repository)})"
+            contract_lines.append(label)
     if contract_lines:
         blocks.append("**Contracts:**\n" + "\n".join(contract_lines))
 

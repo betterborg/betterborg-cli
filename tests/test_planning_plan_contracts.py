@@ -103,6 +103,80 @@ def test_accepts_grounded_existing_and_new_paths(repository: Path) -> None:
     validate_plan(plan, repository)
 
 
+def test_repository_qualified_paths_use_their_owning_roots(
+    repository: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    secondary = tmp_path_factory.mktemp("secondary-repository")
+    (secondary / "README.md").write_text("# Secondary\n", encoding="utf-8")
+    plan = _multi_repository_plan()
+    plan["phases"][0]["repositories"] = ["primary", "secondary"]
+    plan["phases"][0]["files_touched"] = [
+        {"path": "README.md", "role": "modified", "repo": "primary"},
+        {"path": "README.md", "role": "modified", "repo": "secondary"},
+    ]
+
+    validate_plan(
+        plan,
+        repository,
+        repository_roots={"primary": repository, "secondary": secondary},
+    )
+
+
+def test_does_not_ground_secondary_path_against_primary_repository(
+    repository: Path,
+) -> None:
+    plan = _multi_repository_plan()
+
+    with pytest.raises(PlanValidationError, match="no repository root was provided"):
+        validate_plan(plan, repository)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda plan: plan["phases"][0]["files_touched"][0].pop("repo"),
+            "must name its repository",
+        ),
+        (
+            lambda plan: plan["phases"][0]["files_touched"][0].update(
+                {"repo": "unknown"}
+            ),
+            "not declared by the plan",
+        ),
+        (
+            lambda plan: plan["phases"][0]["contracts"][0].pop("repo"),
+            "must name its repository",
+        ),
+        (
+            lambda plan: plan["phases"][0]["contracts"][0].update(
+                {"repo": "unknown"}
+            ),
+            "not declared by the plan",
+        ),
+        (
+            lambda plan: plan["phases"][0].update({"repositories": ["unknown"]}),
+            "not declared by the plan",
+        ),
+    ],
+)
+def test_rejects_ambiguous_or_unknown_repository_ownership(
+    repository: Path, mutate, message: str
+) -> None:
+    plan = _multi_repository_plan()
+    mutate(plan)
+    secondary = repository / "secondary"
+    secondary.mkdir()
+    (secondary / "README.md").write_text("# Secondary\n", encoding="utf-8")
+
+    with pytest.raises(PlanValidationError, match=message):
+        validate_plan(
+            plan,
+            repository,
+            repository_roots={"primary": repository, "secondary": secondary},
+        )
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -194,6 +268,20 @@ def test_renders_portable_plan_markdown() -> None:
     assert "## Code pointers\n\n- `README.md` \u2014 Repository overview." in markdown
     assert markdown.endswith("\n")
     assert not markdown.endswith("\n\n")
+
+
+def test_renders_repository_ownership_in_portable_markdown() -> None:
+    plan = _multi_repository_plan()
+
+    markdown = render_plan_markdown(plan)
+
+    assert (
+        "## Repositories\n\n- `primary` (primary)\n- `secondary` (secondary)"
+        in markdown
+    )
+    assert "**Repositories:**\n- `secondary`" in markdown
+    assert "- `README.md` (modified; repo: `secondary`)" in markdown
+    assert "- _config_ — secondary.enabled: bool (repo: `secondary`)" in markdown
 
 
 def test_renderer_flattens_and_escapes_model_controlled_markdown() -> None:
@@ -291,6 +379,34 @@ def _two_phase_plan() -> dict:
             "acceptance_criteria": ["The release path works."],
             "dependencies_on": ["01-foundation"],
             "deliverables": ["Release workflow"],
+        }
+    )
+    return plan
+
+
+def _multi_repository_plan() -> dict:
+    plan = _plan()
+    plan["repositories"] = [
+        {"id": "primary", "role": "primary"},
+        {"id": "secondary", "role": "secondary"},
+    ]
+    plan["phases"][0].update(
+        {
+            "repositories": ["secondary"],
+            "files_touched": [
+                {
+                    "path": "README.md",
+                    "role": "modified",
+                    "repo": "secondary",
+                }
+            ],
+            "contracts": [
+                {
+                    "kind": "config",
+                    "spec": "secondary.enabled: bool",
+                    "repo": "secondary",
+                }
+            ],
         }
     )
     return plan
