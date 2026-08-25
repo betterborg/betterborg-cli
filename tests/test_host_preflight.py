@@ -162,6 +162,8 @@ def test_validates_complete_plan_and_ignores_unselected_service(
         "example-runtime",
     }
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
+    assert result.package_managers == ()
+    assert [secret.scope for secret in result.secret_requirements] == ["build"]
     assert result.compose_files == (committed_git_repo / "compose.yml",)
     assert [(service.name, service.kind) for service in result.services] == [
         ("database", "compose"),

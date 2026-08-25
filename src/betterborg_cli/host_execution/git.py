@@ -18,6 +18,7 @@ _SAFE_SUBCOMMANDS = frozenset(
         "add",
         "branch",
         "check-ref-format",
+        "check-ignore",
         "checkout",
         "commit",
         "diff",
@@ -366,6 +367,20 @@ class SafeGit:
             if ignore_path is None or any(not ignore_path(path) for path in paths):
                 return False
         return True
+
+    def is_ignored(self, path: Path) -> bool:
+        """Return whether Git ignores one path inside this exact worktree."""
+        resolved = Path(path).resolve()
+        if not resolved.is_relative_to(self._cwd):
+            raise UnsafeGitError(f"ignore path is outside worktree: {resolved}")
+        relative = resolved.relative_to(self._cwd).as_posix()
+        return (
+            self.run(
+                ["check-ignore", "--quiet", "--no-index", relative],
+                check=False,
+            ).returncode
+            == 0
+        )
 
     def create_branch(self, branch: str, start_point: str) -> None:
         """Create a branch without checking it out or moving another ref."""
