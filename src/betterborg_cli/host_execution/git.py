@@ -42,6 +42,7 @@ _BLOCKED_FLAGS = frozenset(
         "--force-with-lease",
         "--hard",
         "--no-verify",
+        "--output",
         "--amend",
         "-B",
         "-D",

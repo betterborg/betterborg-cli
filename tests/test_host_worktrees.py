@@ -62,6 +62,21 @@ def test_safe_git_rejects_destructive_operations(
         SafeGit(committed_git_repo).run(arguments)
 
 
+@pytest.mark.parametrize("subcommand", ["diff", "log", "show"])
+def test_safe_git_preserves_files_when_output_option_is_requested(
+    committed_git_repo: Path, subcommand: str
+) -> None:
+    protected = committed_git_repo / "README.md"
+    original = protected.read_bytes()
+
+    with pytest.raises(UnsafeGitError, match="--output"):
+        SafeGit(committed_git_repo).run(
+            [subcommand, f"--output={protected}", "HEAD"]
+        )
+
+    assert protected.read_bytes() == original
+
+
 def test_safe_git_rejects_parent_discovery_from_nested_path(
     committed_git_repo: Path,
 ) -> None:
