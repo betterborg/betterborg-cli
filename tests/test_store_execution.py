@@ -1077,6 +1077,7 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
         persisted = store.list_task_claims(acquisition.run_id)
         assert persisted[0].released_at is None
         assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.CLAIMED
+        assert store.list_stale_compose_resources(acquisition.run_id) == [resource]
         closed_environment = store.list_environment_attempts(task.id)
         closed_agent = store.list_agent_attempts(task.id)
         assert closed_environment[0].status is ExecutionAttemptStatus.CANCELLED
@@ -1095,6 +1096,7 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
         persisted = store.list_task_claims(acquisition.run_id)
         assert persisted[0].released_at == now + timedelta(minutes=2, seconds=1)
         assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.PENDING
+        assert store.list_stale_compose_resources(acquisition.run_id) == []
 
         replacement_claim = store.claim_dependency_ready_task(
             acquisition.run_id,

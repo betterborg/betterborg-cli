@@ -1557,7 +1557,7 @@ class SqliteStore:
     def list_stale_compose_resources(
         self, run_id: UUID | None = None
     ) -> list[ComposeResource]:
-        """Return terminal-run resources whose exact project awaits teardown."""
+        """Return stale resources whose exact project awaits teardown."""
         with self.locked_connection() as connection:
             rows = self._stale_compose_rows(connection, run_id=run_id)
         return [_row_to_compose_resource(row) for row in rows]
@@ -2008,7 +2008,17 @@ class SqliteStore:
             SELECT resource.*
             FROM compose_resources AS resource
             JOIN execution_runs AS run ON run.id = resource.run_id
-            WHERE run.status != 'running'
+            WHERE (
+                run.status != 'running'
+                OR EXISTS (
+                    SELECT 1 FROM execution_events AS expired
+                    WHERE expired.run_id = resource.run_id
+                      AND expired.task_id = resource.task_id
+                      AND expired.kind = 'task.claim_expired'
+                      AND json_extract(expired.payload_json, '$.claim_id') =
+                          resource.claim_id
+                )
+              )
               {filters}
               AND NOT EXISTS (
                   SELECT 1
