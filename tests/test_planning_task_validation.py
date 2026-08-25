@@ -286,6 +286,54 @@ def test_writing_repository_task_can_own_consumed_repository_contract() -> None:
     validate_task_graph(plan, [task], [])
 
 
+def test_repository_contract_must_be_owned_by_its_writing_repository() -> None:
+    plan = {
+        "repositories": [{"id": "a"}, {"id": "b"}],
+        "phases": [
+            {
+                "name": "01-both",
+                "repositories": ["a", "b"],
+                "deliverables": ["Both outputs"],
+                "contracts": [
+                    {"kind": "config", "spec": "b.setting", "repo": "b"}
+                ],
+                "acceptance_criteria": ["Both work"],
+                "files_touched": [
+                    {"path": "a.py", "role": "new", "repo": "a"},
+                    {"path": "b.py", "role": "new", "repo": "b"},
+                ],
+                "test_strategy": "Test both.",
+                "dependencies_on": [],
+            }
+        ],
+    }
+    task = _task(
+        uuid4(),
+        stage="01-both",
+        stem="01-own-all",
+        position=1,
+        refs=_required_refs(plan, "01-both"),
+        repository="a",
+    )
+    findings = task_graph_findings(plan, [task], [])
+    contract_ref = next(
+        element.ref
+        for element in build_plan_element_catalog(plan)
+        if element.kind == "contract"
+    )
+
+    assert any(
+        finding.rule == "task.traceability.boundary"
+        and finding.plan_refs == (contract_ref,)
+        for finding in findings
+    )
+    assert any(
+        finding.rule == "task.traceability.unowned"
+        and finding.plan_refs == (contract_ref,)
+        for finding in findings
+    )
+
+
 def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
     plan, tasks, dependencies = _valid_graph()
     foundation = tasks[0]
@@ -346,6 +394,80 @@ def test_removing_one_of_multiple_dangling_edges_counts_as_repair_progress() -> 
     }
 
     assert len(dangling_identities) == 2
+    validate_task_repair_progress(previous, repaired)
+
+
+def test_dangling_edge_identity_survives_generation_reconstruction() -> None:
+    plan = _plan()
+    previous_generation = uuid4()
+    previous_foundation = _task(
+        previous_generation,
+        stage="01-foundation",
+        stem="01-build",
+        position=1,
+        refs=_required_refs(plan, "01-foundation")[1:],
+    )
+    previous_consumer = _task(
+        previous_generation,
+        stage="02-consumer",
+        stem="01-build",
+        position=2,
+        refs=_required_refs(plan, "02-consumer"),
+    )
+    previous = task_graph_findings(
+        plan,
+        [previous_foundation, previous_consumer],
+        [
+            TaskDependency(
+                generation_id=previous_generation,
+                task_id=previous_consumer.id,
+                depends_on_task_id=previous_foundation.id,
+            ),
+            TaskDependency(
+                generation_id=previous_generation,
+                task_id=previous_foundation.id,
+                depends_on_task_id=uuid4(),
+            ),
+        ],
+    )
+
+    repaired_generation = uuid4()
+    repaired_foundation = _task(
+        repaired_generation,
+        stage="01-foundation",
+        stem="01-build",
+        position=1,
+        refs=_required_refs(plan, "01-foundation"),
+    )
+    repaired_consumer = _task(
+        repaired_generation,
+        stage="02-consumer",
+        stem="01-build",
+        position=2,
+        refs=_required_refs(plan, "02-consumer"),
+    )
+    repaired = task_graph_findings(
+        plan,
+        [repaired_foundation, repaired_consumer],
+        [
+            TaskDependency(
+                generation_id=repaired_generation,
+                task_id=repaired_consumer.id,
+                depends_on_task_id=repaired_foundation.id,
+            ),
+            TaskDependency(
+                generation_id=repaired_generation,
+                task_id=repaired_foundation.id,
+                depends_on_task_id=uuid4(),
+            ),
+        ],
+    )
+
+    assert _rules(previous) == {
+        "task.traceability.unowned",
+        "task.dependency.dangling",
+    }
+    assert _rules(repaired) == {"task.dependency.dangling"}
     validate_task_repair_progress(previous, repaired)
 
 

@@ -325,7 +325,11 @@ def task_graph_findings(
                 continue
             seen_refs.add(plan_ref)
             element = elements_by_ref[plan_ref]
-            repository_conflict = task_repository_invalid
+            repository_conflict = task_repository_invalid or (
+                element.phase == task.stage
+                and element.repository in phase_repositories
+                and task_repository != element.repository
+            )
             if element.phase != task.stage or repository_conflict:
                 cites_project_context = (
                     not repository_conflict and element.phase == "project"
@@ -379,6 +383,7 @@ def task_graph_findings(
         task_id: [] for task_id in tasks_by_id
     }
     seen_edges: set[tuple[UUID, UUID]] = set()
+    dangling_edge_counts: dict[tuple[str | None, str | None], int] = {}
     for dependency in dependency_rows:
         edge = (dependency.task_id, dependency.depends_on_task_id)
         if edge in seen_edges:
@@ -396,14 +401,23 @@ def task_graph_findings(
         prerequisite = tasks_by_id.get(dependency.depends_on_task_id)
         if task is None or prerequisite is None:
             known = task if task is not None else prerequisite
+            logical_edge = (
+                task.task_ref if task is not None else None,
+                prerequisite.task_ref if prerequisite is not None else None,
+            )
+            occurrence = dangling_edge_counts.get(logical_edge, 0) + 1
+            dangling_edge_counts[logical_edge] = occurrence
             findings.append(
                 TaskGraphFinding(
                     rule="task.dependency.dangling",
                     message="task dependency does not resolve within the generation",
                     task_refs=(known.task_ref,) if known is not None else (),
                     dependency_refs=(
-                        str(dependency.task_id),
-                        str(dependency.depends_on_task_id),
+                        "dependent",
+                        logical_edge[0] or "",
+                        "prerequisite",
+                        logical_edge[1] or "",
+                        f"occurrence:{occurrence}",
                     ),
                 )
             )
