@@ -161,6 +161,27 @@ class TechLeadLoop:
 
         while True:
             borg = self._current_borg()
+            if borg.state in {
+                BorgState.ARCHITECT_WORKING,
+                BorgState.ARCHITECT_AWAITING_ANSWERS,
+            }:
+                revised = ArchitectLoop(
+                    self.repository,
+                    borg,
+                    self.store,
+                    self.architect_agent,
+                    io=self.io,
+                    artifact_dir=self.artifact_dir,
+                    model=self.architect_model,
+                    cancel=self.cancel,
+                    dirty_borg_documents=self.dirty_borg_documents,
+                    worktrees_root=self.worktrees_root,
+                ).run()
+                if revised.borg.state is not BorgState.TECH_REVIEW_WORKING:
+                    raise TechLeadError(
+                        "Architect revision did not return to Tech Lead"
+                    )
+                continue
             if borg.state is not BorgState.TECH_REVIEW_WORKING:
                 raise TechLeadError(
                     f"Borg {borg.name!r} cannot run Tech Lead from state "
@@ -208,21 +229,6 @@ class TechLeadLoop:
 
             if next_state is not BorgState.ARCHITECT_WORKING:
                 return TechLeadResult(borg=borg, plan=plan, attempt=completed)
-
-            revised = ArchitectLoop(
-                self.repository,
-                borg,
-                self.store,
-                self.architect_agent,
-                io=self.io,
-                artifact_dir=self.artifact_dir,
-                model=self.architect_model,
-                cancel=self.cancel,
-                dirty_borg_documents=self.dirty_borg_documents,
-                worktrees_root=self.worktrees_root,
-            ).run()
-            if revised.borg.state is not BorgState.TECH_REVIEW_WORKING:
-                raise TechLeadError("Architect revision did not return to Tech Lead")
 
     def _run_turn(
         self,

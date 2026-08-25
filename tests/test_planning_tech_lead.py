@@ -10,6 +10,7 @@ import pytest
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
+    ArchitectCancelled,
     ArchitectLoop,
     TechLeadError,
     TechLeadLoop,
@@ -161,6 +162,78 @@ def test_recovers_completed_provider_review_without_duplicate_turn(
         ] == [PlanningAttemptStatus.COMPLETED]
         assert loop.run() == resumed
         assert len(reviewer.calls) == 1
+
+
+def test_resumes_committed_change_request_through_architect_pause(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    initial_plan = _plan()
+    ambiguous_plan = _plan(summary="Choose a concrete rollback strategy.")
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = _plan(summary="Use retries before rolling back the release.")
+    database = committed_git_repo.parent / "tech-lead-architect-resume.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(MockResponse(payload=_request_changes("Define rollback behavior.")))
+    reviewer.queue(MockResponse(payload=_approve()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-architect-resume"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        loop = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+        )
+
+        def interrupt_architect(_loop: ArchitectLoop) -> None:
+            raise RuntimeError("simulated Architect interruption")
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(ArchitectLoop, "run", interrupt_architect)
+            with pytest.raises(RuntimeError, match="Architect interruption"):
+                loop.run()
+
+        assert store.get_borg(borg.id).state is BorgState.ARCHITECT_WORKING
+        assert len(reviewer.calls) == 1
+
+        architect.queue(MockResponse(payload=ambiguous_plan))
+        with pytest.raises(ArchitectCancelled, match="awaiting answers"):
+            loop.run()
+
+        assert store.get_borg(borg.id).state is BorgState.ARCHITECT_AWAITING_ANSWERS
+        assert len(reviewer.calls) == 1
+
+        architect.queue(MockResponse(payload=revised_plan))
+        resumed = TechLeadLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(iter(["Retry twice, then roll back."])),
+        ).run()
+
+        assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert resumed.plan == revised_plan
+        assert len(reviewer.calls) == 2
+        assert [
+            item.result["decision"]
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "tech_review"
+        ] == ["request_changes", "approve"]
 
 
 def test_third_change_request_blocks_with_durable_resumable_history(
