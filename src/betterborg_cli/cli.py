@@ -413,7 +413,11 @@ def show_plan(name: str, json_output: bool) -> None:
                     f"run 'borg plan start {name}' first"
                 )
             stored_plan = attempt.result
-            validate_plan(stored_plan, paths.root)
+            validate_plan(
+                stored_plan,
+                paths.root,
+                check_repository_state=False,
+            )
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 

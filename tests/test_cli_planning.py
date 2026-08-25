@@ -9,7 +9,7 @@ from click.testing import CliRunner
 
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
-from betterborg_cli.planning import render_plan_markdown
+from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -192,7 +192,7 @@ def test_plan_start_reports_review_cap_as_blocked(
         assert len(store.list_planning_findings(borg.id)) == 3
 
 
-def test_plan_show_renders_markdown_and_json_without_mutating_planning_history(
+def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     persist_planning_context,
@@ -203,6 +203,14 @@ def test_plan_show_renders_markdown_and_json_without_mutating_planning_history(
         committed_git_repo, persist_planning_context, "show-plan"
     )
     plan = planning_plan_response()
+    plan["phases"][0]["files_touched"].append(
+        {
+            "path": "CHANGELOG.md",
+            "role": "new",
+            "description": "Record release changes.",
+        }
+    )
+    validate_plan(plan, repository.root)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "show-plan")
         assert borg is not None
@@ -268,6 +276,8 @@ def test_plan_show_renders_markdown_and_json_without_mutating_planning_history(
         )
         before = _planning_snapshot(store, borg.id)
 
+    (repository.root / "README.md").unlink()
+    (repository.root / "CHANGELOG.md").write_text("# Changes\n", encoding="utf-8")
     monkeypatch.chdir(repository.root)
 
     markdown_result = cli_runner.invoke(cli, ["plan", "show", "show-plan"])

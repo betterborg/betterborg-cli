@@ -47,6 +47,7 @@ def validate_plan(
     repository_root: Path,
     *,
     repository_roots: Mapping[str, Path] | None = None,
+    check_repository_state: bool = True,
 ) -> None:
     """Validate schema, sequencing, dependencies, paths, and completeness.
 
@@ -54,6 +55,8 @@ def validate_plan(
     deterministic and repository-aware so malformed plans fail before a Tech
     Lead agent is invoked. ``repository_root`` grounds legacy and single-repo
     plans; multi-repo plans must identify each checkout in ``repository_roots``.
+    Stored plans may disable repository-state checks after they have passed
+    planning-time validation, while retaining schema and path-safety checks.
     """
     # Imported lazily to keep the schema's existing public location while the
     # Architect module consumes this validator.
@@ -123,11 +126,6 @@ def validate_plan(
                     phase_repositories,
                     field=f"phase {name!r} file {path!r}",
                 )
-            entry_root = _entry_repository_root(
-                repository,
-                roots,
-                field=f"phase {name!r} file {path!r}",
-            )
             path_key = (repository, path)
             if path_key in seen_paths:
                 repository_label = (
@@ -138,13 +136,21 @@ def validate_plan(
                     "more than once"
                 )
             seen_paths.add(path_key)
-            _validate_planned_path(
-                entry_root,
-                path,
-                entry["role"],
-                phase=name,
-                repository=repository,
-            )
+            if check_repository_state:
+                entry_root = _entry_repository_root(
+                    repository,
+                    roots,
+                    field=f"phase {name!r} file {path!r}",
+                )
+                _validate_planned_path(
+                    entry_root,
+                    path,
+                    entry["role"],
+                    phase=name,
+                    repository=repository,
+                )
+            else:
+                _validate_relative_path(path, field=f"phase {name!r} file")
 
         for contract in phase.get("contracts", []):
             _entry_repository_id(
@@ -154,7 +160,10 @@ def validate_plan(
             )
 
     for pointer in plan.get("code_pointers", []):
-        _validate_existing_path(root, pointer["path"], field="code pointer")
+        if check_repository_state:
+            _validate_existing_path(root, pointer["path"], field="code pointer")
+        else:
+            _validate_relative_path(pointer["path"], field="code pointer")
 
     if plan.get("open_questions"):
         raise PlanValidationError(
@@ -336,6 +345,14 @@ def _validate_existing_path(root: Path, raw_path: str, *, field: str) -> None:
 
 
 def _repository_path(root: Path, raw_path: str, *, field: str) -> Path:
+    path = _validate_relative_path(raw_path, field=field)
+    candidate = root.joinpath(*path.parts).resolve()
+    if not candidate.is_relative_to(root):
+        raise PlanValidationError(f"{field} {raw_path!r} escapes the repository")
+    return candidate
+
+
+def _validate_relative_path(raw_path: str, *, field: str) -> PurePosixPath:
     if "\\" in raw_path:
         raise PlanValidationError(f"{field} {raw_path!r} must use POSIX separators")
     path = PurePosixPath(raw_path)
@@ -345,10 +362,7 @@ def _repository_path(root: Path, raw_path: str, *, field: str) -> Path:
         raise PlanValidationError(
             f"{field} {raw_path!r} must be a normalized repository-relative path"
         )
-    candidate = root.joinpath(*path.parts).resolve()
-    if not candidate.is_relative_to(root):
-        raise PlanValidationError(f"{field} {raw_path!r} escapes the repository")
-    return candidate
+    return path
 
 
 def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
