@@ -49,6 +49,8 @@ from betterborg_cli.store.models import (
     TaskGenerationStatus,
     TaskRecord,
     TaskRuntime,
+    TaskRuntimeCost,
+    TaskRuntimeRow,
     TaskRuntimeStatus,
     utcnow,
 )
@@ -2122,6 +2124,124 @@ class SqliteStore:
                 (str(generation_id),),
             ).fetchall()
         return [_row_to_task_runtime(row) for row in rows]
+
+    def list_task_runtime(self, borg_id: UUID) -> list[TaskRuntimeRow]:
+        """Return the shared runtime projection for a Borg's current tasks.
+
+        Agent-reported subscription estimates are deliberately excluded from
+        API spend. If any API attempt has no reported price, the API component
+        is unknown instead of becoming a partial or zero-valued total.
+        """
+        with self.locked_connection() as connection:
+            task_rows = connection.execute(
+                """
+                SELECT task.*, runtime.status AS runtime_status,
+                       runtime.state_reason AS runtime_state_reason,
+                       runtime.review_round AS runtime_review_round
+                FROM task_generations AS generation
+                JOIN task_records AS task
+                  ON task.generation_id = generation.id
+                LEFT JOIN task_runtimes AS runtime
+                  ON runtime.task_id = task.id
+                 AND runtime.generation_id = generation.id
+                WHERE generation.borg_id = ? AND generation.status = 'current'
+                ORDER BY task.position, task.id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+            if not task_rows:
+                return []
+
+            task_ids = [row["id"] for row in task_rows]
+            attempt_rows = connection.execute(
+                """
+                SELECT attempt.*,
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
+                FROM agent_attempts AS attempt
+                JOIN task_records AS task ON task.id = attempt.task_id
+                JOIN task_generations AS generation
+                  ON generation.id = task.generation_id
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = attempt.id
+                 AND terminal.kind IN (
+                    'agent.attempt_finished', 'agent.attempt_interrupted'
+                 )
+                WHERE generation.borg_id = ? AND generation.status = 'current'
+                ORDER BY attempt.started_at, attempt.id
+                """,
+                (str(borg_id),),
+            ).fetchall()
+
+        attempts_by_task: dict[str, list[AgentAttempt]] = {
+            task_id: [] for task_id in task_ids
+        }
+        for attempt_row in attempt_rows:
+            attempts_by_task[attempt_row["task_id"]].append(
+                _row_to_agent_attempt(attempt_row)
+            )
+
+        rows = []
+        for task_row in task_rows:
+            attempts = attempts_by_task[task_row["id"]]
+            durations = [
+                attempt.duration_seconds
+                for attempt in attempts
+                if attempt.duration_seconds is not None
+            ]
+            api_attempts = [
+                attempt
+                for attempt in attempts
+                if attempt.billing_mode is BillingMode.API
+            ]
+            api_costs = [
+                attempt.usage.cost_usd
+                for attempt in api_attempts
+                if attempt.usage is not None
+                and attempt.usage.cost_usd is not None
+            ]
+            api_spend_unknown = (not attempts) or any(
+                attempt.usage is None or attempt.usage.cost_usd is None
+                for attempt in api_attempts
+            )
+            api_spend_usd = (
+                None
+                if api_spend_unknown or not api_costs
+                else float(sum(api_costs))
+            )
+            rows.append(
+                TaskRuntimeRow(
+                    generation_id=UUID(task_row["generation_id"]),
+                    task_id=UUID(task_row["id"]),
+                    task_ref=task_row["task_ref"],
+                    stage=task_row["stage"],
+                    stem=task_row["stem"],
+                    position=task_row["position"],
+                    title=task_row["title"],
+                    complexity=TaskComplexity(task_row["complexity"]),
+                    status=(
+                        TaskRuntimeStatus(task_row["runtime_status"])
+                        if task_row["runtime_status"] is not None
+                        else TaskRuntimeStatus.PENDING
+                    ),
+                    state_reason=task_row["runtime_state_reason"],
+                    review_round=task_row["runtime_review_round"] or 0,
+                    attempt_count=len(attempts),
+                    duration_seconds=(
+                        float(sum(durations)) if durations else None
+                    ),
+                    cost=TaskRuntimeCost(
+                        api_spend_usd=api_spend_usd,
+                        api_spend_unknown=api_spend_unknown,
+                        subscription_included=any(
+                            attempt.billing_mode is BillingMode.SUBSCRIPTION
+                            for attempt in attempts
+                        ),
+                    ),
+                )
+            )
+        return rows
 
     def append_task_claim(self, claim: TaskClaim) -> None:
         """Persist a run's lease-backed claim on a generated task."""

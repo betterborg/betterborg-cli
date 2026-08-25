@@ -277,6 +277,110 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert reopened.list_compose_resources(task.id) == [compose]
 
 
+@pytest.mark.parametrize(
+    ("attempts", "api_spend_usd", "api_spend_unknown", "included", "duration"),
+    [
+        ([(BillingMode.API, 0.25, 3.0)], 0.25, False, False, 3.0),
+        ([(BillingMode.API, None, 4.0)], None, True, False, 4.0),
+        ([(BillingMode.SUBSCRIPTION, 9.0, 5.0)], None, False, True, 5.0),
+        (
+            [
+                (BillingMode.API, 0.5, 6.0),
+                (BillingMode.SUBSCRIPTION, 12.0, 7.0),
+            ],
+            0.5,
+            False,
+            True,
+            13.0,
+        ),
+        ([], None, True, False, None),
+    ],
+)
+def test_current_task_runtime_projection_preserves_billing_semantics(
+    tmp_path: Path,
+    approved_task_generation,
+    attempts,
+    api_spend_usd: float | None,
+    api_spend_unknown: bool,
+    included: bool,
+    duration: float | None,
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    started_at = utcnow()
+    run = ExecutionRun(
+        borg_id=borg.id,
+        generation_id=generation.id,
+        started_at=started_at,
+        heartbeat_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=5),
+    )
+    runtime = TaskRuntime(
+        generation_id=generation.id,
+        task_id=task.id,
+        status=TaskRuntimeStatus.BLOCKED,
+        state_reason="review requested changes",
+        review_round=3,
+    )
+    claim = TaskClaim(
+        run_id=run.id,
+        task_id=task.id,
+        resume_phase="review",
+        claimed_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=2),
+    )
+
+    with SqliteStore.open(database) as store:
+        store.add_execution_run(run)
+        store.add_task_runtime(runtime)
+        store.append_task_claim(claim)
+        for index, (billing_mode, cost, attempt_duration) in enumerate(
+            attempts, start=1
+        ):
+            store.append_agent_attempt(
+                AgentAttempt(
+                    run_id=run.id,
+                    claim_id=claim.id,
+                    task_id=task.id,
+                    phase=f"phase-{index}",
+                    attempt_number=1,
+                    adapter="mock",
+                    model="test-model",
+                    billing_mode=billing_mode,
+                    status=AgentStatus.COMPLETED,
+                    log_path=f"artifacts/{index}.log",
+                    duration_seconds=attempt_duration,
+                    usage=AgentUsage(cost_usd=cost),
+                    started_at=started_at,
+                    finished_at=started_at + timedelta(seconds=attempt_duration),
+                ),
+                run.owner_token,
+                claim.claim_token,
+                now=started_at,
+            )
+
+        rows = store.list_task_runtime(borg.id)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.generation_id == generation.id
+    assert row.task_id == task.id
+    assert (row.stage, row.stem, row.title) == (
+        task.stage,
+        task.stem,
+        task.title,
+    )
+    assert row.status is TaskRuntimeStatus.BLOCKED
+    assert row.state_reason == "review requested changes"
+    assert row.review_round == 3
+    assert row.attempt_count == len(attempts)
+    assert row.duration_seconds == duration
+    assert row.cost.api_spend_usd == api_spend_usd
+    assert row.cost.api_spend_unknown is api_spend_unknown
+    assert row.cost.subscription_included is included
+
+
 def test_live_run_claim_and_token_ownership_are_database_enforced(
     tmp_path: Path, approved_task_generation
 ) -> None:

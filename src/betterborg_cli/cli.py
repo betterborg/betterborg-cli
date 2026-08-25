@@ -50,6 +50,8 @@ from betterborg_cli.store import (
     PlanningAttemptStatus,
     SqliteStore,
     TaskRecord,
+    TaskRuntimeCost,
+    TaskRuntimeRow,
 )
 from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
@@ -388,13 +390,25 @@ def list_tasks(name: str, json_output: bool) -> None:
     """List the complete SQLite-current task generation for a Borg."""
     try:
         paths, publication = _current_task_publication(name)
+        runtime_rows = _current_task_runtime(paths, name, publication)
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
-    tasks = [
-        _task_listing_item(paths, published.task, published.path)
-        for published in publication.files
-    ]
+    runtime_by_task = {row.task_id: row for row in runtime_rows}
+    tasks = []
+    for published in publication.files:
+        runtime = runtime_by_task.get(published.task.id)
+        if runtime is None:
+            raise click.ClickException(
+                "current task generation changed while it was being inspected"
+            )
+        tasks.append(
+            {
+                **_task_listing_item(paths, published.task, published.path),
+                **_task_runtime_listing_item(runtime),
+            }
+        )
+    totals = _task_runtime_totals(runtime_rows)
     if json_output:
         click.echo(
             json.dumps(
@@ -406,6 +420,7 @@ def list_tasks(name: str, json_output: bool) -> None:
                     "generation_digest": publication.generation.digest,
                     "generation_id": str(publication.generation.id),
                     "tasks": tasks,
+                    "totals": totals,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -421,8 +436,20 @@ def list_tasks(name: str, json_output: bool) -> None:
             f"{item['stage']}/{item['stem']} "
             f"[{item['complexity']}] {item['title']}"
         )
+        click.echo(f"  Status: {item['status']}")
+        if item["state_reason"] is not None:
+            click.echo(f"  Reason: {item['state_reason']}")
+        click.echo(f"  Review rounds: {item['review_round']}")
+        click.echo(f"  Attempts: {item['attempt_count']}")
+        click.echo(f"  Duration: {_format_duration(item['duration_seconds'])}")
+        click.echo(f"  Cost: {_format_runtime_cost(item['cost'])}")
         click.echo(f"  Task ref: {item['task_ref']}")
         click.echo(f"  Markdown: {item['path']}")
+    click.echo(
+        f"Totals: {totals['attempt_count']} attempt(s), "
+        f"{_format_duration(totals['duration_seconds'])}, "
+        f"{_format_runtime_cost(totals['cost'])}"
+    )
 
 
 @task.command(name="show")
@@ -474,7 +501,9 @@ def show_task(name: str, task_ref: str, json_output: bool) -> None:
         click.echo(body.decode("utf-8"), nl=False)
 
 
-def _current_task_publication(name: str) -> tuple[RepoPaths, TaskPublication]:
+def _current_task_publication(
+    name: str,
+) -> tuple[RepoPaths, TaskPublication]:
     """Load and verify the sole current generation without reconciling state."""
     paths = RepoPaths.discover()
     config = load_repository_config(paths)
@@ -493,6 +522,29 @@ def _current_task_publication(name: str) -> tuple[RepoPaths, TaskPublication]:
     return paths, publication
 
 
+def _current_task_runtime(
+    paths: RepoPaths, name: str, publication: TaskPublication
+) -> list[TaskRuntimeRow]:
+    """Load runtime rows and guard against a concurrent generation change."""
+    config = load_repository_config(paths)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        repository = store.get_repository(config.repository_id)
+        if repository is None:
+            raise ValueError("repository is not initialized; run 'borg init' first")
+        borg = store.get_borg_by_name(repository.id, name)
+        if borg is None:
+            raise ValueError(
+                f"Borg {name!r} does not exist; run 'borg create {name}' first"
+            )
+        runtime_rows = store.list_task_runtime(borg.id)
+        generation_ids = {row.generation_id for row in runtime_rows}
+        if generation_ids != {publication.generation.id}:
+            raise RuntimeError(
+                "current task generation changed while it was being inspected"
+            )
+    return runtime_rows
+
+
 def _task_listing_item(
     paths: RepoPaths, record: TaskRecord, path: Path
 ) -> dict[str, object]:
@@ -508,6 +560,85 @@ def _task_listing_item(
         "task_ref": record.task_ref,
         "title": record.title,
     }
+
+
+def _task_runtime_listing_item(row: TaskRuntimeRow) -> dict[str, object]:
+    """Serialize the shared task-runtime projection for CLI consumers."""
+    return {
+        "attempt_count": row.attempt_count,
+        "cost": _task_runtime_cost_item(row.cost),
+        "duration_seconds": row.duration_seconds,
+        "review_round": row.review_round,
+        "state_reason": row.state_reason,
+        "status": row.status.value,
+    }
+
+
+def _task_runtime_cost_item(cost: TaskRuntimeCost) -> dict[str, object]:
+    return {
+        "api_spend_unknown": cost.api_spend_unknown,
+        "api_spend_usd": cost.api_spend_usd,
+        "subscription_included": cost.subscription_included,
+    }
+
+
+def _task_runtime_totals(rows: list[TaskRuntimeRow]) -> dict[str, object]:
+    """Aggregate display totals without turning missing measurements into zero."""
+    attempted = [row for row in rows if row.attempt_count]
+    durations = [
+        row.duration_seconds
+        for row in attempted
+        if row.duration_seconds is not None
+    ]
+    api_spend_unknown = not attempted or any(
+        row.cost.api_spend_unknown for row in attempted
+    )
+    api_costs = [
+        row.cost.api_spend_usd
+        for row in attempted
+        if row.cost.api_spend_usd is not None
+    ]
+    return {
+        "attempt_count": sum(row.attempt_count for row in rows),
+        "cost": _task_runtime_cost_item(
+            TaskRuntimeCost(
+                api_spend_usd=(
+                    None
+                    if api_spend_unknown or not api_costs
+                    else float(sum(api_costs))
+                ),
+                api_spend_unknown=api_spend_unknown,
+                subscription_included=any(
+                    row.cost.subscription_included for row in attempted
+                ),
+            )
+        ),
+        "duration_seconds": float(sum(durations)) if durations else None,
+    }
+
+
+def _format_duration(value: object) -> str:
+    if value is None:
+        return "unknown duration"
+    seconds = float(value)
+    if seconds < 60:
+        return f"{seconds:g}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _format_runtime_cost(value: object) -> str:
+    if not isinstance(value, dict):
+        raise TypeError("runtime cost must be serialized before formatting")
+    parts = []
+    if value["api_spend_unknown"]:
+        parts.append("API spend unknown")
+    elif value["api_spend_usd"] is not None:
+        parts.append(f"${float(value['api_spend_usd']):.4f} API")
+    if value["subscription_included"]:
+        parts.append("subscription included")
+    return " + ".join(parts) if parts else "unknown cost"
 
 
 @plan.command(name="approve")
