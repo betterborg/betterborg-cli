@@ -251,7 +251,9 @@ def test_execution_ownership_records_round_trip_after_reopen(
         store.append_environment_attempt(environment)
         store.append_agent_attempt(agent)
         store.append_execution_event(event)
-        store.add_compose_resource(compose)
+        store.add_compose_resource(
+            compose, run.owner_token, claim.claim_token, now=started_at
+        )
 
         assert store.execution_run_owned_by(run.id, run.owner_token)
         assert not store.execution_run_owned_by(run.id, "wrong-token")
@@ -259,7 +261,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7)
+        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8)
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime
@@ -424,7 +426,9 @@ def test_execution_history_and_resource_ownership_are_immutable(
         store.append_environment_attempt(environment)
         store.append_agent_attempt(agent)
         store.append_execution_event(event)
-        store.add_compose_resource(compose)
+        store.add_compose_resource(
+            compose, run.owner_token, claim.claim_token, now=started_at
+        )
 
         sql, parameters = {
             "UPDATE": (
@@ -620,7 +624,12 @@ def test_expiry_closes_open_attempt_and_blocks_reclaim_until_compose_cleanup(
             created_at=now + timedelta(seconds=15),
         )
         store.append_agent_attempt(attempt)
-        store.add_compose_resource(resource)
+        store.add_compose_resource(
+            resource,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=15),
+        )
 
         renewed = store.renew_execution_run(
             acquisition.run_id,
@@ -819,7 +828,9 @@ def test_cleanup_confirmation_does_not_cover_later_project_resources(
             resource_name="borg-shared-project_default",
             created_at=now,
         )
-        store.add_compose_resource(first)
+        store.add_compose_resource(
+            first, acquisition.owner_token, claim.claim_token, now=now
+        )
         assert store.confirm_compose_project_cleanup(
             acquisition.run_id,
             task.id,
@@ -836,7 +847,12 @@ def test_cleanup_confirmation_does_not_cover_later_project_resources(
             resource_name="borg-shared-project_data",
             created_at=now + timedelta(milliseconds=500),
         )
-        store.add_compose_resource(later)
+        store.add_compose_resource(
+            later,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(milliseconds=1500),
+        )
         assert store.interrupt_execution_run(
             acquisition.run_id,
             acquisition.owner_token,
@@ -909,7 +925,12 @@ def test_interruption_preserves_completed_task_and_guards_phase_ownership(
             resource_name="borg-completed-exact",
             created_at=now + timedelta(seconds=1),
         )
-        store.add_compose_resource(resource)
+        store.add_compose_resource(
+            resource,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=1),
+        )
         completed = store.transition_task_runtime(
             acquisition.run_id,
             acquisition.owner_token,
@@ -974,7 +995,12 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
             resource_name="borg-expired-claim",
             created_at=now + timedelta(seconds=1),
         )
-        store.add_compose_resource(resource)
+        store.add_compose_resource(
+            resource,
+            acquisition.owner_token,
+            expired_claim.claim_token,
+            now=now,
+        )
 
         store.renew_execution_run(
             acquisition.run_id,
@@ -1008,3 +1034,209 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
             event.kind
             for event in store.list_execution_events(acquisition.run_id)
         }
+
+
+def test_compose_resource_cannot_be_persisted_after_expiry_releases_claim(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as stale_worker:
+        acquisition = stale_worker.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = stale_worker.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert claim is not None
+        late_resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name="borg-too-late",
+            resource_type="project",
+            resource_name="borg-too-late",
+            created_at=now + timedelta(minutes=2),
+        )
+
+        with SqliteStore.open(database) as reconciler:
+            assert reconciler.reconcile_expired_execution_runs(
+                now=now + timedelta(minutes=2)
+            ) == []
+            replacement = reconciler.acquire_execution_run(
+                borg.id,
+                generation.id,
+                lease_duration=timedelta(minutes=5),
+                now=now + timedelta(minutes=2),
+            )
+            assert replacement.owner_token is not None
+            replacement_claim = reconciler.claim_dependency_ready_task(
+                replacement.run_id,
+                replacement.owner_token,
+                lease_duration=timedelta(minutes=2),
+                now=now + timedelta(minutes=2),
+            )
+            assert replacement_claim is not None
+
+        with pytest.raises(ExecutionOwnershipError, match="no longer running"):
+            stale_worker.add_compose_resource(
+                late_resource,
+                acquisition.owner_token,
+                claim.claim_token,
+                now=now + timedelta(minutes=2),
+            )
+        assert stale_worker.list_compose_resources(task.id) == []
+
+
+def test_open_attempts_finish_with_durable_results_and_usage(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert claim is not None
+        environment = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:normal-failure",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now + timedelta(seconds=5),
+            finished_at=None,
+        )
+        agent = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.API,
+            status=ExecutionAttemptStatus.RUNNING,
+            log_path="artifacts/coding.log",
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+        store.append_environment_attempt(environment)
+        store.append_agent_attempt(agent)
+
+        with pytest.raises(ExecutionOwnershipError, match="no longer owned"):
+            store.complete_environment_attempt(
+                environment.id,
+                acquisition.owner_token,
+                "wrong-claim-token",
+                status=ExecutionAttemptStatus.FAILED,
+                now=now + timedelta(seconds=14),
+            )
+        failed_environment = store.complete_environment_attempt(
+            environment.id,
+            acquisition.owner_token,
+            claim.claim_token,
+            status=ExecutionAttemptStatus.FAILED,
+            result={"exit_code": 2},
+            error="materialization failed",
+            now=now + timedelta(seconds=15),
+        )
+        usage = AgentUsage(
+            cost_usd=0.5,
+            tokens_input=120,
+            tokens_output=30,
+            tokens_cache_read=80,
+            tokens_cache_write=10,
+            num_turns=2,
+        )
+        completed_agent = store.complete_agent_attempt(
+            agent.id,
+            acquisition.owner_token,
+            claim.claim_token,
+            status=AgentStatus.COMPLETED,
+            result_path="artifacts/coding.json",
+            result={"status": "completed"},
+            summary="Implementation completed.",
+            duration_seconds=18.5,
+            usage=usage,
+            now=now + timedelta(seconds=30),
+        )
+
+        assert failed_environment.status is ExecutionAttemptStatus.FAILED
+        assert failed_environment.result == {"exit_code": 2}
+        assert failed_environment.error == "materialization failed"
+        assert failed_environment.finished_at == now + timedelta(seconds=15)
+        assert failed_environment.duration_seconds == 10
+        assert completed_agent.status is ExecutionAttemptStatus.COMPLETED
+        assert completed_agent.result_path == "artifacts/coding.json"
+        assert completed_agent.result == {"status": "completed"}
+        assert completed_agent.summary == "Implementation completed."
+        assert completed_agent.duration_seconds == 18.5
+        assert completed_agent.usage == usage
+        assert completed_agent.finished_at == now + timedelta(seconds=30)
+
+        with pytest.raises(ValueError, match="already finished"):
+            store.complete_agent_attempt(
+                agent.id,
+                acquisition.owner_token,
+                claim.claim_token,
+                status=ExecutionAttemptStatus.FAILED,
+                now=now + timedelta(seconds=31),
+            )
+
+        assert store.interrupt_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            now=now + timedelta(seconds=40),
+        ) == []
+        attempt_events = [
+            event
+            for event in store.list_execution_events(acquisition.run_id)
+            if event.attempt_id is not None
+        ]
+        assert [(event.kind, event.attempt_id) for event in attempt_events] == [
+            ("environment.attempt_finished", environment.id),
+            ("agent.attempt_finished", agent.id),
+        ]
+        with store.locked_connection() as connection:
+            raw_statuses = (
+                connection.execute(
+                    "SELECT status FROM environment_attempts WHERE id = ?",
+                    (str(environment.id),),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT status FROM agent_attempts WHERE id = ?",
+                    (str(agent.id),),
+                ).fetchone()[0],
+            )
+        assert raw_statuses == ("running", "running")
+
+    with SqliteStore.open(database) as reopened:
+        assert reopened.list_environment_attempts(task.id) == [failed_environment]
+        assert reopened.list_agent_attempts(task.id) == [completed_agent]

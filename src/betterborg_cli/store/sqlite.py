@@ -15,7 +15,7 @@ from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
-from betterborg_cli.agent_runtime.base import AgentUsage, BillingMode
+from betterborg_cli.agent_runtime.base import AgentStatus, AgentUsage, BillingMode
 from betterborg_cli.store.models import (
     AgentAttempt,
     Borg,
@@ -1699,6 +1699,36 @@ class SqliteStore:
             raise ExecutionOwnershipError("execution run lease expired")
         return row
 
+    def _require_live_claim(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        owner_token: str,
+        claim_id: UUID,
+        claim_token: str,
+        task_id: UUID,
+        now: datetime,
+    ) -> sqlite3.Row:
+        self._require_live_run(connection, run_id, owner_token, now=now)
+        claim = connection.execute(
+            """
+            SELECT * FROM task_claims
+            WHERE id = ? AND run_id = ? AND task_id = ? AND claim_token = ?
+              AND released_at IS NULL AND lease_expires_at > ?
+            """,
+            (
+                str(claim_id),
+                str(run_id),
+                str(task_id),
+                claim_token,
+                now.isoformat(),
+            ),
+        ).fetchone()
+        if claim is None:
+            raise ExecutionOwnershipError("task claim is no longer owned")
+        return claim
+
     def _interrupt_run(
         self,
         connection: sqlite3.Connection,
@@ -1785,11 +1815,16 @@ class SqliteStore:
                   AND NOT EXISTS (
                       SELECT 1 FROM execution_events AS event
                       WHERE event.attempt_id = attempt.id
-                        AND event.kind = ?
+                        AND event.kind IN (
+                            'environment.attempt_finished',
+                            'environment.attempt_interrupted',
+                            'agent.attempt_finished',
+                            'agent.attempt_interrupted'
+                        )
                   )
                 ORDER BY started_at, id
                 """,
-                (str(run_id), event_kind),
+                (str(run_id),),
             ).fetchall()
             for attempt in attempts:
                 self._insert_execution_event(
@@ -2157,21 +2192,68 @@ class SqliteStore:
             rows = connection.execute(
                 """
                 SELECT environment_attempts.*,
-                       interruption.created_at AS interrupted_at
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
                 FROM environment_attempts
-                LEFT JOIN (
-                    SELECT attempt_id, MIN(created_at) AS created_at
-                    FROM execution_events
-                    WHERE kind = 'environment.attempt_interrupted'
-                    GROUP BY attempt_id
-                ) AS interruption
-                  ON interruption.attempt_id = environment_attempts.id
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = environment_attempts.id
+                 AND terminal.kind IN (
+                    'environment.attempt_finished',
+                    'environment.attempt_interrupted'
+                 )
                 WHERE environment_attempts.task_id = ?
                 ORDER BY environment_attempts.started_at, environment_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_environment_attempt(row) for row in rows]
+
+    def complete_environment_attempt(
+        self,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        *,
+        status: ExecutionAttemptStatus | AgentStatus,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+        duration_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> EnvironmentAttempt:
+        """Durably finish one owned environment attempt exactly once."""
+        finished_at = _execution_time(now)
+        terminal_status = _terminal_attempt_status(status)
+        if duration_seconds is not None and duration_seconds < 0:
+            raise ValueError("environment attempt duration must not be negative")
+        with self.transaction() as connection:
+            attempt = self._require_owned_open_attempt(
+                connection,
+                table="environment_attempts",
+                attempt_id=attempt_id,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=finished_at,
+            )
+            duration = _completed_attempt_duration(
+                attempt, finished_at=finished_at, duration_seconds=duration_seconds
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=UUID(attempt["run_id"]),
+                task_id=UUID(attempt["task_id"]),
+                attempt_id=attempt_id,
+                kind="environment.attempt_finished",
+                payload={
+                    "status": terminal_status.value,
+                    "result": result,
+                    "error": error,
+                    "duration_seconds": duration,
+                },
+                created_at=finished_at,
+            )
+            row = self._environment_attempt_projection(connection, attempt_id)
+        return _row_to_environment_attempt(row)
 
     def append_agent_attempt(self, attempt: AgentAttempt) -> None:
         """Append one immutable, billing-aware agent attempt."""
@@ -2233,21 +2315,162 @@ class SqliteStore:
             rows = connection.execute(
                 """
                 SELECT agent_attempts.*,
-                       interruption.created_at AS interrupted_at
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
                 FROM agent_attempts
-                LEFT JOIN (
-                    SELECT attempt_id, MIN(created_at) AS created_at
-                    FROM execution_events
-                    WHERE kind = 'agent.attempt_interrupted'
-                    GROUP BY attempt_id
-                ) AS interruption
-                  ON interruption.attempt_id = agent_attempts.id
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = agent_attempts.id
+                 AND terminal.kind IN (
+                    'agent.attempt_finished',
+                    'agent.attempt_interrupted'
+                 )
                 WHERE agent_attempts.task_id = ?
                 ORDER BY agent_attempts.started_at, agent_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_agent_attempt(row) for row in rows]
+
+    def complete_agent_attempt(
+        self,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        *,
+        status: ExecutionAttemptStatus | AgentStatus,
+        result_path: str | None = None,
+        result: dict[str, object] | None = None,
+        summary: str | None = None,
+        duration_seconds: float | None = None,
+        usage: AgentUsage | None = None,
+        now: datetime | None = None,
+    ) -> AgentAttempt:
+        """Durably finish one owned billing-aware agent attempt exactly once."""
+        finished_at = _execution_time(now)
+        terminal_status = _terminal_attempt_status(status)
+        if duration_seconds is not None and duration_seconds < 0:
+            raise ValueError("agent attempt duration must not be negative")
+        if usage is not None and not isinstance(usage, AgentUsage):
+            raise TypeError("agent attempt usage must be an AgentUsage")
+        with self.transaction() as connection:
+            attempt = self._require_owned_open_attempt(
+                connection,
+                table="agent_attempts",
+                attempt_id=attempt_id,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=finished_at,
+            )
+            duration = _completed_attempt_duration(
+                attempt, finished_at=finished_at, duration_seconds=duration_seconds
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=UUID(attempt["run_id"]),
+                task_id=UUID(attempt["task_id"]),
+                attempt_id=attempt_id,
+                kind="agent.attempt_finished",
+                payload={
+                    "status": terminal_status.value,
+                    "result_path": result_path,
+                    "result": result,
+                    "summary": summary,
+                    "duration_seconds": duration,
+                    "usage": _agent_usage_payload(usage),
+                },
+                created_at=finished_at,
+            )
+            row = self._agent_attempt_projection(connection, attempt_id)
+        return _row_to_agent_attempt(row)
+
+    def _require_owned_open_attempt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        now: datetime,
+    ) -> sqlite3.Row:
+        if table not in {"environment_attempts", "agent_attempts"}:
+            raise ValueError("unsupported execution attempt table")
+        attempt = connection.execute(
+            f"SELECT * FROM {table} WHERE id = ?", (str(attempt_id),)
+        ).fetchone()
+        if attempt is None:
+            raise KeyError(f"execution attempt {attempt_id} not found")
+        if attempt["status"] != ExecutionAttemptStatus.RUNNING.value:
+            raise ValueError("execution attempt has already finished")
+        terminal = connection.execute(
+            """
+            SELECT 1 FROM execution_events
+            WHERE attempt_id = ? AND kind IN (
+                'environment.attempt_finished',
+                'environment.attempt_interrupted',
+                'agent.attempt_finished',
+                'agent.attempt_interrupted'
+            )
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+        if terminal is not None:
+            raise ValueError("execution attempt has already finished")
+        self._require_live_claim(
+            connection,
+            run_id=UUID(attempt["run_id"]),
+            owner_token=owner_token,
+            claim_id=UUID(attempt["claim_id"]),
+            claim_token=claim_token,
+            task_id=UUID(attempt["task_id"]),
+            now=now,
+        )
+        return attempt
+
+    @staticmethod
+    def _environment_attempt_projection(
+        connection: sqlite3.Connection, attempt_id: UUID
+    ) -> sqlite3.Row:
+        return connection.execute(
+            """
+            SELECT environment_attempts.*,
+                   terminal.kind AS terminal_kind,
+                   terminal.payload_json AS terminal_payload_json,
+                   terminal.created_at AS terminal_at
+            FROM environment_attempts
+            LEFT JOIN execution_events AS terminal
+              ON terminal.attempt_id = environment_attempts.id
+             AND terminal.kind IN (
+                'environment.attempt_finished',
+                'environment.attempt_interrupted'
+             )
+            WHERE environment_attempts.id = ?
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+
+    @staticmethod
+    def _agent_attempt_projection(
+        connection: sqlite3.Connection, attempt_id: UUID
+    ) -> sqlite3.Row:
+        return connection.execute(
+            """
+            SELECT agent_attempts.*,
+                   terminal.kind AS terminal_kind,
+                   terminal.payload_json AS terminal_payload_json,
+                   terminal.created_at AS terminal_at
+            FROM agent_attempts
+            LEFT JOIN execution_events AS terminal
+              ON terminal.attempt_id = agent_attempts.id
+             AND terminal.kind IN (
+                'agent.attempt_finished',
+                'agent.attempt_interrupted'
+             )
+            WHERE agent_attempts.id = ?
+            """,
+            (str(attempt_id),),
+        ).fetchone()
 
     @staticmethod
     def _require_open_attempt_ownership(
@@ -2307,9 +2530,26 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_execution_event(row) for row in rows]
 
-    def add_compose_resource(self, resource: ComposeResource) -> None:
-        """Persist one task-owned Compose resource identity."""
+    def add_compose_resource(
+        self,
+        resource: ComposeResource,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist Compose identity while its run and task claim are owned."""
+        persisted_at = _execution_time(now)
         with self.transaction() as connection:
+            self._require_live_claim(
+                connection,
+                run_id=resource.run_id,
+                owner_token=owner_token,
+                claim_id=resource.claim_id,
+                claim_token=claim_token,
+                task_id=resource.task_id,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO compose_resources(
@@ -2890,7 +3130,7 @@ def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
 
 
 def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
-    status, finished_at, duration_seconds = _project_attempt_lifecycle(row)
+    status, finished_at, duration_seconds, terminal = _project_attempt_lifecycle(row)
     return EnvironmentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -2902,11 +3142,15 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
         status=status,
         commands=json.loads(row["commands_json"]),
         result=(
-            json.loads(row["result_json"])
-            if row["result_json"] is not None
-            else None
+            terminal["result"]
+            if terminal is not None
+            else (
+                json.loads(row["result_json"])
+                if row["result_json"] is not None
+                else None
+            )
         ),
-        error=row["error"],
+        error=terminal["error"] if terminal is not None else row["error"],
         duration_seconds=duration_seconds,
         started_at=datetime.fromisoformat(row["started_at"]),
         finished_at=finished_at,
@@ -2914,7 +3158,7 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
 
 
 def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
-    status, finished_at, duration_seconds = _project_attempt_lifecycle(row)
+    status, finished_at, duration_seconds, terminal = _project_attempt_lifecycle(row)
     return AgentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -2928,15 +3172,25 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         billing_mode=BillingMode(row["billing_mode"]),
         status=status,
         log_path=row["log_path"],
-        result_path=row["result_path"],
-        result=(
-            json.loads(row["result_json"])
-            if row["result_json"] is not None
-            else None
+        result_path=(
+            terminal["result_path"] if terminal is not None else row["result_path"]
         ),
-        summary=row["summary"],
+        result=(
+            terminal["result"]
+            if terminal is not None
+            else (
+                json.loads(row["result_json"])
+                if row["result_json"] is not None
+                else None
+            )
+        ),
+        summary=terminal["summary"] if terminal is not None else row["summary"],
         duration_seconds=duration_seconds,
-        usage=_row_to_agent_usage(row),
+        usage=(
+            _agent_usage_from_payload(terminal["usage"])
+            if terminal is not None
+            else _row_to_agent_usage(row)
+        ),
         started_at=datetime.fromisoformat(row["started_at"]),
         finished_at=finished_at,
     )
@@ -2944,7 +3198,12 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
 
 def _project_attempt_lifecycle(
     row: sqlite3.Row,
-) -> tuple[ExecutionAttemptStatus, datetime | None, float | None]:
+) -> tuple[
+    ExecutionAttemptStatus,
+    datetime | None,
+    float | None,
+    dict[str, object] | None,
+]:
     status = ExecutionAttemptStatus(row["status"])
     finished_at = (
         datetime.fromisoformat(row["finished_at"])
@@ -2952,17 +3211,66 @@ def _project_attempt_lifecycle(
         else None
     )
     duration_seconds = row["duration_seconds"]
-    interrupted_at = (
-        row["interrupted_at"] if "interrupted_at" in row.keys() else None
-    )
-    if status is ExecutionAttemptStatus.RUNNING and interrupted_at is not None:
-        status = ExecutionAttemptStatus.CANCELLED
-        finished_at = datetime.fromisoformat(interrupted_at)
-        if duration_seconds is None:
+    terminal_kind = row["terminal_kind"] if "terminal_kind" in row.keys() else None
+    terminal = None
+    if status is ExecutionAttemptStatus.RUNNING and terminal_kind is not None:
+        finished_at = datetime.fromisoformat(row["terminal_at"])
+        if terminal_kind.endswith("attempt_finished"):
+            terminal = json.loads(row["terminal_payload_json"])
+            status = ExecutionAttemptStatus(terminal["status"])
+            duration_seconds = terminal["duration_seconds"]
+        else:
+            status = ExecutionAttemptStatus.CANCELLED
             duration_seconds = (
                 finished_at - datetime.fromisoformat(row["started_at"])
             ).total_seconds()
-    return status, finished_at, duration_seconds
+    return status, finished_at, duration_seconds, terminal
+
+
+def _terminal_attempt_status(
+    status: ExecutionAttemptStatus | AgentStatus,
+) -> ExecutionAttemptStatus:
+    if not isinstance(status, ExecutionAttemptStatus | AgentStatus):
+        raise TypeError("attempt status must be an ExecutionAttemptStatus")
+    terminal_status = ExecutionAttemptStatus(status.value)
+    if terminal_status is ExecutionAttemptStatus.RUNNING:
+        raise ValueError("a completed execution attempt cannot remain running")
+    return terminal_status
+
+
+def _completed_attempt_duration(
+    row: sqlite3.Row,
+    *,
+    finished_at: datetime,
+    duration_seconds: float | None,
+) -> float:
+    started_at = datetime.fromisoformat(row["started_at"])
+    if finished_at < started_at:
+        raise ValueError("execution attempt cannot finish before it starts")
+    if duration_seconds is not None:
+        return duration_seconds
+    return (finished_at - started_at).total_seconds()
+
+
+def _agent_usage_payload(usage: AgentUsage | None) -> dict[str, object] | None:
+    if usage is None:
+        return None
+    return {
+        "cost_usd": usage.cost_usd,
+        "tokens_input": usage.tokens_input,
+        "tokens_output": usage.tokens_output,
+        "tokens_cache_read": usage.tokens_cache_read,
+        "tokens_cache_write": usage.tokens_cache_write,
+        "num_turns": usage.num_turns,
+    }
+
+
+def _agent_usage_from_payload(payload: object) -> AgentUsage | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise TypeError("agent attempt usage payload must be a dictionary")
+    return AgentUsage(**payload)
 
 
 def _row_to_agent_usage(row: sqlite3.Row) -> AgentUsage | None:
