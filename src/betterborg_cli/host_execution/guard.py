@@ -9,7 +9,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from betterborg_cli.host_execution.git import _hardened_git_environment, _status_path
+from betterborg_cli.host_execution.git import (
+    _hardened_git_environment,
+    _status_entries,
+)
 
 
 class PrimaryCheckoutContaminationError(RuntimeError):
@@ -98,14 +101,16 @@ class PrimaryCheckoutGuard:
                 active_error.add_note(str(error))
 
     def _snapshot(self) -> _CheckoutSnapshot:
-        status = self._git_output(["status", "--porcelain", "-uall"])
+        status = self._git_output(
+            ["status", "--porcelain=v1", "-z", "-uall"]
+        )
         head = self._git_output(["rev-parse", "--verify", "HEAD"]).strip()
         branch = self._git_output(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
         return _CheckoutSnapshot(
             status=frozenset(
-                line
-                for line in status.splitlines()
-                if line and not self._ignored(_status_path(line))
+                entry
+                for entry, paths in _status_entries(status)
+                if any(not self._ignored(path) for path in paths)
             ),
             head=head,
             branch=branch,

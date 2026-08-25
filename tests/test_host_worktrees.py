@@ -126,6 +126,36 @@ def test_primary_guard_protect_rejects_dirty_phase_entry(
     assert "README.md" in str(caught.value)
 
 
+def test_primary_guard_detects_rename_into_ignored_state_directory(
+    committed_git_repo: Path,
+) -> None:
+    state_directory = committed_git_repo / ".borg/state"
+    state_directory.mkdir(parents=True)
+    _git(committed_git_repo, "mv", "README.md", ".borg/state/README.md")
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="before it started"
+    ) as caught:
+        PrimaryCheckoutGuard(committed_git_repo).assert_clean()
+
+    assert "README.md -> .borg/state/README.md" in str(caught.value)
+
+
+def test_primary_guard_does_not_parse_arrow_in_filename_as_rename(
+    committed_git_repo: Path,
+) -> None:
+    filename = "outside -> .borg-state-hidden"
+    (committed_git_repo / filename).write_text("preserve me\n")
+
+    with pytest.raises(PrimaryCheckoutContaminationError) as caught:
+        PrimaryCheckoutGuard(
+            committed_git_repo,
+            ignored_prefixes=(".borg-state-hidden",),
+        ).assert_clean()
+
+    assert filename in str(caught.value)
+
+
 def test_primary_guard_detects_clean_commit_during_phase(
     committed_git_repo: Path,
 ) -> None:

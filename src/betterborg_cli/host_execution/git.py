@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 
@@ -342,10 +342,9 @@ class SafeGit:
         )
 
     def is_clean(self, *, ignore_path: Callable[[str], bool] | None = None) -> bool:
-        output = self.run(["status", "--porcelain", "-uall"]).stdout
-        for line in output.splitlines():
-            path = _status_path(line)
-            if path and (ignore_path is None or not ignore_path(path)):
+        output = self.run(["status", "--porcelain=v1", "-z", "-uall"]).stdout
+        for _entry, paths in _status_entries(output):
+            if ignore_path is None or any(not ignore_path(path) for path in paths):
                 return False
         return True
 
@@ -411,8 +410,26 @@ class SafeGit:
         return entries
 
 
-def _status_path(line: str) -> str:
-    path = line[3:] if len(line) > 3 else ""
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    return path.strip().strip('"')
+def _status_entries(output: str) -> Iterator[tuple[str, tuple[str, ...]]]:
+    """Yield display text and every path from NUL-delimited porcelain v1."""
+    records = output.split("\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        status = record[:2]
+        path = record[3:]
+        paths = (path,)
+        display = record
+        if "R" in status or "C" in status:
+            if index >= len(records) or not records[index]:
+                # Treat malformed Git output as dirty rather than hiding it.
+                yield record, paths
+                continue
+            source = records[index]
+            index += 1
+            paths = (source, path)
+            display = f"{status} {source} -> {path}"
+        yield display, paths
