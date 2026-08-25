@@ -87,6 +87,7 @@ class CodexAdapter(NativeCliAdapter):
             streaming=True,
             resumable=True,
             host_capable=True,
+            read_only_sandbox=True,
         ),
         init=False,
     )

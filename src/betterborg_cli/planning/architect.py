@@ -239,10 +239,13 @@ class ArchitectLoop:
             raise ValueError(
                 "Borg must already belong to the supplied repository and store"
             )
-        if not agent.capabilities.tool_allowlist:
+        if not (
+            agent.capabilities.tool_allowlist
+            or agent.capabilities.read_only_sandbox
+        ):
             raise ArchitectError(
                 f"adapter {agent.name!r} cannot enforce the Architect "
-                "read-only tool allowlist"
+                "read-only execution boundary"
             )
         if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
             raise ArchitectError(

@@ -54,6 +54,7 @@ class AgentCapabilities:
     tool_allowlist: bool = False
     resumable: bool = False
     host_capable: bool = False
+    read_only_sandbox: bool = False
 
     def supports_billing(self, mode: BillingMode) -> bool:
         """Return whether the adapter can run under ``mode``."""

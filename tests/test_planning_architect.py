@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime import ApiAgentRole, CodexAdapter, select_agent
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -91,6 +94,72 @@ def test_answers_product_questions_inline_and_persists_plan(
             attempt.status is PlanningAttemptStatus.COMPLETED for attempt in attempts
         )
         assert attempts[-1].result == _plan()
+
+
+def test_selected_codex_agent_runs_architect_in_read_only_sandbox(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    commands: list[list[str]] = []
+    trusted_worktrees: list[Path] = []
+    payloads = iter([{"decision": "ready_to_plan"}, _plan()])
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        _log_path: Path,
+        _cancel: object,
+        _env: Mapping[str, str] | None,
+    ) -> int:
+        commands.append(list(command))
+        invocation_result = Path(command[command.index("-o") + 1])
+        invocation_result.write_text(
+            json.dumps(next(payloads)), encoding="utf-8"
+        )
+        return 0
+
+    database = committed_git_repo.parent / "architect-codex.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "codex"
+        )
+        paths = RepoPaths.discover(committed_git_repo)
+        selected = select_agent(
+            load_repository_config(paths),
+            ApiAgentRole.PLANNING,
+            paths,
+            interactive=True,
+            credentials={},
+            executable_lookup=lambda binary: (
+                "/bin/codex" if binary == "codex" else None
+            ),
+            trust_requirement=lambda run_paths, **_kwargs: (
+                trusted_worktrees.append(run_paths.root)
+            ),
+        )
+        assert isinstance(selected.adapter, CodexAdapter)
+        assert not selected.capabilities.tool_allowlist
+        assert selected.capabilities.read_only_sandbox
+        selected.adapter.proc_runner = runner
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            selected,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert len(commands) == 2
+        assert all(
+            command[command.index("-s") + 1] == "read-only"
+            for command in commands
+        )
+        assert len(trusted_worktrees) == 2
+        assert all(not worktree.exists() for worktree in trusted_worktrees)
 
 
 def test_answers_final_question_round_before_forcing_plan(
