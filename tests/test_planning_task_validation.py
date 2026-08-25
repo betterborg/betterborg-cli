@@ -205,6 +205,16 @@ def test_direct_and_transitive_ancestor_references_are_valid_consumption() -> No
     validate_task_graph(plan, [*tasks, final], dependencies)
 
 
+def test_project_context_references_are_valid_non_owning_citations() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    plan["risks"] = ["The upstream API may change."]
+    plan["code_pointers"] = [{"path": "foundation.py", "line": 1}]
+    plan["open_questions"] = ["Should the integration be optional?"]
+    tasks[1].task["plan_refs"].extend(["RISK.1", "CONTEXT.1", "QUESTION.1"])
+
+    validate_task_graph(plan, tasks, dependencies)
+
+
 def test_task_from_unrelated_repository_cannot_own_phase_elements() -> None:
     plan = {
         "repositories": [{"id": "a"}, {"id": "b"}],
@@ -305,6 +315,38 @@ def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
 
     assert "task.dependency.same_stage_order" in rules
     assert "task.dependency.dangling" in rules
+
+
+def test_removing_one_of_multiple_dangling_edges_counts_as_repair_progress() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    first_dangling = TaskDependency(
+        generation_id=tasks[0].generation_id,
+        task_id=tasks[0].id,
+        depends_on_task_id=uuid4(),
+    )
+    second_dangling = TaskDependency(
+        generation_id=tasks[0].generation_id,
+        task_id=tasks[0].id,
+        depends_on_task_id=uuid4(),
+    )
+    previous = task_graph_findings(
+        plan,
+        tasks,
+        [*dependencies, first_dangling, second_dangling],
+    )
+    repaired = task_graph_findings(
+        plan,
+        tasks,
+        [*dependencies, second_dangling],
+    )
+    dangling_identities = {
+        finding.identity
+        for finding in previous
+        if finding.rule == "task.dependency.dangling"
+    }
+
+    assert len(dangling_identities) == 2
+    validate_task_repair_progress(previous, repaired)
 
 
 def test_same_stage_dependency_uses_the_complete_lexical_stem() -> None:

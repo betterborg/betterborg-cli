@@ -34,14 +34,18 @@ class TaskGraphFinding:
     message: str
     task_refs: tuple[str, ...] = ()
     plan_refs: tuple[str, ...] = ()
+    dependency_refs: tuple[str, ...] = ()
 
     @property
-    def identity(self) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    def identity(
+        self,
+    ) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Return the stable identity used to measure repair progress."""
         return (
             self.rule,
             tuple(sorted(set(self.task_refs))),
             tuple(sorted(set(self.plan_refs))),
+            self.dependency_refs,
         )
 
 
@@ -323,15 +327,17 @@ def task_graph_findings(
             element = elements_by_ref[plan_ref]
             repository_conflict = task_repository_invalid
             if element.phase != task.stage or repository_conflict:
+                cites_project_context = (
+                    not repository_conflict and element.phase == "project"
+                )
                 consumes_ancestor = (
                     not repository_conflict
                     and element.phase
                     in ancestors_by_phase.get(task.stage, frozenset())
                 )
-                if consumes_ancestor:
-                    # An ancestor citation records consumption of an upstream
-                    # contract. It is valid traceability, but only a citation
-                    # from the element's own phase can establish ownership.
+                if cites_project_context or consumes_ancestor:
+                    # Project context and ancestor consumption are valid
+                    # traceability, but cannot establish phase ownership.
                     continue
                 findings.append(
                     TaskGraphFinding(
@@ -395,6 +401,10 @@ def task_graph_findings(
                     rule="task.dependency.dangling",
                     message="task dependency does not resolve within the generation",
                     task_refs=(known.task_ref,) if known is not None else (),
+                    dependency_refs=(
+                        str(dependency.task_id),
+                        str(dependency.depends_on_task_id),
+                    ),
                 )
             )
             continue
