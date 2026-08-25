@@ -300,6 +300,12 @@ class HostComposeManager:
                 raise KeyError
             if any(record.get("network_mode") for record in selected_records.values()):
                 raise ValueError("host or service network_mode cannot be isolated")
+            writable_binds = _writable_bind_mounts(selected_records)
+            if writable_binds:
+                raise ValueError(
+                    "writable bind mounts cannot be isolated: "
+                    + ", ".join(writable_binds)
+                )
             if not isinstance(network_records, Mapping) or not isinstance(
                 volume_records, Mapping
             ):
@@ -683,6 +689,37 @@ def _service_target_ports(
 
 def _owned_resource_name(project_name: str, key: str) -> str:
     return f"{project_name}_{key}"
+
+
+def _writable_bind_mounts(
+    services: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    for service_name, service in services.items():
+        volumes = service.get("volumes")
+        if not isinstance(volumes, Sequence) or isinstance(volumes, str | bytes):
+            continue
+        for index, volume in enumerate(volumes):
+            if not isinstance(volume, Mapping):
+                continue
+            volume_type = volume.get("type")
+            if (
+                isinstance(volume_type, str)
+                and volume_type.casefold() == "bind"
+                and not _volume_read_only(volume)
+            ):
+                violations.append(f"{service_name}.volumes[{index}]")
+    return tuple(violations)
+
+
+def _volume_read_only(volume: Mapping[object, object]) -> bool:
+    if volume.get("read_only") is True or volume.get("readonly") is True:
+        return True
+    mode = volume.get("mode")
+    if not isinstance(mode, str):
+        return False
+    modes = {part.strip().casefold() for part in mode.split(",")}
+    return bool({"ro", "readonly"} & modes)
 
 
 def _render_runtime_override(

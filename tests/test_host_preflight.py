@@ -567,6 +567,50 @@ def test_compose_url_environment_requires_an_exact_service_port(
     assert "DATABASE_URL requires an exact port" in result.reason
 
 
+def test_compose_url_environment_uses_first_declared_port(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
+    _executable(
+        binary_dir,
+        "docker",
+        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
+    )
+    (committed_git_repo / "package").mkdir()
+    (committed_git_repo / "runtime.version").write_text(
+        "3.11.9\n", encoding="utf-8"
+    )
+    (committed_git_repo / "compose.yml").write_text(
+        "services:\n  postgres:\n    image: postgres:16\n",
+        encoding="utf-8",
+    )
+    plan = _base_plan()
+    dependencies = plan["service_dependencies"]
+    assert isinstance(dependencies, list)
+    database = dependencies[0]
+    assert isinstance(database, dict)
+    del database["port"]
+    database["ports"] = [{"port": 5432}]
+
+    result = _preflight(
+        committed_git_repo,
+        environment={"PATH": str(binary_dir)},
+    ).validate(
+        plan,
+        available_secret_names={"PACKAGE_TOKEN"},
+        external_urls={"SEARCH_URL": "https://search.example.test/api"},
+    )
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.services[0].port == 5432
+    assert result.services[0].url_targets == (("DATABASE_URL", 5432),)
+    assert service_url_environment(
+        result.services, published_ports={("postgres", 5432): 49152}
+    )["DATABASE_URL"] == "postgres://127.0.0.1:49152/postgres"
+
+
 def test_missing_compose_metadata_and_plugin_block_before_claim(
     committed_git_repo: Path,
 ) -> None:

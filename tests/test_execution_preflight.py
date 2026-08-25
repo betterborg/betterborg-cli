@@ -752,7 +752,9 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
         assert len(failed) == 1 and failed[0].stopped is False
         assert failed[0].project_name == stack.project_name
         assert failed[0].command == runner.down_commands[-1]
-        assert runtime is not None and runtime.state_reason is not None
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.BLOCKED
+        assert runtime.state_reason is not None
         assert stack.project_name in runtime.state_reason
         assert "docker compose" in runtime.state_reason
         assert persisted_claim.released_at is None
@@ -773,6 +775,36 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
     assert succeeded[0].command == failed[0].command
     assert reclaimed is not None and reclaimed.task_id == claim.task_id
     assert artifact.read_text(encoding="utf-8") == "preserved\n"
+
+
+def test_writable_compose_bind_mount_blocks_before_start(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    runner.config_services["healthy"]["volumes"] = [
+        {
+            "type": "bind",
+            "source": "/var/lib/example",
+            "target": "/data",
+        }
+    ]
+    plan = _compose_plan(fixture.repository)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with pytest.raises(
+            ComposeStackError, match=r"writable bind mounts.*healthy\.volumes\[0\]"
+        ):
+            fixture.compose_manager(runner).start_claimed_stack(
+                store, plan, claim, fixture.owner_token
+            )
+        runtime = store.get_task_runtime(claim.task_id)
+        resources = store.list_compose_resources(claim.task_id)
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert runner.active == set()
+    assert resources == []
 
 
 def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
@@ -927,6 +959,10 @@ class _FakeComposeRunner:
         self.down_commands: list[tuple[str, ...]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
+        self.config_services: dict[str, dict[str, object]] = {
+            "healthy": {"networks": {"default": None}},
+            "unused": {"networks": {"default": None}},
+        }
         self._lock = threading.Lock()
 
     def __call__(self, argv, **kwargs):
@@ -939,10 +975,7 @@ class _FakeComposeRunner:
                     0,
                     json.dumps(
                         {
-                            "services": {
-                                "healthy": {"networks": {"default": None}},
-                                "unused": {"networks": {"default": None}},
-                            },
+                            "services": self.config_services,
                             "networks": {"default": {}},
                         }
                     ),

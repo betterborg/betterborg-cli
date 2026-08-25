@@ -1012,9 +1012,19 @@ def _compose_service_url_targets(
     targets: list[tuple[str, int]] = []
     url_env = service.get("url_env")
     port = service.get("port")
+    port_records = _mappings(service.get("ports"))
+    if not _service_port(port):
+        port = next(
+            (
+                record.get("port")
+                for record in port_records
+                if _service_port(record.get("port"))
+            ),
+            None,
+        )
     if isinstance(url_env, str) and _service_port(port):
         targets.append((url_env, port))
-    for record in _mappings(service.get("ports")):
+    for record in port_records:
         port_env = record.get("env")
         port_value = record.get("port")
         if isinstance(port_env, str) and _service_port(port_value):
