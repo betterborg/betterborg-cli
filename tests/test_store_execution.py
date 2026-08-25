@@ -248,8 +248,12 @@ def test_execution_ownership_records_round_trip_after_reopen(
         store.add_execution_run(run)
         store.add_task_runtime(runtime)
         store.append_task_claim(claim)
-        store.append_environment_attempt(environment)
-        store.append_agent_attempt(agent)
+        store.append_environment_attempt(
+            environment, run.owner_token, claim.claim_token, now=started_at
+        )
+        store.append_agent_attempt(
+            agent, run.owner_token, claim.claim_token, now=started_at
+        )
         store.append_execution_event(event)
         store.add_compose_resource(
             compose, run.owner_token, claim.claim_token, now=started_at
@@ -423,8 +427,12 @@ def test_execution_history_and_resource_ownership_are_immutable(
     with SqliteStore.open(database) as store:
         store.add_execution_run(run)
         store.append_task_claim(claim)
-        store.append_environment_attempt(environment)
-        store.append_agent_attempt(agent)
+        store.append_environment_attempt(
+            environment, run.owner_token, claim.claim_token, now=started_at
+        )
+        store.append_agent_attempt(
+            agent, run.owner_token, claim.claim_token, now=started_at
+        )
         store.append_execution_event(event)
         store.add_compose_resource(
             compose, run.owner_token, claim.claim_token, now=started_at
@@ -623,7 +631,12 @@ def test_expiry_closes_open_attempt_and_blocks_reclaim_until_compose_cleanup(
             labels={"com.docker.compose.project": "borg-foundation-exact"},
             created_at=now + timedelta(seconds=15),
         )
-        store.append_agent_attempt(attempt)
+        store.append_agent_attempt(
+            attempt,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
         store.add_compose_resource(
             resource,
             acquisition.owner_token,
@@ -759,8 +772,18 @@ def test_interruption_closes_open_environment_and_agent_attempts(
             started_at=now + timedelta(seconds=10),
             finished_at=None,
         )
-        store.append_environment_attempt(environment)
-        store.append_agent_attempt(agent)
+        store.append_environment_attempt(
+            environment,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
+        store.append_agent_attempt(
+            agent,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
 
         interrupted_at = now + timedelta(seconds=30)
         assert (
@@ -792,8 +815,13 @@ def test_interruption_closes_open_environment_and_agent_attempts(
             ("environment.attempt_interrupted", environment.id),
             ("agent.attempt_interrupted", agent.id),
         }
-        with pytest.raises(ExecutionOwnershipError, match="ownership ended"):
-            store.append_agent_attempt(agent)
+        with pytest.raises(ExecutionOwnershipError, match="no longer running"):
+            store.append_agent_attempt(
+                agent,
+                acquisition.owner_token,
+                claim.claim_token,
+                now=interrupted_at,
+            )
 
 
 def test_cleanup_confirmation_does_not_cover_later_project_resources(
@@ -986,6 +1014,44 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
             now=now,
         )
         assert expired_claim is not None
+        environment = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=expired_claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:expired-claim",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now + timedelta(seconds=5),
+            finished_at=None,
+        )
+        agent = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=expired_claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.SUBSCRIPTION,
+            status=ExecutionAttemptStatus.RUNNING,
+            log_path="artifacts/coding.log",
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+        store.append_environment_attempt(
+            environment,
+            acquisition.owner_token,
+            expired_claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
+        store.append_agent_attempt(
+            agent,
+            acquisition.owner_token,
+            expired_claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
         resource = ComposeResource(
             run_id=acquisition.run_id,
             claim_id=expired_claim.id,
@@ -1011,6 +1077,14 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
         persisted = store.list_task_claims(acquisition.run_id)
         assert persisted[0].released_at is None
         assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.CLAIMED
+        closed_environment = store.list_environment_attempts(task.id)
+        closed_agent = store.list_agent_attempts(task.id)
+        assert closed_environment[0].status is ExecutionAttemptStatus.CANCELLED
+        assert closed_environment[0].finished_at == now + timedelta(minutes=2)
+        assert closed_environment[0].duration_seconds == 115
+        assert closed_agent[0].status is ExecutionAttemptStatus.CANCELLED
+        assert closed_agent[0].finished_at == now + timedelta(minutes=2)
+        assert closed_agent[0].duration_seconds == 110
 
         store.confirm_compose_project_cleanup(
             acquisition.run_id,
@@ -1034,6 +1108,89 @@ def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
             event.kind
             for event in store.list_execution_events(acquisition.run_id)
         }
+
+
+def test_attempts_cannot_open_without_live_run_and_claim_authority(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert claim is not None
+        environment = EnvironmentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            kind="materialize",
+            attempt_number=1,
+            fingerprint="sha256:late-environment",
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[["make", "sync"]],
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+        agent = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.SUBSCRIPTION,
+            status=ExecutionAttemptStatus.RUNNING,
+            log_path="artifacts/coding.log",
+            started_at=now + timedelta(seconds=10),
+            finished_at=None,
+        )
+
+        with pytest.raises(ExecutionOwnershipError, match="ownership changed"):
+            store.append_environment_attempt(
+                environment,
+                "wrong-owner-token",
+                claim.claim_token,
+                now=now + timedelta(seconds=10),
+            )
+        with pytest.raises(ExecutionOwnershipError, match="no longer owned"):
+            store.append_agent_attempt(
+                agent,
+                acquisition.owner_token,
+                "wrong-claim-token",
+                now=now + timedelta(seconds=10),
+            )
+
+        with pytest.raises(ExecutionOwnershipError, match="no longer owned"):
+            store.append_environment_attempt(
+                environment,
+                acquisition.owner_token,
+                claim.claim_token,
+                now=now + timedelta(minutes=2),
+            )
+        with pytest.raises(ExecutionOwnershipError, match="lease expired"):
+            store.append_agent_attempt(
+                agent,
+                acquisition.owner_token,
+                claim.claim_token,
+                now=now + timedelta(minutes=6),
+            )
+        assert store.list_environment_attempts(task.id) == []
+        assert store.list_agent_attempts(task.id) == []
 
 
 def test_compose_resource_cannot_be_persisted_after_expiry_releases_claim(
@@ -1147,8 +1304,18 @@ def test_open_attempts_finish_with_durable_results_and_usage(
             started_at=now + timedelta(seconds=10),
             finished_at=None,
         )
-        store.append_environment_attempt(environment)
-        store.append_agent_attempt(agent)
+        store.append_environment_attempt(
+            environment,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
+        store.append_agent_attempt(
+            agent,
+            acquisition.owner_token,
+            claim.claim_token,
+            now=now + timedelta(seconds=10),
+        )
 
         with pytest.raises(ExecutionOwnershipError, match="no longer owned"):
             store.complete_environment_attempt(

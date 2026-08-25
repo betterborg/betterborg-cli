@@ -1803,15 +1803,18 @@ class SqliteStore:
         run_id: UUID,
         now: datetime,
         reason: str,
+        claim_id: UUID | None = None,
     ) -> None:
         for table, event_kind in (
             ("environment_attempts", "environment.attempt_interrupted"),
             ("agent_attempts", "agent.attempt_interrupted"),
         ):
+            claim_parameter = str(claim_id) if claim_id is not None else None
             attempts = connection.execute(
                 f"""
                 SELECT id, task_id FROM {table} AS attempt
                 WHERE run_id = ? AND status = 'running'
+                  AND (? IS NULL OR claim_id = ?)
                   AND NOT EXISTS (
                       SELECT 1 FROM execution_events AS event
                       WHERE event.attempt_id = attempt.id
@@ -1824,7 +1827,7 @@ class SqliteStore:
                   )
                 ORDER BY started_at, id
                 """,
-                (str(run_id),),
+                (str(run_id), claim_parameter, claim_parameter),
             ).fetchall()
             for attempt in attempts:
                 self._insert_execution_event(
@@ -1903,6 +1906,13 @@ class SqliteStore:
         ).fetchall()
         for claim in expired:
             claim_id = UUID(claim["id"])
+            self._interrupt_open_attempts(
+                connection,
+                run_id=run_id,
+                claim_id=claim_id,
+                now=now,
+                reason="task claim expired",
+            )
             self._insert_execution_event(
                 connection,
                 run_id=run_id,
@@ -2148,10 +2158,24 @@ class SqliteStore:
             ).fetchone()
         return row is not None
 
-    def append_environment_attempt(self, attempt: EnvironmentAttempt) -> None:
-        """Append one immutable environment preparation/materialization attempt."""
+    def append_environment_attempt(
+        self,
+        attempt: EnvironmentAttempt,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Append an environment attempt while its execution lease is owned."""
+        persisted_at = _execution_time(now)
         with self.transaction() as connection:
-            self._require_open_attempt_ownership(connection, attempt)
+            self._require_attempt_ownership(
+                connection,
+                attempt,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO environment_attempts(
@@ -2255,10 +2279,24 @@ class SqliteStore:
             row = self._environment_attempt_projection(connection, attempt_id)
         return _row_to_environment_attempt(row)
 
-    def append_agent_attempt(self, attempt: AgentAttempt) -> None:
-        """Append one immutable, billing-aware agent attempt."""
+    def append_agent_attempt(
+        self,
+        attempt: AgentAttempt,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Append a billing-aware agent attempt while its lease is owned."""
+        persisted_at = _execution_time(now)
         with self.transaction() as connection:
-            self._require_open_attempt_ownership(connection, attempt)
+            self._require_attempt_ownership(
+                connection,
+                attempt,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO agent_attempts(
@@ -2472,30 +2510,24 @@ class SqliteStore:
             (str(attempt_id),),
         ).fetchone()
 
-    @staticmethod
-    def _require_open_attempt_ownership(
+    def _require_attempt_ownership(
+        self,
         connection: sqlite3.Connection,
         attempt: EnvironmentAttempt | AgentAttempt,
+        *,
+        owner_token: str,
+        claim_token: str,
+        now: datetime,
     ) -> None:
-        if attempt.status is not ExecutionAttemptStatus.RUNNING:
-            return
-        owner = connection.execute(
-            """
-            SELECT 1
-            FROM execution_runs AS run
-            JOIN task_claims AS claim
-              ON claim.run_id = run.id
-             AND claim.id = ?
-             AND claim.task_id = ?
-             AND claim.released_at IS NULL
-            WHERE run.id = ? AND run.status = 'running'
-            """,
-            (str(attempt.claim_id), str(attempt.task_id), str(attempt.run_id)),
-        ).fetchone()
-        if owner is None:
-            raise ExecutionOwnershipError(
-                "cannot open an attempt after execution ownership ended"
-            )
+        self._require_live_claim(
+            connection,
+            run_id=attempt.run_id,
+            owner_token=owner_token,
+            claim_id=attempt.claim_id,
+            claim_token=claim_token,
+            task_id=attempt.task_id,
+            now=now,
+        )
 
     def append_execution_event(self, event: ExecutionEvent) -> None:
         """Append one durable execution event."""
