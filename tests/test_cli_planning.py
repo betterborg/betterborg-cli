@@ -486,6 +486,83 @@ def test_plan_change_rejects_empty_note_without_mutating_gate(
         assert _planning_snapshot(store, borg.id) == before
 
 
+def test_plan_change_runtime_failure_is_actionably_resumable(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+) -> None:
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(summary="Original plan."),
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    repository, paths = _planning_cli_repository(
+        committed_git_repo, persist_planning_context, "resume-change"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    started = cli_runner.invoke(cli, ["plan", "start", "resume-change", "--yes"])
+    assert started.exit_code == 0, started.output
+
+    adapter.queue(
+        MockResponse(raise_error=RuntimeError("planning provider unavailable"))
+    )
+    failed = cli_runner.invoke(
+        cli,
+        [
+            "plan",
+            "change",
+            "resume-change",
+            "--note",
+            "Add rollback verification.",
+            "--yes",
+        ],
+    )
+
+    assert failed.exit_code == 1
+    assert "could not continue" in failed.output
+    assert "planning provider unavailable" in failed.output
+    assert "borg plan start resume-change" in failed.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "resume-change")
+        assert borg is not None
+        assert borg.state is BorgState.ARCHITECT_WORKING
+        assert [
+            request.note for request in store.list_plan_change_requests(borg.id)
+        ] == ["Add rollback verification."]
+
+    adapter.queue(
+        MockResponse(payload=planning_plan_response(summary="Revised plan."))
+    )
+    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    resumed = cli_runner.invoke(
+        cli, ["plan", "start", "resume-change", "--yes"]
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "Plan approval pending" in resumed.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "resume-change")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert [
+            request.note for request in store.list_plan_change_requests(borg.id)
+        ] == ["Add rollback verification."]
+
+
 def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(cli, ["plan", "--help"])
 

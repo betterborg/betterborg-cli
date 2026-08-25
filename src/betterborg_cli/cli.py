@@ -29,6 +29,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
+    Borg,
     BorgState,
     PlanChangeRequest,
     PlanningAttemptStatus,
@@ -317,67 +318,8 @@ def plan() -> None:
 @_trusted_workspace_callback
 def start_plan(repository_path: Path, name: str) -> None:
     """Start or resume planning for the named Borg."""
-    paths = RepoPaths.discover(repository_path)
-    try:
-        config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError("repository is not initialized; run 'borg init' first")
-            borg = store.get_borg_by_name(repository.id, name)
-            if borg is None:
-                raise ValueError(
-                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
-                )
-
-            if borg.state not in {
-                BorgState.PLAN_APPROVAL_PENDING,
-                BorgState.BLOCKED,
-            }:
-                interactive = _stdin_is_interactive()
-                agent = select_agent(
-                    config,
-                    ApiAgentRole.PLANNING,
-                    paths,
-                    interactive=interactive,
-                )
-                io = _interactive_io()
-                if borg.state is BorgState.DRAFT:
-                    borg = ArchitectLoop(
-                        repository,
-                        borg,
-                        store,
-                        agent,
-                        io=io,
-                    ).run().borg
-                borg = TechLeadLoop(
-                    repository,
-                    borg,
-                    store,
-                    agent,
-                    architect_agent=agent,
-                    io=io,
-                ).run().borg
-    except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
-        message = str(error).strip()
-        detail = f" ({message})" if message else ""
-        raise click.ClickException(
-            f"Planning for Borg {name!r} was interrupted{detail}. "
-            f"Run 'borg plan start {name}' to resume."
-        ) from error
-    except (OSError, RuntimeError, ValueError) as error:
-        raise click.ClickException(str(error)) from error
-
-    if borg.state is BorgState.PLAN_APPROVAL_PENDING:
-        click.echo(f"Plan approval pending for Borg {name!r}.")
-        click.echo(f"Review it with: borg plan show {name}")
-    elif borg.state is BorgState.BLOCKED:
-        click.echo(f"Planning blocked for Borg {name!r}.")
-        click.echo(f"Review the saved Tech Lead findings with: borg plan show {name}")
-    else:
-        raise click.ClickException(
-            f"Planning stopped in unexpected state {borg.state.value!r}"
-        )
+    borg = _continue_planning(repository_path, name)
+    _write_planning_gate(name, borg, changed=False)
 
 
 @plan.command(name="show")
@@ -453,7 +395,20 @@ def change_plan(repository_path: Path, name: str, note: str | None) -> None:
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
+    borg = _continue_planning(repository_path, name, change_note=note)
+    _write_planning_gate(name, borg, changed=True)
+
+
+def _continue_planning(
+    repository_path: Path,
+    name: str,
+    *,
+    change_note: str | None = None,
+) -> Borg:
+    """Load and drain one initial or change-request planning lifecycle."""
     paths = RepoPaths.discover(repository_path)
+    change_requested = change_note is not None
+    resumable = False
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -465,64 +420,91 @@ def change_plan(repository_path: Path, name: str, note: str | None) -> None:
                 raise ValueError(
                     f"Borg {name!r} does not exist; run 'borg create {name}' first"
                 )
-            if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
-                raise ValueError(
-                    f"Borg {name!r} cannot change its plan from state "
-                    f"{borg.state.value!r}; a plan must be awaiting approval"
-                )
 
-            requests = store.list_plan_change_requests(borg.id)
-            request = PlanChangeRequest(
-                borg_id=borg.id,
-                round=max((item.round for item in requests), default=0) + 1,
-                note=note,
-            )
-            with store.transaction():
-                store.append_plan_change_request(request)
-                borg = store.compare_and_set_borg_state(
-                    borg.id,
-                    expected_state=borg.state,
-                    expected_version=borg.state_version,
-                    new_state=BorgState.ARCHITECT_WORKING,
+            if change_note is not None:
+                if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
+                    raise ValueError(
+                        f"Borg {name!r} cannot change its plan from state "
+                        f"{borg.state.value!r}; a plan must be awaiting approval"
+                    )
+                requests = store.list_plan_change_requests(borg.id)
+                request = PlanChangeRequest(
+                    borg_id=borg.id,
+                    round=max((item.round for item in requests), default=0) + 1,
+                    note=change_note,
                 )
+                with store.transaction():
+                    store.append_plan_change_request(request)
+                    borg = store.compare_and_set_borg_state(
+                        borg.id,
+                        expected_state=borg.state,
+                        expected_version=borg.state_version,
+                        new_state=BorgState.ARCHITECT_WORKING,
+                    )
 
-            interactive = _stdin_is_interactive()
-            agent = select_agent(
-                config,
-                ApiAgentRole.PLANNING,
-                paths,
-                interactive=interactive,
-            )
-            io = _interactive_io()
-            borg = TechLeadLoop(
-                repository,
-                borg,
-                store,
-                agent,
-                architect_agent=agent,
-                io=io,
-            ).run().borg
+            if borg.state not in {
+                BorgState.PLAN_APPROVAL_PENDING,
+                BorgState.BLOCKED,
+            }:
+                resumable = True
+                agent = select_agent(
+                    config,
+                    ApiAgentRole.PLANNING,
+                    paths,
+                    interactive=_stdin_is_interactive(),
+                )
+                io = _interactive_io()
+                if borg.state is BorgState.DRAFT:
+                    borg = ArchitectLoop(
+                        repository,
+                        borg,
+                        store,
+                        agent,
+                        io=io,
+                    ).run().borg
+                borg = TechLeadLoop(
+                    repository,
+                    borg,
+                    store,
+                    agent,
+                    architect_agent=agent,
+                    io=io,
+                ).run().borg
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
         detail = f" ({message})" if message else ""
+        action = "Plan change" if change_requested else "Planning"
         raise click.ClickException(
-            f"Plan change for Borg {name!r} was interrupted{detail}. "
+            f"{action} for Borg {name!r} was interrupted{detail}. "
             f"Run 'borg plan start {name}' to resume."
         ) from error
     except (OSError, RuntimeError, ValueError) as error:
+        if resumable:
+            message = str(error).strip()
+            detail = f" ({message})" if message else ""
+            action = "Plan change" if change_requested else "Planning"
+            raise click.ClickException(
+                f"{action} for Borg {name!r} could not continue{detail}. "
+                f"Run 'borg plan start {name}' to resume."
+            ) from error
         raise click.ClickException(str(error)) from error
+    return borg
 
+
+def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
+    """Report the actionable terminal gate reached by a planning lifecycle."""
     if borg.state is BorgState.PLAN_APPROVAL_PENDING:
-        click.echo(
-            f"Plan approval pending for Borg {name!r} after applying the change."
-        )
+        suffix = " after applying the change" if changed else ""
+        click.echo(f"Plan approval pending for Borg {name!r}{suffix}.")
         click.echo(f"Review it with: borg plan show {name}")
     elif borg.state is BorgState.BLOCKED:
-        click.echo(f"Planning blocked for Borg {name!r} while applying the change.")
+        suffix = " while applying the change" if changed else ""
+        click.echo(f"Planning blocked for Borg {name!r}{suffix}.")
         click.echo(f"Review the saved Tech Lead findings with: borg plan show {name}")
     else:
         raise click.ClickException(
-            f"Plan change stopped in unexpected state {borg.state.value!r}"
+            f"Planning stopped in unexpected state {borg.state.value!r}. "
+            f"Run 'borg plan start {name}' to resume."
         )
 
 
