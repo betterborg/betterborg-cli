@@ -190,6 +190,27 @@ def task_graph_findings(
         if isinstance(phase, Mapping) and isinstance(phase.get("name"), str)
     ]
     phase_order = {phase["name"]: index for index, phase in enumerate(phases)}
+    phase_names = set(phase_order)
+    declared_dependencies = {
+        phase["name"]: [
+            dependency
+            for dependency in phase.get("dependencies_on", []) or []
+            if isinstance(dependency, str) and dependency in phase_names
+        ]
+        for phase in phases
+    }
+    ancestors_by_phase = {
+        phase_name: _phase_ancestors(phase_name, declared_dependencies)
+        for phase_name in phase_names
+    }
+    repositories_by_phase = {
+        phase["name"]: {
+            repository
+            for repository in phase.get("repositories", []) or []
+            if isinstance(repository, str)
+        }
+        for phase in phases
+    }
     catalog = build_plan_element_catalog(plan)
     elements_by_ref = {element.ref: element for element in catalog}
     repositories = {
@@ -226,7 +247,19 @@ def task_graph_findings(
         _validate_task_complexity(task, findings)
 
         task_repository = task.task.get("repository") or sole_repository
-        if len(repositories) > 1 and not isinstance(task_repository, str):
+        phase_repositories = repositories_by_phase.get(task.stage, set())
+        phase_repository_conflict = (
+            isinstance(task_repository, str)
+            and bool(phase_repositories)
+            and task_repository not in phase_repositories
+        )
+        repository_missing = len(repositories) > 1 and not isinstance(
+            task_repository, str
+        )
+        repository_unknown = (
+            task_repository is not None and task_repository not in repositories
+        )
+        if repository_missing:
             findings.append(
                 _finding(
                     "task.repository.missing",
@@ -234,7 +267,7 @@ def task_graph_findings(
                     task,
                 )
             )
-        elif task_repository is not None and task_repository not in repositories:
+        elif repository_unknown:
             findings.append(
                 _finding(
                     "task.repository.unknown",
@@ -242,6 +275,17 @@ def task_graph_findings(
                     task,
                 )
             )
+        elif phase_repository_conflict:
+            findings.append(
+                _finding(
+                    "task.repository.boundary",
+                    "task repository is not written by its approved-plan stage",
+                    task,
+                )
+            )
+        task_repository_invalid = (
+            repository_missing or repository_unknown or phase_repository_conflict
+        )
 
         plan_refs = task.task.get("plan_refs")
         if not isinstance(plan_refs, list) or not plan_refs:
@@ -278,11 +322,24 @@ def task_graph_findings(
             seen_refs.add(plan_ref)
             element = elements_by_ref[plan_ref]
             repository_conflict = (
-                element.repository is not None
-                and task_repository is not None
-                and element.repository != task_repository
+                task_repository_invalid
+                or (
+                    element.repository is not None
+                    and task_repository is not None
+                    and element.repository != task_repository
+                )
             )
             if element.phase != task.stage or repository_conflict:
+                consumes_ancestor = (
+                    not repository_conflict
+                    and element.phase
+                    in ancestors_by_phase.get(task.stage, frozenset())
+                )
+                if consumes_ancestor:
+                    # An ancestor citation records consumption of an upstream
+                    # contract. It is valid traceability, but only a citation
+                    # from the element's own phase can establish ownership.
+                    continue
                 findings.append(
                     TaskGraphFinding(
                         rule="task.traceability.boundary",
@@ -386,13 +443,14 @@ def task_graph_findings(
                     prerequisite,
                 )
             )
-        elif task.stage == prerequisite.stage and (
-            _task_number(prerequisite.stem) >= _task_number(task.stem)
+        elif (
+            task.stage == prerequisite.stage
+            and prerequisite.stem >= task.stem
         ):
             findings.append(
                 _dependency_finding(
                     "task.dependency.same_stage_order",
-                    "same-stage dependency must point to a lower-numbered stem",
+                    "same-stage dependency must point to a lexically earlier stem",
                     task,
                     prerequisite,
                 )
@@ -435,6 +493,20 @@ def _plan_ref(phase_index: int, kind: str, item_index: int | None = None) -> str
     if item_index is None:
         return f"P{phase_index + 1}.{kind}"
     return f"P{phase_index + 1}.{kind}.{item_index + 1}"
+
+
+def _phase_ancestors(
+    phase_name: str, declared_dependencies: Mapping[str, list[str]]
+) -> frozenset[str]:
+    ancestors: set[str] = set()
+    pending = list(declared_dependencies.get(phase_name, []))
+    while pending:
+        ancestor = pending.pop()
+        if ancestor == phase_name or ancestor in ancestors:
+            continue
+        ancestors.add(ancestor)
+        pending.extend(declared_dependencies.get(ancestor, []))
+    return frozenset(ancestors)
 
 
 def _validate_task_identity(
@@ -514,11 +586,6 @@ def _validate_task_complexity(
                 task,
             )
         )
-
-
-def _task_number(stem: str) -> int:
-    match = _TASK_NAME.fullmatch(stem)
-    return int(stem[:2]) if match is not None else -1
 
 
 def _finding(rule: str, message: str, task: TaskRecord) -> TaskGraphFinding:

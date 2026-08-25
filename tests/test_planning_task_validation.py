@@ -70,8 +70,9 @@ def _task(
     refs: Iterable[str],
     complexity: TaskComplexity = TaskComplexity.SMALL,
     declared_complexity: str | None = None,
+    repository: str = "repo",
 ) -> TaskRecord:
-    task = {"plan_refs": list(refs), "repository": "repo"}
+    task = {"plan_refs": list(refs), "repository": repository}
     if declared_complexity is not None:
         task["estimate_complexity"] = declared_complexity
     return TaskRecord(
@@ -168,6 +169,76 @@ def test_unknown_and_out_of_stage_plan_references_are_rejected() -> None:
     assert "task.traceability.boundary" in rules
 
 
+def test_direct_and_transitive_ancestor_references_are_valid_consumption() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    ancestor_ref = _required_refs(plan, "01-foundation")[0]
+    tasks[1].task["plan_refs"].append(ancestor_ref)
+
+    final_phase = {
+        "name": "03-final",
+        "goal": "Finish the workflow.",
+        "technical_approach": "Use the consumer.",
+        "deliverables": ["Final workflow"],
+        "contracts": [],
+        "acceptance_criteria": ["Workflow is finished"],
+        "files_touched": [{"path": "final.py", "role": "new", "repo": "repo"}],
+        "test_strategy": "Run end-to-end tests.",
+        "constraints": [],
+        "dependencies_on": ["02-consumer"],
+    }
+    plan["phases"].append(final_phase)
+    final = _task(
+        tasks[0].generation_id,
+        stage="03-final",
+        stem="01-build",
+        position=3,
+        refs=[*_required_refs(plan, "03-final"), ancestor_ref],
+    )
+    dependencies.append(
+        TaskDependency(
+            generation_id=tasks[0].generation_id,
+            task_id=final.id,
+            depends_on_task_id=tasks[1].id,
+        )
+    )
+
+    validate_task_graph(plan, [*tasks, final], dependencies)
+
+
+def test_task_from_unrelated_repository_cannot_own_phase_elements() -> None:
+    plan = {
+        "repositories": [{"id": "a"}, {"id": "b"}],
+        "phases": [
+            {
+                "name": "01-foundation",
+                "repositories": ["a"],
+                "deliverables": ["Foundation"],
+                "contracts": [],
+                "acceptance_criteria": ["Foundation works"],
+                "files_touched": [
+                    {"path": "foundation.py", "role": "new", "repo": "a"}
+                ],
+                "test_strategy": "Run unit tests.",
+                "dependencies_on": [],
+            }
+        ],
+    }
+    task = _task(
+        uuid4(),
+        stage="01-foundation",
+        stem="01-build",
+        position=1,
+        refs=_required_refs(plan, "01-foundation"),
+        repository="b",
+    )
+
+    rules = _rules(task_graph_findings(plan, [task], []))
+
+    assert "task.repository.boundary" in rules
+    assert "task.traceability.boundary" in rules
+    assert "task.traceability.unowned" in rules
+
+
 def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
     plan, tasks, dependencies = _valid_graph()
     foundation = tasks[0]
@@ -197,6 +268,34 @@ def test_dangling_and_forward_same_stage_dependencies_are_rejected() -> None:
 
     assert "task.dependency.same_stage_order" in rules
     assert "task.dependency.dangling" in rules
+
+
+def test_same_stage_dependency_uses_the_complete_lexical_stem() -> None:
+    plan = _plan()
+    generation_id = uuid4()
+    prerequisite = _task(
+        generation_id,
+        stage="01-foundation",
+        stem="01-a",
+        position=1,
+        refs=_required_refs(plan, "01-foundation"),
+    )
+    dependent = _task(
+        generation_id,
+        stage="01-foundation",
+        stem="01-b",
+        position=2,
+        refs=["P1.goal"],
+    )
+    dependency = TaskDependency(
+        generation_id=generation_id,
+        task_id=dependent.id,
+        depends_on_task_id=prerequisite.id,
+    )
+
+    rules = _rules(task_graph_findings(plan, [prerequisite, dependent], [dependency]))
+
+    assert "task.dependency.same_stage_order" not in rules
 
 
 def test_dependency_cycles_are_rejected_without_recursion() -> None:
