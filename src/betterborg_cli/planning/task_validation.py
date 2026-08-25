@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -36,17 +37,33 @@ class TaskGraphFinding:
     task_refs: tuple[str, ...] = ()
     plan_refs: tuple[str, ...] = ()
     dependency_refs: tuple[str, ...] = ()
+    _identity_task_refs: tuple[str, ...] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _identity_dependency_refs: tuple[str, ...] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def identity(
         self,
     ) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Return the stable identity used to measure repair progress."""
+        task_refs = (
+            self.task_refs
+            if self._identity_task_refs is None
+            else self._identity_task_refs
+        )
+        dependency_refs = (
+            self.dependency_refs
+            if self._identity_dependency_refs is None
+            else self._identity_dependency_refs
+        )
         return (
             self.rule,
-            tuple(sorted(set(self.task_refs))),
+            tuple(sorted(set(task_refs))),
             tuple(sorted(set(self.plan_refs))),
-            self.dependency_refs,
+            dependency_refs,
         )
 
 
@@ -239,6 +256,9 @@ def task_graph_findings(
                 rule="task.generation.mismatch",
                 message="task records do not belong to one generation",
                 task_refs=tuple(sorted(task.task_ref for task in task_rows)),
+                _identity_task_refs=tuple(
+                    sorted(_task_identity(task) for task in task_rows)
+                ),
             )
         )
 
@@ -327,6 +347,7 @@ def task_graph_findings(
                         message=f"task references unknown plan element {plan_ref!r}",
                         task_refs=(task.task_ref,),
                         plan_refs=(str(plan_ref),),
+                        _identity_task_refs=(_task_identity(task),),
                     )
                 )
                 continue
@@ -337,6 +358,7 @@ def task_graph_findings(
                         message="task lists the same plan element more than once",
                         task_refs=(task.task_ref,),
                         plan_refs=(plan_ref,),
+                        _identity_task_refs=(_task_identity(task),),
                     )
                 )
                 continue
@@ -369,6 +391,7 @@ def task_graph_findings(
                         ),
                         task_refs=(task.task_ref,),
                         plan_refs=(plan_ref,),
+                        _identity_task_refs=(_task_identity(task),),
                     )
                 )
                 continue
@@ -411,6 +434,9 @@ def task_graph_findings(
                     message="required approved-plan element has multiple task owners",
                     task_refs=tuple(sorted(task.task_ref for task in element_owners)),
                     plan_refs=(element.ref,),
+                    _identity_task_refs=tuple(
+                        sorted(_task_identity(task) for task in element_owners)
+                    ),
                 )
             )
 
@@ -419,6 +445,9 @@ def task_graph_findings(
     }
     seen_edges: set[tuple[UUID, UUID]] = set()
     dependency_refs_by_edge: dict[tuple[UUID, UUID], tuple[str, ...]] = {}
+    identity_dependency_refs_by_edge: dict[
+        tuple[UUID, UUID], tuple[str, ...]
+    ] = {}
     dangling_edge_counts: dict[tuple[str | None, str | None], int] = {}
     for dependency in dependency_rows:
         edge = (dependency.task_id, dependency.depends_on_task_id)
@@ -431,6 +460,10 @@ def task_graph_findings(
                     message="task dependency is declared more than once",
                     task_refs=(task.task_ref,) if task is not None else (),
                     dependency_refs=dependency_refs_by_edge[edge],
+                    _identity_task_refs=(
+                        (_task_identity(task),) if task is not None else ()
+                    ),
+                    _identity_dependency_refs=identity_dependency_refs_by_edge[edge],
                 )
             )
             continue
@@ -439,28 +472,45 @@ def task_graph_findings(
             task.task_ref if task is not None else None,
             prerequisite.task_ref if prerequisite is not None else None,
         )
+        identity_edge = (
+            _task_identity(task) if task is not None else None,
+            _task_identity(prerequisite) if prerequisite is not None else None,
+        )
         dependency_refs = (
             "dependent",
             logical_edge[0] or "",
             "prerequisite",
             logical_edge[1] or "",
         )
+        identity_dependency_refs = (
+            "dependent",
+            identity_edge[0] or "",
+            "prerequisite",
+            identity_edge[1] or "",
+        )
         if task is None or prerequisite is None:
             known = task if task is not None else prerequisite
-            occurrence = dangling_edge_counts.get(logical_edge, 0) + 1
-            dangling_edge_counts[logical_edge] = occurrence
+            occurrence = dangling_edge_counts.get(identity_edge, 0) + 1
+            dangling_edge_counts[identity_edge] = occurrence
             dependency_refs += (f"occurrence:{occurrence}",)
+            identity_dependency_refs += (f"occurrence:{occurrence}",)
             dependency_refs_by_edge[edge] = dependency_refs
+            identity_dependency_refs_by_edge[edge] = identity_dependency_refs
             findings.append(
                 TaskGraphFinding(
                     rule="task.dependency.dangling",
                     message="task dependency does not resolve within the generation",
                     task_refs=(known.task_ref,) if known is not None else (),
                     dependency_refs=dependency_refs,
+                    _identity_task_refs=(
+                        (_task_identity(known),) if known is not None else ()
+                    ),
+                    _identity_dependency_refs=identity_dependency_refs,
                 )
             )
             continue
         dependency_refs_by_edge[edge] = dependency_refs
+        identity_dependency_refs_by_edge[edge] = identity_dependency_refs
         if (
             dependency.generation_id != task.generation_id
             or dependency.generation_id != prerequisite.generation_id
@@ -644,7 +694,16 @@ def _validate_task_complexity(
 
 
 def _finding(rule: str, message: str, task: TaskRecord) -> TaskGraphFinding:
-    return TaskGraphFinding(rule=rule, message=message, task_refs=(task.task_ref,))
+    return TaskGraphFinding(
+        rule=rule,
+        message=message,
+        task_refs=(task.task_ref,),
+        _identity_task_refs=(_task_identity(task),),
+    )
+
+
+def _task_identity(task: TaskRecord) -> str:
+    return f"position:{task.position}"
 
 
 def _dependency_finding(
@@ -657,6 +716,9 @@ def _dependency_finding(
         rule=rule,
         message=message,
         task_refs=tuple(sorted((task.task_ref, prerequisite.task_ref))),
+        _identity_task_refs=tuple(
+            sorted((_task_identity(task), _task_identity(prerequisite)))
+        ),
     )
 
 
@@ -692,7 +754,7 @@ def _cycle_findings(
             dependents_by_task[dependency_id].append(task_id)
 
     assigned: set[UUID] = set()
-    cyclic_components: list[tuple[str, ...]] = []
+    cyclic_components: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
     for root_id in reversed(finished):
         if root_id in assigned:
             continue
@@ -710,7 +772,16 @@ def _cycle_findings(
             component[0], []
         ):
             cyclic_components.append(
-                tuple(sorted(tasks_by_id[item].task_ref for item in component))
+                (
+                    tuple(
+                        sorted(tasks_by_id[item].task_ref for item in component)
+                    ),
+                    tuple(
+                        sorted(
+                            _task_identity(tasks_by_id[item]) for item in component
+                        )
+                    ),
+                )
             )
 
     return [
@@ -718,8 +789,9 @@ def _cycle_findings(
             rule="task.dependency.cycle",
             message="task dependency graph contains a cycle",
             task_refs=task_refs,
+            _identity_task_refs=identity_task_refs,
         )
-        for task_refs in sorted(cyclic_components)
+        for task_refs, identity_task_refs in sorted(cyclic_components)
     ]
 
 

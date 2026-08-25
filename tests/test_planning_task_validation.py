@@ -1,6 +1,7 @@
 """Deterministic contracts for decomposed task graphs."""
 
 from collections.abc import Iterable
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
@@ -684,7 +685,12 @@ def test_cycle_identity_survives_generation_reconstruction_and_reordering() -> N
     ]
 
     assert previous_cycles == repaired_cycles == [
-        ("task.dependency.cycle", ("task-1", "task-2", "task-3"), (), ())
+        (
+            "task.dependency.cycle",
+            ("position:1", "position:2", "position:3"),
+            (),
+            (),
+        )
     ]
     validate_task_repair_progress(previous, repaired)
 
@@ -755,6 +761,58 @@ def test_removing_one_of_repeated_duplicate_refs_counts_as_repair_progress() -> 
     assert sum(
         finding.rule == "task.traceability.duplicate_ref" for finding in repaired
     ) == 1
+    validate_task_repair_progress(previous, repaired)
+
+
+def test_fixing_duplicate_task_ref_preserves_surviving_finding_identities() -> None:
+    plan = _plan()
+    generation_id = uuid4()
+    foundation_refs = _required_refs(plan, "01-foundation")
+    first = _task(
+        generation_id,
+        stage="01-foundation",
+        stem="01-first",
+        position=1,
+        refs=foundation_refs[:1],
+    )
+    second = replace(
+        _task(
+            generation_id,
+            stage="01-foundation",
+            stem="02-second",
+            position=2,
+            refs=foundation_refs[:1],
+        ),
+        task_ref=first.task_ref,
+    )
+    consumer = _task(
+        generation_id,
+        stage="02-consumer",
+        stem="01-build",
+        position=3,
+        refs=_required_refs(plan, "02-consumer"),
+    )
+
+    previous = task_graph_findings(plan, [first, second, consumer], [])
+    repaired = task_graph_findings(
+        plan,
+        [first, replace(second, task_ref="task-2"), consumer],
+        [],
+    )
+    previous_duplicate_owner = next(
+        finding
+        for finding in previous
+        if finding.rule == "task.traceability.duplicate_owner"
+    )
+    repaired_duplicate_owner = next(
+        finding
+        for finding in repaired
+        if finding.rule == "task.traceability.duplicate_owner"
+    )
+
+    assert previous_duplicate_owner.identity == repaired_duplicate_owner.identity
+    assert sum(finding.rule == "task.ref.duplicate" for finding in previous) == 1
+    assert all(finding.rule != "task.ref.duplicate" for finding in repaired)
     validate_task_repair_progress(previous, repaired)
 
 
