@@ -584,16 +584,14 @@ class SupervisorLoop:
         )
         if batch is None or generation is None:
             return None
-        if (
-            borg.state is BorgState.TASKS_APPROVAL_PENDING
-            and generation.status is TaskGenerationStatus.PREPARING
-        ):
+        if borg.state is BorgState.TASKS_APPROVAL_PENDING:
             try:
-                generation = (
-                    TaskPublisher(self.repository, self.store)
-                    .publish(generation.id)
-                    .generation
-                )
+                publication = TaskPublisher(
+                    self.repository, self.store
+                ).reconcile(self.borg_id)
+                if publication is None or publication.generation.id != generation.id:
+                    return None
+                generation = publication.generation
             except TaskPublicationError as error:
                 raise SupervisorError(
                     f"approved task publication failed: {error}"

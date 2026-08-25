@@ -19,6 +19,7 @@ from betterborg_cli.planning import (
     SupervisorLoop,
     TaskGraphFinding,
     TaskGraphValidationError,
+    TaskPublisher,
     approved_plan_digest,
     build_plan_element_catalog,
     task_graph_findings,
@@ -514,6 +515,78 @@ def test_supervisor_approves_one_validated_batch_for_publication_handoff(
         assert len(supervisor.calls) == 1
         assert loop.run() == result
         assert len(supervisor.calls) == 1
+
+
+def test_supervisor_restart_reconciles_current_publication_after_commit(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-publication-reconcile.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-reconcile"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        stale = (
+            committed_git_repo
+            / ".borg/tasks/supervisor-reconcile"
+            / str(uuid4())
+        )
+        stale.mkdir(parents=True)
+        (stale / "prior.md").write_text("# Prior generation\n", encoding="utf-8")
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("approve"))
+        )
+        original_checkpoint = TaskPublisher._checkpoint
+
+        def interrupt_after_commit(self, point: str) -> None:
+            if point == "after_db_commit":
+                raise RuntimeError("simulated post-commit crash")
+            original_checkpoint(self, point)
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(TaskPublisher, "_checkpoint", interrupt_after_commit)
+            with pytest.raises(RuntimeError, match="post-commit crash"):
+                SupervisorLoop(
+                    repository,
+                    initial.borg,
+                    store,
+                    supervisor,
+                    approved_plan=plan,
+                ).run()
+
+        current = store.get_current_task_generation(borg.id)
+        assert current is not None
+        assert stale.is_dir()
+        assert len(supervisor.calls) == 1
+
+    with SqliteStore.open(database) as reopened:
+        resumed_supervisor = MockAdapter(name="openai")
+        resumed_borg = reopened.get_borg(borg.id)
+        assert resumed_borg is not None
+
+        result = SupervisorLoop(
+            repository,
+            resumed_borg,
+            reopened,
+            resumed_supervisor,
+            approved_plan=plan,
+        ).run()
+
+        assert result.generation.id == current.id
+        assert [path.name for path in stale.parent.iterdir()] == [str(current.id)]
+        assert resumed_supervisor.calls == []
 
 
 def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
