@@ -1,8 +1,10 @@
 """Command-line entry point for BetterBorg."""
 
+import hashlib
 import json
 import re
 import shlex
+import subprocess
 from functools import wraps
 from pathlib import Path
 
@@ -19,18 +21,24 @@ from betterborg_cli.onboarding import (
 from betterborg_cli.planning import (
     ArchitectCancelled,
     ArchitectLoop,
+    SupervisorCancelled,
+    SupervisorLoop,
+    TaskPublisher,
     TechLeadCancelled,
     TechLeadLoop,
+    approved_plan_digest,
     render_plan_markdown,
     validate_plan,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_files import publish_repository_text
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    PlanApproval,
     PlanChangeRequest,
     PlanningAttemptStatus,
     SqliteStore,
@@ -372,6 +380,187 @@ def show_plan(name: str, json_output: bool) -> None:
         click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
     else:
         click.echo(render_plan_markdown(stored_plan), nl=False)
+
+
+@plan.command(name="approve")
+@click.argument("name")
+@click.option(
+    "--yes",
+    "explicit_trust",
+    is_flag=True,
+    help="Trust this workspace without prompting before decomposition.",
+)
+@_trusted_workspace_callback
+def approve_plan(repository_path: Path, name: str) -> None:
+    """Approve the current plan and prepare its executable task generation."""
+    paths = RepoPaths.discover(repository_path)
+    resumable = False
+    try:
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            repository = store.get_repository(config.repository_id)
+            if repository is None:
+                raise ValueError("repository is not initialized; run 'borg init' first")
+            borg = store.get_borg_by_name(repository.id, name)
+            if borg is None:
+                raise ValueError(
+                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                )
+
+            approval, plan_path = _bind_plan_approval(paths, store, borg)
+            borg = store.get_borg(borg.id)
+            if borg is None:
+                raise RuntimeError(f"Borg {name!r} disappeared during approval")
+            resumable = True
+
+            if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
+                agent = select_agent(
+                    config,
+                    ApiAgentRole.PLANNING,
+                    paths,
+                    interactive=_stdin_is_interactive(),
+                )
+                borg = SupervisorLoop(
+                    repository,
+                    borg,
+                    store,
+                    agent,
+                    pm_agent=agent,
+                    approved_plan=approval.manifest["plan"],
+                    plan_approval=approval,
+                ).run().borg
+
+            publication = None
+            if borg.state is BorgState.READY_TO_EXECUTE:
+                publication = TaskPublisher(repository, store).current_task_files(
+                    borg.id
+                )
+            elif borg.state is not BorgState.BLOCKED:
+                raise RuntimeError(
+                    f"decomposition stopped in unexpected state {borg.state.value!r}"
+                )
+    except (SupervisorCancelled, KeyboardInterrupt) as error:
+        message = str(error).strip()
+        detail = f" ({message})" if message else ""
+        raise click.ClickException(
+            f"Decomposition for Borg {name!r} was interrupted{detail}. "
+            f"Run 'borg plan approve {name}' to resume."
+        ) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        if resumable:
+            message = str(error).strip()
+            detail = f" ({message})" if message else ""
+            raise click.ClickException(
+                f"Decomposition for Borg {name!r} could not continue{detail}. "
+                f"Run 'borg plan approve {name}' to resume."
+            ) from error
+        raise click.ClickException(str(error)) from error
+
+    relative_plan = plan_path.relative_to(paths.root).as_posix()
+    click.echo(f"Approved plan: {relative_plan} ({approval.plan_digest})")
+    if borg.state is BorgState.READY_TO_EXECUTE:
+        click.echo(f"Borg {name!r} is ready to execute.")
+        click.echo("Current tasks:")
+        for item in publication.files:
+            click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
+    else:
+        click.echo(f"Task decomposition blocked for Borg {name!r}.")
+
+
+def _bind_plan_approval(
+    paths: RepoPaths,
+    store: SqliteStore,
+    borg: Borg,
+) -> tuple[PlanApproval, Path]:
+    """Bind or recover one approval for the latest exact Architect plan."""
+    plan_attempt = next(
+        (
+            item
+            for item in reversed(store.list_planning_attempts(borg.id))
+            if item.phase == "architect_plan"
+            and item.status is PlanningAttemptStatus.COMPLETED
+            and item.result is not None
+        ),
+        None,
+    )
+    if plan_attempt is None:
+        raise ValueError(
+            f"Borg {borg.name!r} does not have a complete plan to approve"
+        )
+    current_plan = plan_attempt.result
+    validate_plan(current_plan, paths.root, check_repository_state=False)
+    digest = approved_plan_digest(current_plan)
+    body = render_plan_markdown(current_plan)
+    body_digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    relative_path = Path(".borg/plans") / f"{borg.name}.md"
+    plan_path = paths.root / relative_path
+
+    approvals = store.list_plan_approvals(borg.id)
+    if approvals:
+        approval = approvals[-1]
+        if borg.state is BorgState.PLAN_APPROVAL_PENDING:
+            raise ValueError(f"Borg {borg.name!r} already has a plan approval")
+        manifest_plan = approval.manifest.get("plan")
+        if (
+            approval.attempt_id != plan_attempt.id
+            or approval.plan_digest != digest
+            or manifest_plan != current_plan
+            or approval.manifest.get("plan.md") != body_digest
+            or approval.manifest.get("plan_path") != relative_path.as_posix()
+        ):
+            raise ValueError(
+                f"Borg {borg.name!r} approval does not match its current plan"
+            )
+        try:
+            existing = plan_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            publish_repository_text(
+                plan_path, body, root=paths.root, overwrite=True
+            )
+        else:
+            if existing != body:
+                raise ValueError(f"approved plan Markdown drifted: {relative_path}")
+        _require_git_trackable(paths.root, relative_path)
+        return approval, plan_path
+
+    if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
+        raise ValueError(
+            f"Borg {borg.name!r} cannot approve a plan from state "
+            f"{borg.state.value!r}; a plan must be awaiting approval"
+        )
+    publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
+    _require_git_trackable(paths.root, relative_path)
+    approval = PlanApproval(
+        borg_id=borg.id,
+        attempt_id=plan_attempt.id,
+        plan_digest=digest,
+        manifest={
+            "plan": current_plan,
+            "plan.md": body_digest,
+            "plan_path": relative_path.as_posix(),
+        },
+        approved_by="operator",
+    )
+    with store.transaction():
+        store.append_plan_approval(approval)
+        store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.PM_WORKING,
+        )
+    return approval, plan_path
+
+
+def _require_git_trackable(root: Path, relative_path: Path) -> None:
+    ignored = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "--quiet", "--", str(relative_path)],
+        check=False,
+    )
+    if ignored.returncode == 0:
+        raise ValueError(f"approved plan path is ignored by Git: {relative_path}")
+    if ignored.returncode not in {0, 1}:
+        raise RuntimeError("could not verify approved plan Git tracking status")
 
 
 @plan.command(name="change")

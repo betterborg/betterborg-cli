@@ -281,7 +281,7 @@ class SupervisorLoop:
 
             decision = payload["decision"]
             if decision == "approve":
-                next_state = BorgState.TASKS_APPROVAL_PENDING
+                next_state = BorgState.READY_TO_EXECUTE
             elif review_round < SUPERVISOR_ROUND_CAP:
                 next_state = BorgState.PM_WORKING
             else:
@@ -537,7 +537,7 @@ class SupervisorLoop:
     ) -> SupervisorResult | None:
         borg = self._turns.current_borg()
         if borg.state not in {
-            BorgState.TASKS_APPROVAL_PENDING,
+            BorgState.READY_TO_EXECUTE,
             BorgState.BLOCKED,
         }:
             return None
@@ -552,7 +552,7 @@ class SupervisorLoop:
                 item
                 for item in reversed(completed_reviews)
                 if (
-                    borg.state is BorgState.TASKS_APPROVAL_PENDING
+                    borg.state is BorgState.READY_TO_EXECUTE
                     and (item.result or {}).get("decision") == "approve"
                 )
                 or (
@@ -584,7 +584,7 @@ class SupervisorLoop:
         )
         if batch is None or generation is None:
             return None
-        if borg.state is BorgState.TASKS_APPROVAL_PENDING:
+        if borg.state is BorgState.READY_TO_EXECUTE:
             try:
                 publication = TaskPublisher(
                     self.repository, self.store
@@ -597,7 +597,7 @@ class SupervisorLoop:
                     f"approved task publication failed: {error}"
                 ) from error
         if (
-            borg.state is BorgState.TASKS_APPROVAL_PENDING
+            borg.state is BorgState.READY_TO_EXECUTE
             and self.store.get_current_task_generation(self.borg_id) != generation
         ):
             return None

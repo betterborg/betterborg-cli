@@ -22,7 +22,11 @@ class BorgState(str, Enum):
     PLAN_APPROVAL_PENDING = "plan_approval_pending"
     PM_WORKING = "pm_working"
     SUPERVISOR_WORKING = "supervisor_working"
-    TASKS_APPROVAL_PENDING = "tasks_approval_pending"
+    # Keep the persisted value compatible with schema-004 databases while
+    # naming the public lifecycle outcome for what it now means: task
+    # publication is complete and no second human gate remains.
+    READY_TO_EXECUTE = "tasks_approval_pending"
+    TASKS_APPROVAL_PENDING = READY_TO_EXECUTE
     EXECUTING = "executing"
     DONE = "done"
     BLOCKED = "blocked"
