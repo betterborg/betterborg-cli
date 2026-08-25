@@ -685,3 +685,49 @@ def test_removing_one_of_repeated_dependency_edges_counts_as_progress() -> None:
     assert sum(finding.rule == "task.dependency.duplicate" for finding in previous) == 2
     assert sum(finding.rule == "task.dependency.duplicate" for finding in repaired) == 1
     validate_task_repair_progress(previous, repaired)
+
+
+def test_moving_duplicate_dependency_to_another_edge_is_not_progress() -> None:
+    plan, tasks, dependencies = _valid_graph()
+    alternate = _task(
+        tasks[0].generation_id,
+        stage="01-foundation",
+        stem="02-alternate",
+        position=3,
+        refs=["P1.goal"],
+    )
+    alternate_dependency = TaskDependency(
+        generation_id=tasks[0].generation_id,
+        task_id=tasks[1].id,
+        depends_on_task_id=alternate.id,
+    )
+    previous = task_graph_findings(
+        plan,
+        [*tasks, alternate],
+        [*dependencies, dependencies[0], dependencies[0]],
+    )
+    repaired = task_graph_findings(
+        plan,
+        [*tasks, alternate],
+        [*dependencies, alternate_dependency, alternate_dependency],
+    )
+    previous_duplicate_refs = [
+        finding.dependency_refs
+        for finding in previous
+        if finding.rule == "task.dependency.duplicate"
+    ]
+    repaired_duplicate_refs = [
+        finding.dependency_refs
+        for finding in repaired
+        if finding.rule == "task.dependency.duplicate"
+    ]
+
+    assert previous_duplicate_refs == [
+        ("dependent", "task-2", "prerequisite", "task-1"),
+        ("dependent", "task-2", "prerequisite", "task-1"),
+    ]
+    assert repaired_duplicate_refs == [
+        ("dependent", "task-2", "prerequisite", "task-3")
+    ]
+    with pytest.raises(NonProgressingTaskRepairError):
+        validate_task_repair_progress(previous, repaired)

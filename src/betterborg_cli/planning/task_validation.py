@@ -418,45 +418,49 @@ def task_graph_findings(
         task_id: [] for task_id in tasks_by_id
     }
     seen_edges: set[tuple[UUID, UUID]] = set()
+    dependency_refs_by_edge: dict[tuple[UUID, UUID], tuple[str, ...]] = {}
     dangling_edge_counts: dict[tuple[str | None, str | None], int] = {}
     for dependency in dependency_rows:
         edge = (dependency.task_id, dependency.depends_on_task_id)
+        task = tasks_by_id.get(dependency.task_id)
+        prerequisite = tasks_by_id.get(dependency.depends_on_task_id)
         if edge in seen_edges:
-            task = tasks_by_id.get(dependency.task_id)
             findings.append(
                 TaskGraphFinding(
                     rule="task.dependency.duplicate",
                     message="task dependency is declared more than once",
                     task_refs=(task.task_ref,) if task is not None else (),
+                    dependency_refs=dependency_refs_by_edge[edge],
                 )
             )
             continue
         seen_edges.add(edge)
-        task = tasks_by_id.get(dependency.task_id)
-        prerequisite = tasks_by_id.get(dependency.depends_on_task_id)
+        logical_edge = (
+            task.task_ref if task is not None else None,
+            prerequisite.task_ref if prerequisite is not None else None,
+        )
+        dependency_refs = (
+            "dependent",
+            logical_edge[0] or "",
+            "prerequisite",
+            logical_edge[1] or "",
+        )
         if task is None or prerequisite is None:
             known = task if task is not None else prerequisite
-            logical_edge = (
-                task.task_ref if task is not None else None,
-                prerequisite.task_ref if prerequisite is not None else None,
-            )
             occurrence = dangling_edge_counts.get(logical_edge, 0) + 1
             dangling_edge_counts[logical_edge] = occurrence
+            dependency_refs += (f"occurrence:{occurrence}",)
+            dependency_refs_by_edge[edge] = dependency_refs
             findings.append(
                 TaskGraphFinding(
                     rule="task.dependency.dangling",
                     message="task dependency does not resolve within the generation",
                     task_refs=(known.task_ref,) if known is not None else (),
-                    dependency_refs=(
-                        "dependent",
-                        logical_edge[0] or "",
-                        "prerequisite",
-                        logical_edge[1] or "",
-                        f"occurrence:{occurrence}",
-                    ),
+                    dependency_refs=dependency_refs,
                 )
             )
             continue
+        dependency_refs_by_edge[edge] = dependency_refs
         if (
             dependency.generation_id != task.generation_id
             or dependency.generation_id != prerequisite.generation_id
