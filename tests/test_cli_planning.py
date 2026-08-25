@@ -5,9 +5,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from click.testing import CliRunner
-from pytest import MonkeyPatch
 
-from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.prd_session import InteractiveIO
@@ -18,8 +16,10 @@ from betterborg_cli.store import BorgState, SqliteStore
 def test_plan_start_answers_inline_and_reaches_approval_pending(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    monkeypatch: MonkeyPatch,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
 ) -> None:
     adapter = MockAdapter(name="openai")
     adapter.queue(
@@ -37,16 +37,15 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
         )
     )
     adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    adapter.queue(MockResponse(payload=_plan()))
-    adapter.queue(MockResponse(payload=_approve()))
+    adapter.queue(MockResponse(payload=planning_plan_response()))
+    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
     prompts: list[str] = []
     outputs: list[str] = []
 
     repository, paths = _planning_cli_repository(
         committed_git_repo, persist_planning_context, "inline-plan"
     )
-    _configure_cli(
-        monkeypatch,
+    configure_interactive_cli(
         repository.root,
         adapter,
         InteractiveIO(
@@ -54,6 +53,7 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
             confirm=lambda _message, _default: False,
             write=outputs.append,
         ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
     )
 
     result = cli_runner.invoke(cli, ["plan", "start", "inline-plan", "--yes"])
@@ -76,8 +76,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
 def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    monkeypatch: MonkeyPatch,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
 ) -> None:
     adapter = MockAdapter(name="openai").queue(
         MockResponse(
@@ -93,8 +95,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     repository, paths = _planning_cli_repository(
         committed_git_repo, persist_planning_context, "resume-plan"
     )
-    _configure_cli(
-        monkeypatch,
+    configure_interactive_cli(
         repository.root,
         adapter,
         InteractiveIO(
@@ -102,6 +103,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
             confirm=lambda _message, _default: False,
             write=lambda _message: None,
         ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
     )
 
     interrupted = cli_runner.invoke(
@@ -118,8 +120,8 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
         assert store.list_planning_questions(borg.id)[0].answers is None
 
     adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    adapter.queue(MockResponse(payload=_plan()))
-    adapter.queue(MockResponse(payload=_approve()))
+    adapter.queue(MockResponse(payload=planning_plan_response()))
+    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
     resumed = cli_runner.invoke(cli, ["plan", "start", "resume-plan", "--yes"])
 
     assert resumed.exit_code == 0, resumed.output
@@ -137,25 +139,26 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
 def test_plan_start_reports_review_cap_as_blocked(
     cli_runner: CliRunner,
     committed_git_repo: Path,
-    monkeypatch: MonkeyPatch,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
 ) -> None:
     adapter = MockAdapter(name="openai")
     for payload in (
         {"decision": "ready_to_plan"},
-        _plan(),
-        _request_changes("Clarify rollback behavior."),
-        _plan(summary="Clarify rollback behavior."),
-        _request_changes("Name the rollback checks."),
-        _plan(summary="Name the rollback checks."),
-        _request_changes("Cover a partial rollback."),
+        planning_plan_response(),
+        tech_lead_change_request_response("Clarify rollback behavior."),
+        planning_plan_response(summary="Clarify rollback behavior."),
+        tech_lead_change_request_response("Name the rollback checks."),
+        planning_plan_response(summary="Name the rollback checks."),
+        tech_lead_change_request_response("Cover a partial rollback."),
     ):
         adapter.queue(MockResponse(payload=payload))
     repository, paths = _planning_cli_repository(
         committed_git_repo, persist_planning_context, "blocked-plan"
     )
-    _configure_cli(
-        monkeypatch,
+    configure_interactive_cli(
         repository.root,
         adapter,
         InteractiveIO(
@@ -163,6 +166,7 @@ def test_plan_start_reports_review_cap_as_blocked(
             confirm=lambda _message, _default: False,
             write=lambda _message: None,
         ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
     )
 
     result = cli_runner.invoke(cli, ["plan", "start", "blocked-plan", "--yes"])
@@ -195,70 +199,3 @@ def _planning_cli_repository(root: Path, persist_planning_context, name: str):
     paths.state_dir.mkdir(parents=True)
     shutil.copyfile(fixture_database, paths.state_dir / "borg.sqlite3")
     return repository, paths
-
-
-def _configure_cli(
-    monkeypatch: MonkeyPatch,
-    root: Path,
-    adapter: MockAdapter,
-    io: InteractiveIO,
-) -> None:
-    monkeypatch.chdir(root)
-    monkeypatch.setenv("XDG_STATE_HOME", str(root.parent / f".{root.name}-state"))
-    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
-    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
-    monkeypatch.setattr(cli_module, "_interactive_io", lambda: io)
-
-
-def _approve() -> dict:
-    return {
-        "decision": "approve",
-        "summary": "The plan is ready for approval.",
-        "findings": [],
-    }
-
-
-def _request_changes(message: str) -> dict:
-    return {
-        "decision": "request_changes",
-        "summary": message,
-        "findings": [
-            {
-                "severity": "major",
-                "message": message,
-                "suggestion": "Make the verification explicit.",
-            }
-        ],
-    }
-
-
-def _plan(*, summary: str = "Add a small, tested release workflow.") -> dict:
-    return {
-        "title": "Release workflow",
-        "summary": summary,
-        "overall_approach": "Extend the existing repository conventions.",
-        "phases": [
-            {
-                "name": "01-release-workflow",
-                "title": "Add release workflow",
-                "goal": "Document and test the release path.",
-                "technical_approach": "Update the tracked README convention.",
-                "files_touched": [
-                    {
-                        "path": "README.md",
-                        "role": "modified",
-                        "description": "Document the release workflow.",
-                    }
-                ],
-                "test_strategy": "Assert the documented public workflow.",
-                "acceptance_criteria": ["The release path is documented."],
-                "deliverables": ["Release workflow documentation."],
-                "dependencies_on": [],
-            }
-        ],
-        "code_pointers": [
-            {"path": "README.md", "why": "It owns repository guidance."}
-        ],
-        "risks": [],
-        "open_questions": [],
-    }
