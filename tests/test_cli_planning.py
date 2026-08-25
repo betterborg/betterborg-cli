@@ -315,12 +315,184 @@ def test_plan_show_reports_when_no_plan_is_stored(
     assert "borg plan start missing-plan" in result.output
 
 
-def test_plan_exposes_start_and_show_commands(cli_runner: CliRunner) -> None:
+def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+) -> None:
+    original_plan = planning_plan_response(summary="Original plan.")
+    reviewed_plan = planning_plan_response(summary="Address the original finding.")
+    requested_plan = planning_plan_response(summary="Add staged rollout checks.")
+    final_plan = planning_plan_response(summary="Add rollback checks too.")
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        original_plan,
+        tech_lead_change_request_response("Clarify the original rollout."),
+        reviewed_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    repository, paths = _planning_cli_repository(
+        committed_git_repo, persist_planning_context, "change-plan"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+
+    started = cli_runner.invoke(cli, ["plan", "start", "change-plan", "--yes"])
+
+    assert started.exit_code == 0, started.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "change-plan")
+        assert borg is not None
+        before_attempts = store.list_planning_attempts(borg.id)
+        before_findings = store.list_planning_findings(borg.id)
+        assert len(before_findings) == 1
+
+    def requested_revision(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".borg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        current_plan = json.loads(
+            (spec.cwd / manifest["current_plan"]).read_text(encoding="utf-8")
+        )
+        changes = json.loads(
+            (spec.cwd / manifest["change_requests"]).read_text(encoding="utf-8")
+        )
+        assert current_plan == reviewed_plan
+        assert [item["note"] for item in changes] == [
+            "Add staged rollout safety."
+        ]
+        return requested_plan
+
+    adapter.queue(MockResponse(dynamic=requested_revision))
+    for payload in (
+        tech_lead_change_request_response("Add rollback verification."),
+        final_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+
+    changed = cli_runner.invoke(
+        cli,
+        [
+            "plan",
+            "change",
+            "change-plan",
+            "--note",
+            "  Add staged rollout safety.  ",
+            "--yes",
+        ],
+    )
+
+    assert changed.exit_code == 0, changed.output
+    assert "Plan approval pending" in changed.output
+    assert "borg plan show change-plan" in changed.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "change-plan")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        attempts = store.list_planning_attempts(borg.id)
+        assert attempts[: len(before_attempts)] == before_attempts
+        assert [
+            item.result["summary"]
+            for item in attempts
+            if item.phase == "architect_plan"
+        ] == [
+            "Original plan.",
+            "Address the original finding.",
+            "Add staged rollout checks.",
+            "Add rollback checks too.",
+        ]
+        findings = store.list_planning_findings(borg.id)
+        assert findings[: len(before_findings)] == before_findings
+        assert [item.message for item in findings] == [
+            "Clarify the original rollout.",
+            "Add rollback verification.",
+        ]
+        assert [item.round for item in findings] == [1, 1]
+        requests = store.list_plan_change_requests(borg.id)
+        assert [item.note for item in requests] == ["Add staged rollout safety."]
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "change-plan", "--json"])
+
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.output) == final_plan
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert store.list_planning_attempts(borg.id) == attempts
+        assert store.list_planning_findings(borg.id) == findings
+        assert store.list_plan_change_requests(borg.id) == requests
+
+
+def test_plan_change_rejects_empty_note_without_mutating_gate(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+) -> None:
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(),
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    repository, paths = _planning_cli_repository(
+        committed_git_repo, persist_planning_context, "empty-change"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    started = cli_runner.invoke(cli, ["plan", "start", "empty-change", "--yes"])
+    assert started.exit_code == 0, started.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "empty-change")
+        assert borg is not None
+        before = _planning_snapshot(store, borg.id)
+
+    result = cli_runner.invoke(
+        cli,
+        ["plan", "change", "empty-change", "--yes"],
+        input="   \n",
+    )
+
+    assert result.exit_code == 1
+    assert "plan change note must not be empty" in result.output
+    assert len(adapter.calls) == 3
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert _planning_snapshot(store, borg.id) == before
+
+
+def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(cli, ["plan", "--help"])
 
     assert result.exit_code == 0
     assert "start" in result.output
     assert "show" in result.output
+    assert "change" in result.output
     assert "question" not in result.output
     assert "answer" not in result.output
 

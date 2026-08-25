@@ -393,4 +393,11 @@ class TechLeadLoop:
         ]
 
     def _review_attempts(self) -> list[PlanningAttempt]:
-        return self._turns.attempts(_TECH_REVIEW_PHASE)
+        attempts = self._turns.attempts(_TECH_REVIEW_PHASE)
+        change_requests = self.store.list_plan_change_requests(self.borg_id)
+        if not change_requests:
+            return attempts
+        cycle_started_at = change_requests[-1].created_at
+        return [
+            attempt for attempt in attempts if attempt.started_at >= cycle_started_at
+        ]

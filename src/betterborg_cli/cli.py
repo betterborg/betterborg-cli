@@ -28,7 +28,12 @@ from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
-from betterborg_cli.store import BorgState, PlanningAttemptStatus, SqliteStore
+from betterborg_cli.store import (
+    BorgState,
+    PlanChangeRequest,
+    PlanningAttemptStatus,
+    SqliteStore,
+)
 from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
     require_workspace_trust,
@@ -425,6 +430,100 @@ def show_plan(name: str, json_output: bool) -> None:
         click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
     else:
         click.echo(render_plan_markdown(stored_plan), nl=False)
+
+
+@plan.command(name="change")
+@click.argument("name")
+@click.option(
+    "--note",
+    help="Plain-language changes for the Architect to apply.",
+)
+@click.option(
+    "--yes",
+    "explicit_trust",
+    is_flag=True,
+    help="Trust this workspace without prompting before revising the plan.",
+)
+@_trusted_workspace_callback
+def change_plan(repository_path: Path, name: str, note: str | None) -> None:
+    """Request changes to a plan awaiting human approval."""
+    if note is None:
+        note = _prompt("Change note")
+    if note is None or not note.strip():
+        raise click.ClickException("plan change note must not be empty")
+    note = note.strip()
+
+    paths = RepoPaths.discover(repository_path)
+    try:
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            repository = store.get_repository(config.repository_id)
+            if repository is None:
+                raise ValueError("repository is not initialized; run 'borg init' first")
+            borg = store.get_borg_by_name(repository.id, name)
+            if borg is None:
+                raise ValueError(
+                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                )
+            if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
+                raise ValueError(
+                    f"Borg {name!r} cannot change its plan from state "
+                    f"{borg.state.value!r}; a plan must be awaiting approval"
+                )
+
+            requests = store.list_plan_change_requests(borg.id)
+            request = PlanChangeRequest(
+                borg_id=borg.id,
+                round=max((item.round for item in requests), default=0) + 1,
+                note=note,
+            )
+            with store.transaction():
+                store.append_plan_change_request(request)
+                borg = store.compare_and_set_borg_state(
+                    borg.id,
+                    expected_state=borg.state,
+                    expected_version=borg.state_version,
+                    new_state=BorgState.ARCHITECT_WORKING,
+                )
+
+            interactive = _stdin_is_interactive()
+            agent = select_agent(
+                config,
+                ApiAgentRole.PLANNING,
+                paths,
+                interactive=interactive,
+            )
+            io = _interactive_io()
+            borg = TechLeadLoop(
+                repository,
+                borg,
+                store,
+                agent,
+                architect_agent=agent,
+                io=io,
+            ).run().borg
+    except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
+        message = str(error).strip()
+        detail = f" ({message})" if message else ""
+        raise click.ClickException(
+            f"Plan change for Borg {name!r} was interrupted{detail}. "
+            f"Run 'borg plan start {name}' to resume."
+        ) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if borg.state is BorgState.PLAN_APPROVAL_PENDING:
+        click.echo(
+            f"Plan approval pending for Borg {name!r} after applying the change."
+        )
+        click.echo(f"Review it with: borg plan show {name}")
+    elif borg.state is BorgState.BLOCKED:
+        click.echo(f"Planning blocked for Borg {name!r} while applying the change.")
+        click.echo(f"Review the saved Tech Lead findings with: borg plan show {name}")
+    else:
+        raise click.ClickException(
+            f"Plan change stopped in unexpected state {borg.state.value!r}"
+        )
 
 
 def _write_initialized(result) -> None:
