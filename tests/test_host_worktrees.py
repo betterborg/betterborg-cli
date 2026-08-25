@@ -86,6 +86,18 @@ def test_safe_git_rejects_parent_discovery_from_nested_path(
         SafeGit(nested).run(["status", "--porcelain"])
 
 
+def test_primary_guard_rejects_parent_discovery_from_nested_path(
+    committed_git_repo: Path,
+) -> None:
+    nested = committed_git_repo / "nested"
+    nested.mkdir()
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="nested path"
+    ):
+        PrimaryCheckoutGuard(nested).assert_clean()
+
+
 def test_safe_git_strips_repository_routing_environment(
     committed_git_repo: Path, tmp_path: Path
 ) -> None:

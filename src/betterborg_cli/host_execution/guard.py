@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import subprocess
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from betterborg_cli.host_execution.git import (
-    _hardened_git_environment,
-    _status_entries,
-)
+from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError, _status_entries
+from betterborg_cli.repo_paths import MANAGED_IGNORE_RULE
 
 
 class PrimaryCheckoutContaminationError(RuntimeError):
@@ -33,9 +30,10 @@ class PrimaryCheckoutGuard:
         self,
         primary_repo: Path,
         *,
-        ignored_prefixes: Iterable[str] = (".borg/state/",),
+        ignored_prefixes: Iterable[str] = (MANAGED_IGNORE_RULE,),
     ) -> None:
         self._repo = Path(primary_repo).resolve()
+        self._git = SafeGit(self._repo)
         self._ignored_prefixes = tuple(ignored_prefixes)
         self._snapshots: dict[tuple[str, str], _CheckoutSnapshot] = {}
         self._lock = threading.Lock()
@@ -117,14 +115,12 @@ class PrimaryCheckoutGuard:
         )
 
     def _git_output(self, arguments: list[str]) -> str:
-        result = subprocess.run(
-            ["git", *arguments],
-            cwd=str(self._repo),
-            check=False,
-            capture_output=True,
-            text=True,
-            env=_hardened_git_environment(),
-        )
+        try:
+            result = self._git.run(arguments, check=False)
+        except UnsafeGitError as error:
+            raise PrimaryCheckoutContaminationError(
+                f"unable to inspect primary checkout {self._repo}: {error}"
+            ) from error
         if result.returncode != 0:
             raise PrimaryCheckoutContaminationError(
                 f"unable to inspect primary checkout {self._repo}: "
