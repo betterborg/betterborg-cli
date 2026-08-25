@@ -1,10 +1,14 @@
 """Shared fixtures for BetterBorg CLI tests."""
 
+from __future__ import annotations
+
 import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from click.testing import CliRunner
@@ -12,17 +16,37 @@ from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime.mock import MockAdapter
+from betterborg_cli.planning import (
+    approved_plan_digest,
+    render_task_markdown,
+    task_markdown_digest,
+)
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
+    PlanApproval,
+    PlanningAttempt,
+    PlanningAttemptStatus,
     PrdSession,
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
     SqliteStore,
+    TaskBatch,
+    TaskComplexity,
+    TaskGeneration,
+    TaskRecord,
 )
+
+
+@dataclass(frozen=True)
+class TaskGenerationFixture:
+    """A persisted generation and its sole task record."""
+
+    generation: TaskGeneration
+    task: TaskRecord
 
 
 @pytest.fixture
@@ -113,6 +137,12 @@ def planning_cli_repository(persist_planning_context):
 
 
 @pytest.fixture
+def approved_task_generation():
+    """Return the shared factory for one approved persisted task generation."""
+    return _add_approved_task_generation
+
+
+@pytest.fixture
 def planning_plan_response():
     """Build a valid plan response shared by planning lifecycle tests."""
     return _planning_plan_response
@@ -161,6 +191,94 @@ def _write_repository_config(root: Path, repository: Repository) -> None:
         'default_branch = "main"\n',
         encoding="utf-8",
     )
+
+
+def _add_approved_task_generation(
+    store: SqliteStore,
+    borg: Borg,
+    approval: PlanApproval,
+    *,
+    body: dict,
+    round_number: int,
+    task_ref: str | None = None,
+) -> TaskGenerationFixture:
+    attempt = PlanningAttempt(
+        borg_id=borg.id,
+        phase="supervisor_review",
+        round=round_number,
+        adapter="mock",
+        model="test-model",
+    )
+    batch = TaskBatch(
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        attempt_id=attempt.id,
+        round=round_number,
+        digest=f"sha256:batch-{round_number}",
+        manifest={},
+    )
+    generation_id = uuid4()
+    digest = task_markdown_digest(render_task_markdown(body))
+    task = TaskRecord(
+        generation_id=generation_id,
+        borg_id=borg.id,
+        task_ref=task_ref or f"T-{generation_id.hex}",
+        stage=body["stage"],
+        stem=body["stem"],
+        position=1,
+        title=body["title"],
+        complexity=TaskComplexity(body["estimate_complexity"]),
+        digest=digest,
+        task=body,
+        manifest={"approved_plan_digest": approval.plan_digest, "task.md": digest},
+    )
+    relative_path = (
+        f".borg/tasks/{borg.name}/{generation_id}/{task.stage}/{task.stem}.md"
+    )
+    manifest = {
+        "approved_plan_digest": approval.plan_digest,
+        "batch_digest": batch.digest,
+        "dependencies": [],
+        "plan_approval_id": str(approval.id),
+        "tasks": [
+            {
+                "digest": digest,
+                "path": relative_path,
+                "position": task.position,
+                "task_ref": task.task_ref,
+            }
+        ],
+    }
+    generation = TaskGeneration(
+        id=generation_id,
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        batch_id=batch.id,
+        digest=approved_plan_digest(manifest),
+        manifest=manifest,
+    )
+    attempt = PlanningAttempt(
+        id=attempt.id,
+        borg_id=attempt.borg_id,
+        phase=attempt.phase,
+        round=attempt.round,
+        adapter=attempt.adapter,
+        model=attempt.model,
+        request={
+            "batch_id": str(batch.id),
+            "generation_id": str(generation.id),
+        },
+    )
+    store.append_planning_attempt(attempt)
+    store.append_task_batch(batch)
+    store.add_task_generation(generation, [task])
+    store.complete_planning_attempt(
+        attempt.id,
+        status=PlanningAttemptStatus.COMPLETED,
+        result={"decision": "approve", "summary": "Ready.", "findings": []},
+        summary="Ready.",
+    )
+    return TaskGenerationFixture(generation=generation, task=task)
 
 
 def _persist_repository_analysis(

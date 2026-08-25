@@ -3,38 +3,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
 
 from click.testing import CliRunner
 
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import (
     TaskPublisher,
-    approved_plan_digest,
     render_task_markdown,
-    task_markdown_digest,
 )
 from betterborg_cli.store import (
-    Borg,
     BorgState,
     PlanApproval,
-    PlanningAttempt,
-    PlanningAttemptStatus,
     SqliteStore,
-    TaskBatch,
-    TaskComplexity,
-    TaskGeneration,
     TaskGenerationStatus,
-    TaskRecord,
 )
-
-
-@dataclass(frozen=True)
-class GenerationFixture:
-    generation: TaskGeneration
-    task: TaskRecord
 
 
 def _task_body(stem: str, title: str) -> dict:
@@ -54,102 +37,11 @@ def _task_body(stem: str, title: str) -> dict:
     }
 
 
-def _add_generation(
-    store: SqliteStore,
-    borg: Borg,
-    approval: PlanApproval,
-    *,
-    stem: str,
-    title: str,
-    round_number: int,
-) -> GenerationFixture:
-    attempt_id = uuid4()
-    attempt = PlanningAttempt(
-        id=attempt_id,
-        borg_id=borg.id,
-        phase="supervisor_review",
-        round=round_number,
-        adapter="mock",
-        model="test-model",
-        request={},
-    )
-    batch = TaskBatch(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        attempt_id=attempt.id,
-        round=round_number,
-        digest=f"sha256:batch-{round_number}",
-        manifest={},
-    )
-    generation_id = uuid4()
-    body = _task_body(stem, title)
-    digest = task_markdown_digest(render_task_markdown(body))
-    record = TaskRecord(
-        generation_id=generation_id,
-        borg_id=borg.id,
-        task_ref=f"T-{round_number}",
-        stage=body["stage"],
-        stem=stem,
-        position=1,
-        title=title,
-        complexity=TaskComplexity.SMALL,
-        digest=digest,
-        task=body,
-        manifest={"approved_plan_digest": approval.plan_digest, "task.md": digest},
-    )
-    relative_path = (
-        f".borg/tasks/{borg.name}/{generation_id}/{record.stage}/{record.stem}.md"
-    )
-    manifest = {
-        "approved_plan_digest": approval.plan_digest,
-        "batch_digest": batch.digest,
-        "dependencies": [],
-        "plan_approval_id": str(approval.id),
-        "tasks": [
-            {
-                "digest": digest,
-                "path": relative_path,
-                "position": record.position,
-                "task_ref": record.task_ref,
-            }
-        ],
-    }
-    generation = TaskGeneration(
-        id=generation_id,
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        batch_id=batch.id,
-        digest=approved_plan_digest(manifest),
-        manifest=manifest,
-    )
-    attempt = PlanningAttempt(
-        id=attempt.id,
-        borg_id=attempt.borg_id,
-        phase=attempt.phase,
-        round=attempt.round,
-        adapter=attempt.adapter,
-        model=attempt.model,
-        request={
-            "batch_id": str(batch.id),
-            "generation_id": str(generation.id),
-        },
-    )
-    store.append_planning_attempt(attempt)
-    store.append_task_batch(batch)
-    store.add_task_generation(generation, [record])
-    store.complete_planning_attempt(
-        attempt.id,
-        status=PlanningAttemptStatus.COMPLETED,
-        result={"decision": "approve", "summary": "Ready.", "findings": []},
-        summary="Ready.",
-    )
-    return GenerationFixture(generation=generation, task=record)
-
-
 def _multiple_generations(
     root: Path,
     planning_cli_repository,
-) -> tuple[Path, GenerationFixture, GenerationFixture, GenerationFixture]:
+    approved_task_generation,
+):
     repository, paths = planning_cli_repository(root, "inspect-tasks")
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "inspect-tasks")
@@ -166,31 +58,31 @@ def _multiple_generations(
             manifest={},
         )
         store.append_plan_approval(approval)
-        superseded = _add_generation(
+        superseded = approved_task_generation(
             store,
             borg,
             approval,
-            stem="01-superseded",
-            title="Superseded task",
+            body=_task_body("01-superseded", "Superseded task"),
             round_number=1,
+            task_ref="T-1",
         )
         TaskPublisher(repository, store).publish(superseded.generation.id)
-        current = _add_generation(
+        current = approved_task_generation(
             store,
             borg,
             approval,
-            stem="02-current",
-            title="Current task",
+            body=_task_body("02-current", "Current task"),
             round_number=2,
+            task_ref="T-2",
         )
         TaskPublisher(repository, store).publish(current.generation.id)
-        preparing = _add_generation(
+        preparing = approved_task_generation(
             store,
             borg,
             approval,
-            stem="03-preparing",
-            title="Preparing task",
+            body=_task_body("03-preparing", "Preparing task"),
             round_number=3,
+            task_ref="T-3",
         )
     return paths.state_dir / "borg.sqlite3", superseded, current, preparing
 
@@ -199,10 +91,11 @@ def test_task_list_exposes_only_current_and_does_not_reconcile_other_trees(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
+    approved_task_generation,
     monkeypatch,
 ) -> None:
     database, superseded, current, preparing = _multiple_generations(
-        committed_git_repo, planning_cli_repository
+        committed_git_repo, planning_cli_repository, approved_task_generation
     )
     stale_tree = (
         committed_git_repo
@@ -237,10 +130,11 @@ def test_task_list_json_describes_only_verified_current_records(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
+    approved_task_generation,
     monkeypatch,
 ) -> None:
     _database, _superseded, current, _preparing = _multiple_generations(
-        committed_git_repo, planning_cli_repository
+        committed_git_repo, planning_cli_repository, approved_task_generation
     )
     monkeypatch.chdir(committed_git_repo)
 
@@ -271,14 +165,15 @@ def test_task_list_json_describes_only_verified_current_records(
     }
 
 
-def test_task_show_renders_current_markdown_and_rejects_noncurrent_refs(
+def test_task_show_renders_current_markdown_and_json_and_rejects_noncurrent_refs(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
+    approved_task_generation,
     monkeypatch,
 ) -> None:
     _database, superseded, current, preparing = _multiple_generations(
-        committed_git_repo, planning_cli_repository
+        committed_git_repo, planning_cli_repository, approved_task_generation
     )
     monkeypatch.chdir(committed_git_repo)
 
@@ -288,6 +183,31 @@ def test_task_show_renders_current_markdown_and_rejects_noncurrent_refs(
 
     assert shown.exit_code == 0, shown.output
     assert shown.output == render_task_markdown(current.task.task)
+
+    shown_json = cli_runner.invoke(
+        cli,
+        [
+            "task",
+            "show",
+            "inspect-tasks",
+            current.task.task_ref,
+            "--json",
+        ],
+    )
+    assert shown_json.exit_code == 0, shown_json.output
+    assert json.loads(shown_json.output) == {
+        "complexity": "small",
+        "dependencies": [],
+        "digest": current.task.digest,
+        "path": current.generation.manifest["tasks"][0]["path"],
+        "position": 1,
+        "stage": "01-foundation",
+        "stem": "02-current",
+        "task": current.task.task,
+        "task_ref": current.task.task_ref,
+        "title": "Current task",
+    }
+
     for hidden in (superseded, preparing):
         result = cli_runner.invoke(
             cli, ["task", "show", "inspect-tasks", hidden.task.task_ref]
@@ -301,10 +221,11 @@ def test_task_list_and_show_block_digest_mismatch(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
+    approved_task_generation,
     monkeypatch,
 ) -> None:
     _database, _superseded, current, _preparing = _multiple_generations(
-        committed_git_repo, planning_cli_repository
+        committed_git_repo, planning_cli_repository, approved_task_generation
     )
     task_path = committed_git_repo / current.generation.manifest["tasks"][0]["path"]
     task_path.write_text("# drifted\n", encoding="utf-8")
