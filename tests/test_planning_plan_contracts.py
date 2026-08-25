@@ -131,41 +131,63 @@ def test_does_not_ground_secondary_path_against_primary_repository(
         validate_plan(plan, repository)
 
 
-@pytest.mark.parametrize(
-    ("mutate", "entry"),
-    [
-        (
-            lambda plan: plan["phases"][0].update(
-                {"repositories": ["primary"]}
-            ),
-            "file",
-        ),
-        (
-            lambda plan: plan["phases"][0]["contracts"][0].update(
-                {"repo": "primary"}
-            ),
-            "contract",
-        ),
-    ],
-)
-def test_rejects_entry_ownership_outside_phase_repositories(
-    repository: Path, mutate, entry: str
+def test_rejects_written_file_outside_phase_repositories(
+    repository: Path,
 ) -> None:
     plan = _multi_repository_plan()
-    mutate(plan)
+    plan["phases"][0]["repositories"] = ["primary"]
     secondary = repository / "secondary"
     secondary.mkdir()
     (secondary / "README.md").write_text("# Secondary\n", encoding="utf-8")
 
     with pytest.raises(
         PlanValidationError,
-        match=rf"{entry}.*not listed in the phase repositories",
+        match=r"file.*not listed in the phase repositories",
     ):
         validate_plan(
             plan,
             repository,
             repository_roots={"primary": repository, "secondary": secondary},
         )
+
+
+def test_phase_repositories_exclude_read_only_and_consumed_contract_repos(
+    repository: Path,
+) -> None:
+    plan = _multi_repository_plan()
+    plan["phases"][0].update(
+        {
+            "repositories": ["primary"],
+            "files_touched": [
+                {
+                    "path": "README.md",
+                    "role": "modified",
+                    "repo": "primary",
+                },
+                {
+                    "path": "README.md",
+                    "role": "read",
+                    "repo": "secondary",
+                },
+            ],
+            "contracts": [
+                {
+                    "kind": "config",
+                    "spec": "secondary.enabled: bool",
+                    "repo": "secondary",
+                }
+            ],
+        }
+    )
+    secondary = repository / "secondary"
+    secondary.mkdir()
+    (secondary / "README.md").write_text("# Secondary\n", encoding="utf-8")
+
+    validate_plan(
+        plan,
+        repository,
+        repository_roots={"primary": repository, "secondary": secondary},
+    )
 
 
 @pytest.mark.parametrize(

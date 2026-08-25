@@ -117,11 +117,12 @@ def validate_plan(
                 roots,
                 field=f"phase {name!r} file {path!r}",
             )
-            _validate_phase_repository(
-                repository,
-                phase_repositories,
-                field=f"phase {name!r} file {path!r}",
-            )
+            if entry["role"] != "read":
+                _validate_phase_write_repository(
+                    repository,
+                    phase_repositories,
+                    field=f"phase {name!r} file {path!r}",
+                )
             entry_root = _entry_repository_root(
                 repository,
                 roots,
@@ -146,14 +147,9 @@ def validate_plan(
             )
 
         for contract in phase.get("contracts", []):
-            repository = _entry_repository_id(
+            _entry_repository_id(
                 contract,
                 roots,
-                field=f"phase {name!r} contract",
-            )
-            _validate_phase_repository(
-                repository,
-                phase_repositories,
                 field=f"phase {name!r} contract",
             )
 
@@ -293,7 +289,7 @@ def _entry_repository_root(
     return root
 
 
-def _validate_phase_repository(
+def _validate_phase_write_repository(
     repository: str | None,
     phase_repositories: set[str],
     *,
@@ -302,7 +298,7 @@ def _validate_phase_repository(
     if phase_repositories and repository not in phase_repositories:
         raise PlanValidationError(
             f"{field} belongs to repository {repository!r}, which is not listed "
-            "in the phase repositories"
+            "in the phase repositories written by this phase"
         )
 
 
