@@ -616,6 +616,78 @@ def test_invalid_plan_contract_fails_before_tech_review(
         assert "expected number 01" in plan_attempt.summary
 
 
+def test_plan_validation_rejects_untracked_source_the_architect_did_not_see(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["code_pointers"] = [
+        {"path": "untracked.py", "why": "This file is not in the planning snapshot."}
+    ]
+
+    def create_untracked_source(_spec):
+        (committed_git_repo / "untracked.py").write_text(
+            "print('dirty source')\n", encoding="utf-8"
+        )
+        return invalid_plan
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(dynamic=create_untracked_source))
+    database = committed_git_repo.parent / "architect-untracked-source.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "untracked-source"
+        )
+
+        with pytest.raises(ArchitectError, match="not grounded in the repository"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        plan_attempt = store.list_planning_attempts(borg.id)[-1]
+        assert plan_attempt.status is PlanningAttemptStatus.FAILED
+        assert plan_attempt.result == invalid_plan
+
+
+def test_plan_validation_ignores_dirty_source_drift_after_architect_turn(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    def remove_tracked_source_after_inspection(spec):
+        assert (spec.cwd / "README.md").is_file()
+        (committed_git_repo / "README.md").unlink()
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(dynamic=remove_tracked_source_after_inspection))
+    database = committed_git_repo.parent / "architect-dirty-drift.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "dirty-drift"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+
+
 def test_revalidates_a_durable_completed_plan_before_resuming(
     committed_git_repo: Path,
     persist_planning_context,

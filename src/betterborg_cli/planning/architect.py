@@ -400,7 +400,7 @@ class ArchitectLoop:
                 continue
 
             try:
-                validate_plan(payload, self.repository.root)
+                self._validate_plan_in_snapshot(payload)
             except PlanValidationError as error:
                 self.store.complete_planning_attempt(
                     attempt.id,
@@ -641,13 +641,24 @@ class ArchitectLoop:
         if completed is None:
             return None
         try:
-            validate_plan(completed.result or {}, self.repository.root)
+            self._validate_plan_in_snapshot(completed.result or {})
         except PlanValidationError as error:
             raise ArchitectError(
                 "Stored Architect plan failed deterministic validation: "
                 f"{error}"
             ) from error
         return completed
+
+    def _validate_plan_in_snapshot(self, plan: dict[str, Any]) -> None:
+        """Validate against the same committed-only view exposed to Architect."""
+        with materialize_planning_worktree(
+            self.repository,
+            self._current_borg(),
+            self.store,
+            dirty_borg_documents=self.dirty_borg_documents,
+            worktrees_root=self.worktrees_root,
+        ) as worktree:
+            validate_plan(plan, worktree)
 
     def _latest_ambiguous_plan(self) -> PlanningAttempt | None:
         return next(
