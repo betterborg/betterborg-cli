@@ -149,6 +149,41 @@ _SERVICE_DEPENDENCY_SCHEMA: dict[str, Any] = {
         },
     },
 }
+_COMPOSE_FILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["path"],
+    "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+        "profiles": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "services": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+}
+_COMPOSE_CATALOG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "file": {"type": "string", "minLength": 1},
+        "files": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/compose_file"},
+        },
+        "source": {"type": "string", "minLength": 1},
+        "profiles": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "project_name": {"type": "string", "minLength": 1},
+        "notes": {"type": "string"},
+    },
+}
 _ENVIRONMENT_COMMAND_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -247,6 +282,7 @@ ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
         },
         "command_catalog": {"$ref": "#/$defs/command_catalog"},
         "environment": {"$ref": "#/$defs/environment"},
+        "compose": {"$ref": "#/$defs/compose_catalog"},
         "required_secrets": {
             "type": "array",
             "items": {"$ref": "#/$defs/secret_requirement"},
@@ -264,6 +300,8 @@ ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
         "secret_requirement": _SECRET_REQUIREMENT_SCHEMA,
         "service_port": _SERVICE_PORT_SCHEMA,
         "service_dependency": _SERVICE_DEPENDENCY_SCHEMA,
+        "compose_file": _COMPOSE_FILE_SCHEMA,
+        "compose_catalog": _COMPOSE_CATALOG_SCHEMA,
         "environment_command": _ENVIRONMENT_COMMAND_SCHEMA,
         "environment_toolchain": _ENVIRONMENT_TOOLCHAIN_SCHEMA,
         "environment": _ENVIRONMENT_SCHEMA,
@@ -296,8 +334,8 @@ Open analysis_input.json first and inspect only files listed in its files array.
 Score every package on the eight required dimensions. Every recommendation must
 cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
-rationale. Every reported Harness command, environment input, required secret,
-and service must cite a manifest path in its source field or inherit a source
+rationale. Every reported Harness command, environment input, Compose file,
+required secret, and service must cite a manifest path or inherit a source
 from its containing catalog/environment/service. Service env contains variable
 names only, never values. Omit an optional category when bounded evidence is
 insufficient. Return only the JSON object required by the supplied schema.
@@ -561,6 +599,24 @@ def _validate_harness_evidence(
             and not environment_sources
         ):
             uncited_claims.add("environment package manager")
+
+    compose = payload.get("compose")
+    if isinstance(compose, Mapping):
+        _add_source(cited_paths, compose)
+        compose_source = _source(compose)
+        primary_file = compose.get("file")
+        if isinstance(primary_file, str):
+            cited_paths.add(primary_file)
+        files = compose.get("files")
+        if isinstance(files, list):
+            for compose_file in files:
+                _add_source(cited_paths, compose_file)
+                if isinstance(compose_file, Mapping):
+                    path = compose_file.get("path")
+                    if isinstance(path, str):
+                        cited_paths.add(path)
+                    elif _source(compose_file) is None and compose_source is None:
+                        uncited_claims.add("Compose file")
 
     for key in ("required_secrets", "service_dependencies"):
         records = payload.get(key)
