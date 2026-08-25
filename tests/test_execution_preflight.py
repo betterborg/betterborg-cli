@@ -215,7 +215,9 @@ def test_package_manager_caches_are_fingerprint_local(tmp_path: Path) -> None:
     assert environment["POETRY_CACHE_DIR"] == str(cache / "poetry/cache")
     assert environment["CARGO_HOME"] == str(cache / "cargo")
     assert environment["GOMODCACHE"] == str(cache / "go/pkg/mod")
-    assert environment["BUNDLE_PATH"] == str(cache / "bundle")
+    assert environment["BUNDLE_USER_CACHE"] == str(cache / "bundler")
+    assert "BUNDLE_PATH" not in environment
+    assert "GEM_HOME" not in environment
 
 
 def test_repository_local_cache_must_be_ignored(
@@ -283,33 +285,78 @@ def test_restart_reuses_matching_successful_materialization(
     assert _materialization_count(fixture.cache_root) == 1
 
 
-def test_descriptor_change_rematerializes_before_coding(
+def test_same_task_descriptor_change_rematerializes_before_sanity(
     execution_preflight_fixture,
 ) -> None:
-    fixture = execution_preflight_fixture(task_count=2)
+    fixture = execution_preflight_fixture()
     plan = _plan(fixture.repository)
 
     with SqliteStore.open(fixture.database) as store:
-        first_claim = fixture.claim(store)
+        claim = fixture.claim(store)
         first = fixture.manager().materialize_claimed_task(
-            store, plan, first_claim, fixture.owner_token
+            store, plan, claim, fixture.owner_token
         )
 
-        changed_worktree = fixture.worktree_paths[1]
+        changed_worktree = fixture.worktree_paths[0]
+        (changed_worktree / "README.md").write_text(
+            "coding work\n", encoding="utf-8"
+        )
         (changed_worktree / "package.lock").write_text(
             "lock-v2\n", encoding="utf-8"
         )
         _git(changed_worktree, "add", "package.lock")
         _git(changed_worktree, "commit", "--quiet", "-m", "update lock")
 
-        second_claim = fixture.claim(store)
         second = fixture.manager().materialize_claimed_task(
-            store, plan, second_claim, fixture.owner_token
+            store, plan, claim, fixture.owner_token
         )
+        runtime = store.get_task_runtime(claim.task_id)
 
     assert second.fingerprint != first.fingerprint
     assert second.preparation_reused is False
     assert _preparation_count(fixture.cache_root) == 2
+    assert (changed_worktree / "README.md").read_text() == "coding work\n"
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+
+
+def test_environment_command_contaminating_primary_checkout_blocks_task(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="materialize",
+    )
+
+    def contaminate_primary(*args, **kwargs):
+        (fixture.repository / "README.md").write_text(
+            "contaminated\n", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args[0], 0, "", "")
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={"PATH": os.environ["PATH"]},
+        command_runner=contaminate_primary,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with pytest.raises(
+            EnvironmentMaterializationError,
+            match="primary checkout.*changed",
+        ):
+            manager.materialize_claimed_task(
+                store, plan, claim, fixture.owner_token
+            )
+        runtime = store.get_task_runtime(claim.task_id)
+        attempts = store.list_environment_attempts(claim.task_id)
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert attempts[-1].status is ExecutionAttemptStatus.FAILED
+    assert (fixture.repository / "README.md").read_text() == "contaminated\n"
 
 
 def test_build_secret_is_scoped_and_redacted_from_durable_failure(
@@ -350,6 +397,39 @@ def test_build_secret_is_scoped_and_redacted_from_durable_failure(
     assert token not in attempts[-1].error
     assert "[REDACTED]" in attempts[-1].error
     assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+
+
+def test_build_secret_is_not_exposed_outside_used_by_stage(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    token = "test-only-package-token"
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="capture-secret",
+        secrets=(
+            HostSecret(
+                name="PACKAGE_TOKEN",
+                scope="build",
+                used_by=("test",),
+                evidence="fixture",
+            ),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        fixture.manager().materialize_claimed_task(
+            store,
+            plan,
+            claim,
+            fixture.owner_token,
+            secret_values={"PACKAGE_TOKEN": token},
+        )
+
+    captured = fixture.worktree_paths[0] / ".dependencies/secret"
+    assert captured.read_text(encoding="utf-8") == "unset\n"
 
 
 def test_tracked_changes_are_rejected_and_task_work_is_preserved(
@@ -481,6 +561,10 @@ def _write_fake_package_manager(path: Path) -> None:
         "    ;;\n"
         "  tracked)\n"
         "    printf 'changed\\n' > README.md\n"
+        "    ;;\n"
+        "  capture-secret)\n"
+        "    mkdir -p .dependencies\n"
+        "    printf '%s\\n' \"${PACKAGE_TOKEN:-unset}\" > .dependencies/secret\n"
         "    ;;\n"
         "  fail)\n"
         "    printf '%s\\n' \"${PACKAGE_TOKEN:-package failed}\" >&2\n"

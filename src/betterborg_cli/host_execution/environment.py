@@ -196,13 +196,10 @@ def package_manager_cache_environment(
             }
         )
     if managers & {"bundler", "bundle", "ruby"}:
-        result.update(
-            {
-                "BUNDLE_PATH": str(cache / "bundle"),
-                "BUNDLE_USER_CACHE": str(cache / "bundler"),
-                "GEM_HOME": str(cache / "gem"),
-            }
-        )
+        # BUNDLE_PATH and GEM_HOME are installation locations, not download
+        # caches.  Setting either here would put the consumer's installed gems
+        # in shared state instead of its own checkout.
+        result["BUNDLE_USER_CACHE"] = str(cache / "bundler")
     return result
 
 
@@ -268,6 +265,7 @@ class HostEnvironmentManager:
                 "claimed task has no persisted worktree"
             )
         worktree = Path(runtime.worktree_path).resolve()
+        resumed_from_coding = runtime.status is TaskRuntimeStatus.CODING
         if runtime.status is TaskRuntimeStatus.CLAIMED:
             runtime = store.transition_task_runtime(
                 claim.run_id,
@@ -278,21 +276,26 @@ class HostEnvironmentManager:
                 new_status=TaskRuntimeStatus.ENVIRONMENT,
                 now=self._clock(),
             )
-        elif runtime.status is not TaskRuntimeStatus.ENVIRONMENT:
+        elif runtime.status not in {
+            TaskRuntimeStatus.ENVIRONMENT,
+            TaskRuntimeStatus.CODING,
+        }:
             raise EnvironmentMaterializationError(
-                "task must be claimed or resuming its environment phase"
+                "task must be claimed, resuming its environment phase, or "
+                "rematerializing before sanity"
             )
 
         try:
             self._assert_task_worktree(worktree, runtime.branch)
             self._guard.assert_clean("task environment materialization")
-            self._assert_no_tracked_changes(
-                worktree, "before environment materialization"
-            )
+            if not resumed_from_coding:
+                self._assert_no_tracked_changes(
+                    worktree, "before environment materialization"
+                )
             fingerprint = environment_fingerprint(plan, worktree)
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
-            command_environment, mask_values = self._command_environment(
+            command_environments = self._command_environments(
                 plan, cache_path, secret_values or {}
             )
             preparation_reused = self._ensure_prepared(
@@ -303,8 +306,7 @@ class HostEnvironmentManager:
                 fingerprint=fingerprint,
                 cache_path=cache_path,
                 source_worktree=worktree,
-                command_environment=command_environment,
-                mask_values=mask_values,
+                command_environments=command_environments,
             )
             materialization_reused = self._materialize_worktree(
                 store,
@@ -314,22 +316,22 @@ class HostEnvironmentManager:
                 fingerprint=fingerprint,
                 worktree=worktree,
                 cache_path=cache_path,
-                command_environment=command_environment,
-                mask_values=mask_values,
+                command_environments=command_environments,
             )
         except BaseException as error:
             self._block_environment_task(store, claim, owner_token, error)
             raise
 
-        store.transition_task_runtime(
-            claim.run_id,
-            owner_token,
-            claim.id,
-            claim.claim_token,
-            expected_status=TaskRuntimeStatus.ENVIRONMENT,
-            new_status=TaskRuntimeStatus.CODING,
-            now=self._clock(),
-        )
+        if not resumed_from_coding:
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.ENVIRONMENT,
+                new_status=TaskRuntimeStatus.CODING,
+                now=self._clock(),
+            )
         return EnvironmentMaterialization(
             fingerprint=fingerprint,
             cache_path=cache_path,
@@ -347,8 +349,9 @@ class HostEnvironmentManager:
         fingerprint: str,
         cache_path: Path,
         source_worktree: Path,
-        command_environment: Mapping[str, str],
-        mask_values: Sequence[str],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
     ) -> bool:
         if not plan.prepare_commands:
             return False
@@ -373,8 +376,7 @@ class HostEnvironmentManager:
                 worktree=None,
                 preparation_source=source_worktree,
                 cache_path=cache_path,
-                command_environment=command_environment,
-                mask_values=mask_values,
+                command_environments=command_environments,
             )
             return False
 
@@ -388,8 +390,9 @@ class HostEnvironmentManager:
         fingerprint: str,
         worktree: Path,
         cache_path: Path,
-        command_environment: Mapping[str, str],
-        mask_values: Sequence[str],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
     ) -> bool:
         if store.find_completed_environment_attempt(
             fingerprint, kind="materialize", task_id=claim.task_id
@@ -409,8 +412,7 @@ class HostEnvironmentManager:
             commands=commands,
             worktree=worktree,
             cache_path=cache_path,
-            command_environment=command_environment,
-            mask_values=mask_values,
+            command_environments=command_environments,
         )
         return False
 
@@ -425,8 +427,9 @@ class HostEnvironmentManager:
         commands: Sequence[HostCommand],
         worktree: Path | None,
         cache_path: Path,
-        command_environment: Mapping[str, str],
-        mask_values: Sequence[str],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
         preparation_source: Path | None = None,
     ) -> None:
         prior = [
@@ -455,33 +458,45 @@ class HostEnvironmentManager:
         )
 
         started = time.monotonic()
+        mask_values = tuple(
+            sorted(
+                {
+                    value
+                    for command in commands
+                    for value in command_environments[command.stage][1]
+                },
+                key=len,
+                reverse=True,
+            )
+        )
         try:
-            if preparation_source is None:
-                if worktree is None:
-                    raise AssertionError("materialization worktree is required")
-                results = self._run_commands(
-                    commands,
-                    worktree=worktree,
-                    environment=command_environment,
-                    mask_values=mask_values,
-                )
-            else:
-                if worktree is not None:
-                    raise AssertionError(
-                        "preparation cannot use a caller-provided worktree"
-                    )
-                with self._preparation_worktree(
-                    fingerprint, preparation_source
-                ) as preparation_worktree:
+            with self._guard.protect(str(claim.task_id), f"environment {kind}"):
+                if preparation_source is None:
+                    if worktree is None:
+                        raise AssertionError(
+                            "materialization worktree is required"
+                        )
                     results = self._run_commands(
                         commands,
-                        worktree=preparation_worktree,
-                        environment=command_environment,
-                        mask_values=mask_values,
+                        worktree=worktree,
+                        command_environments=command_environments,
                     )
-                (cache_path / ".betterborg-prepared").write_text(
-                    f"{fingerprint}\n", encoding="utf-8"
-                )
+                else:
+                    if worktree is not None:
+                        raise AssertionError(
+                            "preparation cannot use a caller-provided worktree"
+                        )
+                    with self._preparation_worktree(
+                        fingerprint, preparation_source
+                    ) as preparation_worktree:
+                        results = self._run_commands(
+                            commands,
+                            worktree=preparation_worktree,
+                            command_environments=command_environments,
+                        )
+                    (cache_path / ".betterborg-prepared").write_text(
+                        f"{fingerprint}\n", encoding="utf-8"
+                    )
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = _redact(str(error), mask_values)
@@ -514,13 +529,15 @@ class HostEnvironmentManager:
         commands: Sequence[HostCommand],
         *,
         worktree: Path,
-        environment: Mapping[str, str],
-        mask_values: Sequence[str],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
     ) -> list[dict[str, object]]:
-        self._assert_no_tracked_changes(worktree, "before environment command")
+        before = self._tracked_state(worktree)
         results: list[dict[str, object]] = []
         for command in commands:
             cwd = _command_cwd(worktree, command.cwd)
+            environment, mask_values = command_environments[command.stage]
             try:
                 completed = self._run(
                     list(command.argv),
@@ -551,45 +568,65 @@ class HostEnvironmentManager:
                     f"environment command {command.argv!r} failed with exit code "
                     f"{completed.returncode}: {detail}"
                 )
-        self._assert_no_tracked_changes(worktree, "after environment command")
+        after = self._tracked_state(worktree)
+        if after != before:
+            details = after[1].replace("\0", "\n").strip() or "HEAD changed"
+            raise EnvironmentMaterializationError(
+                "worktree has unexpected tracked changes after environment "
+                f"command: {details}"
+            )
         return results
 
-    def _command_environment(
+    def _command_environments(
         self,
         plan: HostPreflightPlan,
         cache_path: Path,
         secret_values: Mapping[str, str],
-    ) -> tuple[dict[str, str], tuple[str, ...]]:
-        environment = {
+    ) -> dict[str, tuple[dict[str, str], tuple[str, ...]]]:
+        base_environment = {
             name: self._environment[name]
             for name in _SAFE_HOST_ENVIRONMENT
             if name in self._environment
         }
-        environment.update(
+        base_environment.update(
             package_manager_cache_environment(cache_path, plan.package_managers)
         )
         home = cache_path / "home"
         home.mkdir(parents=True, exist_ok=True)
-        environment.update(
+        base_environment.update(
             {
                 "GIT_TERMINAL_PROMPT": "0",
                 "HOME": str(home),
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             }
         )
-        mask_values: list[str] = []
-        for secret in plan.secret_requirements:
-            if secret.scope not in {"all", "build"}:
-                continue
-            value = secret_values.get(secret.name)
-            if value is None:
-                raise EnvironmentMaterializationError(
-                    f"build-scoped secret value is unavailable: {secret.name}"
-                )
-            environment[secret.name] = value
-            if value:
-                mask_values.append(value)
-        return environment, tuple(sorted(set(mask_values), key=len, reverse=True))
+        stages = {
+            command.stage
+            for command in (*plan.prepare_commands, *plan.materialize_commands)
+        }
+        environments: dict[str, tuple[dict[str, str], tuple[str, ...]]] = {}
+        for stage in stages:
+            environment = dict(base_environment)
+            mask_values: list[str] = []
+            for secret in plan.secret_requirements:
+                if (
+                    secret.scope not in {"all", "build"}
+                    or stage not in secret.used_by
+                ):
+                    continue
+                value = secret_values.get(secret.name)
+                if value is None:
+                    raise EnvironmentMaterializationError(
+                        f"build-scoped secret value is unavailable: {secret.name}"
+                    )
+                environment[secret.name] = value
+                if value:
+                    mask_values.append(value)
+            environments[stage] = (
+                environment,
+                tuple(sorted(set(mask_values), key=len, reverse=True)),
+            )
+        return environments
 
     @contextmanager
     def _preparation_worktree(
@@ -656,6 +693,12 @@ class HostEnvironmentManager:
                 f"{details}"
             )
 
+    def _tracked_state(self, worktree: Path) -> tuple[str, str, str]:
+        git = SafeGit(worktree)
+        status = git.run(["status", "--porcelain=v1", "-z", "-uno"]).stdout
+        diff = git.run(["diff", "--binary", "HEAD", "--"]).stdout
+        return git.head_sha(), status, diff
+
     def _assert_task_worktree(self, worktree: Path, branch: str | None) -> None:
         expected_branch = f"refs/heads/{branch}" if branch is not None else None
         if not any(
@@ -700,7 +743,10 @@ class HostEnvironmentManager:
         error: BaseException,
     ) -> None:
         runtime = store.get_task_runtime(claim.task_id)
-        if runtime is None or runtime.status is not TaskRuntimeStatus.ENVIRONMENT:
+        if runtime is None or runtime.status not in {
+            TaskRuntimeStatus.ENVIRONMENT,
+            TaskRuntimeStatus.CODING,
+        }:
             return
         reason = str(error) or error.__class__.__name__
         try:
@@ -709,7 +755,7 @@ class HostEnvironmentManager:
                 owner_token,
                 claim.id,
                 claim.claim_token,
-                expected_status=TaskRuntimeStatus.ENVIRONMENT,
+                expected_status=runtime.status,
                 new_status=TaskRuntimeStatus.BLOCKED,
                 state_reason=reason,
                 now=self._clock(),
