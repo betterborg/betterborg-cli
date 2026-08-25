@@ -633,6 +633,32 @@ class ExecutionRun:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionRunAcquisition:
+    """Result of contending for one Borg execution operation.
+
+    Every contender learns the durable operation ID, but only the caller that
+    created the run receives its ownership token.
+    """
+
+    operation_id: UUID
+    owner_token: str | None
+    acquired: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, UUID):
+            raise TypeError("execution operation ID must be a UUID")
+        if self.acquired != (self.owner_token is not None):
+            raise ValueError("only an acquired execution run has an owner token")
+        if self.owner_token is not None and len(self.owner_token) < 32:
+            raise ValueError("execution run owner token must be unguessable")
+
+    @property
+    def run_id(self) -> UUID:
+        """Return the operation ID using the execution-store name."""
+        return self.operation_id
+
+
+@dataclass(frozen=True, slots=True)
 class TaskRuntime:
     """Mutable execution projection for one immutable generated task."""
 

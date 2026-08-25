@@ -1,8 +1,11 @@
 """Contracts for migration-006 host-execution ownership state."""
 
+import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -14,11 +17,18 @@ from betterborg_cli.store import (
     ComposeResource,
     EnvironmentAttempt,
     ExecutionEvent,
+    ExecutionOwnershipError,
     ExecutionRun,
+    ExecutionRunStatus,
     PlanApproval,
     Repository,
     SqliteStore,
+    TaskBatch,
     TaskClaim,
+    TaskComplexity,
+    TaskDependency,
+    TaskGeneration,
+    TaskRecord,
     TaskRuntime,
     TaskRuntimeStatus,
 )
@@ -73,6 +83,76 @@ def _execution_fixture(tmp_path: Path, approved_task_generation):
         )
 
     return database, borg, generation, task
+
+
+def _dependency_execution_fixture(tmp_path: Path):
+    database = tmp_path / "state.sqlite3"
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="DependencyExecutor")
+    approval = PlanApproval(
+        borg_id=borg.id,
+        plan_digest="sha256:plan",
+        manifest={"plan.md": "sha256:plan"},
+    )
+    batch = TaskBatch(
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        round=1,
+        digest="sha256:batch",
+        manifest={"tasks": ["foundation", "consumer"]},
+    )
+    generation = TaskGeneration(
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        batch_id=batch.id,
+        digest="sha256:generation",
+        manifest={"tasks": ["foundation", "consumer"]},
+    )
+
+    def task(task_ref: str, position: int) -> TaskRecord:
+        digest = hashlib.sha256(task_ref.encode()).hexdigest()
+        return TaskRecord(
+            generation_id=generation.id,
+            borg_id=borg.id,
+            task_ref=task_ref,
+            stage="07-host-execution",
+            stem=f"{position:02d}-{task_ref}",
+            position=position,
+            title=f"Implement {task_ref}",
+            complexity=TaskComplexity.SMALL,
+            digest=f"sha256:{digest}",
+            task={"acceptance_criteria": [f"{task_ref} works"]},
+            manifest={"task.md": f"sha256:{digest}"},
+        )
+
+    foundation = task("foundation", 1)
+    consumer = task("consumer", 2)
+    dependency = TaskDependency(
+        generation_id=generation.id,
+        task_id=consumer.id,
+        depends_on_task_id=foundation.id,
+    )
+    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_plan_approval(approval)
+        store.append_task_batch(batch)
+        store.add_task_generation(
+            generation,
+            [foundation, consumer],
+            [dependency],
+        )
+        for record in (foundation, consumer):
+            path = durable_root / record.stage / f"{record.stem}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(record.task_ref, encoding="utf-8")
+        store._promote_published_task_generation(
+            generation.id, durable_root=durable_root
+        )
+
+    return database, borg, generation, foundation, consumer
 
 
 def test_execution_ownership_records_round_trip_after_reopen(
@@ -374,3 +454,389 @@ def test_execution_history_and_resource_ownership_are_immutable(
             "compose_resources": store.list_compose_resources(task.id),
         }
         assert persisted_records[table] == [records[table]]
+
+
+def test_execution_acquisition_is_atomic_across_store_connections(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, _task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+    barrier = Barrier(2)
+
+    def acquire():
+        with SqliteStore.open(database) as store:
+            barrier.wait()
+            return store.acquire_execution_run(
+                borg.id,
+                generation.id,
+                lease_duration=timedelta(minutes=5),
+                now=now,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        acquisitions = list(executor.map(lambda _index: acquire(), range(2)))
+
+    assert len({result.operation_id for result in acquisitions}) == 1
+    assert [result.acquired for result in acquisitions].count(True) == 1
+    owner = next(result for result in acquisitions if result.acquired)
+    observer = next(result for result in acquisitions if not result.acquired)
+    assert owner.owner_token is not None
+    assert observer.owner_token is None
+
+    claim_barrier = Barrier(2)
+
+    def claim():
+        with SqliteStore.open(database) as store:
+            claim_barrier.wait()
+            return store.claim_dependency_ready_task(
+                owner.run_id,
+                owner.owner_token,
+                lease_duration=timedelta(minutes=2),
+                now=now,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(lambda _index: claim(), range(2)))
+
+    assert sum(result is not None for result in claims) == 1
+    with SqliteStore.open(database) as store:
+        assert len(store.list_execution_runs(borg.id)) == 1
+        assert len(store.list_task_claims(owner.run_id)) == 1
+        assert {event.kind for event in store.list_execution_events(owner.run_id)} == {
+            "run.acquired",
+            "task.claimed",
+        }
+
+
+def test_claims_only_select_dependency_ready_tasks(tmp_path: Path) -> None:
+    database, borg, generation, foundation, consumer = (
+        _dependency_execution_fixture(tmp_path)
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        first = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert first is not None
+        assert first.task_id == foundation.id
+        assert (
+            store.claim_dependency_ready_task(
+                acquisition.run_id,
+                acquisition.owner_token,
+                lease_duration=timedelta(minutes=2),
+                now=now + timedelta(seconds=1),
+            )
+            is None
+        )
+
+        store.transition_task_runtime(
+            acquisition.run_id,
+            acquisition.owner_token,
+            first.id,
+            first.claim_token,
+            expected_status=TaskRuntimeStatus.CLAIMED,
+            new_status=TaskRuntimeStatus.DONE,
+            now=now + timedelta(seconds=2),
+        )
+        second = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now + timedelta(seconds=3),
+        )
+        assert second is not None
+        assert second.task_id == consumer.id
+
+
+def test_expiry_preserves_attempts_and_blocks_reclaim_until_compose_cleanup(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert claim is not None
+        runtime = store.transition_task_runtime(
+            acquisition.run_id,
+            acquisition.owner_token,
+            claim.id,
+            claim.claim_token,
+            expected_status=TaskRuntimeStatus.CLAIMED,
+            new_status=TaskRuntimeStatus.CODING,
+            now=now + timedelta(seconds=10),
+        )
+        assert runtime.status is TaskRuntimeStatus.CODING
+        attempt = AgentAttempt(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="coding",
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.SUBSCRIPTION,
+            status=AgentStatus.COMPLETED,
+            log_path="artifacts/coding.log",
+            result_path="artifacts/coding.json",
+            summary="Checkpoint preserved.",
+            started_at=now + timedelta(seconds=10),
+            finished_at=now + timedelta(seconds=20),
+        )
+        resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name="borg-foundation-exact",
+            resource_type="network",
+            resource_name="borg-foundation-exact_default",
+            labels={"com.docker.compose.project": "borg-foundation-exact"},
+            created_at=now + timedelta(seconds=15),
+        )
+        store.append_agent_attempt(attempt)
+        store.add_compose_resource(resource)
+
+        renewed = store.renew_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=5),
+            now=now + timedelta(minutes=1),
+        )
+        assert renewed.lease_expires_at == now + timedelta(minutes=6)
+        assert store.reconcile_expired_execution_runs(
+            now=now + timedelta(minutes=5)
+        ) == []
+
+        stale = store.reconcile_expired_execution_runs(
+            now=now + timedelta(minutes=7)
+        )
+        assert stale == [resource]
+        interrupted = store.get_execution_run(acquisition.run_id)
+        assert interrupted is not None
+        assert interrupted.status is ExecutionRunStatus.CANCELLED
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.CODING
+        assert store.list_agent_attempts(task.id) == [attempt]
+        assert store.list_task_claims(acquisition.run_id)[0].released_at is None
+
+        replacement = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now + timedelta(minutes=7),
+        )
+        assert replacement.owner_token is not None
+        assert (
+            store.claim_dependency_ready_task(
+                replacement.run_id,
+                replacement.owner_token,
+                lease_duration=timedelta(minutes=2),
+                now=now + timedelta(minutes=7),
+            )
+            is None
+        )
+
+        cleaned = store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            resource.project_name,
+            now=now + timedelta(minutes=7, seconds=1),
+        )
+        assert cleaned == [resource]
+        assert store.list_stale_compose_resources(acquisition.run_id) == []
+        released = store.list_task_claims(acquisition.run_id)[0]
+        assert released.released_at == now + timedelta(minutes=7, seconds=1)
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.PENDING
+        reclaimed = store.claim_dependency_ready_task(
+            replacement.run_id,
+            replacement.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now + timedelta(minutes=7, seconds=2),
+        )
+        assert reclaimed is not None
+        assert reclaimed.task_id == task.id
+
+        kinds = {
+            event.kind
+            for event in store.list_execution_events(acquisition.run_id)
+        }
+        assert {
+            "run.acquired",
+            "run.lease_renewed",
+            "run.expired",
+            "task.claimed",
+            "task.interrupted",
+            "task.phase_transitioned",
+            "compose.cleanup_completed",
+        } <= kinds
+
+
+def test_interruption_preserves_completed_task_and_guards_phase_ownership(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=2),
+            now=now,
+        )
+        assert claim is not None
+
+        with pytest.raises(ExecutionOwnershipError, match="no longer owned"):
+            store.transition_task_runtime(
+                acquisition.run_id,
+                acquisition.owner_token,
+                claim.id,
+                "wrong-claim-token",
+                expected_status=TaskRuntimeStatus.CLAIMED,
+                new_status=TaskRuntimeStatus.DONE,
+                now=now + timedelta(seconds=1),
+            )
+
+        resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=claim.id,
+            task_id=task.id,
+            project_name="borg-completed-exact",
+            resource_type="project",
+            resource_name="borg-completed-exact",
+            created_at=now + timedelta(seconds=1),
+        )
+        store.add_compose_resource(resource)
+        completed = store.transition_task_runtime(
+            acquisition.run_id,
+            acquisition.owner_token,
+            claim.id,
+            claim.claim_token,
+            expected_status=TaskRuntimeStatus.CLAIMED,
+            new_status=TaskRuntimeStatus.DONE,
+            now=now + timedelta(seconds=2),
+        )
+        assert completed.status is TaskRuntimeStatus.DONE
+
+        assert store.interrupt_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            reason="operator requested stop",
+            now=now + timedelta(seconds=3),
+        ) == [resource]
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+        assert store.list_task_claims(acquisition.run_id)[0].released_at is None
+
+        store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            resource.project_name,
+            now=now + timedelta(seconds=4),
+        )
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+        assert store.list_task_claims(acquisition.run_id)[0].released_at == (
+            now + timedelta(seconds=4)
+        )
+
+
+def test_renewal_reconciles_an_expired_open_claim_before_reclaim(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        expired_claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now,
+        )
+        assert expired_claim is not None
+        resource = ComposeResource(
+            run_id=acquisition.run_id,
+            claim_id=expired_claim.id,
+            task_id=task.id,
+            project_name="borg-expired-claim",
+            resource_type="project",
+            resource_name="borg-expired-claim",
+            created_at=now + timedelta(seconds=1),
+        )
+        store.add_compose_resource(resource)
+
+        store.renew_execution_run(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=5),
+            now=now + timedelta(minutes=2),
+        )
+        persisted = store.list_task_claims(acquisition.run_id)
+        assert persisted[0].released_at is None
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.CLAIMED
+
+        store.confirm_compose_project_cleanup(
+            acquisition.run_id,
+            task.id,
+            resource.project_name,
+            now=now + timedelta(minutes=2, seconds=1),
+        )
+        persisted = store.list_task_claims(acquisition.run_id)
+        assert persisted[0].released_at == now + timedelta(minutes=2, seconds=1)
+        assert store.get_task_runtime(task.id).status is TaskRuntimeStatus.PENDING
+
+        replacement_claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=1),
+            now=now + timedelta(minutes=2, seconds=2),
+        )
+        assert replacement_claim is not None
+        assert replacement_claim.id != expired_claim.id
+        assert "task.claim_expired" in {
+            event.kind
+            for event in store.list_execution_events(acquisition.run_id)
+        }
