@@ -82,6 +82,45 @@ def test_primary_guard_detects_dirt_and_phase_contamination(
         guard.assert_clean()
 
 
+def test_primary_guard_detects_clean_commit_during_phase(
+    committed_git_repo: Path,
+) -> None:
+    guard = PrimaryCheckoutGuard(committed_git_repo)
+    original_head = _git(committed_git_repo, "rev-parse", "HEAD").strip()
+    guard.before_phase("07-host/task", "coding")
+
+    (committed_git_repo / "escaped.py").write_text("ESCAPED = True\n")
+    _git(committed_git_repo, "add", "escaped.py")
+    _git(committed_git_repo, "commit", "-m", "escaped commit")
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="HEAD changed"
+    ) as caught:
+        guard.after_phase("07-host/task", "coding")
+    assert original_head in str(caught.value)
+    assert _git(committed_git_repo, "status", "--porcelain") == ""
+
+
+def test_primary_guard_detects_clean_branch_switch_during_phase(
+    committed_git_repo: Path,
+) -> None:
+    guard = PrimaryCheckoutGuard(committed_git_repo)
+    original_branch = _git(
+        committed_git_repo, "rev-parse", "--abbrev-ref", "HEAD"
+    ).strip()
+    _git(committed_git_repo, "branch", "escaped-branch")
+    guard.before_phase("07-host/task", "coding")
+
+    _git(committed_git_repo, "checkout", "escaped-branch")
+
+    with pytest.raises(
+        PrimaryCheckoutContaminationError, match="branch changed"
+    ) as caught:
+        guard.after_phase("07-host/task", "coding")
+    assert f"{original_branch} -> escaped-branch" in str(caught.value)
+    assert _git(committed_git_repo, "status", "--porcelain") == ""
+
+
 def test_allocates_persists_reuses_and_cleans_task_worktree(
     committed_git_repo: Path,
     approved_task_generation,
