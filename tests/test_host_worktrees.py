@@ -34,6 +34,8 @@ from betterborg_cli.store.models import TaskRuntimeStatus, utcnow
 @pytest.mark.parametrize(
     "arguments",
     [
+        ["reset", "HEAD~1"],
+        ["reset", "--soft", "HEAD~1"],
         ["reset", "--hard", "HEAD"],
         ["checkout", "--", "README.md"],
         ["checkout", "HEAD", "README.md"],

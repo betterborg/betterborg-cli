@@ -26,7 +26,6 @@ _SAFE_SUBCOMMANDS = frozenset(
         "ls-files",
         "merge",
         "merge-base",
-        "reset",
         "rev-list",
         "rev-parse",
         "show",
@@ -52,8 +51,6 @@ _BLOCKED_FLAGS = frozenset(
 _BLOCKED_COMBINATIONS = (
     ("checkout", "--"),
     ("checkout", "."),
-    ("reset", "--merge"),
-    ("reset", "--keep"),
     ("worktree", "remove", "--force"),
 )
 
