@@ -746,6 +746,7 @@ def service_url_environment(
                 if published is not None:
                     environment[service.url_env] = _service_url(
                         service.url_env,
+                        service.compose_service,
                         "127.0.0.1",
                         published,
                         target_port=service.port,
@@ -768,26 +769,27 @@ def _published_port(
 
 def _service_url(
     env_name: str,
-    service_name: str,
+    service_identity: str,
+    host: str,
     port: int,
     *,
     target_port: int | None = None,
     protocol: str = "tcp",
 ) -> str:
     if protocol == "udp":
-        return f"udp://{service_name}:{port}"
-    key = f"{env_name} {service_name}".casefold()
+        return f"udp://{host}:{port}"
+    key = f"{env_name} {service_identity}".casefold()
     if "redis" in key:
-        return f"redis://{service_name}:{port}/0"
+        return f"redis://{host}:{port}/0"
     if "postgres" in key or "database" in key:
-        return f"postgres://{service_name}:{port}/postgres"
+        return f"postgres://{host}:{port}/postgres"
     if "mysql" in key or "mariadb" in key:
-        return f"mysql://{service_name}:{port}/mysql"
+        return f"mysql://{host}:{port}/mysql"
     if "mongo" in key:
-        return f"mongodb://{service_name}:{port}"
+        return f"mongodb://{host}:{port}"
     if "http" in key or target_port in {80, 3000, 8000, 8080}:
-        return f"http://{service_name}:{port}"
-    return f"tcp://{service_name}:{port}"
+        return f"http://{host}:{port}"
+    return f"tcp://{host}:{port}"
 
 
 def _service_target_ports(

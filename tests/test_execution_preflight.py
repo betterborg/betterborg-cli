@@ -1118,6 +1118,25 @@ def test_external_service_urls_do_not_create_compose_inputs() -> None:
     }
 
 
+def test_compose_url_scheme_uses_service_identity_with_loopback_host() -> None:
+    services = (
+        HostService(
+            name="cache",
+            kind="compose",
+            evidence="fixture",
+            compose_service="redis",
+            url_env="CACHE_URL",
+            port=6379,
+            url_targets=(("CACHE_URL", 6379, "tcp"),),
+        ),
+    )
+
+    assert service_url_environment(
+        services,
+        published_ports={("redis", 6379, "tcp"): 49153},
+    ) == {"CACHE_URL": "redis://127.0.0.1:49153/0"}
+
+
 def _task_record(
     generation: TaskGeneration, borg: Borg, position: int
 ) -> TaskRecord:

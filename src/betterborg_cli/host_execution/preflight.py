@@ -19,6 +19,8 @@ from betterborg_cli.workspace_trust import (
     require_workspace_trust,
 )
 
+_MINIMUM_COMPOSE_VERSION = (2, 24, 4)
+
 
 @dataclass(frozen=True, slots=True)
 class HostPreflightFailure:
@@ -755,21 +757,48 @@ class HostPreflight:
                 else:
                     docker = HostExecutable("docker", docker_path)
                     executables.append(docker)
-            if docker is not None and self._compose_version_output(docker.path) is None:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            "the Docker Compose plugin must be available on the host"
-                        ),
-                        evidence=", ".join(
-                            _evidence(item, name) for name, item in compose_selected
-                        ),
-                        guidance=(
-                            "Install or enable 'docker compose' and verify "
-                            "'docker compose version' succeeds."
-                        ),
+            if docker is not None:
+                compose_version = self._compose_version_output(docker.path)
+                if compose_version is None:
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                "the Docker Compose plugin must be available on the "
+                                "host"
+                            ),
+                            evidence=", ".join(
+                                _evidence(item, name)
+                                for name, item in compose_selected
+                            ),
+                            guidance=(
+                                "Install or enable 'docker compose' and verify "
+                                "'docker compose version' succeeds."
+                            ),
+                        )
                     )
-                )
+                elif not _supported_compose_version(compose_version):
+                    minimum = ".".join(map(str, _MINIMUM_COMPOSE_VERSION))
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"Docker Compose {minimum} or newer is required for "
+                                "selected services"
+                            ),
+                            evidence=(
+                                ", ".join(
+                                    _evidence(item, name)
+                                    for name, item in compose_selected
+                                )
+                                + f"; docker compose version reported: "
+                                f"{compose_version}"
+                            ),
+                            guidance=(
+                                "Upgrade the Docker Compose plugin, verify "
+                                f"'docker compose version' reports {minimum} or "
+                                "newer, then retry."
+                            ),
+                        )
+                    )
         return compose_files, compose_profiles, services
 
     def _validate_compose(
@@ -1086,6 +1115,17 @@ def _contains_version(output: str, version: str) -> bool:
         )
         is not None
     )
+
+
+def _supported_compose_version(output: str) -> bool:
+    match = re.search(
+        r"(?<![0-9A-Za-z])v?(\d+)\.(\d+)\.(\d+)(?!\d)",
+        output,
+    )
+    if match is None:
+        return False
+    version = tuple(int(component) for component in match.groups())
+    return version >= _MINIMUM_COMPOSE_VERSION
 
 
 def _valid_external_url(value: object) -> bool:

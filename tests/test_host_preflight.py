@@ -652,6 +652,64 @@ def test_missing_compose_metadata_and_plugin_block_before_claim(
     assert "compose.yml#postgres" in result.reason
 
 
+@pytest.mark.parametrize(
+    ("compose_version", "supported"),
+    [("2.24.3", False), ("2.24.4", True)],
+)
+def test_compose_plugin_must_support_runtime_overrides(
+    committed_git_repo: Path,
+    compose_version: str,
+    supported: bool,
+) -> None:
+    binary_dir = (
+        committed_git_repo.parent / f"{committed_git_repo.name}-compose-version-bin"
+    )
+    binary_dir.mkdir()
+    _executable(binary_dir, "available-command", "exit 0")
+    _executable(
+        binary_dir,
+        "docker",
+        "test \"$1 $2\" = 'compose version' "
+        f"&& echo 'Docker Compose v{compose_version}'",
+    )
+    compose_file = committed_git_repo / "compose.yml"
+    compose_file.write_text(
+        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
+    )
+    plan = {
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["available-command"],
+                    "uses_services": ["database"],
+                }
+            ]
+        },
+        "compose": {"file": "compose.yml", "source": "compose.yml"},
+        "service_dependencies": [
+            {
+                "name": "database",
+                "compose_service": "postgres",
+                "source": "compose.yml#services.postgres",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    if supported:
+        assert isinstance(result, HostPreflightPlan)
+        return
+    assert isinstance(result, HostPreflightBlock)
+    assert len(result.failures) == 1
+    assert "Docker Compose 2.24.4 or newer is required" in result.reason
+    assert f"Docker Compose v{compose_version}" in result.reason
+    assert "Upgrade the Docker Compose plugin" in result.reason
+
+
 def test_preserves_ordered_compose_stack_and_active_profiles(
     committed_git_repo: Path,
 ) -> None:
