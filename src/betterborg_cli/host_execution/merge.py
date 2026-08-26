@@ -68,7 +68,6 @@ class HostMergeConfig:
     """Provider and artifact settings for conflict-resolution attempts."""
 
     model: str
-    project_name: str
     billing_mode: BillingMode = BillingMode.API
     effort: str | None = None
     allowed_tools: tuple[str, ...] = ()
@@ -78,8 +77,6 @@ class HostMergeConfig:
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("merge model must not be empty")
-        if not self.project_name.strip():
-            raise ValueError("merge project name must not be empty")
         object.__setattr__(self, "billing_mode", BillingMode(self.billing_mode))
         object.__setattr__(self, "allowed_tools", tuple(self.allowed_tools))
         if self.artifact_root is not None:
@@ -739,7 +736,7 @@ class HostMergePhase:
             raise MergePhaseError("task Borg is missing")
         if borg.id != generation.borg_id:
             raise MergePhaseError("task Borg does not match its generation")
-        branch = f"project/{self._config.project_name}"
+        branch = f"project/{borg.name}"
         if not self._primary_git.is_valid_branch_name(branch):
             raise MergePhaseError(f"invalid project branch: {branch!r}")
         return branch

@@ -60,6 +60,10 @@ def _git(root: Path, *arguments: str, check: bool = True) -> str:
     ).stdout.strip()
 
 
+def _project_branch(fixture: CodingFixture) -> str:
+    return f"project/{fixture.borg.name}"
+
+
 def _approved_merge_fixture(tmp_path: Path) -> CodingFixture:
     fixture = _coding_fixture(tmp_path)
     review = MockAdapter().queue(
@@ -91,7 +95,7 @@ def _advance_project_base(
     (fixture.repository / filename).write_text(content, encoding="utf-8")
     _git(fixture.repository, "add", filename)
     _git(fixture.repository, "commit", "--quiet", "-m", "advance project base")
-    project_branch = "project/coding"
+    project_branch = _project_branch(fixture)
     previous = _git(fixture.repository, "rev-parse", project_branch)
     destination = _git(fixture.repository, "rev-parse", "main")
     _git(
@@ -112,7 +116,7 @@ def _phase(
     return HostMergePhase(
         fixture.repository,
         adapter,
-        config=HostMergeConfig(model="merge-model", project_name="coding"),
+        config=HostMergeConfig(model="merge-model"),
         repository_lock=repository_lock,
     )
 
@@ -138,6 +142,7 @@ def test_clean_merge_produces_tip_without_agent_or_base_advance(
 
     assert result.status is TaskRuntimeStatus.MERGING
     assert result.tip is not None and not result.tip.agent_used
+    assert result.tip.project_branch == _project_branch(fixture)
     assert result.tip.base_commit == base_commit
     assert adapter.calls == []
     assert phases == ["coding", "review"]
@@ -154,7 +159,10 @@ def test_clean_merge_produces_tip_without_agent_or_base_advance(
     assert completion["commit_sha"] == result.tip.commit_sha
     assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
     assert repository_lock.entries == 1
-    assert _git(fixture.repository, "rev-parse", "project/coding") == base_commit
+    assert (
+        _git(fixture.repository, "rev-parse", _project_branch(fixture))
+        == base_commit
+    )
     assert SafeGit(Path(runtime.worktree_path)).is_ancestor(
         base_commit, result.tip.commit_sha
     )
@@ -427,7 +435,10 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
     assert "feature.txt" in adapter.calls[0].user_prompt
     assert runtime is not None
     assert _git(Path(runtime.worktree_path), "status", "--porcelain") == ""
-    assert _git(fixture.repository, "rev-parse", "project/coding") == base_commit
+    assert (
+        _git(fixture.repository, "rev-parse", _project_branch(fixture))
+        == base_commit
+    )
 
 
 def test_conflict_verification_reacquires_real_path_lock_factory(
@@ -508,7 +519,7 @@ def test_conflict_agent_moving_project_base_is_detected(
         _git(
             spec.cwd,
             "update-ref",
-            "refs/heads/project/coding",
+            f"refs/heads/{_project_branch(fixture)}",
             approved_commit,
             base_commit,
         )
@@ -528,7 +539,7 @@ def test_conflict_agent_moving_project_base_is_detected(
     assert result.tip is None
     assert "project base moved" in result.reason
     assert repository_lock.entries == 2
-    assert _git(fixture.repository, "rev-parse", "project/coding") == (
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
         approved_commit
     )
     assert attempt.result["_betterborg"]["commit_sha"] is None
@@ -560,7 +571,10 @@ def test_agent_claiming_completion_with_unresolved_paths_blocks_and_preserves(
         "feature.txt"
     )
     assert "unresolved paths" in (runtime.state_reason or "")
-    assert _git(fixture.repository, "rev-parse", "project/coding") == base_commit
+    assert (
+        _git(fixture.repository, "rev-parse", _project_branch(fixture))
+        == base_commit
+    )
 
 
 def test_safe_git_denial_blocks_without_invoking_agent(
@@ -624,4 +638,7 @@ def test_primary_checkout_contamination_blocks_after_clean_merge(
     )
     assert worktree.is_dir()
     assert (fixture.repository / "escaped.txt").read_text() == "escaped\n"
-    assert _git(fixture.repository, "rev-parse", "project/coding") == base_commit
+    assert (
+        _git(fixture.repository, "rev-parse", _project_branch(fixture))
+        == base_commit
+    )
