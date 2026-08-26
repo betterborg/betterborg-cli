@@ -12,6 +12,7 @@ from uuid import UUID
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.store import (
     ExecutionOwnershipError,
+    ExecutionRunAcquisition,
     ExecutionRunStatus,
     SqliteStore,
     TaskClaim,
@@ -145,7 +146,6 @@ class HostTaskScheduler:
         cancel: CancellationToken | None = None,
     ) -> HostSchedulerResult:
         """Run or observe the Borg's current-generation execution operation."""
-        token = cancel or CancellationToken()
         started_at = self._clock()
         acquisition = self._store.acquire_execution_run(
             borg_id,
@@ -153,12 +153,24 @@ class HostTaskScheduler:
             lease_duration=self._config.lease_duration,
             now=started_at,
         )
+        return self.run_acquired(generation_id, acquisition, cancel=cancel)
+
+    def run_acquired(
+        self,
+        generation_id: UUID,
+        acquisition: ExecutionRunAcquisition,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> HostSchedulerResult:
+        """Schedule a run already acquired by the host integration owner."""
         if not acquisition.acquired:
             return self._result(
                 acquisition.operation_id,
                 generation_id,
                 acquired=False,
             )
+        token = cancel or CancellationToken()
+        started_at = self._clock()
         owner_token = acquisition.owner_token
         if owner_token is None:  # Defensive narrowing of the acquisition contract.
             raise RuntimeError("acquired execution run has no owner token")

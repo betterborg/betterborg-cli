@@ -115,8 +115,15 @@ class HostWorktreeManager:
         # checks and is durable. This also makes a partial Git failure wholly
         # resumable: all later tasks already have the exact identity to reuse.
         project_branch = self.ensure_project_base(project_name)
-        for spec in prepared:
-            self._ensure_worktree(spec, base_branch=project_branch)
+        runtimes = {
+            runtime.task_id: runtime
+            for runtime in store.list_task_runtimes(generation_id)
+        }
+        for task, spec in zip(records, prepared, strict=True):
+            # Successful tasks have already published and removed their
+            # checkout. Resume must not recreate completed phase state.
+            if runtimes[task.id].status is not TaskRuntimeStatus.DONE:
+                self._ensure_worktree(spec, base_branch=project_branch)
         return prepared
 
     def cleanup_task_worktree(self, runtime: TaskRuntime) -> bool:

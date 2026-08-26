@@ -63,6 +63,12 @@ from betterborg_cli.host_execution.scheduler import (
     HostTaskScheduler,
     ScheduledTaskContext,
 )
+from betterborg_cli.host_execution.service import (
+    HostExecutionError,
+    HostExecutionResult,
+    HostExecutionService,
+    HostTaskRuntime,
+)
 from betterborg_cli.host_execution.worktrees import (
     HostWorktreeManager,
     WorktreeError,
@@ -77,6 +83,9 @@ __all__ = [
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
     "HostEnvironmentManager",
+    "HostExecutionError",
+    "HostExecutionResult",
+    "HostExecutionService",
     "HostMergeConfig",
     "HostMergePhase",
     "HostMergeResult",
@@ -100,6 +109,7 @@ __all__ = [
     "HostSecret",
     "HostService",
     "HostTaskBehavior",
+    "HostTaskRuntime",
     "HostTaskScheduler",
     "PrimaryCheckoutContaminationError",
     "PrimaryCheckoutGuard",

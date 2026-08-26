@@ -150,7 +150,14 @@ class HostReviewFixPhase:
                 "repository-local review artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+        review_environment: Mapping[str, str] | None = None,
+        fix_environment: Mapping[str, str] | None = None,
+    ) -> TaskRuntimeStatus:
         """Drive REVIEW/FIX until approval, a cap, or another durable stop."""
         while True:
             try:
@@ -205,6 +212,10 @@ class HostReviewFixPhase:
                     inputs,
                     base_commit=base_commit,
                     current_commit=current_commit,
+                    environment={
+                        **(environment or {}),
+                        **(review_environment or {}),
+                    },
                 )
             else:
                 status = self._run_fix(
@@ -214,6 +225,10 @@ class HostReviewFixPhase:
                     inputs,
                     base_commit=base_commit,
                     current_commit=current_commit,
+                    environment={
+                        **(environment or {}),
+                        **(fix_environment or {}),
+                    },
                 )
             if status not in {TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.FIX}:
                 return status
@@ -227,6 +242,7 @@ class HostReviewFixPhase:
         *,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         user_prompt = _render_review_prompt(
             inputs,
@@ -250,6 +266,7 @@ class HostReviewFixPhase:
             user_prompt=user_prompt,
             base_commit=base_commit,
             current_commit=current_commit,
+            environment=environment,
         )
 
     def _run_fix(
@@ -261,6 +278,7 @@ class HostReviewFixPhase:
         *,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         findings = self._findings_for_fix(context, runtime.review_round)
         user_prompt = _render_fix_prompt(
@@ -283,6 +301,7 @@ class HostReviewFixPhase:
             user_prompt=user_prompt,
             base_commit=base_commit,
             current_commit=current_commit,
+            environment=environment,
         )
 
     def _invoke(
@@ -302,6 +321,7 @@ class HostReviewFixPhase:
         user_prompt: str,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         attempts = context.store.list_agent_attempts(context.claim.task_id)
         attempt_number = 1 + sum(item.phase == phase for item in attempts)
@@ -361,7 +381,7 @@ class HostReviewFixPhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=effort,
             billing_mode=billing_mode,
         )

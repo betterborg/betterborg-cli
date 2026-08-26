@@ -139,7 +139,12 @@ class HostCodingPhase:
                 "repository-local coding artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> TaskRuntimeStatus:
         """Invoke coding once, persist its outcome, and require a new commit."""
         try:
             runtime, worktree = self._require_ready_worktree(context)
@@ -217,7 +222,7 @@ class HostCodingPhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=self._config.allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
         )

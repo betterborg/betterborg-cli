@@ -152,7 +152,12 @@ class HostMergePhase:
                 "repository-local merge artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> HostMergeResult:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> HostMergeResult:
         """Produce an attested merge tip without advancing the project base."""
         try:
             runtime, worktree = require_ready_worktree(
@@ -189,6 +194,7 @@ class HostMergePhase:
                 inputs,
                 project_branch=project_branch,
                 approved_commit=approved_commit,
+                environment=environment,
             )
         except (
             HostAgentPhaseError,
@@ -220,6 +226,7 @@ class HostMergePhase:
         *,
         project_branch: str,
         approved_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> HostMergeResult:
         git = SafeGit(worktree)
         if current_branch(git) != runtime.branch:
@@ -267,6 +274,7 @@ class HostMergePhase:
                 approved_commit=approved_commit,
                 base_commit=base_commit,
                 unresolved=unresolved,
+                environment=environment,
             )
         if unresolved:
             raise MergePhaseError(
@@ -402,6 +410,7 @@ class HostMergePhase:
             approved_commit=approved_commit,
             base_commit=base_commit,
             unresolved=unresolved,
+            environment=environment,
         )
 
     def _invoke_agent(
@@ -415,6 +424,7 @@ class HostMergePhase:
         approved_commit: str,
         base_commit: str,
         unresolved: tuple[str, ...],
+        environment: Mapping[str, str] | None,
     ) -> HostMergeResult:
         resumed = self._resume_agent_tip(
             context,
@@ -494,7 +504,7 @@ class HostMergePhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=self._config.allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
         )
