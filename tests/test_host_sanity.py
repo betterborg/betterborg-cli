@@ -116,6 +116,7 @@ def _plan(fixture) -> HostPreflightPlan:  # noqa: ANN001
                 url="https://registry.example.test",
             ),
         ),
+        package_managers=("cargo", "go", "pnpm"),
         secret_requirements=(
             HostSecret("BUILD_TOKEN", "build", ("install",), "fixture"),
             HostSecret("AGENT_TOKEN", "agent", ("install", "test"), "fixture"),
@@ -135,7 +136,10 @@ def _sanity_phase(
         plan,
         environment_manager=HostEnvironmentManager(
             fixture.repository,
-            environment={"PATH": os.environ["PATH"]},
+            environment={
+                "PATH": os.environ["PATH"],
+                "UNDECLARED_HOST": "no",
+            },
         ),
         compose_manager=compose,
         worktree_manager=HostWorktreeManager(
@@ -144,7 +148,6 @@ def _sanity_phase(
             source_branch="main",
         ),
         repository_lock=repository_lock,
-        environment={"PATH": os.environ["PATH"], "UNDECLARED_HOST": "no"},
         command_runner=runner,
     )
 
@@ -153,10 +156,20 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     tmp_path: Path,
 ) -> None:
     fixture, tip, repository_lock = _merged_fixture(tmp_path)
-    plan = _plan(fixture)
+    secret = 'token"with/slash space?x=1&y=2'
+    original_plan = _plan(fixture)
+    plan = replace(
+        original_plan,
+        commands=(
+            replace(
+                original_plan.commands[0],
+                argv=("catalog-install", secret),
+            ),
+            original_plan.commands[1],
+        ),
+    )
     compose = _RecordingCompose(repository_lock, with_stack=False)
     calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
-    secret = 'token"with/slash space?x=1&y=2'
 
     def runner(argv, *, cwd, env, **kwargs):  # noqa: ANN001, ANN003
         assert repository_lock.locked()
@@ -190,7 +203,7 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
         tip.commit_sha
     )
     assert [call[0] for call in calls] == [
-        ("catalog-install",),
+        ("catalog-install", secret),
         ("catalog-test",),
     ]
     assert [
@@ -206,13 +219,31 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert "UNDECLARED_TOKEN" not in install_env | test_env
     assert "UNDECLARED_HOST" not in install_env | test_env
     assert install_env["REGISTRY_URL"] == "https://registry.example.test"
+    assert install_env["HOME"] == test_env["HOME"]
+    assert install_env["XDG_CACHE_HOME"] == test_env["XDG_CACHE_HOME"]
+    assert install_env["CARGO_HOME"] == test_env["CARGO_HOME"]
+    assert install_env["GOCACHE"] == test_env["GOCACHE"]
+    assert install_env["PNPM_STORE_DIR"] == test_env["PNPM_STORE_DIR"]
     assert len(attempts) == len(before_attempts) + 1
     assert attempts[-1].kind == "materialize"
+    cache_path = Path(attempts[-1].result["cache_path"])
+    assert all(
+        Path(value).is_relative_to(cache_path)
+        for value in (
+            install_env["HOME"],
+            install_env["XDG_CACHE_HOME"],
+            install_env["CARGO_HOME"],
+            install_env["GOCACHE"],
+            install_env["PNPM_STORE_DIR"],
+        )
+    )
+    assert result.commands[0].command.argv == ("catalog-install", "[REDACTED]")
+    assert secret not in repr(result)
     persisted = json.dumps(sanity_events[-1].payload)
     assert secret not in persisted
     assert json.dumps(secret)[1:-1] not in persisted
     assert quote(secret, safe="") not in persisted
-    assert persisted.count("[REDACTED]") == 6
+    assert persisted.count("[REDACTED]") == 7
     assert len(compose.started) == 1
     assert compose.stopped == []
 

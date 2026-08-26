@@ -10,9 +10,10 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from urllib.parse import quote
 
 from betterborg_cli.host_execution._locking import path_lock
@@ -52,6 +53,7 @@ class EnvironmentMaterialization:
     cache_path: Path
     preparation_reused: bool
     materialization_reused: bool
+    environment: Mapping[str, str] = field(repr=False, hash=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,8 +339,9 @@ class HostEnvironmentManager:
             fingerprint = _fingerprint_descriptors(plan, descriptors)
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
+            base_environment = self._base_command_environment(plan, cache_path)
             command_environments = self._command_environments(
-                plan, cache_path, secret_values or {}
+                plan, base_environment, secret_values or {}
             )
             preparation_reused = self._ensure_prepared(
                 store,
@@ -380,6 +383,7 @@ class HostEnvironmentManager:
             cache_path=cache_path,
             preparation_reused=preparation_reused,
             materialization_reused=materialization_reused,
+            environment=MappingProxyType(dict(base_environment)),
         )
 
     def _ensure_prepared(
@@ -642,12 +646,11 @@ class HostEnvironmentManager:
             )
         return results
 
-    def _command_environments(
+    def _base_command_environment(
         self,
         plan: HostPreflightPlan,
         cache_path: Path,
-        secret_values: Mapping[str, str],
-    ) -> dict[str, tuple[dict[str, str], tuple[str, ...]]]:
+    ) -> dict[str, str]:
         base_environment = {
             name: self._environment[name]
             for name in _SAFE_HOST_ENVIRONMENT
@@ -665,6 +668,14 @@ class HostEnvironmentManager:
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             }
         )
+        return base_environment
+
+    def _command_environments(
+        self,
+        plan: HostPreflightPlan,
+        base_environment: Mapping[str, str],
+        secret_values: Mapping[str, str],
+    ) -> dict[str, tuple[dict[str, str], tuple[str, ...]]]:
         stages = {
             command.stage
             for command in (*plan.prepare_commands, *plan.materialize_commands)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shlex
 import subprocess
 from collections.abc import Callable, Mapping
@@ -39,14 +38,6 @@ from betterborg_cli.store import ExecutionEvent, TaskRuntime, TaskRuntimeStatus
 RepositoryLockFactory = Callable[[], AbstractContextManager[None]]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
-_SAFE_HOST_ENVIRONMENT = (
-    "LANG",
-    "LC_ALL",
-    "PATH",
-    "PATHEXT",
-    "SYSTEMROOT",
-    "TMPDIR",
-)
 _SANITY_COMPLETED_EVENT = "sanity.completed"
 _BASE_ADVANCE_STARTED_EVENT = "base.advance_started"
 _BASE_ADVANCED_EVENT = "base.advanced"
@@ -103,7 +94,6 @@ class HostSanityPhase:
         compose_manager: HostComposeManager,
         worktree_manager: HostWorktreeManager,
         repository_lock: RepositoryLockFactory,
-        environment: Mapping[str, str] | None = None,
         command_runner: CommandRunner | None = None,
         timeout_seconds: float = 600,
     ) -> None:
@@ -122,12 +112,6 @@ class HostSanityPhase:
         self._compose_manager = compose_manager
         self._worktree_manager = worktree_manager
         self._repository_lock = repository_lock
-        source_environment = os.environ if environment is None else environment
-        self._environment = {
-            name: source_environment[name]
-            for name in _SAFE_HOST_ENVIRONMENT
-            if name in source_environment
-        }
         self._run = command_runner or subprocess.run
         self._timeout_seconds = timeout_seconds
         self._git = SafeGit(self.repository_root)
@@ -249,6 +233,7 @@ class HostSanityPhase:
                 service_environment.update(stack.environment)
             commands = self._run_commands(
                 worktree,
+                materialization_environment=materialization.environment,
                 service_environment=service_environment,
                 secret_values=secret_values,
             )
@@ -341,6 +326,7 @@ class HostSanityPhase:
         self,
         worktree: Path,
         *,
+        materialization_environment: Mapping[str, str],
         service_environment: Mapping[str, str],
         secret_values: Mapping[str, str],
     ) -> tuple[SanityCommandResult, ...]:
@@ -348,13 +334,19 @@ class HostSanityPhase:
         masks = declared_secret_mask_values(self.plan, secret_values)
         for command in self.plan.commands:
             cwd = command_cwd(worktree, command.cwd)
-            environment = dict(self._environment)
+            environment = dict(materialization_environment)
             environment["CI"] = "true"
             environment.update(service_environment)
             command_secrets, _ = command_secret_environment(
                 self.plan, command.stage, secret_values
             )
             environment.update(command_secrets)
+            redacted_command = HostCommand(
+                redact_secrets(command.stage, masks),
+                tuple(redact_secrets(argument, masks) for argument in command.argv),
+                redact_secrets(command.cwd, masks),
+                redact_secrets(command.evidence, masks),
+            )
             try:
                 completed = self._run(
                     list(command.argv),
@@ -366,14 +358,14 @@ class HostSanityPhase:
                     timeout=self._timeout_seconds,
                 )
                 result = SanityCommandResult(
-                    command,
+                    redacted_command,
                     completed.returncode,
                     redact_secrets(completed.stdout or "", masks),
                     redact_secrets(completed.stderr or "", masks),
                 )
             except subprocess.TimeoutExpired as error:
                 result = SanityCommandResult(
-                    command,
+                    redacted_command,
                     -1,
                     redact_secrets(_output(error.stdout), masks),
                     redact_secrets(
@@ -384,7 +376,7 @@ class HostSanityPhase:
                 )
             except OSError as error:
                 result = SanityCommandResult(
-                    command,
+                    redacted_command,
                     -1,
                     "",
                     redact_secrets(f"sanity command could not run: {error}", masks),
