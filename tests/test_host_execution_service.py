@@ -712,6 +712,128 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
         store.close()
 
 
+def test_cancellation_during_materialization_does_not_start_services(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    cancel = CancellationToken()
+    materializing = threading.Event()
+
+    class PausingEnvironment(_Environment):
+        def materialize_claimed_task(self, store, plan, claim, owner_token, **kwargs):
+            self.calls.append("environment")
+            materializing.set()
+            assert cancel.wait(timeout=2)
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.CLAIMED,
+                new_status=TaskRuntimeStatus.CODING,
+            )
+            return SimpleNamespace(environment={"CACHE": "prepared"})
+
+    compose = _Compose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=PausingEnvironment(calls),
+        compose_manager=compose,
+        coding=_Coding(calls),
+        review_fix=_Review(calls),
+        merge=_Merge(calls),
+        sanity=_Sanity(calls),
+    )
+    try:
+        service = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                service.run,
+                borg.id,
+                generation.id,
+                {},
+                cancel=cancel,
+            )
+            assert materializing.wait(timeout=2)
+            cancel.cancel()
+            result = running.result(timeout=2)
+
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert store.get_task_runtime(records[0].id).status is (
+            TaskRuntimeStatus.PENDING
+        )
+        assert "services-start" not in calls
+        assert "coding" not in calls
+    finally:
+        store.close()
+
+
+def test_cancellation_during_compose_startup_does_not_start_coding(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    cancel = CancellationToken()
+    starting_services = threading.Event()
+
+    class PausingCompose(_Compose):
+        def start_claimed_stack(self, *args, **kwargs):
+            self.calls.append("services-start")
+            starting_services.set()
+            assert cancel.wait(timeout=2)
+            return SimpleNamespace(environment={"SERVICE_URL": "http://127.0.0.1"})
+
+    compose = PausingCompose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=_Environment(calls),
+        compose_manager=compose,
+        coding=_Coding(calls),
+        review_fix=_Review(calls),
+        merge=_Merge(calls),
+        sanity=_Sanity(calls),
+    )
+    try:
+        service = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                service.run,
+                borg.id,
+                generation.id,
+                {},
+                cancel=cancel,
+            )
+            assert starting_services.wait(timeout=2)
+            cancel.cancel()
+            result = running.result(timeout=2)
+
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert store.get_task_runtime(records[0].id).status is (
+            TaskRuntimeStatus.PENDING
+        )
+        assert "services-stop" in calls
+        assert "coding" not in calls
+    finally:
+        store.close()
+
+
 def test_external_only_service_url_reaches_every_agent_phase(tmp_path: Path) -> None:
     store, borg, generation, records = _store_fixture(tmp_path)
     calls: list[str] = []
@@ -911,7 +1033,30 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
             "cancelled"
         )
 
-        fixture.coding.queue(_coding_response())
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert runtime is not None and runtime.worktree_path is not None
+        preserved = Path(runtime.worktree_path) / "README.md"
+        preserved.write_text("# Fixture\n\npreserved agent edit\n", encoding="utf-8")
+        fixture.clock.advance(timedelta(seconds=1))
+
+        def commit_preserved_edit(spec):
+            feature = spec.cwd / "feature-resumed.txt"
+            feature.write_text("implemented after resume\n", encoding="utf-8")
+            _git(spec.cwd, "add", "README.md", feature.name)
+            _git(spec.cwd, "commit", "--quiet", "-m", "finish resumed task")
+            return MockResponse(
+                payload={
+                    "task_file": ".betterborg-task/task.md",
+                    "status": "completed",
+                    "summary": "Completed the preserved work.",
+                    "changed_files": ["README.md", feature.name],
+                    "tests_run": ["integration"],
+                    "follow_ups": [],
+                    "blockers": [],
+                }
+            )
+
+        fixture.coding.queue(MockResponse(dynamic=commit_preserved_edit))
         resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         assert resumed.status is ExecutionRunStatus.COMPLETED, (
@@ -922,6 +1067,16 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
         )
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 1
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert (
+            _git(
+                repository.root,
+                "show",
+                f"project/{fixture.borg.name}:README.md",
+            )
+            == "# Fixture\n\npreserved agent edit"
+        )
     finally:
         fixture.store.close()
 

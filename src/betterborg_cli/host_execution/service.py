@@ -190,6 +190,8 @@ class HostTaskRuntime:
 
     def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
         """Materialize, execute, publish, and clean one durable task."""
+        if context.cancel.is_set():
+            return self._durable_status(context)
         try:
             materialization = self._environment.materialize_claimed_task(
                 context.store,
@@ -199,6 +201,8 @@ class HostTaskRuntime:
                 secret_values=self._secret_values,
             )
         except EnvironmentMaterializationError:
+            return self._durable_status(context)
+        if context.cancel.is_set():
             return self._durable_status(context)
 
         stack = None
@@ -214,6 +218,8 @@ class HostTaskRuntime:
             service_environment.update(service_url_environment(self.plan.services))
             if stack is not None:
                 service_environment.update(stack.environment)
+            if context.cancel.is_set():
+                return self._durable_status(context)
 
             status = self._coding.run(
                 context,

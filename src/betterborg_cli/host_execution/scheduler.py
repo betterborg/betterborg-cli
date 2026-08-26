@@ -210,7 +210,7 @@ class HostTaskScheduler:
 
                     self._settle_completed(active, owner_token)
 
-                    while len(active) < self._config.jobs:
+                    while len(active) < self._config.jobs and not token.is_set():
                         claim = self._store.claim_dependency_ready_task(
                             acquisition.run_id,
                             owner_token,

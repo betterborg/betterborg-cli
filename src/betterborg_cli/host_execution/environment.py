@@ -363,10 +363,14 @@ class HostEnvironmentManager:
                 "claimed task has no persisted worktree"
             )
         worktree = Path(runtime.worktree_path).resolve()
-        resumed_from_coding = runtime.status in {
+        preserving_active_phase = runtime.status in {
             TaskRuntimeStatus.CODING,
             TaskRuntimeStatus.MERGING,
         }
+        reclaimed_agent_work = (
+            runtime.status is TaskRuntimeStatus.CLAIMED
+            and claim.resume_phase != TaskRuntimeStatus.ENVIRONMENT.value
+        )
         if runtime.status is TaskRuntimeStatus.CLAIMED:
             runtime = store.transition_task_runtime(
                 claim.run_id,
@@ -375,6 +379,7 @@ class HostEnvironmentManager:
                 claim.claim_token,
                 expected_status=TaskRuntimeStatus.CLAIMED,
                 new_status=TaskRuntimeStatus.ENVIRONMENT,
+                resume_phase=claim.resume_phase,
                 now=self._clock(),
             )
         elif runtime.status not in {
@@ -390,7 +395,7 @@ class HostEnvironmentManager:
         try:
             self._assert_task_worktree(worktree, runtime.branch)
             self._guard.assert_clean("task environment materialization")
-            if not resumed_from_coding:
+            if not preserving_active_phase and not reclaimed_agent_work:
                 self._assert_no_tracked_changes(
                     worktree, "before environment materialization"
                 )
@@ -427,7 +432,7 @@ class HostEnvironmentManager:
             self._block_environment_task(store, claim, owner_token, error)
             raise
 
-        if not resumed_from_coding:
+        if not preserving_active_phase:
             store.transition_task_runtime(
                 claim.run_id,
                 owner_token,
@@ -435,6 +440,7 @@ class HostEnvironmentManager:
                 claim.claim_token,
                 expected_status=TaskRuntimeStatus.ENVIRONMENT,
                 new_status=TaskRuntimeStatus.CODING,
+                resume_phase=(claim.resume_phase if reclaimed_agent_work else None),
                 now=self._clock(),
             )
         return EnvironmentMaterialization(
