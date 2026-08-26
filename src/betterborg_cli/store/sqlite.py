@@ -2511,12 +2511,13 @@ class SqliteStore:
         return rows
 
     def list_task_completion_samples(self) -> list[TaskCompletionSample]:
-        """Return repository-local coding/review work for completed tasks.
+        """Return repository-local agent work for completed tasks.
 
-        Fix attempts are review-loop agent work. Merge, environment, waits, and
-        incomplete attempts are intentionally outside this total-agent-work
-        sample. Missing durations or token fields remain unknown rather than
-        being converted to zero or a partial measurement.
+        Fix attempts are review-loop agent work. Every terminal attempt counts,
+        including failed or interrupted work later retried before task
+        completion. Environment work and waits are not agent work. Missing
+        durations or token fields remain unknown rather than being converted to
+        zero or a partial measurement.
         """
         with self.locked_connection() as connection:
             task_rows = connection.execute(
@@ -2545,7 +2546,7 @@ class SqliteStore:
                     'agent.attempt_finished', 'agent.attempt_interrupted'
                  )
                 WHERE runtime.status = 'done'
-                  AND attempt.phase IN ('coding', 'review', 'fix')
+                  AND attempt.phase IN ('coding', 'review', 'fix', 'merge')
                 ORDER BY attempt.started_at, attempt.id
                 """
             ).fetchall()
@@ -2555,7 +2556,7 @@ class SqliteStore:
         }
         for row in attempt_rows:
             attempt = _row_to_agent_attempt(row)
-            if attempt.status is ExecutionAttemptStatus.COMPLETED:
+            if attempt.status is not ExecutionAttemptStatus.RUNNING:
                 attempts_by_task[str(attempt.task_id)].append(attempt)
 
         samples = []
@@ -2571,6 +2572,7 @@ class SqliteStore:
             review = [
                 attempt for attempt in attempts if attempt.phase in {"review", "fix"}
             ]
+            merge = [attempt for attempt in attempts if attempt.phase == "merge"]
             samples.append(
                 TaskCompletionSample(
                     generation_id=UUID(row["generation_id"]),
@@ -2579,6 +2581,7 @@ class SqliteStore:
                     duration_seconds=duration,
                     coding_usage=_strict_attempt_usage(coding),
                     review_usage=_strict_attempt_usage(review),
+                    merge_usage=_strict_attempt_usage(merge),
                 )
             )
         return samples

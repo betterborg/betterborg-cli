@@ -89,7 +89,7 @@ def test_native_command_validates_and_persists_result_metadata(
                 (
                     json.dumps({"type": "thread.started", "thread_id": "test"}),
                     _usage_event(20, 7, 5, 2, 4),
-                    _usage_event(12, 10, 3, cache_write_input_tokens=6),
+                    _usage_event(18, 10, 3, cache_write_input_tokens=6),
                 )
             ),
             encoding="utf-8",
@@ -149,7 +149,7 @@ def test_native_command_validates_and_persists_result_metadata(
     assert result.billing_mode == BillingMode.SUBSCRIPTION
     assert result.artifacts == (artifact,)
     assert result.usage == AgentUsage(
-        tokens_input=32,
+        tokens_input=11,
         tokens_output=8,
         tokens_cache_read=17,
         tokens_cache_write=10,
@@ -282,7 +282,7 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert result.usage == AgentUsage(
-        tokens_input=400,
+        tokens_input=310,
         tokens_output=40,
         tokens_cache_read=75,
         tokens_cache_write=15,

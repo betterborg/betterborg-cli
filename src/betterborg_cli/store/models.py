@@ -773,6 +773,7 @@ class TaskCompletionSample:
     duration_seconds: float | None
     coding_usage: AgentUsage | None
     review_usage: AgentUsage | None
+    merge_usage: AgentUsage | None
 
     def __post_init__(self) -> None:
         for name in ("generation_id", "task_id"):
@@ -784,7 +785,7 @@ class TaskCompletionSample:
             )
         if self.duration_seconds is not None and self.duration_seconds < 0:
             raise ValueError("task completion sample duration must not be negative")
-        for name in ("coding_usage", "review_usage"):
+        for name in ("coding_usage", "review_usage", "merge_usage"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, AgentUsage):
                 raise TypeError(f"task completion sample {name} must be AgentUsage")

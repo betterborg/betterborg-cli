@@ -459,11 +459,19 @@ def _response_usage(response: Mapping[str, Any]) -> AgentUsage:
     details = raw.get("input_tokens_details", {})
     if not isinstance(details, Mapping):
         raise OpenAIApiError("OpenAI input token details are malformed")
+    total_input = token(raw, "input_tokens")
+    cache_read = token(details, "cached_tokens")
+    cache_write = token(details, "cache_write_tokens")
+    cached_input = (cache_read or 0) + (cache_write or 0)
+    if total_input is not None and cached_input > total_input:
+        raise OpenAIApiError("OpenAI cached input exceeds total input")
     return AgentUsage(
-        tokens_input=token(raw, "input_tokens"),
+        tokens_input=(
+            total_input - cached_input if total_input is not None else None
+        ),
         tokens_output=token(raw, "output_tokens"),
-        tokens_cache_read=token(details, "cached_tokens"),
-        tokens_cache_write=token(details, "cache_write_tokens"),
+        tokens_cache_read=cache_read,
+        tokens_cache_write=cache_write,
         num_turns=1,
     )
 

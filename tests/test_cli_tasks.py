@@ -220,7 +220,7 @@ def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
     )
     assert "n=0, source=dummy_prior" in terminal.output
     assert "API estimate: unknown" in terminal.output
-    assert "Billing mode unknown for: coding, review" in terminal.output
+    assert "Billing mode unknown for: coding, merge, review" in terminal.output
 
     assert machine.exit_code == 0, machine.output
     estimate = json.loads(machine.output)

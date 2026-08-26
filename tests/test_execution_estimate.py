@@ -12,6 +12,12 @@ from betterborg_cli.execution_estimate import (
     DUMMY_PRIORS,
     PhaseBilling,
     estimate_generation,
+    phase_billing_from_config,
+)
+from betterborg_cli.repository_config import (
+    AgentChoice,
+    AgentChoices,
+    RepositoryConfig,
 )
 from betterborg_cli.store import TaskCompletionSample, TaskComplexity
 
@@ -33,12 +39,14 @@ def _sample(complexity: TaskComplexity, duration: float) -> TaskCompletionSample
         duration_seconds=duration,
         coding_usage=_usage(int(duration)),
         review_usage=_usage(int(duration)),
+        merge_usage=_usage(int(duration)),
     )
 
 
 def _billing(
     coding: BillingMode | None = BillingMode.SUBSCRIPTION,
     review: BillingMode | None = BillingMode.SUBSCRIPTION,
+    merge: BillingMode | None = BillingMode.SUBSCRIPTION,
     *,
     model: str = "gpt-5",
 ) -> tuple[PhaseBilling, ...]:
@@ -50,7 +58,7 @@ def _billing(
             model,
         )
 
-    return phase("coding", coding), phase("review", review)
+    return phase("coding", coding), phase("review", review), phase("merge", merge)
 
 
 def test_zero_samples_uses_prominently_versioned_dummy_prior() -> None:
@@ -134,17 +142,44 @@ def test_missing_prior_and_unsized_tasks_stay_unknown() -> None:
     assert estimate["per_complexity"][0]["source"] == "unknown"
 
 
+def test_unsized_task_makes_an_api_total_unknown_instead_of_partial() -> None:
+    estimate = estimate_generation(
+        uuid4(),
+        [TaskComplexity.SMALL, None],
+        [],
+        _billing(BillingMode.API, BillingMode.API, BillingMode.API),
+    )
+
+    assert estimate["billing"]["api"]["unknown"] is True
+    assert estimate["billing"]["api"]["estimate"] is None
+
+
 @pytest.mark.parametrize(
-    ("billing", "api_unknown", "has_api", "subscription"),
+    ("billing", "api_unknown", "has_api", "subscription_phases"),
     (
-        (_billing(BillingMode.API, BillingMode.API), False, True, False),
-        (_billing(), False, False, True),
-        (_billing(BillingMode.API, BillingMode.SUBSCRIPTION), False, True, True),
         (
-            _billing(BillingMode.API, BillingMode.API, model="unpriced-model"),
+            _billing(BillingMode.API, BillingMode.API, BillingMode.API),
+            False,
+            True,
+            [],
+        ),
+        (_billing(), False, False, ["coding", "merge", "review"]),
+        (
+            _billing(BillingMode.API, BillingMode.SUBSCRIPTION),
+            False,
+            True,
+            ["merge", "review"],
+        ),
+        (
+            _billing(
+                BillingMode.API,
+                BillingMode.API,
+                BillingMode.API,
+                model="unpriced-model",
+            ),
             True,
             False,
-            False,
+            [],
         ),
     ),
 )
@@ -152,7 +187,7 @@ def test_api_subscription_mixed_and_unpriced_billing_are_honest(
     billing: tuple[PhaseBilling, ...],
     api_unknown: bool,
     has_api: bool,
-    subscription: bool,
+    subscription_phases: list[str],
 ) -> None:
     estimate = estimate_generation(
         uuid4(), [TaskComplexity.SMALL], [], billing
@@ -161,12 +196,58 @@ def test_api_subscription_mixed_and_unpriced_billing_are_honest(
     assert estimate["billing"]["api"]["unknown"] is api_unknown
     assert (estimate["billing"]["api"]["estimate"] is not None) is has_api
     assert estimate["billing"]["subscription"] == {
-        "included": subscription,
-        "phases": ["review"] if len(set(item.mode for item in billing)) > 1 else (
-            ["coding", "review"] if subscription else []
-        ),
+        "included": bool(subscription_phases),
+        "phases": subscription_phases,
         "usd": None,
     }
+
+
+def test_merge_agent_usage_and_billing_are_part_of_api_commitment() -> None:
+    with_merge = estimate_generation(
+        uuid4(),
+        [TaskComplexity.SMALL],
+        [],
+        _billing(BillingMode.API, BillingMode.API, BillingMode.API),
+    )
+    without_merge_api = estimate_generation(
+        uuid4(),
+        [TaskComplexity.SMALL],
+        [],
+        _billing(BillingMode.API, BillingMode.API, BillingMode.SUBSCRIPTION),
+    )
+
+    assert [item["phase"] for item in with_merge["billing"]["api"]["models"]] == [
+        "coding",
+        "review",
+        "merge",
+    ]
+    assert with_merge["billing"]["api"]["estimate"]["p50"] > (
+        without_merge_api["billing"]["api"]["estimate"]["p50"]
+    )
+    assert with_merge["per_complexity"][0]["token_source"]["merge"] == (
+        "dummy_prior"
+    )
+
+
+def test_phase_billing_resolves_configured_merge_agent() -> None:
+    config = RepositoryConfig(
+        version=1,
+        repository_id=uuid4(),
+        default_branch="main",
+        agents=AgentChoices(
+            coding=AgentChoice(adapter="codex"),
+            review=AgentChoice(adapter="claude"),
+            merge=AgentChoice(adapter="openai", model="gpt-5-mini"),
+        ),
+    )
+
+    assert phase_billing_from_config(config) == (
+        PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+        PhaseBilling(
+            "review", BillingMode.SUBSCRIPTION, None, "claude-opus-4-8"
+        ),
+        PhaseBilling("merge", BillingMode.API, "openai", "gpt-5-mini"),
+    )
 
 
 def test_missing_usage_or_unpriced_model_is_not_converted_to_zero() -> None:
@@ -175,6 +256,19 @@ def test_missing_usage_or_unpriced_model_is_not_converted_to_zero() -> None:
     assert estimate_api_cost_usd("openai", "gpt-5", _usage()) == pytest.approx(
         0.012625
     )
+
+
+def test_openai_cached_input_is_not_also_charged_as_fresh_input() -> None:
+    assert estimate_api_cost_usd(
+        "openai",
+        "gpt-5",
+        AgentUsage(
+            tokens_input=0,
+            tokens_output=0,
+            tokens_cache_read=1_000,
+            tokens_cache_write=0,
+        ),
+    ) == pytest.approx(0.000125)
 
 
 def test_dummy_priors_are_complete_for_each_size() -> None:

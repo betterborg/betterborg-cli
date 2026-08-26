@@ -31,6 +31,7 @@ DUMMY_PRIOR_LABEL = (
 )
 LOCAL_BLEND_SAMPLE_COUNT = 5
 _LEVELS = tuple(TaskComplexity)
+_PHASES = ("coding", "review", "merge")
 _DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "claude": "claude-opus-4-8",
@@ -62,6 +63,7 @@ class ComplexityPrior:
     time_seconds: EstimateRange
     coding_usage: UsageRange
     review_usage: UsageRange
+    merge_usage: UsageRange
 
 
 def _usage(
@@ -91,6 +93,10 @@ DUMMY_PRIORS: dict[TaskComplexity, ComplexityPrior] = {
             _usage(40_000, 80_000, 10_000, 8_000),
             _usage(80_000, 160_000, 20_000, 16_000),
         ),
+        merge_usage=UsageRange(
+            _usage(40_000, 80_000, 10_000, 8_000),
+            _usage(80_000, 160_000, 20_000, 16_000),
+        ),
     ),
     TaskComplexity.MEDIUM: ComplexityPrior(
         time_seconds=EstimateRange(3_600.0, 7_200.0),
@@ -102,6 +108,10 @@ DUMMY_PRIORS: dict[TaskComplexity, ComplexityPrior] = {
             _usage(80_000, 160_000, 20_000, 16_000),
             _usage(160_000, 320_000, 40_000, 32_000),
         ),
+        merge_usage=UsageRange(
+            _usage(80_000, 160_000, 20_000, 16_000),
+            _usage(160_000, 320_000, 40_000, 32_000),
+        ),
     ),
     TaskComplexity.LARGE: ComplexityPrior(
         time_seconds=EstimateRange(7_200.0, 14_400.0),
@@ -110,6 +120,10 @@ DUMMY_PRIORS: dict[TaskComplexity, ComplexityPrior] = {
             _usage(640_000, 1_280_000, 160_000, 128_000),
         ),
         review_usage=UsageRange(
+            _usage(160_000, 320_000, 40_000, 32_000),
+            _usage(320_000, 640_000, 80_000, 64_000),
+        ),
+        merge_usage=UsageRange(
             _usage(160_000, 320_000, 40_000, 32_000),
             _usage(320_000, 640_000, 80_000, 64_000),
         ),
@@ -128,10 +142,11 @@ class PhaseBilling:
 
 
 def phase_billing_from_config(config: RepositoryConfig) -> tuple[PhaseBilling, ...]:
-    """Resolve non-secret coding/review billing facts from tracked config."""
+    """Resolve non-secret agent-phase billing facts from tracked config."""
     return (
         _choice_billing("coding", config.agents.coding),
         _choice_billing("review", config.agents.review),
+        _choice_billing("merge", config.agents.merge),
     )
 
 
@@ -172,7 +187,7 @@ def estimate_generation(
 
     local = list(samples)
     phase_billings = {item.phase: item for item in billing}
-    for phase in ("coding", "review"):
+    for phase in _PHASES:
         phase_billings.setdefault(phase, PhaseBilling(phase, None, None, None))
     per_complexity = []
     total_p50 = 0.0
@@ -181,8 +196,6 @@ def estimate_generation(
     total_sample_size = 0
     api_p50 = 0.0
     api_p80 = 0.0
-    api_unknown = False
-    api_present = False
     subscription_phases = sorted(
         item.phase
         for item in phase_billings.values()
@@ -190,6 +203,12 @@ def estimate_generation(
     )
     unknown_phases = sorted(
         item.phase for item in phase_billings.values() if item.mode is None
+    )
+    api_present = bool(task_items) and any(
+        item.mode is BillingMode.API for item in phase_billings.values()
+    )
+    api_unknown = bool(task_items and unknown_phases) or bool(
+        unsized and api_present
     )
 
     for level in _LEVELS:
@@ -214,7 +233,7 @@ def estimate_generation(
                 total_p80 += count * time_range.p80
 
         usage_ranges: dict[str, tuple[UsageRange | None, int]] = {}
-        for phase in ("coding", "review"):
+        for phase in _PHASES:
             usages = [
                 usage
                 for sample in level_samples
@@ -259,7 +278,6 @@ def estimate_generation(
             if selection.mode is None:
                 api_unknown = True
                 continue
-            api_present = True
             usage_range = usage_ranges.get(phase, (None, 0))[0]
             if (
                 usage_range is None

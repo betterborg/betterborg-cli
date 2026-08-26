@@ -286,12 +286,7 @@ def _terminal_error(log_path: Path, exit_code: int) -> str:
 
 
 def _extract_usage(log_path: Path) -> AgentUsage | None:
-    """Sum Codex totals while preserving cache breakdowns separately.
-
-    Codex mirrors the Responses API: ``input_tokens`` already includes cached
-    input and ``output_tokens`` already includes reasoning output.  The detail
-    fields must therefore not be subtracted from or added to those totals.
-    """
+    """Sum Codex usage while preserving mutually exclusive token buckets."""
     if not log_path.exists() or log_path.stat().st_size == 0:
         return None
     total_input = 0
@@ -309,9 +304,12 @@ def _extract_usage(log_path: Path) -> AgentUsage | None:
         usage = event.get("usage")
         if not isinstance(usage, Mapping):
             continue
-        total_input += _token(usage.get("input_tokens"))
-        cached_input += _token(usage.get("cached_input_tokens"))
-        cache_write_input += _token(usage.get("cache_write_input_tokens"))
+        turn_input = _token(usage.get("input_tokens"))
+        turn_cached = _token(usage.get("cached_input_tokens"))
+        turn_cache_write = _token(usage.get("cache_write_input_tokens"))
+        total_input += max(turn_input - turn_cached - turn_cache_write, 0)
+        cached_input += turn_cached
+        cache_write_input += turn_cache_write
         total_output += _token(usage.get("output_tokens"))
         turns += 1
     if turns == 0:

@@ -701,7 +701,13 @@ def test_completed_task_samples_include_agent_work_and_preserve_missing_usage(
         )
         assert claim is not None
 
-        for offset, phase in enumerate(("coding", "review", "fix", "merge"), 1):
+        statuses = {
+            "coding": AgentStatus.COMPLETED,
+            "review": AgentStatus.COMPLETED,
+            "fix": AgentStatus.FAILED,
+            "merge": AgentStatus.CANCELLED,
+        }
+        for offset, phase in enumerate(statuses, 1):
             attempt = AgentAttempt(
                 run_id=acquisition.run_id,
                 claim_id=claim.id,
@@ -726,7 +732,7 @@ def test_completed_task_samples_include_agent_work_and_preserve_missing_usage(
                 attempt.id,
                 acquisition.owner_token,
                 claim.claim_token,
-                status=AgentStatus.COMPLETED,
+                status=statuses[phase],
                 duration_seconds=float(offset * 10),
                 usage=(
                     AgentUsage(
@@ -755,7 +761,7 @@ def test_completed_task_samples_include_agent_work_and_preserve_missing_usage(
     assert len(samples) == 1
     sample = samples[0]
     assert sample.complexity is TaskComplexity.MEDIUM
-    assert sample.duration_seconds == 60.0  # merge's 40 seconds are excluded
+    assert sample.duration_seconds == 100.0
     assert sample.coding_usage == AgentUsage(
         tokens_input=1,
         tokens_output=1,
@@ -769,6 +775,12 @@ def test_completed_task_samples_include_agent_work_and_preserve_missing_usage(
         tokens_cache_write=None,
         cost_usd=None,
         num_turns=None,
+    )
+    assert sample.merge_usage == AgentUsage(
+        tokens_input=4,
+        tokens_output=4,
+        tokens_cache_read=4,
+        tokens_cache_write=4,
     )
 
 
