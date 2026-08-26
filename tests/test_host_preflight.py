@@ -567,7 +567,7 @@ def test_compose_url_environment_requires_an_exact_service_port(
     assert "DATABASE_URL requires an exact port" in result.reason
 
 
-def test_compose_url_environment_uses_first_port_without_promoting_port_env(
+def test_compose_url_environment_includes_declared_port_endpoints(
     committed_git_repo: Path,
 ) -> None:
     binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
@@ -593,7 +593,8 @@ def test_compose_url_environment_uses_first_port_without_promoting_port_env(
     assert isinstance(database, dict)
     del database["port"]
     database["ports"] = [
-        {"port": 5432, "protocol": "udp", "env": "POSTGRES_PORT"}
+        {"port": 5432, "protocol": "udp", "env": "POSTGRES_PORT"},
+        {"port": 9187, "protocol": "tcp", "env": "METRICS_URL"},
     ]
 
     result = _preflight(
@@ -607,11 +608,21 @@ def test_compose_url_environment_uses_first_port_without_promoting_port_env(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.services[0].port == 5432
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
+    assert result.services[0].url_targets == (
+        ("DATABASE_URL", 5432, "udp"),
+        ("POSTGRES_PORT", 5432, "udp"),
+        ("METRICS_URL", 9187, "tcp"),
+    )
     assert service_url_environment(
-        result.services, published_ports={("postgres", 5432, "udp"): 49152}
+        result.services,
+        published_ports={
+            ("postgres", 5432, "udp"): 49152,
+            ("postgres", 9187, "tcp"): 49153,
+        },
     ) == {
         "DATABASE_URL": "udp://127.0.0.1:49152",
+        "POSTGRES_PORT": "udp://127.0.0.1:49152",
+        "METRICS_URL": "postgres://127.0.0.1:49153/postgres",
         "SEARCH_URL": "https://search.example.test/api",
     }
 

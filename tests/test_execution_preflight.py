@@ -974,6 +974,95 @@ def test_compose_subprocess_environment_excludes_host_credentials(
     )
 
 
+def test_compose_cleanup_metadata_excludes_resolved_env_file_secrets(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    credential = "credential-from-service-env-file"
+    worktree = fixture.worktree_paths[0]
+    (worktree / "service.env").write_text(
+        f"SERVICE_TOKEN={credential}\n", encoding="utf-8"
+    )
+    compose_file = worktree / "compose.yml"
+    compose_file.write_text(
+        compose_file.read_text(encoding="utf-8").replace(
+            "  healthy:\n", "  healthy:\n    env_file: service.env\n"
+        ),
+        encoding="utf-8",
+    )
+    runner.config_services["healthy"]["environment"] = {
+        "SERVICE_TOKEN": credential
+    }
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, _compose_plan(fixture.repository), claim, fixture.owner_token
+        )
+        assert stack is not None
+        persisted = "\n".join(
+            path.read_text(encoding="utf-8") for path in stack.compose_files
+        )
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, stack, claim, fixture.owner_token
+        )
+
+    assert credential not in persisted
+    assert "SERVICE_TOKEN" not in persisted
+    assert stack.compose_files[0].name == "compose.cleanup.json"
+
+
+def test_distinct_dependencies_share_one_compose_service(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    plan = replace(
+        _compose_plan(fixture.repository),
+        services=(
+            HostService(
+                name="application",
+                kind="compose",
+                evidence="fixture",
+                compose_service="healthy",
+                url_env="SERVICE_URL",
+                port=8080,
+                url_targets=(("SERVICE_URL", 8080, "tcp"),),
+            ),
+            HostService(
+                name="metrics",
+                kind="compose",
+                evidence="fixture",
+                compose_service="healthy",
+                url_env="METRICS_HTTP_URL",
+                port=8081,
+                url_targets=(("METRICS_HTTP_URL", 8081, "tcp"),),
+            ),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, plan, claim, fixture.owner_token
+        )
+        assert stack is not None
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, stack, claim, fixture.owner_token
+        )
+
+    assert runner.started_services[stack.project_name] == ("healthy",)
+    assert set(stack.environment) == {"SERVICE_URL", "METRICS_HTTP_URL"}
+    assert all(
+        value.startswith("http://127.0.0.1:")
+        for value in stack.environment.values()
+    )
+    assert {
+        command[-1] for command in runner.port_commands
+    } == {"8080", "8081"}
+
+
 def test_udp_compose_endpoint_preserves_protocol_and_loopback_binding(
     execution_preflight_fixture,
 ) -> None:

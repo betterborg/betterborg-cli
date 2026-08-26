@@ -126,11 +126,11 @@ class HostComposeManager:
                 if service.compose_service is not None
             )
         )
-        if len(selected) != len(compose_services):
+        if any(service.compose_service is None for service in compose_services):
             raise ValueError("validated Compose services require exact service names")
 
         try:
-            files, network_names = self._write_runtime_configuration(
+            startup_files, files, network_names = self._write_runtime_configuration(
                 project_name,
                 source_files,
                 plan.compose_profiles,
@@ -179,7 +179,9 @@ class HostComposeManager:
                 for name in network_names
             ),
         )
-        command = _compose_base(project_name, files, plan.compose_profiles) + (
+        command = _compose_base(
+            project_name, startup_files, plan.compose_profiles
+        ) + (
             "up",
             "--detach",
             "--wait",
@@ -223,7 +225,7 @@ class HostComposeManager:
                     now=created_at,
                 )
 
-                result = self._invoke(command, cwd=runtime_directory)
+                result = self._invoke(command, cwd=worktree)
                 if result.returncode != 0:
                     raise ComposeStackError(
                         _command_error(
@@ -310,8 +312,8 @@ class HostComposeManager:
         compose_services: Sequence[HostService],
         selected: Sequence[str],
         worktree: Path,
-    ) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-        """Resolve mutable task inputs into claim-owned Compose files."""
+    ) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[str, ...]]:
+        """Create claim-owned startup isolation and secret-free cleanup files."""
         config_command = _compose_base(project_name, files, profiles) + (
             "config",
             "--format",
@@ -378,12 +380,17 @@ class HostComposeManager:
             owned_volumes,
         )
         override_directory = self.repository_root / ".borg/state/compose" / project_name
-        resolved = override_directory / "compose.resolved.json"
+        cleanup = override_directory / "compose.cleanup.json"
         override = override_directory / "compose.override.yml"
+        cleanup_model = _cleanup_compose_model(
+            selected,
+            owned_networks,
+            owned_volumes,
+        )
         try:
             override_directory.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(
-                json.dumps(model, indent=2, sort_keys=True) + "\n",
+            cleanup.write_text(
+                json.dumps(cleanup_model, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
             override.write_text(override_text, encoding="utf-8")
@@ -393,7 +400,7 @@ class HostComposeManager:
                 project_name=project_name,
                 command=config_command,
             ) from error
-        return (resolved, override), network_names
+        return (*files, override), (cleanup, override), network_names
 
     def _assert_services_healthy(
         self,
@@ -718,38 +725,30 @@ def service_url_environment(
     """Return only URL variables declared by the validated service plan."""
     environment: dict[str, str] = {}
     for service in services:
-        if service.url_env is None:
-            continue
-        if service.kind == "external" and service.url is not None:
+        if (
+            service.kind == "external"
+            and service.url_env is not None
+            and service.url is not None
+        ):
             environment[service.url_env] = service.url
         elif service.kind == "compose" and service.compose_service is not None:
-            if service.url is not None:
-                environment[service.url_env] = service.url
-            elif service.port is not None and 0 < service.port <= 65535:
-                protocol = next(
-                    (
-                        target_protocol
-                        for target_env, target_port, target_protocol in (
-                            service.url_targets
-                        )
-                        if target_env == service.url_env
-                        and target_port == service.port
-                    ),
-                    "tcp",
-                )
+            for env_name, target_port, protocol in service.url_targets:
+                if service.url is not None and env_name == service.url_env:
+                    environment[env_name] = service.url
+                    continue
                 published = _published_port(
                     published_ports,
                     service.compose_service,
-                    service.port,
+                    target_port,
                     protocol,
                 )
                 if published is not None:
-                    environment[service.url_env] = _service_url(
-                        service.url_env,
+                    environment[env_name] = _service_url(
+                        env_name,
                         service.compose_service,
                         "127.0.0.1",
                         published,
-                        target_port=service.port,
+                        target_port=target_port,
                         protocol=protocol,
                     )
     return environment
@@ -903,6 +902,36 @@ def _render_runtime_override(
                 )
             )
     return "\n".join(lines) + "\n"
+
+
+def _cleanup_compose_model(
+    services: Sequence[str],
+    networks: Mapping[str, str],
+    volumes: Mapping[str, str],
+) -> dict[str, object]:
+    """Return only immutable project metadata needed by ``compose down``.
+
+    The resolved Compose model can contain literals from service env files,
+    interpolation, build arguments, and other repository-controlled fields.
+    Cleanup deliberately retains none of those values.  A harmless build
+    marker preserves Compose's default project/service image identity so
+    ``down --rmi local`` can still remove locally built task images.
+    """
+    model: dict[str, object] = {
+        "services": {
+            service: {"build": {"context": "."}} for service in services
+        },
+        "networks": {
+            key: {"name": name, "external": False}
+            for key, name in networks.items()
+        },
+    }
+    if volumes:
+        model["volumes"] = {
+            key: {"name": name, "external": False}
+            for key, name in volumes.items()
+        }
+    return model
 
 
 def _parse_published_port(output: str) -> int | None:
