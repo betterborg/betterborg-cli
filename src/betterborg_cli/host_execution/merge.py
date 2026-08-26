@@ -40,6 +40,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
+    ExecutionEvent,
     TaskRuntime,
     TaskRuntimeStatus,
 )
@@ -52,6 +53,8 @@ _MERGE_IDENTITY = {
     "GIT_COMMITTER_NAME": "BetterBorg",
     "GIT_COMMITTER_EMAIL": "betterborg@example.invalid",
 }
+_MERGE_STARTED_EVENT = "merge.started"
+_MERGE_COMPLETED_EVENT = "merge.completed"
 
 
 class MergePhaseError(RuntimeError):
@@ -228,10 +231,36 @@ class HostMergePhase:
         merge_head = self._merge_head(git)
         unresolved = git.unmerged_paths()
         if merge_head is not None:
-            if git.head_sha() != approved_commit:
-                raise MergePhaseError(
-                    "approved task commit no longer matches task worktree"
-                )
+            with self._repository_lock:
+                base_commit = self._resolve_project_tip(project_branch)
+                starting_commit = git.head_sha()
+                if merge_head != base_commit:
+                    raise MergePhaseError(
+                        "active merge does not match the current project base"
+                    )
+                if self._attested_tip_agent_used(
+                    context,
+                    git,
+                    approved_commit=approved_commit,
+                    project_branch=project_branch,
+                    task_branch=runtime.branch or "",
+                    target_base=base_commit,
+                    commit_sha=starting_commit,
+                ) is None:
+                    raise MergePhaseError(
+                        "active merge did not start from an attested task tip"
+                    )
+                if not self._has_started_attestation(
+                    context,
+                    approved_commit=approved_commit,
+                    project_branch=project_branch,
+                    task_branch=runtime.branch or "",
+                    starting_commit=starting_commit,
+                    base_commit=base_commit,
+                ):
+                    raise MergePhaseError(
+                        "active merge lacks a durable host attestation"
+                    )
             return self._invoke_agent(
                 context,
                 runtime,
@@ -239,7 +268,7 @@ class HostMergePhase:
                 inputs,
                 project_branch=project_branch,
                 approved_commit=approved_commit,
-                base_commit=merge_head,
+                base_commit=base_commit,
                 unresolved=unresolved,
             )
         if unresolved:
@@ -256,48 +285,84 @@ class HostMergePhase:
         with self._repository_lock:
             base_commit = self._resolve_project_tip(project_branch)
             current = git.head_sha()
-            if not self._is_resumable_merge_tip(
+            agent_used = self._attested_tip_agent_used(
                 context,
                 git,
                 approved_commit=approved_commit,
-                base_commit=base_commit,
+                project_branch=project_branch,
+                task_branch=runtime.branch or "",
+                target_base=base_commit,
                 commit_sha=current,
-            ):
+            )
+            if agent_used is None:
                 raise MergePhaseError(
                     "approved task commit no longer matches task worktree"
                 )
             if git.is_ancestor(base_commit, current):
-                return self._verified_tip(
+                outcome = self._verified_tip_locked(
                     git,
                     runtime,
                     project_branch=project_branch,
                     approved_commit=approved_commit,
                     base_commit=base_commit,
-                    agent_used=(
-                        self._completed_merge_attestation(
-                            context,
-                            approved_commit=approved_commit,
-                            commit_sha=current,
-                        )
-                        is not None
-                    ),
+                    agent_used=agent_used,
                 )
+                if not agent_used and not self._has_completed_host_attestation(
+                    context,
+                    approved_commit=approved_commit,
+                    project_branch=project_branch,
+                    task_branch=runtime.branch or "",
+                    base_commit=base_commit,
+                    commit_sha=current,
+                ):
+                    self._record_merge_event(
+                        context,
+                        kind=_MERGE_COMPLETED_EVENT,
+                        approved_commit=approved_commit,
+                        project_branch=project_branch,
+                        task_branch=runtime.branch or "",
+                        starting_commit=current,
+                        base_commit=base_commit,
+                        commit_sha=current,
+                    )
+                return outcome
+            self._record_merge_event(
+                context,
+                kind=_MERGE_STARTED_EVENT,
+                approved_commit=approved_commit,
+                project_branch=project_branch,
+                task_branch=runtime.branch or "",
+                starting_commit=current,
+                base_commit=base_commit,
+            )
             merged = git.run(
                 ["merge", "--no-edit", base_commit],
                 check=False,
                 env=self._merge_environment(),
             )
+            unresolved = git.unmerged_paths()
+            if merged.returncode == 0 and not unresolved:
+                outcome = self._verified_tip_locked(
+                    git,
+                    runtime,
+                    project_branch=project_branch,
+                    approved_commit=approved_commit,
+                    base_commit=base_commit,
+                    agent_used=False,
+                )
+                assert outcome.tip is not None
+                self._record_merge_event(
+                    context,
+                    kind=_MERGE_COMPLETED_EVENT,
+                    approved_commit=approved_commit,
+                    project_branch=project_branch,
+                    task_branch=runtime.branch or "",
+                    starting_commit=current,
+                    base_commit=base_commit,
+                    commit_sha=outcome.tip.commit_sha,
+                )
+                return outcome
 
-        unresolved = git.unmerged_paths()
-        if merged.returncode == 0 and not unresolved:
-            return self._verified_tip(
-                git,
-                runtime,
-                project_branch=project_branch,
-                approved_commit=approved_commit,
-                base_commit=base_commit,
-                agent_used=False,
-            )
         if not unresolved:
             detail = (merged.stderr or merged.stdout).strip()[-4000:]
             return HostMergeResult(
@@ -538,6 +603,31 @@ class HostMergePhase:
         base_commit: str,
         agent_used: bool,
     ) -> HostMergeResult:
+        with self._repository_lock:
+            return self._verified_tip_locked(
+                git,
+                runtime,
+                project_branch=project_branch,
+                approved_commit=approved_commit,
+                base_commit=base_commit,
+                agent_used=agent_used,
+            )
+
+    def _verified_tip_locked(
+        self,
+        git: SafeGit,
+        runtime: TaskRuntime,
+        *,
+        project_branch: str,
+        approved_commit: str,
+        base_commit: str,
+        agent_used: bool,
+    ) -> HostMergeResult:
+        """Verify a tip while the caller holds the repository lock."""
+        if self._resolve_project_tip(project_branch) != base_commit:
+            raise MergePhaseError(
+                "project base moved while the merge phase was running"
+            )
         branch = current_branch(git)
         if branch != runtime.branch:
             raise MergePhaseError("merge agent changed the task branch")
@@ -648,48 +738,56 @@ class HostMergePhase:
             raise MergePhaseError("review approval lacks a commit attestation")
         return commit_sha
 
-    def _is_resumable_merge_tip(
+    def _attested_tip_agent_used(
         self,
         context: ScheduledTaskContext,
         git: SafeGit,
         *,
         approved_commit: str,
-        base_commit: str,
+        project_branch: str,
+        task_branch: str,
+        target_base: str,
         commit_sha: str,
-    ) -> bool:
-        """Recognize an approved tip plus host-created merge topology.
-
-        Clean Git merges have no agent attempt to carry an attestation. Their
-        two-parent commits are themselves durable evidence: the first-parent
-        chain starts at the reviewed commit (or an attested conflict result),
-        and every integrated second parent belongs to the current project-base
-        history. This also permits a retry to integrate a base that advanced
-        after an earlier clean merge.
-        """
-        cursor = commit_sha
-        seen: set[str] = set()
-        while cursor not in seen:
-            if cursor == approved_commit or self._completed_merge_attestation(
-                context,
-                approved_commit=approved_commit,
-                commit_sha=cursor,
-            ) is not None:
+    ) -> bool | None:
+        """Return agent provenance for an exact trusted tip, if any."""
+        if commit_sha == approved_commit:
+            return False
+        agent = self._completed_merge_attestation(
+            context,
+            approved_commit=approved_commit,
+            project_branch=project_branch,
+            task_branch=task_branch,
+            commit_sha=commit_sha,
+        )
+        if agent is not None:
+            attested_base = agent.get("base_commit")
+            if isinstance(attested_base, str) and git.is_ancestor(
+                attested_base, target_base
+            ):
                 return True
-            seen.add(cursor)
-            parents = self._commit_parents(git, cursor)
-            if len(parents) != 2:
+        host = self._host_merge_attestation(
+            context,
+            kind=_MERGE_COMPLETED_EVENT,
+            approved_commit=approved_commit,
+            project_branch=project_branch,
+            task_branch=task_branch,
+            commit_sha=commit_sha,
+        )
+        if host is not None:
+            attested_base = host.get("base_commit")
+            if isinstance(attested_base, str) and git.is_ancestor(
+                attested_base, target_base
+            ):
                 return False
-            first_parent, integrated_parent = parents
-            if not git.is_ancestor(integrated_parent, base_commit):
-                return False
-            cursor = first_parent
-        return False
+        return None
 
     def _completed_merge_attestation(
         self,
         context: ScheduledTaskContext,
         *,
         approved_commit: str,
+        project_branch: str,
+        task_branch: str,
         commit_sha: str,
     ) -> Mapping[str, Any] | None:
         for attempt in reversed(
@@ -706,10 +804,111 @@ class HostMergePhase:
                 and metadata.get("outcome_status")
                 == TaskRuntimeStatus.MERGING.value
                 and metadata.get("approved_commit") == approved_commit
+                and metadata.get("project_branch") == project_branch
+                and metadata.get("task_branch") == task_branch
                 and metadata.get("commit_sha") == commit_sha
             ):
                 return metadata
         return None
+
+    def _record_merge_event(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        kind: str,
+        approved_commit: str,
+        project_branch: str,
+        task_branch: str,
+        starting_commit: str,
+        base_commit: str,
+        commit_sha: str | None = None,
+    ) -> None:
+        recorded_at = context.clock()
+        context.store.append_claim_execution_event(
+            ExecutionEvent(
+                run_id=context.claim.run_id,
+                task_id=context.claim.task_id,
+                kind=kind,
+                payload={
+                    "claim_id": str(context.claim.id),
+                    "approved_commit": approved_commit,
+                    "project_branch": project_branch,
+                    "task_branch": task_branch,
+                    "starting_commit": starting_commit,
+                    "base_commit": base_commit,
+                    "commit_sha": commit_sha,
+                },
+                created_at=recorded_at,
+            ),
+            context.owner_token,
+            context.claim.claim_token,
+            now=recorded_at,
+        )
+
+    def _host_merge_attestation(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        kind: str,
+        **expected: str,
+    ) -> Mapping[str, Any] | None:
+        for event in reversed(
+            context.store.list_task_execution_events(
+                context.claim.task_id, kind=kind
+            )
+        ):
+            if all(
+                event.payload.get(name) == value
+                for name, value in expected.items()
+            ):
+                return event.payload
+        return None
+
+    def _has_started_attestation(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        approved_commit: str,
+        project_branch: str,
+        task_branch: str,
+        starting_commit: str,
+        base_commit: str,
+    ) -> bool:
+        return (
+            self._host_merge_attestation(
+                context,
+                kind=_MERGE_STARTED_EVENT,
+                approved_commit=approved_commit,
+                project_branch=project_branch,
+                task_branch=task_branch,
+                starting_commit=starting_commit,
+                base_commit=base_commit,
+            )
+            is not None
+        )
+
+    def _has_completed_host_attestation(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        approved_commit: str,
+        project_branch: str,
+        task_branch: str,
+        base_commit: str,
+        commit_sha: str,
+    ) -> bool:
+        return (
+            self._host_merge_attestation(
+                context,
+                kind=_MERGE_COMPLETED_EVENT,
+                approved_commit=approved_commit,
+                project_branch=project_branch,
+                task_branch=task_branch,
+                base_commit=base_commit,
+                commit_sha=commit_sha,
+            )
+            is not None
+        )
 
     def _resolve_project_tip(self, project_branch: str) -> str:
         result = self._primary_git.run(
@@ -734,16 +933,6 @@ class HostMergePhase:
         )
         commit_sha = result.stdout.strip()
         return commit_sha if result.returncode == 0 and commit_sha else None
-
-    @staticmethod
-    def _commit_parents(git: SafeGit, commit_sha: str) -> tuple[str, ...]:
-        line = git.run(
-            ["rev-list", "--parents", "--max-count=1", commit_sha]
-        ).stdout.strip()
-        fields = line.split()
-        if not fields or fields[0] != commit_sha:
-            raise MergePhaseError(f"cannot inspect merge tip {commit_sha}")
-        return tuple(fields[1:])
 
     def _merge_environment(self) -> dict[str, str]:
         environment = dict(os.environ)

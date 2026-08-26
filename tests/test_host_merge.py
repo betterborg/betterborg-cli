@@ -124,6 +124,7 @@ def test_clean_merge_produces_tip_without_agent_or_base_advance(
             fixture.context(store)
         )
         runtime = store.get_task_runtime(fixture.task.id)
+        merge_events = store.list_task_execution_events(fixture.task.id)
         phases = [
             attempt.phase
             for attempt in store.list_agent_attempts(fixture.task.id)
@@ -134,6 +135,17 @@ def test_clean_merge_produces_tip_without_agent_or_base_advance(
     assert result.tip.base_commit == base_commit
     assert adapter.calls == []
     assert phases == ["coding", "review"]
+    merge_event_kinds = [
+        event.kind for event in merge_events if event.kind.startswith("merge.")
+    ]
+    assert merge_event_kinds == [
+        "merge.started",
+        "merge.completed",
+    ]
+    completion = merge_events[-1].payload
+    assert completion["approved_commit"] == result.tip.approved_commit
+    assert completion["base_commit"] == base_commit
+    assert completion["commit_sha"] == result.tip.commit_sha
     assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
     assert repository_lock.entries == 1
     assert _git(fixture.repository, "rev-parse", "project/coding") == base_commit
@@ -186,6 +198,131 @@ def test_unreviewed_commit_is_not_accepted_as_resumable_merge_tip(
     assert result.tip is None
     assert "approved task commit no longer matches" in result.reason
     assert adapter.calls == []
+
+
+def test_forged_two_parent_commit_is_not_a_resumable_clean_merge(
+    tmp_path: Path,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    base_commit = _advance_project_base(fixture, "base.txt", "base progress\n")
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+        approved_commit = store.list_agent_attempts(fixture.task.id)[-1].result[
+            "_betterborg"
+        ]["commit_sha"]
+    assert runtime is not None and runtime.branch is not None
+    worktree = Path(runtime.worktree_path)
+    (worktree / "unreviewed.txt").write_text("not reviewed\n", encoding="utf-8")
+    _git(worktree, "add", "unreviewed.txt")
+    tree = _git(worktree, "write-tree")
+    forged = _git(
+        worktree,
+        "commit-tree",
+        tree,
+        "-p",
+        approved_commit,
+        "-p",
+        base_commit,
+        "-m",
+        "forged merge",
+    )
+    _git(
+        worktree,
+        "update-ref",
+        f"refs/heads/{runtime.branch}",
+        forged,
+        approved_commit,
+    )
+
+    adapter = MockAdapter()
+    with SqliteStore.open(fixture.database) as store:
+        result = _phase(fixture, adapter, RecordingLock()).run(
+            fixture.context(store)
+        )
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert result.tip is None
+    assert "approved task commit no longer matches" in result.reason
+    assert adapter.calls == []
+
+
+def test_unattested_active_merge_is_preserved_and_blocked(
+    tmp_path: Path,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    base_commit = _advance_project_base(
+        fixture, "feature.txt", "project version\n"
+    )
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+    assert runtime is not None
+    worktree = Path(runtime.worktree_path)
+    _git(worktree, "merge", "--no-edit", base_commit, check=False)
+    assert _git(worktree, "rev-parse", "MERGE_HEAD") == base_commit
+
+    adapter = MockAdapter()
+    with SqliteStore.open(fixture.database) as store:
+        result = _phase(fixture, adapter, RecordingLock()).run(
+            fixture.context(store)
+        )
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert result.tip is None
+    assert "lacks a durable host attestation" in result.reason
+    assert adapter.calls == []
+    assert _git(worktree, "rev-parse", "MERGE_HEAD") == base_commit
+
+
+def test_host_attested_active_merge_resumes_after_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    base_commit = _advance_project_base(
+        fixture, "feature.txt", "project version\n"
+    )
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+    assert runtime is not None
+    worktree = Path(runtime.worktree_path)
+    original_run = SafeGit.run
+
+    def interrupt_after_merge(self, arguments, **kwargs):
+        result = original_run(self, arguments, **kwargs)
+        if self.cwd == worktree and arguments[0] == "merge":
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(SafeGit, "run", interrupt_after_merge)
+    with SqliteStore.open(fixture.database) as store:
+        with pytest.raises(KeyboardInterrupt):
+            _phase(fixture, MockAdapter(), RecordingLock()).run(
+                fixture.context(store)
+            )
+        merge_events = store.list_task_execution_events(
+            fixture.task.id, kind="merge.started"
+        )
+    assert len(merge_events) == 1
+    assert merge_events[0].payload["base_commit"] == base_commit
+    assert _git(worktree, "rev-parse", "MERGE_HEAD") == base_commit
+
+    monkeypatch.setattr(SafeGit, "run", original_run)
+
+    def resolve(spec):
+        (spec.cwd / "feature.txt").write_text("resolved\n", encoding="utf-8")
+        _git(spec.cwd, "add", "feature.txt")
+        _git(spec.cwd, "commit", "--quiet", "-m", "resolve project merge")
+        return MockResponse(payload=_completed_payload(fixture.task))
+
+    adapter = MockAdapter().queue(MockResponse(dynamic=resolve))
+    with SqliteStore.open(fixture.database) as store:
+        result = _phase(fixture, adapter, RecordingLock()).run(
+            fixture.context(store)
+        )
+
+    assert result.status is TaskRuntimeStatus.MERGING
+    assert result.tip is not None and result.tip.agent_used
+    assert result.tip.base_commit == base_commit
+    assert len(adapter.calls) == 1
 
 
 def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
@@ -263,6 +400,49 @@ def test_completed_conflict_merge_resumes_without_replaying_agent(
     assert resumed.tip is not None and resumed.tip.agent_used
     assert resumed.tip.commit_sha == initial.tip.commit_sha
     assert replay.calls == []
+
+
+def test_conflict_agent_moving_project_base_is_detected(
+    tmp_path: Path,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    base_commit = _advance_project_base(
+        fixture, "feature.txt", "project version\n"
+    )
+    with SqliteStore.open(fixture.database) as store:
+        approved_commit = store.list_agent_attempts(fixture.task.id)[-1].result[
+            "_betterborg"
+        ]["commit_sha"]
+    repository_lock = RecordingLock()
+
+    def resolve(spec):
+        _git(
+            spec.cwd,
+            "update-ref",
+            "refs/heads/project/coding",
+            approved_commit,
+            base_commit,
+        )
+        (spec.cwd / "feature.txt").write_text("resolved\n", encoding="utf-8")
+        _git(spec.cwd, "add", "feature.txt")
+        _git(spec.cwd, "commit", "--quiet", "-m", "resolve project merge")
+        return MockResponse(payload=_completed_payload(fixture.task))
+
+    adapter = MockAdapter().queue(MockResponse(dynamic=resolve))
+    with SqliteStore.open(fixture.database) as store:
+        result = _phase(fixture, adapter, repository_lock).run(
+            fixture.context(store)
+        )
+        attempt = store.list_agent_attempts(fixture.task.id)[-1]
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert result.tip is None
+    assert "project base moved" in result.reason
+    assert repository_lock.entries == 2
+    assert _git(fixture.repository, "rev-parse", "project/coding") == (
+        approved_commit
+    )
+    assert attempt.result["_betterborg"]["commit_sha"] is None
 
 
 def test_agent_claiming_completion_with_unresolved_paths_blocks_and_preserves(
