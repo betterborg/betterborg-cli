@@ -96,9 +96,7 @@ class ScheduledTaskContext:
 class HostTaskBehavior(Protocol):
     """Temporary task-runtime seam used until concrete phases are assembled."""
 
-    def __call__(
-        self, context: ScheduledTaskContext
-    ) -> TaskRuntimeStatus | None: ...
+    def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,13 +183,18 @@ class HostTaskScheduler:
                 while True:
                     now = self._clock()
                     if token.is_set():
+                        self._drain_cancelled(
+                            active,
+                            acquisition.run_id,
+                            owner_token,
+                            next_heartbeat,
+                        )
                         self._store.interrupt_execution_run(
                             acquisition.run_id,
                             owner_token,
                             reason="execution cancelled",
-                            now=now,
+                            now=self._clock(),
                         )
-                        self._drain(active)
                         return self._result(
                             acquisition.run_id, generation_id, acquired=True
                         )
@@ -298,6 +301,31 @@ class HostTaskScheduler:
     ) -> None:
         if active:
             wait(tuple(active))
+
+    def _drain_cancelled(
+        self,
+        active: dict[Future[TaskRuntimeStatus | None], TaskClaim],
+        run_id: UUID,
+        owner_token: str,
+        next_heartbeat: datetime,
+    ) -> None:
+        """Fence interruption behind active work while retaining ownership."""
+        pending = {future for future in active if not future.done()}
+        while pending:
+            _, pending = wait(
+                pending,
+                timeout=self._config.poll_interval_seconds,
+                return_when=FIRST_COMPLETED,
+            )
+            now = self._clock()
+            if now >= next_heartbeat:
+                self._store.renew_execution_run(
+                    run_id,
+                    owner_token,
+                    lease_duration=self._config.lease_duration,
+                    now=now,
+                )
+                next_heartbeat = now + self._config.heartbeat_interval
 
     def _finish(
         self,

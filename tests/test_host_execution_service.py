@@ -7,7 +7,7 @@ import json
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,8 +177,16 @@ class _Environment:
 
 
 class _Coding:
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        expected_environment: dict[str, str] | None = None,
+    ) -> None:
         self.calls = calls
+        self.expected_environment = expected_environment or {
+            "CACHE": "prepared",
+            "SERVICE_URL": "http://127.0.0.1",
+        }
 
     def run(
         self,
@@ -186,18 +194,20 @@ class _Coding:
         *,
         environment=None,
     ) -> TaskRuntimeStatus:
-        assert environment == {
-            "CACHE": "prepared",
-            "SERVICE_URL": "http://127.0.0.1",
-        }
+        assert environment == self.expected_environment
         self.calls.append("coding")
         context.transition(TaskRuntimeStatus.CODING, TaskRuntimeStatus.REVIEW)
         return TaskRuntimeStatus.REVIEW
 
 
 class _Review:
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        expected_environment: dict[str, str] | None = None,
+    ) -> None:
         self.calls = calls
+        self.expected_environment = expected_environment
 
     def run(
         self,
@@ -207,17 +217,27 @@ class _Review:
         review_environment=None,
         fix_environment=None,
     ) -> TaskRuntimeStatus:
-        assert environment["SERVICE_URL"] == "http://127.0.0.1"
+        if self.expected_environment is None:
+            assert environment["SERVICE_URL"] == "http://127.0.0.1"
+        else:
+            assert environment == self.expected_environment
         self.calls.append("review")
         context.transition(TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.MERGING)
         return TaskRuntimeStatus.MERGING
 
 
 class _Merge:
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        expected_environment: dict[str, str] | None = None,
+    ) -> None:
         self.calls = calls
+        self.expected_environment = expected_environment
 
     def run(self, context, *, environment=None) -> HostMergeResult:
+        if self.expected_environment is not None:
+            assert environment == self.expected_environment
         self.calls.append("merge")
         return HostMergeResult(
             TaskRuntimeStatus.MERGING,
@@ -343,6 +363,7 @@ class _ConcreteHostFixture:
     coding: MockAdapter
     review: MockAdapter
     compose: _ConcreteComposeRunner
+    clock: _FakeClock
 
 
 class _ConcreteComposeRunner:
@@ -400,6 +421,7 @@ def _concrete_host_fixture(
     *,
     task_count: int = 1,
     coding_delay_seconds: float = 0,
+    review_delay_seconds: float = 0,
     dependency_chain: bool = False,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
@@ -588,7 +610,8 @@ def _concrete_host_fixture(
                     "summary": "Implementation approved.",
                     "issues_file": "",
                     "findings": [],
-                }
+                },
+                delay_seconds=review_delay_seconds,
             )
         )
     repository_lock = threading.RLock()
@@ -636,7 +659,15 @@ def _concrete_host_fixture(
         clock=clock,
     )
     return _ConcreteHostFixture(
-        store, borg, generation, tasks, service, coding, review, compose_runner
+        store,
+        borg,
+        generation,
+        tasks,
+        service,
+        coding,
+        review,
+        compose_runner,
+        clock,
     )
 
 
@@ -675,6 +706,68 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             "review",
             "merge",
             "services-stop",
+            "sanity",
+        ]
+    finally:
+        store.close()
+
+
+def test_external_only_service_url_reaches_every_agent_phase(tmp_path: Path) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    registry_url = "https://registry.example.test"
+    plan = replace(
+        _plan(tmp_path),
+        services=(
+            HostService(
+                name="registry",
+                kind="external",
+                evidence="validated external fixture",
+                url_env="REGISTRY_URL",
+                url=registry_url,
+            ),
+        ),
+    )
+    expected_environment = {
+        "CACHE": "prepared",
+        "REGISTRY_URL": registry_url,
+    }
+
+    class ExternalOnlyCompose(_Compose):
+        def start_claimed_stack(self, *args, **kwargs):
+            self.calls.append("services-start")
+            return None
+
+    compose = ExternalOnlyCompose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=_Environment(calls),
+        compose_manager=compose,
+        coding=_Coding(calls, expected_environment),
+        review_fix=_Review(calls, expected_environment),
+        merge=_Merge(calls, expected_environment),
+        sanity=_Sanity(calls),
+    )
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+        ).run(borg.id, generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert store.get_task_runtime(records[0].id).status is TaskRuntimeStatus.DONE
+        assert calls == [
+            "preflight",
+            "worktrees",
+            "environment",
+            "services-start",
+            "coding",
+            "review",
+            "merge",
             "sanity",
         ]
     finally:
@@ -830,6 +923,143 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 1
     finally:
+        fixture.store.close()
+
+
+def test_concrete_review_cancellation_resumes_without_replaying_coding(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path, review_delay_seconds=2)
+    cancel = CancellationToken()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            for _ in range(200):
+                if fixture.review.calls:
+                    break
+                threading.Event().wait(0.005)
+            assert fixture.review.calls
+            cancel.cancel()
+            cancelled = running.result(timeout=3)
+
+        task = fixture.tasks[0]
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert fixture.store.get_task_runtime(task.id).status is (
+            TaskRuntimeStatus.PENDING
+        )
+        attempts = fixture.store.list_agent_attempts(task.id)
+        attempts_by_phase = {attempt.phase: attempt for attempt in attempts}
+        assert set(attempts_by_phase) == {"coding", "review"}
+        assert attempts_by_phase["coding"].status.value == "completed"
+        assert attempts_by_phase["review"].status.value == "cancelled"
+
+        fixture.review.queue(
+            MockResponse(
+                payload={
+                    "task_file": ".betterborg-task/task.md",
+                    "status": "approved",
+                    "summary": "Implementation approved after resume.",
+                    "issues_file": "",
+                    "findings": [],
+                }
+            )
+        )
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(task.id).state_reason
+        )
+        assert fixture.store.get_task_runtime(task.id).status is (
+            TaskRuntimeStatus.DONE
+        )
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 2
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_during_base_advance_preserves_durable_attestation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    advancing = threading.Event()
+    release_advance = threading.Event()
+    append_event = fixture.store.append_claim_execution_event
+
+    def pause_after_fast_forward(event, owner_token, claim_token, *, now=None):
+        if event.kind == "base.advanced":
+            advancing.set()
+            assert release_advance.wait(timeout=2)
+        return append_event(
+            event,
+            owner_token,
+            claim_token,
+            now=now,
+        )
+
+    monkeypatch.setattr(
+        fixture.store,
+        "append_claim_execution_event",
+        pause_after_fast_forward,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            assert advancing.wait(timeout=3)
+            cancel.cancel()
+            fixture.clock.advance(timedelta(minutes=1))
+            # Give the scheduler multiple poll intervals to observe cancellation.
+            # It must retain ownership until publication records its attestation.
+            for _ in range(100):
+                active_run = fixture.store.list_execution_runs(fixture.borg.id)[-1]
+                if active_run.heartbeat_at == fixture.clock.now:
+                    break
+                threading.Event().wait(0.005)
+            assert active_run.status is ExecutionRunStatus.RUNNING
+            assert active_run.heartbeat_at == fixture.clock.now
+            release_advance.set()
+            cancelled = running.result(timeout=3)
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.DONE
+        advanced = fixture.store.list_task_execution_events(
+            task.id,
+            kind="base.advanced",
+        )
+        assert len(advanced) == 1
+        assert advanced[0].payload["commit_sha"] == _git(
+            fixture.store.get_repository(fixture.borg.repository_id).root,
+            "rev-parse",
+            f"project/{fixture.borg.name}",
+        )
+
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 1
+        assert (
+            len(fixture.store.list_task_execution_events(task.id, kind="base.advanced"))
+            == 1
+        )
+    finally:
+        release_advance.set()
         fixture.store.close()
 
 

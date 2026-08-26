@@ -16,6 +16,7 @@ from betterborg_cli.host_execution.compose import (
     ComposeCleanupResult,
     ComposeStackError,
     HostComposeManager,
+    service_url_environment,
 )
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
@@ -210,6 +211,7 @@ class HostTaskRuntime:
                 context.owner_token,
             )
             service_environment = dict(materialization.environment)
+            service_environment.update(service_url_environment(self.plan.services))
             if stack is not None:
                 service_environment.update(stack.environment)
 
@@ -220,6 +222,8 @@ class HostTaskRuntime:
                     **self._agent_secrets("coding"),
                 },
             )
+            if context.cancel.is_set():
+                return self._durable_status(context)
             if status is TaskRuntimeStatus.REVIEW:
                 status = self._review_fix.run(
                     context,
@@ -227,11 +231,15 @@ class HostTaskRuntime:
                     review_environment=self._agent_secrets("review"),
                     fix_environment=self._agent_secrets("fix"),
                 )
+            if context.cancel.is_set():
+                return self._durable_status(context)
             if status is TaskRuntimeStatus.MERGING:
                 # One project ref is shared by every task.  Keep merge-tip
                 # production and sanity/base advancement in one process-local
                 # critical section so jobs=2 cannot publish a stale tip.
                 with self._publication_lock:
+                    if context.cancel.is_set():
+                        return self._durable_status(context)
                     merge_result = self._merge.run(
                         context,
                         environment={
@@ -239,7 +247,7 @@ class HostTaskRuntime:
                             **self._agent_secrets("merge"),
                         },
                     )
-                    if merge_result.tip is not None:
+                    if merge_result.tip is not None and not context.cancel.is_set():
                         published_status = self._sanity.run(
                             context,
                             merge_result.tip,
