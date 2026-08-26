@@ -17,7 +17,11 @@ from betterborg_cli.repo_analysis import (
 )
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
-from betterborg_cli.repository_files import publish_repository_text
+from betterborg_cli.repository_files import (
+    RepositoryPathError,
+    publish_repository_text,
+    read_repository_text,
+)
 from betterborg_cli.store import (
     Borg,
     PlanChangeRequest,
@@ -358,12 +362,10 @@ def _borg_relative_path(path: Path, repository_root: Path) -> Path:
 
 
 def _read_owned_text(repository_root: Path, relative: Path, label: str) -> str:
-    source = repository_root / relative
-    if source.is_symlink() or not source.is_file():
-        raise PlanningWorktreeError(f"{label} is not a regular file: {relative}")
-    if not source.resolve(strict=True).is_relative_to(repository_root):
-        raise PlanningWorktreeError(f"{label} escapes the repository: {relative}")
-    return source.read_text(encoding="utf-8")
+    try:
+        return read_repository_text(relative, root=repository_root)
+    except RepositoryPathError as error:
+        raise PlanningWorktreeError(f"{label} is unsafe: {error}") from error
 
 
 def _publish(root: Path, relative: Path, body: str) -> None:

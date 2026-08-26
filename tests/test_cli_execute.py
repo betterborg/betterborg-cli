@@ -894,6 +894,46 @@ def test_pr_creation_failure_preserves_completed_local_branch(
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
+def test_pr_rejects_external_prd_symlink_without_uploading_host_file(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-external-prd"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    outside = committed_git_repo.parent / f"{name}-host-secret.md"
+    outside.write_text("host secret must not be uploaded\n", encoding="utf-8")
+    prd_path = committed_git_repo / ".borg/prds" / f"{name}.md"
+    prd_path.unlink()
+    prd_path.symlink_to(outside)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "repository path is not a regular file" in result.output
+    assert not args_path.exists()
+    assert not body_path.exists()
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
 def test_concurrent_decision_insert_reaches_active_host_execution(
     cli_runner: CliRunner,
     committed_git_repo: Path,

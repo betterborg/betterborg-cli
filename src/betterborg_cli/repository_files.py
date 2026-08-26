@@ -62,6 +62,21 @@ def require_git_trackable(path: Path, *, root: Path) -> None:
         )
 
 
+def read_repository_text(path: Path, *, root: Path) -> str:
+    """Read UTF-8 text only from a contained, non-symlink regular file."""
+    resolved_root = root.resolve(strict=True)
+    candidate = path if path.is_absolute() else resolved_root / path
+    if candidate.is_symlink() or not candidate.is_file():
+        raise RepositoryPathError(
+            f"repository path is not a regular file: {path}"
+        )
+    try:
+        candidate.resolve(strict=True).relative_to(resolved_root)
+    except ValueError as error:
+        raise RepositoryPathError(f"repository path escapes root: {path}") from error
+    return candidate.read_text(encoding="utf-8")
+
+
 def publish_repository_text(
     path: Path,
     body: str,

@@ -71,6 +71,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import (
     publish_repository_text,
+    read_repository_text,
     require_git_trackable,
 )
 from betterborg_cli.repository_service import RepositoryService
@@ -767,6 +768,20 @@ def _open_rollup_pull_request(
     branch = f"project/{name}"
     failure_prefix = "Local execution completed, but rollup PR creation failed"
     try:
+        prd_markdown = (
+            read_repository_text(prd_path, root=repository_root)
+            if prd_path is not None
+            else None
+        )
+        body = build_project_pr_body(
+            prd_markdown=prd_markdown,
+            plan=plan,
+            project_name=name,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+
+    try:
         remote = subprocess.run(
             ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
             check=False,
@@ -841,20 +856,6 @@ def _open_rollup_pull_request(
             f"{_command_failure(default, 'gh repo view returned no default branch')}"
         )
     default_branch = default_branch_lines[0].strip()
-
-    try:
-        prd_markdown = (
-            (repository_root / prd_path).read_text(encoding="utf-8")
-            if prd_path is not None
-            else None
-        )
-        body = build_project_pr_body(
-            prd_markdown=prd_markdown,
-            plan=plan,
-            project_name=name,
-        )
-    except (OSError, UnicodeError, ValueError) as error:
-        raise click.ClickException(f"{failure_prefix}: {error}") from error
 
     title_value = plan.get("title") if plan is not None else None
     title = (
