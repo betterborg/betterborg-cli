@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.host_execution import (
     HostSchedulerConfig,
@@ -17,6 +19,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.store import (
     Borg,
+    ExecutionOwnershipError,
     ExecutionRunStatus,
     PlanApproval,
     Repository,
@@ -316,6 +319,52 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
         assert runs_by_id[resumed.operation_id].status is (
             ExecutionRunStatus.COMPLETED
         )
+
+
+def test_scheduler_cancels_inflight_behavior_when_run_lease_expires(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    clock = FakeClock()
+    started = threading.Event()
+    cancellation_observed = threading.Event()
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            if context.cancel.wait(timeout=2):
+                cancellation_observed.set()
+            return TaskRuntimeStatus.DONE
+
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(
+                lease_duration=timedelta(seconds=10),
+                heartbeat_interval=timedelta(seconds=2),
+                poll_interval_seconds=0.005,
+            ),
+            clock=clock,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            clock.advance(timedelta(seconds=11))
+
+            with pytest.raises(ExecutionOwnershipError, match="lease expired"):
+                running.result(timeout=2)
+
+        assert cancellation_observed.is_set()
+        run = store.list_execution_runs(borg.id)[0]
+        assert run.status is ExecutionRunStatus.CANCELLED
+        runtime = store.get_task_runtime(records["task"].id)
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
 
 
 def test_scheduler_isolates_task_failure_and_finishes_run(tmp_path: Path) -> None:

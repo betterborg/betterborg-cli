@@ -169,61 +169,66 @@ class HostTaskScheduler:
             max_workers=self._config.jobs,
             thread_name_prefix="betterborg-task",
         ) as executor:
-            while True:
-                now = self._clock()
-                if token.is_set():
-                    self._store.interrupt_execution_run(
-                        acquisition.run_id,
-                        owner_token,
-                        reason="execution cancelled",
-                        now=now,
-                    )
-                    self._drain(active)
-                    return self._result(
-                        acquisition.run_id, generation_id, acquired=True
-                    )
+            try:
+                while True:
+                    now = self._clock()
+                    if token.is_set():
+                        self._store.interrupt_execution_run(
+                            acquisition.run_id,
+                            owner_token,
+                            reason="execution cancelled",
+                            now=now,
+                        )
+                        self._drain(active)
+                        return self._result(
+                            acquisition.run_id, generation_id, acquired=True
+                        )
 
-                if now >= next_heartbeat:
-                    self._store.renew_execution_run(
-                        acquisition.run_id,
-                        owner_token,
-                        lease_duration=self._config.lease_duration,
-                        now=now,
-                    )
-                    next_heartbeat = now + self._config.heartbeat_interval
+                    if now >= next_heartbeat:
+                        self._store.renew_execution_run(
+                            acquisition.run_id,
+                            owner_token,
+                            lease_duration=self._config.lease_duration,
+                            now=now,
+                        )
+                        next_heartbeat = now + self._config.heartbeat_interval
 
-                self._settle_completed(active, owner_token)
+                    self._settle_completed(active, owner_token)
 
-                while len(active) < self._config.jobs:
-                    claim = self._store.claim_dependency_ready_task(
-                        acquisition.run_id,
-                        owner_token,
-                        lease_duration=self._config.lease_duration,
-                        now=self._clock(),
-                    )
-                    if claim is None:
-                        break
-                    context = ScheduledTaskContext(
-                        store=self._store,
-                        claim=claim,
-                        owner_token=owner_token,
-                        cancel=token,
-                        clock=self._clock,
-                    )
-                    active[executor.submit(self._behavior, context)] = claim
+                    while len(active) < self._config.jobs:
+                        claim = self._store.claim_dependency_ready_task(
+                            acquisition.run_id,
+                            owner_token,
+                            lease_duration=self._config.lease_duration,
+                            now=self._clock(),
+                        )
+                        if claim is None:
+                            break
+                        context = ScheduledTaskContext(
+                            store=self._store,
+                            claim=claim,
+                            owner_token=owner_token,
+                            cancel=token,
+                            clock=self._clock,
+                        )
+                        active[executor.submit(self._behavior, context)] = claim
 
-                if not active:
-                    return self._finish(
-                        acquisition.run_id,
-                        generation_id,
-                        owner_token,
-                    )
+                    if not active:
+                        return self._finish(
+                            acquisition.run_id,
+                            generation_id,
+                            owner_token,
+                        )
 
-                wait(
-                    tuple(active),
-                    timeout=self._config.poll_interval_seconds,
-                    return_when=FIRST_COMPLETED,
-                )
+                    wait(
+                        tuple(active),
+                        timeout=self._config.poll_interval_seconds,
+                        return_when=FIRST_COMPLETED,
+                    )
+            except ExecutionOwnershipError:
+                token.cancel()
+                self._drain(active)
+                raise
 
     def _settle_completed(
         self,
