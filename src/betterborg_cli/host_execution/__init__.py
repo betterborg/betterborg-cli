@@ -31,6 +31,13 @@ from betterborg_cli.host_execution.preflight import (
     HostSecret,
     HostService,
 )
+from betterborg_cli.host_execution.scheduler import (
+    HostSchedulerConfig,
+    HostSchedulerResult,
+    HostTaskBehavior,
+    HostTaskScheduler,
+    ScheduledTaskContext,
+)
 from betterborg_cli.host_execution.worktrees import (
     HostWorktreeManager,
     WorktreeError,
@@ -53,11 +60,16 @@ __all__ = [
     "HostPreflightFailure",
     "HostPreflightPlan",
     "HostPreflightResult",
+    "HostSchedulerConfig",
+    "HostSchedulerResult",
     "HostSecret",
     "HostService",
+    "HostTaskBehavior",
+    "HostTaskScheduler",
     "PrimaryCheckoutContaminationError",
     "PrimaryCheckoutGuard",
     "SafeGit",
+    "ScheduledTaskContext",
     "UnsafeGitError",
     "WorktreeError",
     "WorktreeSpec",

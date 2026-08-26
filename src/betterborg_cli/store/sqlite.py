@@ -1295,6 +1295,72 @@ class SqliteStore:
             raise ExecutionOwnershipError("execution run lease expired")
         return _row_to_execution_run(updated)
 
+    def finish_execution_run(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        *,
+        status: ExecutionRunStatus,
+        now: datetime | None = None,
+    ) -> ExecutionRun:
+        """Finish an owned run after its scheduler has no in-flight work."""
+        finished_at = _execution_time(now)
+        if status not in {
+            ExecutionRunStatus.COMPLETED,
+            ExecutionRunStatus.FAILED,
+        }:
+            raise ValueError("scheduler may only finish a run completed or failed")
+        with self.transaction() as connection:
+            run = self._require_live_run(
+                connection, run_id, owner_token, now=finished_at
+            )
+            runtime_rows = connection.execute(
+                """
+                SELECT status FROM task_runtimes
+                WHERE generation_id = ?
+                """,
+                (run["generation_id"],),
+            ).fetchall()
+            runtime_statuses = {
+                TaskRuntimeStatus(row["status"]) for row in runtime_rows
+            }
+            if runtime_statuses & _ACTIVE_TASK_STATUSES:
+                raise ValueError("execution run still has active task runtimes")
+            all_done = all(
+                TaskRuntimeStatus(row["status"]) is TaskRuntimeStatus.DONE
+                for row in runtime_rows
+            )
+            if status is ExecutionRunStatus.COMPLETED and not all_done:
+                raise ValueError("completed execution run still has unfinished tasks")
+            if status is ExecutionRunStatus.FAILED and all_done:
+                raise ValueError("failed execution run has no unfinished tasks")
+            cursor = connection.execute(
+                """
+                UPDATE execution_runs
+                SET status = ?, finished_at = ?
+                WHERE id = ? AND owner_token = ? AND status = 'running'
+                """,
+                (
+                    status.value,
+                    finished_at.isoformat(),
+                    str(run_id),
+                    owner_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ExecutionOwnershipError("execution run ownership changed")
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                kind=f"run.{status.value}",
+                payload={},
+                created_at=finished_at,
+            )
+            updated = connection.execute(
+                "SELECT * FROM execution_runs WHERE id = ?", (str(run_id),)
+            ).fetchone()
+        return _row_to_execution_run(updated)
+
     def claim_dependency_ready_task(
         self,
         run_id: UUID,
