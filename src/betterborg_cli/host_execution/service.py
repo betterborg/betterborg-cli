@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from threading import Event, Lock, Thread
 from typing import Any
 from uuid import UUID
@@ -35,7 +36,7 @@ from betterborg_cli.host_execution.scheduler import (
     HostTaskScheduler,
     ScheduledTaskContext,
 )
-from betterborg_cli.host_execution.worktrees import HostWorktreeManager
+from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
 from betterborg_cli.store import ExecutionRunStatus, SqliteStore, TaskRuntimeStatus
 
 
@@ -58,9 +59,7 @@ class HostExecutionResult:
     @property
     def active_operation_id(self) -> UUID | None:
         return (
-            self.scheduler.active_operation_id
-            if self.scheduler is not None
-            else None
+            self.scheduler.active_operation_id if self.scheduler is not None else None
         )
 
     @property
@@ -117,9 +116,7 @@ class _SetupLeaseHeartbeats:
             raise self._error
 
     def _run(self) -> None:
-        poll_seconds = min(
-            self._config.heartbeat_interval.total_seconds(), 0.1
-        )
+        poll_seconds = min(self._config.heartbeat_interval.total_seconds(), 0.1)
         while not self._stop.wait(poll_seconds):
             try:
                 self._renew_through(self._clock())
@@ -166,9 +163,7 @@ class HostTaskRuntime:
         self._secret_values = dict(secret_values or {})
         self._publication_lock = publication_lock or Lock()
 
-    def with_secret_values(
-        self, secret_values: Mapping[str, str]
-    ) -> HostTaskRuntime:
+    def with_secret_values(self, secret_values: Mapping[str, str]) -> HostTaskRuntime:
         """Bind one run's validated secret values without shared mutation."""
         return HostTaskRuntime(
             self.plan,
@@ -355,12 +350,7 @@ class HostExecutionService:
             lease_duration=config.lease_duration,
             now=acquired_at,
         )
-        scheduler = HostTaskScheduler(
-            self._store,
-            runtime,
-            config=self._scheduler_config,
-            **({"clock": self._clock} if self._clock is not None else {}),
-        )
+        behavior = runtime
         if acquisition.acquired:
             owner_token = acquisition.owner_token
             if owner_token is None:
@@ -378,6 +368,12 @@ class HostExecutionService:
             )
             heartbeats.start()
             try:
+                # Acquisition itself atomically expires a prior owner.  That
+                # can happen after the pre-acquisition reconciliation above,
+                # so repeat cleanup while the new lease is heartbeating and
+                # before any new worktree setup or task dispatch begins.
+                cleanup.extend(self._cleanup_stale())
+                heartbeats.checkpoint()
                 prepared = self._worktrees.prepare_current_task_worktrees(
                     self._store,
                     run_id=acquisition.run_id,
@@ -418,6 +414,14 @@ class HostExecutionService:
                         setup_error,
                     )
                     raise
+            behavior = partial(self._run_claimed_task, runtime, borg.name)
+
+        scheduler = HostTaskScheduler(
+            self._store,
+            behavior,
+            config=self._scheduler_config,
+            **({"clock": self._clock} if self._clock is not None else {}),
+        )
 
         scheduled = scheduler.run_acquired(
             generation_id,
@@ -426,6 +430,32 @@ class HostExecutionService:
         )
         cleanup.extend(self._cleanup_stale())
         return HostExecutionResult(validated, scheduled, tuple(cleanup))
+
+    def _run_claimed_task(
+        self,
+        runtime: HostTaskRuntime,
+        project_name: str,
+        context: ScheduledTaskContext,
+    ) -> TaskRuntimeStatus:
+        """Refresh a never-started claim before entering concrete phases."""
+        task_id = context.claim.task_id
+        unstarted = not self._store.list_environment_attempts(
+            task_id
+        ) and not self._store.list_agent_attempts(task_id)
+        if unstarted:
+            try:
+                self._worktrees.refresh_unstarted_task_worktree(
+                    context.runtime,
+                    project_name=project_name,
+                )
+            except WorktreeError as error:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.BLOCKED,
+                    state_reason=str(error),
+                )
+                return TaskRuntimeStatus.BLOCKED
+        return runtime(context)
 
     def _cleanup_stale(self) -> tuple[ComposeCleanupResult, ...]:
         resources = self._store.reconcile_expired_execution_runs(now=self._now())

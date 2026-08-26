@@ -140,6 +140,50 @@ class HostWorktreeManager:
             return False
         return self._cleanup_task_worktree(runtime)
 
+    def refresh_unstarted_task_worktree(
+        self, runtime: TaskRuntime, *, project_name: str
+    ) -> bool:
+        """Fast-forward one newly claimed task to the latest project base.
+
+        Worktrees are allocated before scheduling so cache preparation can use
+        them.  A dependent may not become claimable until an earlier task has
+        advanced the shared project branch, however, so its still-clean branch
+        must be refreshed at the last responsible moment before materializing
+        the task environment.
+        """
+        if runtime.status is not TaskRuntimeStatus.CLAIMED:
+            raise WorktreeError("only a newly claimed task worktree may be refreshed")
+        if runtime.branch is None or runtime.worktree_path is None:
+            raise WorktreeError("claimed task has no persisted worktree")
+
+        path = self._managed_path(Path(runtime.worktree_path))
+        if not self._is_worktree_for_branch(path, runtime.branch):
+            raise WorktreeError(
+                f"claimed task path is not its registered worktree: {path}"
+            )
+        task_git = SafeGit(path)
+        if not task_git.is_clean():
+            raise WorktreeError(
+                f"refusing to refresh dirty claimed task worktree: {path}"
+            )
+
+        project_branch = self.ensure_project_base(project_name)
+        current = task_git.head_sha()
+        target = self._resolve(project_branch)
+        if current == target:
+            return False
+        if not task_git.is_ancestor(current, target):
+            raise WorktreeError(
+                f"task branch {runtime.branch!r} cannot fast-forward to "
+                f"{project_branch!r}"
+            )
+        result = task_git.run(["merge", "--ff-only", project_branch], check=False)
+        if result.returncode != 0 or task_git.head_sha() != target:
+            raise WorktreeError(
+                f"task branch {runtime.branch!r} could not fast-forward safely"
+            )
+        return True
+
     def cleanup_published_task_worktree(self, runtime: TaskRuntime) -> bool:
         """Remove a sanity-published worktree before its terminal transition.
 
@@ -159,9 +203,7 @@ class HostWorktreeManager:
         if not path.exists():
             return True
         if not self._is_worktree_for_branch(path, runtime.branch):
-            raise WorktreeError(
-                f"refusing to clean foreign path or branch at {path}"
-            )
+            raise WorktreeError(f"refusing to clean foreign path or branch at {path}")
         try:
             self._git.remove_worktree(path)
         except subprocess.CalledProcessError as error:
@@ -187,14 +229,9 @@ class HostWorktreeManager:
         if runtime.branch is None or runtime.worktree_path is None:
             raise WorktreeError("persisted task identity is incomplete")
         match = _TASK_BRANCH.fullmatch(runtime.branch)
-        if (
-            match is None
-            or match["stage"] != stage
-            or match["stem"] != stem
-        ):
+        if match is None or match["stage"] != stage or match["stem"] != stem:
             raise WorktreeError(
-                f"persisted task branch does not match {stage}/{stem}: "
-                f"{runtime.branch}"
+                f"persisted task branch does not match {stage}/{stem}: {runtime.branch}"
             )
         path = self._managed_path(Path(runtime.worktree_path))
         expected = self.worktree_root / stage / f"{stem}-{match['identity']}"
@@ -208,9 +245,7 @@ class HostWorktreeManager:
         if self._is_worktree_for_branch(spec.path, spec.branch):
             return
         if spec.path.exists():
-            raise WorktreeError(
-                f"path exists but is not {spec.branch!r}: {spec.path}"
-            )
+            raise WorktreeError(f"path exists but is not {spec.branch!r}: {spec.path}")
         spec.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._git.add_worktree(spec.path, spec.branch, base=base_branch)

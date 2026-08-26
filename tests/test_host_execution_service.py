@@ -47,6 +47,7 @@ from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    ComposeResource,
     ExecutionRunStatus,
     PlanApproval,
     Repository,
@@ -55,6 +56,7 @@ from betterborg_cli.store import (
     SqliteStore,
     TaskBatch,
     TaskComplexity,
+    TaskDependency,
     TaskGeneration,
     TaskRecord,
     TaskRuntimeStatus,
@@ -115,9 +117,7 @@ def _store_fixture(
         path = durable_root / record.stage / f"{record.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(record.task_ref, encoding="utf-8")
-    store._promote_published_task_generation(
-        generation.id, durable_root=durable_root
-    )
+    store._promote_published_task_generation(generation.id, durable_root=durable_root)
     return store, borg, generation, records
 
 
@@ -138,6 +138,9 @@ class _Worktrees:
     def prepare_current_task_worktrees(self, *args, **kwargs) -> list[object]:
         self.calls.append("worktrees")
         return []
+
+    def refresh_unstarted_task_worktree(self, *args, **kwargs) -> bool:
+        return False
 
 
 class _Compose:
@@ -266,7 +269,11 @@ def _git(root: Path, *arguments: str) -> str:
 
 
 def _concrete_task(
-    generation_id: UUID, borg: Borg, position: int
+    generation_id: UUID,
+    borg: Borg,
+    position: int,
+    *,
+    dependencies: tuple[str, ...] = (),
 ) -> TaskRecord:
     stem = f"{position:02d}-integrated-task"
     body = {
@@ -278,7 +285,7 @@ def _concrete_task(
         "implementation_notes": [],
         "acceptance_criteria": ["The project base advances."],
         "tests": ["Run the concrete integration fixture."],
-        "dependencies": [],
+        "dependencies": list(dependencies),
         "out_of_scope": [],
         "plan_refs": ["P1.deliverable.1"],
         "estimate_complexity": "small",
@@ -299,8 +306,14 @@ def _concrete_task(
     )
 
 
-def _coding_response(*, delay_seconds: float = 0) -> MockResponse:
+def _coding_response(
+    *, delay_seconds: float = 0, expected_existing_features: int | None = None
+) -> MockResponse:
     def commit(spec):
+        if expected_existing_features is not None:
+            assert len(tuple(spec.cwd.glob("feature-*.txt"))) == (
+                expected_existing_features
+            )
         feature = spec.cwd / f"feature-{spec.cwd.name}.txt"
         feature.write_text("implemented\n", encoding="utf-8")
         _git(spec.cwd, "add", feature.name)
@@ -349,9 +362,7 @@ class _ConcreteComposeRunner:
                     0,
                     json.dumps(
                         {
-                            "services": {
-                                "healthy": {"networks": {"default": None}}
-                            },
+                            "services": {"healthy": {"networks": {"default": None}}},
                             "networks": {"default": {}},
                         }
                     ),
@@ -373,14 +384,10 @@ class _ConcreteComposeRunner:
                     if project in self.active
                     else []
                 )
-                return subprocess.CompletedProcess(
-                    argv, 0, json.dumps(records), ""
-                )
+                return subprocess.CompletedProcess(argv, 0, json.dumps(records), "")
             if "port" in command:
                 port = 41000 + sum(project.encode()) % 20000
-                return subprocess.CompletedProcess(
-                    argv, 0, f"127.0.0.1:{port}\n", ""
-                )
+                return subprocess.CompletedProcess(argv, 0, f"127.0.0.1:{port}\n", "")
             if "down" in command:
                 self.active.discard(project)
                 self.down_projects.append(project)
@@ -393,6 +400,7 @@ def _concrete_host_fixture(
     *,
     task_count: int = 1,
     coding_delay_seconds: float = 0,
+    dependency_chain: bool = False,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
@@ -427,14 +435,43 @@ def _concrete_host_fixture(
         manifest={},
     )
     generation_id = uuid4()
-    tasks = tuple(
-        _concrete_task(generation_id, borg, position)
-        for position in range(1, task_count + 1)
+    task_list: list[TaskRecord] = []
+    for position in range(1, task_count + 1):
+        task_list.append(
+            _concrete_task(
+                generation_id,
+                borg,
+                position,
+                dependencies=(task_list[-1].task_ref,)
+                if dependency_chain and task_list
+                else (),
+            )
+        )
+    tasks = tuple(task_list)
+    dependencies = (
+        tuple(
+            TaskDependency(
+                generation_id=generation_id,
+                task_id=tasks[position].id,
+                depends_on_task_id=tasks[position - 1].id,
+            )
+            for position in range(1, len(tasks))
+        )
+        if dependency_chain
+        else ()
     )
     generation_manifest = {
         "approved_plan_digest": approval.plan_digest,
         "batch_digest": batch.digest,
-        "dependencies": [],
+        "dependencies": [
+            {
+                "task_ref": tasks[position].task_ref,
+                "depends_on": tasks[position - 1].task_ref,
+            }
+            for position in range(1, len(tasks))
+        ]
+        if dependency_chain
+        else [],
         "plan_approval_id": str(approval.id),
         "tasks": [
             {
@@ -488,17 +525,13 @@ def _concrete_host_fixture(
         )
     store.append_plan_approval(approval)
     store.append_task_batch(batch)
-    store.add_task_generation(generation, tasks, [])
-    durable_root = (
-        repository_root / ".borg/tasks" / borg.name / str(generation.id)
-    )
+    store.add_task_generation(generation, tasks, dependencies)
+    durable_root = repository_root / ".borg/tasks" / borg.name / str(generation.id)
     for task in tasks:
         path = durable_root / task.stage / f"{task.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_task_markdown(task.task), encoding="utf-8")
-    store._promote_published_task_generation(
-        generation.id, durable_root=durable_root
-    )
+    store._promote_published_task_generation(generation.id, durable_root=durable_root)
     _git(repository_root, "add", ".")
     _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
 
@@ -506,14 +539,10 @@ def _concrete_host_fixture(
     plan = HostPreflightPlan(
         repository_root=repository_root,
         commands=(HostCommand("test", ("git", "status", "--short"), "."),),
-        prepare_commands=(
-            HostCommand("prepare", ("git", "status", "--short"), "."),
-        ),
+        prepare_commands=(HostCommand("prepare", ("git", "status", "--short"), "."),),
         materialize_commands=(),
         environment_files=(repository_root / "README.md",),
-        executables=(
-            HostExecutable("docker", Path("/validated/docker")),
-        ),
+        executables=(HostExecutable("docker", Path("/validated/docker")),),
         required_secret_names=(),
         compose_files=(repository_root / "compose.yml",),
         services=(
@@ -542,8 +571,13 @@ def _concrete_host_fixture(
         source_branch="main",
     )
     coding = MockAdapter()
-    for _ in tasks:
-        coding.queue(_coding_response(delay_seconds=coding_delay_seconds))
+    for position, _ in enumerate(tasks):
+        coding.queue(
+            _coding_response(
+                delay_seconds=coding_delay_seconds,
+                expected_existing_features=(position if dependency_chain else None),
+            )
+        )
     review = MockAdapter()
     for _ in tasks:
         review.queue(
@@ -652,9 +686,7 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
 ) -> None:
     fixture = _concrete_host_fixture(tmp_path, task_count=2)
     try:
-        first = fixture.service.run(
-            fixture.borg.id, fixture.generation.id, {}
-        )
+        first = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         assert first.status is ExecutionRunStatus.COMPLETED, [
             fixture.store.get_task_runtime(task.id).state_reason
@@ -662,8 +694,7 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         ]
         assert len(fixture.store.list_task_claims(first.operation_id)) == 2
         assert all(
-            fixture.store.get_task_runtime(task.id).status
-            is TaskRuntimeStatus.DONE
+            fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
             for task in fixture.tasks
         )
         assert len(fixture.coding.calls) == 2
@@ -688,35 +719,78 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         ]
         assert len(preparations) == 1
         assert preparations[0].result["prepared_before_dispatch"] is True
-        assert sum(
-            attempt.kind == "materialize" for attempt in environment_attempts
-        ) == 2
+        assert (
+            sum(attempt.kind == "materialize" for attempt in environment_attempts) == 2
+        )
         project_tip = _git(
             fixture.store.get_repository(fixture.borg.repository_id).root,
             "rev-parse",
             f"project/{fixture.borg.name}",
         )
 
-        resumed = fixture.service.run(
-            fixture.borg.id, fixture.generation.id, {}
-        )
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         assert resumed.status is ExecutionRunStatus.COMPLETED
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 2
-        assert _git(
-            fixture.store.get_repository(fixture.borg.repository_id).root,
-            "rev-parse",
-            f"project/{fixture.borg.name}",
-        ) == project_tip
+        assert (
+            _git(
+                fixture.store.get_repository(fixture.borg.repository_id).root,
+                "rev-parse",
+                f"project/{fixture.borg.name}",
+            )
+            == project_tip
+        )
+    finally:
+        fixture.store.close()
+
+
+def test_concrete_dependent_starts_from_published_prerequisite(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        task_count=2,
+        dependency_chain=True,
+    )
+    try:
+        result = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
+
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        first = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        second = fixture.store.get_task_runtime(fixture.tasks[1].id)
+        assert first is not None and first.branch is not None
+        assert second is not None and second.branch is not None
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository.root),
+                    "merge-base",
+                    "--is-ancestor",
+                    first.branch,
+                    second.branch,
+                ],
+                check=False,
+            ).returncode
+            == 0
+        )
     finally:
         fixture.store.close()
 
 
 def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
-    fixture = _concrete_host_fixture(
-        tmp_path, coding_delay_seconds=2
-    )
+    fixture = _concrete_host_fixture(tmp_path, coding_delay_seconds=2)
     cancel = CancellationToken()
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -745,9 +819,7 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
         )
 
         fixture.coding.queue(_coding_response())
-        resumed = fixture.service.run(
-            fixture.borg.id, fixture.generation.id, {}
-        )
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         assert resumed.status is ExecutionRunStatus.COMPLETED, (
             fixture.store.get_task_runtime(task.id).state_reason
@@ -776,9 +848,7 @@ class _ConcurrentRuntime:
             self.started.wait(timeout=2)
         if self.release is not None:
             self.release.wait(timeout=2)
-        outcome = (
-            TaskRuntimeStatus.BLOCKED if self.block else TaskRuntimeStatus.DONE
-        )
+        outcome = TaskRuntimeStatus.BLOCKED if self.block else TaskRuntimeStatus.DONE
         context.transition(TaskRuntimeStatus.CLAIMED, outcome)
         return outcome
 
@@ -907,6 +977,84 @@ def test_setup_heartbeats_keep_the_execution_lease_owned(tmp_path: Path) -> None
         store.close()
 
 
+def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    start = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    expired_at = start + timedelta(seconds=2)
+    previous = store.acquire_execution_run(
+        borg.id,
+        generation.id,
+        lease_duration=timedelta(seconds=1),
+        now=start,
+    )
+    assert previous.owner_token is not None
+    previous_claim = store.claim_dependency_ready_task(
+        previous.run_id,
+        previous.owner_token,
+        lease_duration=timedelta(seconds=1),
+        now=start,
+    )
+    assert previous_claim is not None
+    resource = ComposeResource(
+        run_id=previous.run_id,
+        claim_id=previous_claim.id,
+        task_id=records[0].id,
+        project_name="expired-between-reconcile-and-acquire",
+        resource_type="project",
+        resource_name="expired-between-reconcile-and-acquire",
+        created_at=start,
+    )
+    store.add_compose_resource(
+        resource,
+        previous.owner_token,
+        previous_claim.claim_token,
+        now=start,
+    )
+
+    class ExpiryRaceClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> datetime:
+            self.calls += 1
+            return start if self.calls == 1 else expired_at
+
+    class CleanupCompose(_Compose):
+        def cleanup_stale_projects(self, cleanup_store, resources):
+            self.calls.append("stale-cleanup")
+            for stale in resources:
+                cleanup_store.confirm_compose_project_cleanup(
+                    stale.run_id,
+                    stale.task_id,
+                    stale.project_name,
+                    now=expired_at,
+                )
+            return ()
+
+    clock = ExpiryRaceClock()
+    compose = CleanupCompose(calls)
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            _ConcurrentRuntime(plan),
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            clock=clock,
+        ).run(borg.id, generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert calls.index("stale-cleanup") < calls.index("worktrees")
+        assert store.list_stale_compose_resources(previous.run_id) == []
+        assert store.list_task_claims(previous.run_id)[0].released_at == expired_at
+    finally:
+        store.close()
+
+
 def test_reusable_cache_preparation_precedes_task_dispatch(tmp_path: Path) -> None:
     store, borg, generation, _ = _store_fixture(tmp_path)
     calls: list[str] = []
@@ -1018,9 +1166,7 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
 
             def __call__(self, context) -> TaskRuntimeStatus:
                 resumed_ids.append(str(context.claim.task_id))
-                context.transition(
-                    TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE
-                )
+                context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
                 return TaskRuntimeStatus.DONE
 
         resumed = HostExecutionService(
