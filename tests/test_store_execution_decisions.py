@@ -1,22 +1,38 @@
 """Contracts for generation-bound execution decisions."""
 
-import hashlib
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from betterborg_cli.planning import TaskPublisher
 from betterborg_cli.store import (
     Borg,
+    BorgState,
     ExecutionDecision,
     PlanApproval,
     Repository,
     SqliteStore,
-    TaskBatch,
-    TaskComplexity,
     TaskGeneration,
-    TaskRecord,
 )
+
+
+def _task_body(round_number: int) -> dict:
+    label = f"generation-{round_number}"
+    return {
+        "stage": "08-estimate-publish",
+        "stem": f"{round_number:02d}-{label}",
+        "title": f"Publish {label}",
+        "why": "Execution decisions must follow the published generation.",
+        "scope": [f"Publish {label}."],
+        "implementation_notes": [],
+        "acceptance_criteria": ["The generation is published."],
+        "tests": ["Verify the generation-bound decision."],
+        "dependencies": [],
+        "out_of_scope": [],
+        "plan_refs": ["P1.deliverable.1"],
+        "estimate_complexity": "small",
+    }
 
 
 def _publish_generation(
@@ -24,57 +40,39 @@ def _publish_generation(
     repository: Repository,
     borg: Borg,
     approval: PlanApproval,
+    approved_task_generation,
     *,
-    round: int,
-) -> tuple[TaskBatch, TaskGeneration]:
-    label = f"generation-{round}"
-    batch = TaskBatch(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        round=round,
-        digest=f"sha256:batch-{round}",
-        manifest={"tasks": [label]},
+    round_number: int,
+) -> tuple[str, TaskGeneration]:
+    fixture = approved_task_generation(
+        store,
+        borg,
+        approval,
+        body=_task_body(round_number),
+        round_number=round_number,
     )
-    generation = TaskGeneration(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        batch_id=batch.id,
-        digest=f"sha256:{label}",
-        manifest={"tasks": [label]},
+    generation = (
+        TaskPublisher(repository, store).publish(fixture.generation.id).generation
     )
-    body = label.encode()
-    task = TaskRecord(
-        generation_id=generation.id,
-        borg_id=borg.id,
-        task_ref=label,
-        stage="08-estimate-publish",
-        stem=f"{round:02d}-{label}",
-        position=1,
-        title=f"Publish {label}",
-        complexity=TaskComplexity.SMALL,
-        digest=f"sha256:{hashlib.sha256(body).hexdigest()}",
-        task={"acceptance_criteria": ["published"]},
-        manifest={"task.md": label},
+    batch = next(
+        batch
+        for batch in store.list_task_batches(borg.id)
+        if batch.id == generation.batch_id
     )
-    store.append_task_batch(batch)
-    store.add_task_generation(generation, [task])
-    durable_root = (
-        repository.root / ".borg" / "tasks" / borg.name / str(generation.id)
-    )
-    task_path = durable_root / task.stage / f"{task.stem}.md"
-    task_path.parent.mkdir(parents=True, exist_ok=True)
-    task_path.write_bytes(body)
-    return batch, store._promote_published_task_generation(
-        generation.id, durable_root=durable_root
-    )
+    return batch.digest, generation
 
 
 def test_decisions_are_complete_unique_and_current_generation_bound(
-    tmp_path: Path,
+    committed_git_repo: Path,
+    approved_task_generation,
 ) -> None:
-    database = tmp_path / "state" / "borg.sqlite3"
-    repository = Repository(root=tmp_path / "repository")
-    borg = Borg(repository_id=repository.id, name="Estimator")
+    database = committed_git_repo.parent / "state" / "borg.sqlite3"
+    repository = Repository(root=committed_git_repo)
+    borg = Borg(
+        repository_id=repository.id,
+        name="Estimator",
+        state=BorgState.SUPERVISOR_WORKING,
+    )
     approval = PlanApproval(
         borg_id=borg.id,
         plan_digest="sha256:approved-plan",
@@ -85,14 +83,19 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
         store.add_repository(repository)
         store.add_borg(borg)
         store.append_plan_approval(approval)
-        first_batch, first_generation = _publish_generation(
-            store, repository, borg, approval, round=1
+        first_batch_digest, first_generation = _publish_generation(
+            store,
+            repository,
+            borg,
+            approval,
+            approved_task_generation,
+            round_number=1,
         )
         first = ExecutionDecision(
             borg_id=borg.id,
             generation_id=first_generation.id,
             approved_plan_digest=approval.plan_digest,
-            task_batch_digest=first_batch.digest,
+            task_batch_digest=first_batch_digest,
             estimate_version="execution-estimate-v1",
             source="interactive",
             snapshot={
@@ -115,7 +118,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
             borg_id=borg.id,
             generation_id=first_generation.id,
             approved_plan_digest=approval.plan_digest,
-            task_batch_digest=first_batch.digest,
+            task_batch_digest=first_batch_digest,
             estimate_version="execution-estimate-v1",
             source="noninteractive",
             snapshot=first.snapshot,
@@ -124,8 +127,13 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
         with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
             store.append_execution_decision(duplicate)
 
-        second_batch, second_generation = _publish_generation(
-            store, repository, borg, approval, round=2
+        second_batch_digest, second_generation = _publish_generation(
+            store,
+            repository,
+            borg,
+            approval,
+            approved_task_generation,
+            round_number=2,
         )
         assert store.get_current_execution_decision(borg.id) is None
         assert store.get_execution_decision(borg.id, first_generation.id) == first
@@ -134,7 +142,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
             borg_id=borg.id,
             generation_id=first_generation.id,
             approved_plan_digest=approval.plan_digest,
-            task_batch_digest=first_batch.digest,
+            task_batch_digest=first_batch_digest,
             estimate_version="execution-estimate-v2",
             source="interactive",
             snapshot={"generation_id": str(first_generation.id)},
@@ -150,7 +158,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
             borg_id=borg.id,
             generation_id=second_generation.id,
             approved_plan_digest=approval.plan_digest,
-            task_batch_digest=second_batch.digest,
+            task_batch_digest=second_batch_digest,
             estimate_version="execution-estimate-v2",
             source="noninteractive",
             snapshot={"generation_id": str(second_generation.id)},
@@ -162,8 +170,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             with store.transaction() as connection:
                 connection.execute(
-                    "UPDATE execution_decisions SET decision = 'rejected' "
-                    "WHERE id = ?",
+                    "UPDATE execution_decisions SET decision = 'rejected' WHERE id = ?",
                     (str(second.id),),
                 )
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -185,27 +192,39 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
     assert reopened_applied_at == migration_applied_at
 
 
-def test_decision_digests_must_match_the_current_generation(tmp_path: Path) -> None:
-    repository = Repository(root=tmp_path / "repository")
-    borg = Borg(repository_id=repository.id, name="DigestBound")
+def test_decision_digests_must_match_the_current_generation(
+    committed_git_repo: Path,
+    approved_task_generation,
+) -> None:
+    repository = Repository(root=committed_git_repo)
+    borg = Borg(
+        repository_id=repository.id,
+        name="DigestBound",
+        state=BorgState.SUPERVISOR_WORKING,
+    )
     approval = PlanApproval(
         borg_id=borg.id,
         plan_digest="sha256:approved-plan",
         manifest={},
     )
 
-    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+    with SqliteStore.open(committed_git_repo.parent / "borg.sqlite3") as store:
         store.add_repository(repository)
         store.add_borg(borg)
         store.append_plan_approval(approval)
-        batch, generation = _publish_generation(
-            store, repository, borg, approval, round=1
+        batch_digest, generation = _publish_generation(
+            store,
+            repository,
+            borg,
+            approval,
+            approved_task_generation,
+            round_number=1,
         )
         mismatched = ExecutionDecision(
             borg_id=borg.id,
             generation_id=generation.id,
             approved_plan_digest=approval.plan_digest,
-            task_batch_digest=f"{batch.digest}-changed",
+            task_batch_digest=f"{batch_digest}-changed",
             estimate_version="execution-estimate-v1",
             source="interactive",
             snapshot={"generation_id": str(generation.id)},
