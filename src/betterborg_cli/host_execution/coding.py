@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,20 +16,28 @@ from betterborg_cli.agent_runtime import (
     AgentStatus,
     BillingMode,
 )
+from betterborg_cli.host_execution._agent_phase import (
+    AgentAttemptArtifacts,
+    HostAgentPhaseError,
+    VerifiedTaskInputs,
+    current_branch,
+    require_ready_worktree,
+    result_summary,
+    verified_task_inputs,
+)
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
-from betterborg_cli.planning import TaskDigestDriftError, TaskPublisher
+from betterborg_cli.planning import TaskDigestDriftError
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
-    TaskRecord,
     TaskRuntime,
     TaskRuntimeStatus,
 )
 
-_CODING_SCHEMA: dict[str, Any] = {
+CODING_RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -101,15 +107,6 @@ class HostCodingConfig:
             object.__setattr__(self, "artifact_root", Path(self.artifact_root))
 
 
-@dataclass(frozen=True, slots=True)
-class _CodingInputs:
-    task: TaskRecord
-    task_path: Path
-    task_markdown: str
-    dependencies: tuple[tuple[TaskRecord, Path, str], ...]
-    system_prompt: str
-
-
 class HostCodingPhase:
     """Run one coding attempt without claiming or preparing task work."""
 
@@ -147,7 +144,12 @@ class HostCodingPhase:
         try:
             runtime, worktree = self._require_ready_worktree(context)
             inputs = self._verified_inputs(context, worktree)
-        except (CodingPhaseError, TaskDigestDriftError, OSError) as error:
+        except (
+            CodingPhaseError,
+            HostAgentPhaseError,
+            TaskDigestDriftError,
+            OSError,
+        ) as error:
             return self._block(context, str(error) or error.__class__.__name__)
 
         resumed = self._resume_completed_attempt(context, worktree)
@@ -168,12 +170,15 @@ class HostCodingPhase:
         )
         try:
             attempt_dir.mkdir(parents=True, exist_ok=False)
+            artifacts = AgentAttemptArtifacts(
+                self.repository_root, attempt_dir, worktree, "coding"
+            )
             user_prompt = _render_user_prompt(inputs)
-            _write_new(attempt_dir / "system-prompt.md", inputs.system_prompt)
-            _write_new(attempt_dir / "user-prompt.md", user_prompt)
-            _write_new(
-                attempt_dir / "result-schema.json",
-                json.dumps(_CODING_SCHEMA, indent=2, sort_keys=True) + "\n",
+            artifacts.write_text("system-prompt.md", inputs.system_prompt)
+            artifacts.write_text("user-prompt.md", user_prompt)
+            artifacts.write_text(
+                "result-schema.json",
+                json.dumps(CODING_RESULT_SCHEMA, indent=2, sort_keys=True) + "\n",
             )
         except OSError as error:
             return self._block(context, f"unable to create coding artifacts: {error}")
@@ -206,7 +211,7 @@ class HostCodingPhase:
         spec = AgentRunSpec(
             system_prompt=inputs.system_prompt,
             user_prompt=user_prompt,
-            schema=_CODING_SCHEMA,
+            schema=CODING_RESULT_SCHEMA,
             cwd=worktree,
             model=self._config.model,
             log_path=log_path,
@@ -238,7 +243,7 @@ class HostCodingPhase:
 
         try:
             final_head = worktree_git.head_sha()
-            branch = _current_branch(worktree_git)
+            branch = current_branch(worktree_git)
         except BaseException as error:
             operational_error = operational_error or error
             final_head = base_head
@@ -265,9 +270,7 @@ class HostCodingPhase:
             "billing_mode": result.billing_mode.value,
         }
         try:
-            self._finish_artifacts(
-                attempt_dir, worktree, result, durable_result
-            )
+            artifacts.finish(result, durable_result)
         except OSError as error:
             outcome = (
                 TaskRuntimeStatus.BLOCKED,
@@ -290,7 +293,7 @@ class HostCodingPhase:
                 self._artifact_ref(result_path) if result_path.is_file() else None
             ),
             result=durable_result,
-            summary=_result_summary(result),
+            summary=result_summary(result),
             duration_seconds=result.duration_seconds,
             usage=result.usage,
             now=context.clock(),
@@ -300,104 +303,21 @@ class HostCodingPhase:
     def _require_ready_worktree(
         self, context: ScheduledTaskContext
     ) -> tuple[TaskRuntime, Path]:
-        runtime = context.runtime
-        if runtime.status is not TaskRuntimeStatus.CODING:
-            raise CodingPhaseError(
-                f"task is {runtime.status.value}, not ready for coding"
-            )
-        if runtime.last_run_id != context.claim.run_id:
-            raise CodingPhaseError("task runtime is not owned by the claimed run")
-        if runtime.worktree_path is None or runtime.branch is None:
-            raise CodingPhaseError("claimed task has no persisted worktree")
-        worktree = Path(runtime.worktree_path).resolve()
-        if not any(
-            Path(entry.get("path", "")).resolve() == worktree
-            and entry.get("branch") == f"refs/heads/{runtime.branch}"
-            for entry in self._primary_git.worktree_list()
-        ):
-            raise CodingPhaseError(
-                "claimed task path is not its registered BetterBorg worktree"
-            )
-        materializations = [
-            attempt
-            for attempt in context.store.list_environment_attempts(
-                context.claim.task_id
-            )
-            if attempt.kind == "materialize"
-            and attempt.status is ExecutionAttemptStatus.COMPLETED
-        ]
-        if not materializations:
-            raise CodingPhaseError("claimed task environment is not materialized")
-        marker = worktree / ".borg/state/environment-materialization"
-        try:
-            fingerprint = marker.read_text(encoding="utf-8").strip()
-        except OSError as error:
-            raise CodingPhaseError(
-                "claimed task environment marker is missing"
-            ) from error
-        if fingerprint != materializations[-1].fingerprint:
-            raise CodingPhaseError("claimed task environment marker has drifted")
-        if _current_branch(SafeGit(worktree)) != runtime.branch:
-            raise CodingPhaseError("claimed task worktree is on the wrong branch")
-        return runtime, worktree
+        return require_ready_worktree(
+            self.repository_root,
+            self._primary_git,
+            context,
+            expected_statuses={TaskRuntimeStatus.CODING},
+        )
 
     def _verified_inputs(
         self, context: ScheduledTaskContext, worktree: Path
-    ) -> _CodingInputs:
-        generation = context.store.get_task_generation(
-            context.runtime.generation_id
-        )
-        if generation is None:
-            raise CodingPhaseError("task generation is missing")
-        borg = context.store.get_borg(generation.borg_id)
-        if borg is None:
-            raise CodingPhaseError("task Borg is missing")
-        repository = context.store.get_repository(borg.repository_id)
-        if repository is None or repository.root != self.repository_root:
-            raise CodingPhaseError("task repository does not match coding checkout")
-        publication = TaskPublisher(
-            repository, context.store
-        ).inspect_current_task_files(borg.id)
-        by_id = {published.task.id: published for published in publication.files}
-        published = by_id.get(context.claim.task_id)
-        if published is None:
-            raise CodingPhaseError("claimed task is not in the current generation")
-
-        relative = published.path.relative_to(self.repository_root)
-        task_path = worktree / relative
-        task_markdown = _read_digest_valid(task_path, published.task.digest)
-        dependency_ids = {
-            edge.depends_on_task_id
-            for edge in context.store.list_task_dependencies(generation.id)
-            if edge.task_id == context.claim.task_id
-        }
-        dependencies: list[tuple[TaskRecord, Path, str]] = []
-        for dependency_id in sorted(
-            dependency_ids, key=lambda item: by_id[item].task.position
-        ):
-            dependency = by_id.get(dependency_id)
-            if dependency is None:
-                raise CodingPhaseError("task dependency is not in the generation")
-            dependency_relative = dependency.path.relative_to(self.repository_root)
-            dependency_path = worktree / dependency_relative
-            dependencies.append(
-                (
-                    dependency.task,
-                    dependency_relative,
-                    _read_digest_valid(dependency_path, dependency.task.digest),
-                )
-            )
-
-        prompts = context.store.get_latest_generated_prompts(repository.id)
-        coding_prompt = prompts.get("coding")
-        if coding_prompt is None or not coding_prompt.body_md.strip():
-            raise CodingPhaseError("repository has no generated coding prompt")
-        return _CodingInputs(
-            task=published.task,
-            task_path=relative,
-            task_markdown=task_markdown,
-            dependencies=tuple(dependencies),
-            system_prompt=coding_prompt.body_md,
+    ) -> VerifiedTaskInputs:
+        return verified_task_inputs(
+            self.repository_root,
+            context,
+            worktree,
+            prompt_role="coding",
         )
 
     def _resume_completed_attempt(
@@ -477,81 +397,10 @@ class HostCodingPhase:
             )
         return TaskRuntimeStatus.REVIEW, f"coding committed {final_head}"
 
-    def _finish_artifacts(
-        self,
-        attempt_dir: Path,
-        worktree: Path,
-        result: AgentResult,
-        durable_result: dict[str, Any],
-    ) -> None:
-        canonical_result = attempt_dir / "coding.result.json"
-        if result.payload is not None and not canonical_result.exists():
-            _write_new(
-                canonical_result,
-                json.dumps(result.payload, indent=2, sort_keys=True) + "\n",
-            )
-        durable_result["_betterborg"]["adapter_artifacts"] = (
-            self._snapshot_adapter_artifacts(attempt_dir, worktree, result)
-        )
-        outcome = {
-            "status": result.status.value,
-            "exit_code": result.exit_code,
-            "error": result.error,
-            "result": durable_result,
-        }
-        _write_new(
-            attempt_dir / "coding.outcome.json",
-            json.dumps(outcome, indent=2, sort_keys=True) + "\n",
-        )
-        files = sorted(path for path in attempt_dir.rglob("*") if path.is_file())
-        manifest = {
-            path.relative_to(attempt_dir).as_posix(): (
-                f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
-            )
-            for path in files
-        }
-        _write_new(
-            attempt_dir / "artifact-manifest.json",
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        )
-        for path in attempt_dir.rglob("*"):
-            if path.is_file():
-                path.chmod(0o444)
-
-    def _snapshot_adapter_artifacts(
-        self, attempt_dir: Path, worktree: Path, result: AgentResult
-    ) -> list[dict[str, str]]:
-        snapshots: list[dict[str, str]] = []
-        destination_root = attempt_dir / "adapter-artifacts"
-        for index, artifact in enumerate(result.artifacts, start=1):
-            reference = str(artifact.path)
-            if "://" in reference:
-                snapshots.append(
-                    {"kind": artifact.kind, "reference": reference}
-                )
-                continue
-            source = Path(artifact.path)
-            if not source.is_absolute():
-                source = worktree / source
-            source = source.resolve()
-            if not source.is_file():
-                raise OSError(f"agent artifact is not a file: {source}")
-            if source.is_relative_to(attempt_dir):
-                snapshot = source
-            else:
-                destination_root.mkdir(exist_ok=True)
-                snapshot = destination_root / f"{index:03d}-{source.name}"
-                _write_new_bytes(snapshot, source.read_bytes())
-            snapshots.append(
-                {"kind": artifact.kind, "path": self._artifact_ref(snapshot)}
-            )
-        return snapshots
-
     def _artifact_ref(self, path: Path) -> str:
-        resolved = path.resolve()
-        if resolved.is_relative_to(self.repository_root):
-            return resolved.relative_to(self.repository_root).as_posix()
-        return str(resolved)
+        return AgentAttemptArtifacts(
+            self.repository_root, path.parent, self.repository_root, "coding"
+        ).reference(path)
 
     def _transition(
         self,
@@ -598,29 +447,7 @@ class HostCodingPhase:
         return TaskRuntimeStatus.BLOCKED
 
 
-def _current_branch(git: SafeGit) -> str:
-    result = git.run(["rev-parse", "--abbrev-ref", "HEAD"], check=False)
-    branch = result.stdout.strip()
-    if result.returncode != 0 or not branch or branch == "HEAD":
-        raise CodingPhaseError("task worktree is not on an attached branch")
-    return branch
-
-
-def _read_digest_valid(path: Path, digest: str) -> str:
-    try:
-        body = path.read_bytes()
-    except OSError as error:
-        raise TaskDigestDriftError(f"task input is missing: {path}") from error
-    actual = f"sha256:{hashlib.sha256(body).hexdigest()}"
-    if actual != digest:
-        raise TaskDigestDriftError(f"task input digest drifted: {path}")
-    try:
-        return body.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise TaskDigestDriftError(f"task input is not UTF-8: {path}") from error
-
-
-def _render_user_prompt(inputs: _CodingInputs) -> str:
+def _render_user_prompt(inputs: VerifiedTaskInputs) -> str:
     sections = [
         "Implement the assigned task in the current worktree. Commit all required "
         "changes before returning completed.",
@@ -648,23 +475,9 @@ def _render_user_prompt(inputs: _CodingInputs) -> str:
     return "\n".join(sections).rstrip() + "\n"
 
 
-def _result_summary(result: AgentResult) -> str:
-    summary = (result.payload or {}).get("summary")
-    if isinstance(summary, str) and summary.strip():
-        return summary[:1000]
-    return (result.error or result.status.value)[:1000]
-
-
-def _write_new(path: Path, content: str) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(content)
-
-
-def _write_new_bytes(path: Path, content: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(content)
-
-
-__all__ = ["CodingPhaseError", "HostCodingConfig", "HostCodingPhase"]
+__all__ = [
+    "CODING_RESULT_SCHEMA",
+    "CodingPhaseError",
+    "HostCodingConfig",
+    "HostCodingPhase",
+]

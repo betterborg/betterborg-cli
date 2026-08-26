@@ -24,6 +24,8 @@ from betterborg_cli.host_execution import (
     HostCodingPhase,
     HostEnvironmentManager,
     HostPreflightPlan,
+    HostReviewFixConfig,
+    HostReviewFixPhase,
     HostWorktreeManager,
     ScheduledTaskContext,
 )
@@ -348,6 +350,63 @@ def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
     return MockResponse(dynamic=commit)
 
 
+def _review_payload(
+    task: TaskRecord,
+    *,
+    status: str,
+    findings: list[str] | None = None,
+) -> dict:
+    return {
+        "task_file": f"{task.stage}/{task.stem}.md",
+        "status": status,
+        "summary": (
+            "Implementation approved."
+            if status == "approved"
+            else "Implementation needs changes."
+        ),
+        "issues_file": "",
+        "findings": findings or [],
+    }
+
+
+def _fixing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
+    def commit(spec):
+        feature = spec.cwd / "feature.txt"
+        feature.write_text(feature.read_text() + "fixed\n", encoding="utf-8")
+        _git(spec.cwd, "add", "feature.txt")
+        _git(spec.cwd, "commit", "--quiet", "-m", "fix review finding")
+        return MockResponse(
+            payload=_completed_payload(task),
+            usage=usage,
+            billing_mode=spec.billing_mode,
+        )
+
+    return MockResponse(dynamic=commit)
+
+
+def _prepare_review(
+    fixture: CodingFixture,
+    store: SqliteStore,
+    *,
+    usage: AgentUsage | None = None,
+) -> None:
+    coding_prompt = store.get_latest_generated_prompts(
+        fixture.borg.repository_id
+    )["coding"]
+    store.append_generated_prompt(
+        repository_id=fixture.borg.repository_id,
+        analysis_id=coding_prompt.analysis_id,
+        role="review",
+        body_md="You are the generated read-only review agent.\n",
+    )
+    status = HostCodingPhase(
+        fixture.repository,
+        MockAdapter().queue(_committing_response(fixture.task, usage=usage)),
+        config=HostCodingConfig(model="coding-model"),
+    ).run(fixture.context(store))
+    assert status is TaskRuntimeStatus.REVIEW
+
+
 def test_coding_runs_from_digest_verified_inputs_and_persists_billing(
     tmp_path: Path,
 ) -> None:
@@ -561,3 +620,255 @@ def test_primary_checkout_guard_blocks_coding_without_discarding_state(
     assert adapter.calls == []
     assert runtime is not None and "primary checkout" in runtime.state_reason
     assert (fixture.repository / "README.md").read_text() == "# operator work\n"
+
+
+def test_review_approval_persists_immutable_artifacts_and_declared_base(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    review_usage = AgentUsage(tokens_input=80, tokens_output=10)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(fixture.task, status="approved"),
+            usage=review_usage,
+            billing_mode=BillingMode.SUBSCRIPTION,
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        before = store.get_task_runtime(fixture.task.id)
+        assert before is not None
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                review_billing_mode=BillingMode.SUBSCRIPTION,
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
+    assert runtime.branch == before.branch
+    assert runtime.worktree_path == before.worktree_path
+    assert runtime.branch is not None
+    assert runtime.branch.rsplit("-", 1)[-1].isalnum()
+    assert [attempt.phase for attempt in attempts] == ["coding", "review"]
+    review_attempt = attempts[-1]
+    assert review_attempt.review_round == 0
+    assert review_attempt.billing_mode is BillingMode.SUBSCRIPTION
+    assert review_attempt.usage == review_usage
+    metadata = review_attempt.result["_betterborg"]
+    coding_metadata = attempts[0].result["_betterborg"]
+    assert metadata["base_commit"] == coding_metadata["base_commit"]
+    assert metadata["commit_sha"] == coding_metadata["commit_sha"]
+    artifact_dir = fixture.repository / metadata["artifact_dir"]
+    assert not (artifact_dir / "artifact-manifest.json").stat().st_mode & stat.S_IWUSR
+    assert "Declared base commit" in review.calls[0].user_prompt
+    assert _git(fixture.repository, "status", "--porcelain") == ""
+
+
+def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    finding = "feature.txt must include the reviewed fix"
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[finding],
+                ),
+                usage=AgentUsage(tokens_input=50),
+                billing_mode=BillingMode.SUBSCRIPTION,
+            )
+        )
+        .queue(
+            MockResponse(
+                payload=_review_payload(fixture.task, status="approved"),
+                usage=AgentUsage(tokens_input=40),
+                billing_mode=BillingMode.SUBSCRIPTION,
+            )
+        )
+    )
+    fix = MockAdapter().queue(
+        _fixing_response(
+            fixture.task,
+            usage=AgentUsage(cost_usd=0.25, tokens_input=100, tokens_output=20),
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(
+            fixture, store, usage=AgentUsage(cost_usd=0.50, tokens_input=120)
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                fix_model="fix-model",
+                review_billing_mode=BillingMode.SUBSCRIPTION,
+                fix_billing_mode=BillingMode.API,
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+        projection = store.list_task_runtime(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert runtime is not None and runtime.review_round == 1
+    assert [(attempt.phase, attempt.review_round) for attempt in attempts] == [
+        ("coding", 0),
+        ("review", 0),
+        ("fix", 1),
+        ("review", 1),
+    ]
+    assert attempts[1].result["findings"] == [finding]
+    assert finding in fix.calls[0].user_prompt
+    assert _git(Path(runtime.worktree_path), "log", "-1", "--pretty=%s") == (
+        "fix review finding"
+    )
+    task_row = next(row for row in projection if row.task_id == fixture.task.id)
+    assert task_row.attempt_count == 4
+    assert task_row.cost.api_spend_usd == pytest.approx(0.75)
+    assert task_row.cost.api_spend_unknown is False
+    assert task_row.cost.subscription_included is True
+
+
+def test_review_pass_cap_blocks_after_persisting_last_findings(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=["first finding"],
+                )
+            )
+        )
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=["still failing after the fix"],
+                )
+            )
+        )
+    )
+    fix = MockAdapter().queue(_fixing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                review_passes=2,
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.review_round == 2
+    assert runtime.resume_phase == "review"
+    assert runtime.state_reason == "review pass limit 2 reached"
+    assert [attempt.phase for attempt in attempts] == [
+        "coding",
+        "review",
+        "fix",
+        "review",
+    ]
+    assert attempts[-1].result["findings"] == ["still failing after the fix"]
+    assert len(fix.calls) == 1
+
+
+def test_cancelled_review_blocks_resumably_with_immutable_attempt(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+    cancel.cancel()
+    review = MockAdapter().queue(
+        MockResponse(payload=_review_payload(fixture.task, status="approved"))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        attempt = store.list_agent_attempts(fixture.task.id)[-1]
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None and runtime.resume_phase == "review"
+    assert "interrupted" in runtime.state_reason
+    assert attempt.status is ExecutionAttemptStatus.CANCELLED
+    assert attempt.result["_betterborg"]["outcome_status"] == "blocked"
+    artifact_dir = fixture.repository / attempt.result["_betterborg"]["artifact_dir"]
+    assert not (artifact_dir / "artifact-manifest.json").stat().st_mode & stat.S_IWUSR
+
+
+def test_completed_review_resumes_transition_without_replaying_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    first_review = MockAdapter().queue(
+        MockResponse(payload=_review_payload(fixture.task, status="approved"))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        transition = store.transition_task_runtime
+
+        def crash_before_merge(*args, **kwargs):
+            if kwargs.get("new_status") is TaskRuntimeStatus.MERGING:
+                raise RuntimeError("simulated restart after durable review")
+            return transition(*args, **kwargs)
+
+        monkeypatch.setattr(store, "transition_task_runtime", crash_before_merge)
+        with pytest.raises(RuntimeError, match="simulated restart"):
+            HostReviewFixPhase(
+                fixture.repository,
+                first_review,
+                config=HostReviewFixConfig(review_model="review-model"),
+            ).run(fixture.context(store))
+        monkeypatch.setattr(store, "transition_task_runtime", transition)
+        interrupted = store.get_task_runtime(fixture.task.id)
+        assert interrupted is not None
+        assert interrupted.status is TaskRuntimeStatus.REVIEW
+
+        replay = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            replay,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(first_review.calls) == 1
+    assert replay.calls == []
+    with SqliteStore.open(fixture.database) as reopened:
+        assert [
+            attempt.phase
+            for attempt in reopened.list_agent_attempts(fixture.task.id)
+        ] == ["coding", "review"]
