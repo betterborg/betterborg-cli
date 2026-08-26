@@ -74,6 +74,7 @@ from betterborg_cli.store import (
     Borg,
     BorgState,
     ExecutionDecision,
+    ExecutionRunStatus,
     PlanApproval,
     PlanChangeRequest,
     PlanningAttempt,
@@ -695,27 +696,34 @@ def _invoke_host_execution(
         raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
     analyzer_plan = analysis.analysis_json
     preflight = HostPreflight(paths.root)
-    validated = preflight.validate(analyzer_plan)
+    validated = preflight.validate(
+        analyzer_plan,
+        available_secret_names=os.environ.keys(),
+    )
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
+    execution_trust = _execution_agent_trust_requirement(paths)
     coding_agent = select_agent(
         config,
         ApiAgentRole.CODING,
         paths,
         interactive=_stdin_is_interactive(),
+        trust_requirement=execution_trust,
     )
     review_agent = select_agent(
         config,
         ApiAgentRole.REVIEW,
         paths,
         interactive=_stdin_is_interactive(),
+        trust_requirement=execution_trust,
     )
     merge_agent = select_agent(
         config,
         ApiAgentRole.MERGE,
         paths,
         interactive=_stdin_is_interactive(),
+        trust_requirement=execution_trust,
     )
     environment = HostEnvironmentManager(paths.root)
     compose = HostComposeManager(paths.root)
@@ -796,6 +804,15 @@ def _invoke_host_execution(
     )
 
 
+def _execution_agent_trust_requirement(primary_paths: RepoPaths):
+    """Reuse explicit primary-checkout trust for verified managed worktrees."""
+
+    def require_primary_workspace_trust(_run_paths: RepoPaths, **kwargs):
+        return require_workspace_trust(primary_paths, **kwargs)
+
+    return require_primary_workspace_trust
+
+
 def _agent_billing_mode(adapter_name: str) -> BillingMode:
     if adapter_name in {"claude", "codex"}:
         return BillingMode.SUBSCRIPTION
@@ -810,9 +827,13 @@ def _write_host_execution_result(result: HostExecutionResult) -> None:
         return
     if result.operation_id is None or result.status is None:
         raise click.ClickException("host execution returned no operation")
-    click.echo(
-        f"Execution operation {result.operation_id}: {result.status.value}"
-    )
+    message = f"Execution operation {result.operation_id}: {result.status.value}"
+    if result.status in {
+        ExecutionRunStatus.FAILED,
+        ExecutionRunStatus.CANCELLED,
+    }:
+        raise click.ClickException(message)
+    click.echo(message)
 
 
 @task.command(name="show")

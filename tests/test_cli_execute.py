@@ -88,7 +88,9 @@ def _seed_executable_generation(
     return repository, paths, borg, approval, fixture, publication
 
 
-def _execution_result():
+def _execution_result(
+    status: ExecutionRunStatus = ExecutionRunStatus.COMPLETED,
+):
     return SimpleNamespace(
         preflight=HostPreflightPlan(
             repository_root=Path.cwd(),
@@ -103,7 +105,7 @@ def _execution_result():
         ),
         active_operation_id=None,
         operation_id=uuid4(),
-        status=ExecutionRunStatus.COMPLETED,
+        status=status,
     )
 
 
@@ -248,6 +250,41 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     assert decision.snapshot["generation_id"] == str(fixture.generation.id)
 
 
+@pytest.mark.parametrize(
+    "status",
+    [ExecutionRunStatus.FAILED, ExecutionRunStatus.CANCELLED],
+)
+def test_execute_exits_nonzero_for_unsuccessful_host_execution(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    status: ExecutionRunStatus,
+) -> None:
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name="unsuccessful-execution",
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(status),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", "unsuccessful-execution", "--auto-execute"],
+    )
+
+    assert result.exit_code == 1
+    assert "Execution operation " in result.output
+    assert f": {status.value}" in result.output
+
+
 def test_task_digest_drift_blocks_before_decision_or_host_execution(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -298,11 +335,14 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     )
     _trust(cli_runner, committed_git_repo, monkeypatch)
     config = cli_module.load_repository_config(paths)
+    monkeypatch.setenv("EXECUTE_TOKEN", "owner-secret")
     adapters: list[MockAdapter] = []
+    execution_trust: list[object] = []
 
-    def select(*_args, **_kwargs):
+    def select(*_args, **kwargs):
         adapter = MockAdapter(name="openai")
         adapters.append(adapter)
+        execution_trust.append(kwargs["trust_requirement"])
         return adapter
 
     calls: list[tuple[object, ...]] = []
@@ -322,6 +362,24 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         analysis = store.get_prior_ready_analysis(repository.id)
         assert analysis is not None
+        analyzer_plan = {
+            **analysis.analysis_json,
+            "required_secrets": [
+                {
+                    "name": "EXECUTE_TOKEN",
+                    "used_by": ["coding"],
+                    "scope": "agent",
+                    "source": "test",
+                }
+            ],
+        }
+        monkeypatch.setattr(
+            cli_module.SqliteStore,
+            "get_prior_ready_analysis",
+            lambda _store, _repository_id: SimpleNamespace(
+                analysis_json=analyzer_plan
+            ),
+        )
         result = cli_module._invoke_host_execution(
             paths,
             store,
@@ -333,11 +391,21 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
 
     assert isinstance(result, HostExecutionResult)
     assert len(adapters) == 3
+    observed_trust_paths: list[Path] = []
+    monkeypatch.setattr(
+        cli_module,
+        "require_workspace_trust",
+        lambda observed, **_kwargs: observed_trust_paths.append(observed.root),
+    )
+    managed_worktree_paths = SimpleNamespace(root=paths.worktrees_dir / "task")
+    for requirement in execution_trust:
+        requirement(managed_worktree_paths)
+    assert observed_trust_paths == [paths.root] * 3
     assert calls == [
         (
             borg.id,
             fixture.generation.id,
-            analysis.analysis_json,
-            {"secret_values": {}},
+            analyzer_plan,
+            {"secret_values": {"EXECUTE_TOKEN": "owner-secret"}},
         )
     ]
