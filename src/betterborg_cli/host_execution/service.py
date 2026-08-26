@@ -229,9 +229,24 @@ class HostTaskRuntime:
                     **self._agent_secrets("coding"),
                 },
             )
+            if (
+                status is TaskRuntimeStatus.REVIEW
+                and context.claim.resume_phase == TaskRuntimeStatus.FIX.value
+            ):
+                # Rematerialization stages every reclaimed agent phase through
+                # CODING so the completed coding commit can be re-attested.
+                # Restore an interrupted FIX before checking cancellation or
+                # entering the review/fix loop; its rejecting review belongs to
+                # the preceding round and must not be replayed at this round.
+                context.transition(
+                    TaskRuntimeStatus.REVIEW,
+                    TaskRuntimeStatus.FIX,
+                    resume_phase=TaskRuntimeStatus.FIX.value,
+                )
+                status = TaskRuntimeStatus.FIX
             if context.cancel.is_set():
                 return self._durable_status(context)
-            if status is TaskRuntimeStatus.REVIEW:
+            if status in {TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.FIX}:
                 status = self._review_fix.run(
                     context,
                     environment=service_environment,

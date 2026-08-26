@@ -1192,6 +1192,124 @@ def test_concrete_review_cancellation_resumes_without_replaying_coding(
         fixture.store.close()
 
 
+def test_concrete_fix_cancellation_resumes_without_replaying_review(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    finding = "feature must include the reviewed fix"
+
+    def commit_fix(spec):
+        fixed = spec.cwd / "review-fix.txt"
+        fixed.write_text("fixed\n", encoding="utf-8")
+        _git(spec.cwd, "add", fixed.name)
+        _git(spec.cwd, "commit", "--quiet", "-m", "fix review finding")
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Fixed the review finding.",
+                "changed_files": [fixed.name],
+                "tests_run": ["integration"],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.review.responses.clear()
+    fixture.review.queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "issues_found",
+                "summary": "The implementation needs a fix.",
+                "issues_file": ".betterborg-task/issues.md",
+                "findings": [finding],
+            }
+        )
+    ).queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "This fix turn will be cancelled.",
+                "changed_files": [],
+                "tests_run": [],
+                "follow_ups": [],
+                "blockers": [],
+            },
+            delay_seconds=2,
+        )
+    ).queue(MockResponse(dynamic=commit_fix)).queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "approved",
+                "summary": "The fix is approved.",
+                "issues_file": "",
+                "findings": [],
+            }
+        )
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            for _ in range(200):
+                if len(fixture.review.calls) >= 2:
+                    break
+                threading.Event().wait(0.005)
+            assert len(fixture.review.calls) == 2
+            cancel.cancel()
+            cancelled = running.result(timeout=3)
+
+        task = fixture.tasks[0]
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert fixture.store.get_task_runtime(task.id).status is (
+            TaskRuntimeStatus.PENDING
+        )
+        cancelled_attempts = fixture.store.list_agent_attempts(task.id)
+        assert sorted(
+            (attempt.phase, attempt.review_round, attempt.status.value)
+            for attempt in cancelled_attempts
+        ) == [
+            ("coding", 0, "completed"),
+            ("fix", 1, "cancelled"),
+            ("review", 0, "completed"),
+        ]
+
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(task.id).state_reason
+        )
+        assert fixture.store.get_task_runtime(task.id).status is (
+            TaskRuntimeStatus.DONE
+        )
+        assert sorted(
+            (attempt.phase, attempt.review_round, attempt.status.value)
+            for attempt in fixture.store.list_agent_attempts(task.id)
+        ) == [
+            ("coding", 0, "completed"),
+            ("fix", 1, "cancelled"),
+            ("fix", 1, "completed"),
+            ("review", 0, "completed"),
+            ("review", 1, "completed"),
+        ]
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 4
+        assert finding in fixture.review.calls[2].user_prompt
+    finally:
+        fixture.store.close()
+
+
 def test_cancellation_during_base_advance_preserves_durable_attestation(
     tmp_path: Path,
     monkeypatch,
