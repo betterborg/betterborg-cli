@@ -26,6 +26,7 @@ from betterborg_cli.store.models import (
     TaskRecord,
 )
 
+EXECUTION_ESTIMATE_VERSION = "execution-estimate-v1"
 DUMMY_PRIOR_VERSION = "dummy-v1"
 DUMMY_PRIOR_LABEL = (
     "DUMMY DATA — bootstrap prior only; replace with local completion history"

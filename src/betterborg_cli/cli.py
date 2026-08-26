@@ -2,20 +2,44 @@
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import sqlite3
 from functools import wraps
 from pathlib import Path
+from threading import RLock
+from uuid import UUID
 
 import click
 
 from betterborg_cli import __version__
+from betterborg_cli.agent_runtime import BillingMode
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
-from betterborg_cli.agent_runtime.selection import select_agent
+from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
+    EXECUTION_ESTIMATE_VERSION,
     estimate_generation,
     phase_billing_from_config,
+)
+from betterborg_cli.host_execution import (
+    HostCodingConfig,
+    HostCodingPhase,
+    HostComposeManager,
+    HostEnvironmentManager,
+    HostExecutionResult,
+    HostExecutionService,
+    HostMergeConfig,
+    HostMergePhase,
+    HostPreflight,
+    HostPreflightBlock,
+    HostReviewFixConfig,
+    HostReviewFixPhase,
+    HostSanityPhase,
+    HostSchedulerConfig,
+    HostTaskRuntime,
+    HostWorktreeManager,
 )
 from betterborg_cli.onboarding import (
     CreateService,
@@ -40,7 +64,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import (
     publish_repository_text,
     require_git_trackable,
@@ -49,6 +73,7 @@ from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    ExecutionDecision,
     PlanApproval,
     PlanChangeRequest,
     PlanningAttempt,
@@ -84,7 +109,7 @@ def _trusted_workspace_callback(function):
     """Gate a callback before it can load repository-controlled context."""
 
     @wraps(function)
-    def guarded(*args, explicit_trust: bool, **kwargs):
+    def guarded(*args, explicit_trust: bool = False, **kwargs):
         try:
             paths = RepoPaths.discover()
             interactive = _stdin_is_interactive() and not kwargs.get(
@@ -493,6 +518,11 @@ def estimate_tasks(name: str, json_output: bool) -> None:
         click.echo(json.dumps(estimate, sort_keys=True, separators=(",", ":")))
         return
 
+    _write_execution_estimate(name, estimate)
+
+
+def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
+    """Render the estimate shared by inspection and the execution gate."""
     mix = estimate["task_mix"]
     time = estimate["time"]
     click.echo(DUMMY_PRIOR_LABEL)
@@ -539,6 +569,250 @@ def estimate_tasks(name: str, json_output: bool) -> None:
         click.echo(
             "Billing mode unknown for: " + ", ".join(billing["unknown_phases"])
         )
+
+
+@cli.command(name="execute")
+@click.argument("name")
+@click.option(
+    "--auto-execute",
+    is_flag=True,
+    help="Record an estimate bypass and execute without asking for approval.",
+)
+@_trusted_workspace_callback
+def execute_borg(repository_path: Path, name: str, auto_execute: bool) -> None:
+    """Run the current, digest-verified task generation for a Borg."""
+    paths = RepoPaths.discover(repository_path)
+    try:
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            repository = store.get_repository(config.repository_id)
+            if repository is None:
+                raise ValueError("repository is not initialized; run 'borg init' first")
+            borg = store.get_borg_by_name(repository.id, name)
+            if borg is None:
+                raise ValueError(
+                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                )
+            if borg.state is not BorgState.READY_TO_EXECUTE:
+                raise ValueError(f"Borg {name!r} is not ready to execute")
+
+            # This verifies the complete immutable tree before estimating,
+            # selecting an agent, or allowing HostExecutionService to claim.
+            publication = TaskPublisher(
+                repository, store
+            ).inspect_current_task_files(borg.id)
+            generation = publication.generation
+            decision = store.get_current_execution_decision(borg.id)
+            if decision is None:
+                estimate = estimate_generation(
+                    generation.id,
+                    [item.task for item in publication.files],
+                    store.list_task_completion_samples(),
+                    phase_billing_from_config(config),
+                )
+                _write_execution_estimate(name, estimate)
+                if auto_execute:
+                    source = "auto_execute"
+                    outcome = "bypassed"
+                else:
+                    click.confirm(
+                        "Approve this estimate and begin host execution?",
+                        default=False,
+                        abort=True,
+                    )
+                    source = "interactive"
+                    outcome = "approved"
+                approval = next(
+                    (
+                        item
+                        for item in store.list_plan_approvals(borg.id)
+                        if item.id == generation.plan_approval_id
+                    ),
+                    None,
+                )
+                batch = next(
+                    (
+                        item
+                        for item in store.list_task_batches(borg.id)
+                        if item.id == generation.batch_id
+                    ),
+                    None,
+                )
+                if approval is None or batch is None:
+                    raise RuntimeError(
+                        "current task generation has no approval or batch"
+                    )
+                decision = ExecutionDecision(
+                    borg_id=borg.id,
+                    generation_id=generation.id,
+                    approved_plan_digest=approval.plan_digest,
+                    task_batch_digest=batch.digest,
+                    estimate_version=EXECUTION_ESTIMATE_VERSION,
+                    source=source,
+                    snapshot=estimate,
+                    decision=outcome,
+                )
+                store.append_execution_decision(decision)
+                click.echo(
+                    f"Recorded execution estimate {outcome} for generation "
+                    f"{generation.id}."
+                )
+            elif decision.decision not in {"approved", "bypassed"}:
+                raise RuntimeError(
+                    "current generation has an unsupported execution decision"
+                )
+            else:
+                click.echo(
+                    f"Using recorded execution decision for generation "
+                    f"{generation.id}."
+                )
+
+            result = _invoke_host_execution(
+                paths,
+                store,
+                config,
+                repository.id,
+                borg.id,
+                generation.id,
+            )
+    except (OSError, RuntimeError, ValueError, sqlite3.IntegrityError) as error:
+        raise click.ClickException(str(error)) from error
+
+    _write_host_execution_result(result)
+
+
+def _invoke_host_execution(
+    paths: RepoPaths,
+    store: SqliteStore,
+    config: RepositoryConfig,
+    repository_id: UUID,
+    borg_id: UUID,
+    generation_id: UUID,
+) -> HostExecutionResult:
+    """Assemble and invoke the sole concrete phase-07 host service."""
+    analysis = store.get_prior_ready_analysis(repository_id)
+    if analysis is None:
+        raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
+    analyzer_plan = analysis.analysis_json
+    preflight = HostPreflight(paths.root)
+    validated = preflight.validate(analyzer_plan)
+    if isinstance(validated, HostPreflightBlock):
+        return HostExecutionResult(validated)
+
+    coding_agent = select_agent(
+        config,
+        ApiAgentRole.CODING,
+        paths,
+        interactive=_stdin_is_interactive(),
+    )
+    review_agent = select_agent(
+        config,
+        ApiAgentRole.REVIEW,
+        paths,
+        interactive=_stdin_is_interactive(),
+    )
+    merge_agent = select_agent(
+        config,
+        ApiAgentRole.MERGE,
+        paths,
+        interactive=_stdin_is_interactive(),
+    )
+    environment = HostEnvironmentManager(paths.root)
+    compose = HostComposeManager(paths.root)
+    worktrees = HostWorktreeManager(
+        paths.root,
+        paths.worktrees_dir,
+        source_branch=config.default_branch,
+    )
+    repository_lock = RLock()
+
+    def locked_repository():
+        return repository_lock
+
+    runtime = HostTaskRuntime(
+        validated,
+        environment_manager=environment,
+        compose_manager=compose,
+        coding=HostCodingPhase(
+            paths.root,
+            coding_agent,
+            config=HostCodingConfig(
+                model=resolve_agent_model(coding_agent, config.agents.coding.model),
+                billing_mode=_agent_billing_mode(coding_agent.name),
+                effort=config.agents.coding.effort,
+            ),
+        ),
+        review_fix=HostReviewFixPhase(
+            paths.root,
+            review_agent,
+            config=HostReviewFixConfig(
+                review_model=resolve_agent_model(
+                    review_agent, config.agents.review.model
+                ),
+                review_passes=config.execution.review_passes,
+                review_billing_mode=_agent_billing_mode(review_agent.name),
+                fix_billing_mode=_agent_billing_mode(review_agent.name),
+                review_effort=config.agents.review.effort,
+                fix_effort=config.agents.review.effort,
+            ),
+        ),
+        merge=HostMergePhase(
+            paths.root,
+            merge_agent,
+            config=HostMergeConfig(
+                model=resolve_agent_model(merge_agent, config.agents.merge.model),
+                billing_mode=_agent_billing_mode(merge_agent.name),
+                effort=config.agents.merge.effort,
+            ),
+            repository_lock=locked_repository,
+        ),
+        sanity=HostSanityPhase(
+            paths.root,
+            validated,
+            environment_manager=environment,
+            compose_manager=compose,
+            worktree_manager=worktrees,
+            repository_lock=locked_repository,
+        ),
+    )
+    service = HostExecutionService(
+        store,
+        preflight,
+        runtime,
+        worktree_manager=worktrees,
+        compose_manager=compose,
+        scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
+    )
+    secrets = {
+        name: os.environ[name]
+        for name in validated.required_secret_names
+        if name in os.environ
+    }
+    return service.run(
+        borg_id,
+        generation_id,
+        analyzer_plan,
+        secret_values=secrets,
+    )
+
+
+def _agent_billing_mode(adapter_name: str) -> BillingMode:
+    if adapter_name in {"claude", "codex"}:
+        return BillingMode.SUBSCRIPTION
+    return BillingMode.API
+
+
+def _write_host_execution_result(result: HostExecutionResult) -> None:
+    if isinstance(result.preflight, HostPreflightBlock):
+        raise click.ClickException(result.preflight.reason)
+    if result.active_operation_id is not None:
+        click.echo(f"Execution already active: {result.active_operation_id}")
+        return
+    if result.operation_id is None or result.status is None:
+        raise click.ClickException("host execution returned no operation")
+    click.echo(
+        f"Execution operation {result.operation_id}: {result.status.value}"
+    )
 
 
 @task.command(name="show")
