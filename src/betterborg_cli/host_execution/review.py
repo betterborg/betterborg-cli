@@ -711,7 +711,7 @@ class HostReviewFixPhase:
     def _declared_commits(
         self, context: ScheduledTaskContext, worktree: Path
     ) -> tuple[str, str]:
-        attestations: list[tuple[str, str]] = []
+        attestations: list[tuple[int, int, int, str, str]] = []
         for attempt in context.store.list_agent_attempts(context.claim.task_id):
             if (
                 attempt.phase not in {"coding", "fix"}
@@ -724,13 +724,22 @@ class HostReviewFixPhase:
             base_commit = metadata.get("base_commit")
             commit_sha = metadata.get("commit_sha")
             if isinstance(base_commit, str) and isinstance(commit_sha, str):
-                attestations.append((base_commit, commit_sha))
+                attestations.append(
+                    (
+                        attempt.review_round,
+                        0 if attempt.phase == "coding" else 1,
+                        attempt.attempt_number,
+                        base_commit,
+                        commit_sha,
+                    )
+                )
         if not attestations:
             raise ReviewFixPhaseError(
                 "review requires a completed coding commit attestation"
             )
-        base_commit = attestations[0][0]
-        current_commit = attestations[-1][1]
+        attestations.sort(key=lambda item: item[:3])
+        base_commit = attestations[0][3]
+        current_commit = attestations[-1][4]
         git = SafeGit(worktree)
         if git.head_sha() != current_commit:
             raise ReviewFixPhaseError(

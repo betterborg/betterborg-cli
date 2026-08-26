@@ -1898,9 +1898,20 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
 
 def test_cancellation_after_fix_resumes_from_fixed_commit(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     fixture = _concrete_host_fixture(tmp_path)
     cancel = CancellationToken()
+    coding_attempt_ids = iter([UUID(int=3)])
+    review_attempt_ids = iter([UUID(int=2), UUID(int=1), UUID(int=4)])
+    monkeypatch.setattr(
+        "betterborg_cli.host_execution.coding.uuid4",
+        lambda: next(coding_attempt_ids),
+    )
+    monkeypatch.setattr(
+        "betterborg_cli.host_execution.review.uuid4",
+        lambda: next(review_attempt_ids),
+    )
 
     def commit_fix_then_cancel(spec):  # noqa: ANN001
         fixed = spec.cwd / "review-fix.txt"
@@ -1959,9 +1970,15 @@ def test_cancellation_after_fix_resumes_from_fixed_commit(
         assert runtime.resume_phase == TaskRuntimeStatus.REVIEW.value
         assert runtime.worktree_path is not None
         fixed_commit = _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
+        attempts = fixture.store.list_agent_attempts(task.id)
+        assert [attempt.phase for attempt in attempts] == [
+            "fix",
+            "review",
+            "coding",
+        ]
         assert sorted(
             (attempt.phase, attempt.review_round, attempt.status.value)
-            for attempt in fixture.store.list_agent_attempts(task.id)
+            for attempt in attempts
         ) == [
             ("coding", 0, "completed"),
             ("fix", 1, "completed"),
