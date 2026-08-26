@@ -168,7 +168,7 @@ class HostMergePhase:
                 prompt_role="merge",
             )
             project_branch = self._project_branch(context)
-            approved_commit = self._approved_commit(context, worktree)
+            approved_commit = self._approved_commit(context)
             self._guard.before_phase(inputs.task.task_ref, "merge")
         except (
             HostAgentPhaseError,
@@ -228,6 +228,10 @@ class HostMergePhase:
         merge_head = self._merge_head(git)
         unresolved = git.unmerged_paths()
         if merge_head is not None:
+            if git.head_sha() != approved_commit:
+                raise MergePhaseError(
+                    "approved task commit no longer matches task worktree"
+                )
             return self._invoke_agent(
                 context,
                 runtime,
@@ -252,6 +256,16 @@ class HostMergePhase:
         with self._repository_lock:
             base_commit = self._resolve_project_tip(project_branch)
             current = git.head_sha()
+            if not self._is_resumable_merge_tip(
+                context,
+                git,
+                approved_commit=approved_commit,
+                base_commit=base_commit,
+                commit_sha=current,
+            ):
+                raise MergePhaseError(
+                    "approved task commit no longer matches task worktree"
+                )
             if git.is_ancestor(base_commit, current):
                 return self._verified_tip(
                     git,
@@ -614,9 +628,7 @@ class HostMergePhase:
             raise MergePhaseError(f"invalid project branch: {branch!r}")
         return branch
 
-    def _approved_commit(
-        self, context: ScheduledTaskContext, worktree: Path
-    ) -> str:
+    def _approved_commit(self, context: ScheduledTaskContext) -> str:
         reviews = [
             attempt
             for attempt in context.store.list_agent_attempts(context.claim.task_id)
@@ -634,16 +646,44 @@ class HostMergePhase:
         commit_sha = metadata.get("commit_sha")
         if not isinstance(commit_sha, str) or not commit_sha:
             raise MergePhaseError("review approval lacks a commit attestation")
-        head = SafeGit(worktree).head_sha()
-        if head != commit_sha and self._completed_merge_attestation(
-            context,
-            approved_commit=commit_sha,
-            commit_sha=head,
-        ) is None:
-            raise MergePhaseError(
-                "approved task commit no longer matches task worktree"
-            )
         return commit_sha
+
+    def _is_resumable_merge_tip(
+        self,
+        context: ScheduledTaskContext,
+        git: SafeGit,
+        *,
+        approved_commit: str,
+        base_commit: str,
+        commit_sha: str,
+    ) -> bool:
+        """Recognize an approved tip plus host-created merge topology.
+
+        Clean Git merges have no agent attempt to carry an attestation. Their
+        two-parent commits are themselves durable evidence: the first-parent
+        chain starts at the reviewed commit (or an attested conflict result),
+        and every integrated second parent belongs to the current project-base
+        history. This also permits a retry to integrate a base that advanced
+        after an earlier clean merge.
+        """
+        cursor = commit_sha
+        seen: set[str] = set()
+        while cursor not in seen:
+            if cursor == approved_commit or self._completed_merge_attestation(
+                context,
+                approved_commit=approved_commit,
+                commit_sha=cursor,
+            ) is not None:
+                return True
+            seen.add(cursor)
+            parents = self._commit_parents(git, cursor)
+            if len(parents) != 2:
+                return False
+            first_parent, integrated_parent = parents
+            if not git.is_ancestor(integrated_parent, base_commit):
+                return False
+            cursor = first_parent
+        return False
 
     def _completed_merge_attestation(
         self,
@@ -694,6 +734,16 @@ class HostMergePhase:
         )
         commit_sha = result.stdout.strip()
         return commit_sha if result.returncode == 0 and commit_sha else None
+
+    @staticmethod
+    def _commit_parents(git: SafeGit, commit_sha: str) -> tuple[str, ...]:
+        line = git.run(
+            ["rev-list", "--parents", "--max-count=1", commit_sha]
+        ).stdout.strip()
+        fields = line.split()
+        if not fields or fields[0] != commit_sha:
+            raise MergePhaseError(f"cannot inspect merge tip {commit_sha}")
+        return tuple(fields[1:])
 
     def _merge_environment(self) -> dict[str, str]:
         environment = dict(os.environ)

@@ -142,6 +142,52 @@ def test_clean_merge_produces_tip_without_agent_or_base_advance(
     )
 
 
+def test_completed_clean_merge_resumes_without_agent(
+    tmp_path: Path,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    base_commit = _advance_project_base(fixture, "base.txt", "base progress\n")
+    adapter = MockAdapter()
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _phase(fixture, adapter, RecordingLock())
+        initial = phase.run(fixture.context(store))
+        resumed = phase.run(fixture.context(store))
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert initial.tip is not None and not initial.tip.agent_used
+    assert resumed.status is TaskRuntimeStatus.MERGING
+    assert resumed.tip is not None and not resumed.tip.agent_used
+    assert resumed.tip.commit_sha == initial.tip.commit_sha
+    assert resumed.tip.base_commit == base_commit
+    assert adapter.calls == []
+    assert [attempt.phase for attempt in attempts] == ["coding", "review"]
+
+
+def test_unreviewed_commit_is_not_accepted_as_resumable_merge_tip(
+    tmp_path: Path,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+    assert runtime is not None
+    worktree = Path(runtime.worktree_path)
+    (worktree / "unreviewed.txt").write_text("not reviewed\n", encoding="utf-8")
+    _git(worktree, "add", "unreviewed.txt")
+    _git(worktree, "commit", "--quiet", "-m", "unreviewed change")
+    adapter = MockAdapter()
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _phase(fixture, adapter, RecordingLock()).run(
+            fixture.context(store)
+        )
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert result.tip is None
+    assert "approved task commit no longer matches" in result.reason
+    assert adapter.calls == []
+
+
 def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
     tmp_path: Path,
 ) -> None:

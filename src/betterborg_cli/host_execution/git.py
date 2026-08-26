@@ -368,10 +368,6 @@ class SafeGit:
         ).stdout
         return tuple(path for path in output.split("\0") if path)
 
-    def has_unmerged_paths(self) -> bool:
-        """Return whether this worktree contains unresolved index entries."""
-        return bool(self.unmerged_paths())
-
     def is_clean(self, *, ignore_path: Callable[[str], bool] | None = None) -> bool:
         output = self.run(["status", "--porcelain=v1", "-z", "-uall"]).stdout
         for _entry, paths in _status_entries(output):
