@@ -151,6 +151,27 @@ class HostSanityPhase:
                         tip,
                         secret_values or {},
                     )
+                    cleanup_runtime = context.store.get_task_runtime(
+                        context.claim.task_id
+                    )
+                    if cleanup_runtime is None:
+                        raise SanityPhaseError(
+                            "task runtime disappeared before cleanup"
+                        )
+                    if not self._worktree_manager.cleanup_published_task_worktree(
+                        cleanup_runtime
+                    ):
+                        raise SanityPhaseError(
+                            "published task worktree was not eligible for cleanup"
+                        )
+                    context.transition(
+                        TaskRuntimeStatus.MERGING,
+                        TaskRuntimeStatus.DONE,
+                        resume_phase="done",
+                        state_reason=(
+                            f"advanced {tip.project_branch} to {published}"
+                        ),
+                    )
         except (
             ComposeStackError,
             EnvironmentMaterializationError,
@@ -167,16 +188,6 @@ class HostSanityPhase:
             )
             return self._block(context, reason, commands)
 
-        context.transition(
-            TaskRuntimeStatus.MERGING,
-            TaskRuntimeStatus.DONE,
-            resume_phase="done",
-            state_reason=f"advanced {tip.project_branch} to {published}",
-        )
-        completed = context.store.get_task_runtime(context.claim.task_id)
-        if completed is None:
-            raise SanityPhaseError("completed task runtime disappeared")
-        self._worktree_manager.cleanup_task_worktree(completed)
         return HostSanityResult(
             TaskRuntimeStatus.DONE,
             f"sanity passed and advanced {tip.project_branch} to {published}",
@@ -193,19 +204,25 @@ class HostSanityPhase:
         secret_values: Mapping[str, str],
     ) -> tuple[str, tuple[SanityCommandResult, ...]]:
         current_base = self._resolve_project_tip(tip.project_branch)
-        self._verify_tip(runtime, worktree, tip)
         if current_base == tip.commit_sha:
             if not self._advance_was_attested(context, tip):
                 raise SanityPhaseError(
                     "project base is already at the merge tip without a durable "
                     "BetterBorg advancement attestation"
                 )
+            if worktree.exists():
+                if not worktree.is_dir():
+                    raise SanityPhaseError("merged task worktree is not a directory")
+                self._verify_tip(runtime, worktree, tip)
             return tip.commit_sha, ()
         if current_base != tip.base_commit:
             raise SanityPhaseError(
                 "project base moved after the merge tip was produced; rerun the "
                 "merge phase before sanity"
             )
+        if not worktree.is_dir():
+            raise SanityPhaseError("merged task worktree is missing")
+        self._verify_tip(runtime, worktree, tip)
 
         materialization = self._environment_manager.materialize_claimed_task(
             context.store,
@@ -407,8 +424,6 @@ class HostSanityPhase:
         if runtime.branch != tip.task_branch or runtime.worktree_path is None:
             raise SanityPhaseError("merge tip does not match the claimed worktree")
         worktree = Path(runtime.worktree_path).resolve()
-        if not worktree.is_dir():
-            raise SanityPhaseError("merged task worktree is missing")
         expected_project = self._project_branch(context)
         if tip.project_branch != expected_project:
             raise SanityPhaseError("merge tip belongs to another project base")

@@ -29,6 +29,7 @@ from betterborg_cli.host_execution import (
     HostSecret,
     HostService,
     HostWorktreeManager,
+    WorktreeError,
 )
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
 
@@ -250,6 +251,50 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
     assert Path(runtime.worktree_path).is_dir()
 
 
+def test_cleanup_failure_blocks_before_completion_while_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _plan(fixture)
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _sanity_phase(fixture, plan, repository_lock, compose, runner)
+
+        def fail_cleanup(runtime):  # noqa: ANN001
+            assert repository_lock.locked()
+            assert runtime.status is TaskRuntimeStatus.MERGING
+            raise WorktreeError("injected cleanup failure")
+
+        monkeypatch.setattr(
+            phase._worktree_manager,  # noqa: SLF001
+            "cleanup_published_task_worktree",
+            fail_cleanup,
+        )
+        result = phase.run(
+            fixture.context(store),
+            tip,
+            secret_values={
+                "BUILD_TOKEN": "build-secret",
+                "AGENT_TOKEN": "agent-secret",
+            },
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "injected cleanup failure" in result.reason
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert Path(runtime.worktree_path).is_dir()
+    assert (
+        _git(fixture.repository, "rev-parse", _project_branch(fixture))
+        == tip.commit_sha
+    )
+
+
 def test_resume_after_fast_forward_uses_durable_attestation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -283,6 +328,7 @@ def test_resume_after_fast_forward_uses_durable_attestation(
         interrupted = store.get_task_runtime(fixture.task.id)
         assert interrupted is not None
         assert interrupted.status is TaskRuntimeStatus.MERGING
+        assert not Path(interrupted.worktree_path).exists()
         assert (
             _git(fixture.repository, "rev-parse", _project_branch(fixture))
             == tip.commit_sha
