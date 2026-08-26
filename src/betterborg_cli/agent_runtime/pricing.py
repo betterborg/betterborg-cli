@@ -8,6 +8,7 @@ separate rate for that token class.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from betterborg_cli.agent_runtime.base import AgentUsage
@@ -15,7 +16,7 @@ from betterborg_cli.agent_runtime.base import AgentUsage
 PRICE_CATALOG_VERSION = "2026-08-26"
 PRICE_CATALOG_SOURCES = {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "openai": "https://platform.openai.com/pricing",
+    "openai": "https://developers.openai.com/api/docs/models/compare",
 }
 
 
@@ -39,9 +40,9 @@ MODEL_PRICES: dict[tuple[str, str], ModelPrice] = {
     ("anthropic", "claude-sonnet-4-6"): ModelPrice(3.00, 0.30, 3.75, 15.00),
     ("anthropic", "claude-sonnet-4-5"): ModelPrice(3.00, 0.30, 3.75, 15.00),
     ("anthropic", "claude-haiku-4-5"): ModelPrice(1.00, 0.10, 1.25, 5.00),
-    ("openai", "gpt-5.6-sol"): ModelPrice(5.00, 0.50, 6.25, 30.00),
-    ("openai", "gpt-5.6-terra"): ModelPrice(2.50, 0.25, 3.125, 15.00),
-    ("openai", "gpt-5.6-luna"): ModelPrice(1.00, 0.10, 1.25, 6.00),
+    ("openai", "gpt-5.6-sol"): ModelPrice(4.00, 0.40, 5.00, 20.00),
+    ("openai", "gpt-5.6-terra"): ModelPrice(2.00, 0.20, 2.50, 12.00),
+    ("openai", "gpt-5.6-luna"): ModelPrice(0.20, 0.02, 0.25, 1.20),
     ("openai", "gpt-5.5"): ModelPrice(5.00, 0.50, None, 30.00),
     ("openai", "gpt-5.5-pro"): ModelPrice(30.00, None, None, 180.00),
     ("openai", "gpt-5.4"): ModelPrice(2.50, 0.25, None, 15.00),
@@ -58,6 +59,8 @@ MODEL_PRICES: dict[tuple[str, str], ModelPrice] = {
     ("openai", "gpt-5-pro"): ModelPrice(15.00, None, None, 120.00),
 }
 
+_SNAPSHOT_SUFFIX = re.compile(r"(?:-\d{8}|-\d{4}-\d{2}-\d{2})$")
+
 
 def lookup_model_price(provider: str, model: str) -> ModelPrice | None:
     """Return an exact or date-suffixed model's standard API price."""
@@ -65,10 +68,8 @@ def lookup_model_price(provider: str, model: str) -> ModelPrice | None:
     direct = MODEL_PRICES.get(key)
     if direct is not None:
         return direct
-    parts = key[1].rsplit("-", 3)
-    if len(parts) == 4 and all(part.isdigit() for part in parts[-3:]):
-        return MODEL_PRICES.get((key[0], parts[0]))
-    return None
+    normalized_model = _SNAPSHOT_SUFFIX.sub("", key[1])
+    return MODEL_PRICES.get((key[0], normalized_model))
 
 
 def estimate_api_cost_usd(

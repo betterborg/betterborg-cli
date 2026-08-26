@@ -7,7 +7,11 @@ from uuid import uuid4
 import pytest
 
 from betterborg_cli.agent_runtime import AgentUsage, BillingMode
-from betterborg_cli.agent_runtime.pricing import estimate_api_cost_usd
+from betterborg_cli.agent_runtime.pricing import (
+    ModelPrice,
+    estimate_api_cost_usd,
+    lookup_model_price,
+)
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIORS,
     PhaseBilling,
@@ -269,6 +273,48 @@ def test_openai_cached_input_is_not_also_charged_as_fresh_input() -> None:
             tokens_cache_write=0,
         ),
     ) == pytest.approx(0.000125)
+
+
+@pytest.mark.parametrize(
+    ("model", "price"),
+    (
+        ("gpt-5.6-sol", ModelPrice(4.00, 0.40, 5.00, 20.00)),
+        ("gpt-5.6-terra", ModelPrice(2.00, 0.20, 2.50, 12.00)),
+        ("gpt-5.6-luna", ModelPrice(0.20, 0.02, 0.25, 1.20)),
+    ),
+)
+def test_gpt_5_6_uses_release_verified_rates(
+    model: str, price: ModelPrice
+) -> None:
+    assert lookup_model_price("openai", model) == price
+
+
+def test_gpt_5_6_sol_fresh_input_and_output_cost() -> None:
+    assert estimate_api_cost_usd(
+        "openai",
+        "gpt-5.6-sol",
+        AgentUsage(
+            tokens_input=1_000_000,
+            tokens_output=1_000_000,
+            tokens_cache_read=0,
+            tokens_cache_write=0,
+        ),
+    ) == pytest.approx(24.00)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "alias"),
+    (
+        ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+        ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+    ),
+)
+def test_anthropic_compact_date_snapshot_uses_alias_price(
+    snapshot: str, alias: str
+) -> None:
+    assert lookup_model_price("anthropic", snapshot) == lookup_model_price(
+        "anthropic", alias
+    )
 
 
 def test_dummy_priors_are_complete_for_each_size() -> None:

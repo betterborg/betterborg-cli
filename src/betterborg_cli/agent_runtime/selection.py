@@ -279,11 +279,18 @@ def resolve_agent_model(
         return configured_model
     if isinstance(agent, SelectedAgent) and agent.model is not None:
         return agent.model
+    return resolve_adapter_model(agent.name, None)
+
+
+def resolve_adapter_model(adapter: str, configured_model: str | None) -> str:
+    """Resolve an explicit model or the runtime default for an adapter name."""
+    if configured_model is not None:
+        return configured_model
     try:
-        return _DEFAULT_MODELS[agent.name]
+        return _DEFAULT_MODELS[adapter]
     except KeyError as error:
         raise AgentSelectionError(
-            f"Agent model must be configured for adapter {agent.name!r}"
+            f"Agent model must be configured for adapter {adapter!r}"
         ) from error
 
 

@@ -18,6 +18,7 @@ from betterborg_cli.agent_runtime.pricing import (
     PRICE_CATALOG_VERSION,
     estimate_api_cost_usd,
 )
+from betterborg_cli.agent_runtime.selection import resolve_adapter_model
 from betterborg_cli.repository_config import AgentChoice, RepositoryConfig
 from betterborg_cli.store.models import (
     TaskCompletionSample,
@@ -32,12 +33,6 @@ DUMMY_PRIOR_LABEL = (
 LOCAL_BLEND_SAMPLE_COUNT = 5
 _LEVELS = tuple(TaskComplexity)
 _PHASES = ("coding", "review", "merge")
-_DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "claude": "claude-opus-4-8",
-    "codex": "gpt-5",
-    "openai": "gpt-5",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,14 +149,17 @@ def _choice_billing(phase: str, choice: AgentChoice) -> PhaseBilling:
     adapter = choice.adapter
     if adapter in {"anthropic", "openai"}:
         return PhaseBilling(
-            phase, BillingMode.API, adapter, choice.model or _DEFAULT_MODELS[adapter]
+            phase,
+            BillingMode.API,
+            adapter,
+            resolve_adapter_model(adapter, choice.model),
         )
     if adapter in {"claude", "codex"}:
         return PhaseBilling(
             phase,
             BillingMode.SUBSCRIPTION,
             None,
-            choice.model or _DEFAULT_MODELS[adapter],
+            resolve_adapter_model(adapter, choice.model),
         )
     return PhaseBilling(phase, None, None, choice.model)
 
