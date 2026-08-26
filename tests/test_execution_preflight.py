@@ -106,6 +106,7 @@ def execution_preflight_fixture(tmp_path: Path):
         (repository / "compose.yml").write_text(
             "services:\n"
             "  healthy:\n"
+            "    image: betterborg/shared-compose-fixture:dev\n"
             "    build:\n"
             "      context: .\n"
             "      dockerfile: ComposeFixture.Dockerfile\n"
@@ -689,6 +690,8 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
         assert first is not None and second is not None
         assert first.project_name != second.project_name
         assert first.network_name != second.network_name
+        assert set(first.image_names).isdisjoint(second.image_names)
+        assert len(first.image_names) == len(second.image_names) == 1
         assert first.environment["SERVICE_URL"] != second.environment["SERVICE_URL"]
         assert _http_body(first.environment["SERVICE_URL"]) == "healthy\n"
         assert _http_body(second.environment["SERVICE_URL"]) == "healthy\n"
@@ -703,6 +706,10 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
         assert set(first.network_names).isdisjoint(second.network_names)
         for stack in (first, second):
             assert _compose_container_services(stack.project_name) == {"healthy"}
+            assert _compose_container_images(stack.project_name) == set(
+                stack.image_names
+            )
+            assert all(_docker_image_exists(image) for image in stack.image_names)
             assert _compose_published_host_ips(stack.project_name) == {
                 "127.0.0.1"
             }
@@ -714,7 +721,10 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
             assert [
                 {resource.resource_type for resource in owned}
                 for owned in resources
-            ] == [{"project", "network"}, {"project", "network"}]
+            ] == [
+                {"project", "network", "image"},
+                {"project", "network", "image"},
+            ]
             assert [
                 {
                     resource.resource_name
@@ -733,6 +743,8 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
             }
 
         assert _compose_container_services(first.project_name) == set()
+        assert not any(_docker_image_exists(image) for image in first.image_names)
+        assert all(_docker_image_exists(image) for image in second.image_names)
         assert _http_body(second.environment["SERVICE_URL"]) == "healthy\n"
         assert _compose_container_services(second.project_name) == {"healthy"}
         assert {
@@ -748,6 +760,8 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
             and event.kind == "compose.starting"
         )
         assert "--no-deps" in starting.payload["command"]
+        wait_timeout = starting.payload["command"].index("--wait-timeout")
+        assert int(starting.payload["command"][wait_timeout + 1]) > 0
     finally:
         for stack, claim in zip(stacks, claims, strict=False):
             if stack is None or not _compose_container_services(stack.project_name):
@@ -758,7 +772,7 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
                 )
 
 
-def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
+def test_expired_compose_cleanup_timeout_blocks_reclaim_until_retry(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
@@ -800,12 +814,13 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
             now=expired_at,
         ) is None
 
-        runner.fail_down.add(stack.project_name)
+        runner.timeout_down.add(stack.project_name)
         failed = fixture.compose_manager(runner).cleanup_stale_projects(store, stale)
         runtime = store.get_task_runtime(claim.task_id)
         persisted_claim = store.list_task_claims(fixture.run_id)[0]
 
         assert len(failed) == 1 and failed[0].stopped is False
+        assert failed[0].error is not None and "timed out after" in failed[0].error
         assert failed[0].project_name == stack.project_name
         assert failed[0].command == runner.down_commands[-1]
         assert runtime is not None
@@ -816,7 +831,7 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
         assert persisted_claim.released_at is None
         assert store.list_stale_compose_resources(fixture.run_id) == stale
 
-        runner.fail_down.clear()
+        runner.timeout_down.clear()
         succeeded = fixture.compose_manager(runner).cleanup_stale_projects(
             store, store.list_stale_compose_resources(fixture.run_id)
         )
@@ -831,6 +846,7 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
     assert succeeded[0].command == failed[0].command
     assert succeeded[0].command[0] == str(validated_docker)
     assert all(command[0] == str(validated_docker) for command in runner.commands)
+    assert runner.timeouts and all(timeout > 0 for timeout in runner.timeouts)
     assert str(source_compose) not in succeeded[0].command
     assert all(str(path) in succeeded[0].command for path in stack.compose_files)
     assert reclaimed is not None and reclaimed.task_id == claim.task_id
@@ -1019,6 +1035,39 @@ def test_compose_cleanup_metadata_excludes_resolved_env_file_secrets(
     assert credential not in persisted
     assert "SERVICE_TOKEN" not in persisted
     assert stack.compose_files[0].name == "compose.cleanup.json"
+
+
+def test_build_images_are_claim_owned_and_exactly_removed(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, _compose_plan(fixture.repository), claim, fixture.owner_token
+        )
+        assert stack is not None
+        override = stack.compose_files[-1].read_text(encoding="utf-8")
+        cleanup = json.loads(stack.compose_files[0].read_text(encoding="utf-8"))
+        resources = store.list_compose_resources(claim.task_id)
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, stack, claim, fixture.owner_token
+        )
+
+    assert len(stack.image_names) == 1
+    image_name = stack.image_names[0]
+    assert image_name.startswith(f"betterborg/{stack.project_name}-")
+    assert f'image: "{image_name}"' in override
+    assert "pull_policy: build" in override
+    assert cleanup["services"]["healthy"]["image"] == image_name
+    assert {
+        resource.resource_name
+        for resource in resources
+        if resource.resource_type == "image"
+    } == {image_name}
+    assert runner.down_commands[-1][-2:] == ("--rmi", "all")
 
 
 def test_distinct_dependencies_share_one_compose_service(
@@ -1338,6 +1387,7 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
         compose_profiles=(),
         compose_networks=("fixture",),
         compose_volumes=("fixture-data",),
+        compose_build_services=("healthy",),
     )
 
 
@@ -1348,9 +1398,11 @@ class _FakeComposeRunner:
         self.down_commands: list[tuple[str, ...]] = []
         self.port_commands: list[tuple[str, ...]] = []
         self.environments: list[dict[str, str]] = []
+        self.timeouts: list[float] = []
         self.commands: list[tuple[str, ...]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
+        self.timeout_down: set[str] = set()
         self.pause_up: set[str] = set()
         self.up_entered = threading.Event()
         self.release_up = threading.Event()
@@ -1376,6 +1428,7 @@ class _FakeComposeRunner:
             self.down_entered.set()
         with self._lock:
             self.environments.append(dict(kwargs["env"]))
+            self.timeouts.append(kwargs["timeout"])
             if "config" in command:
                 return subprocess.CompletedProcess(
                     argv,
@@ -1418,6 +1471,8 @@ class _FakeComposeRunner:
                 )
             if "down" in command:
                 self.down_commands.append(command)
+                if project in self.timeout_down:
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
                 file_paths = [
                     Path(command[index + 1])
                     for index, value in enumerate(command[:-1])
@@ -1519,6 +1574,36 @@ def _compose_container_services(project_name: str) -> set[str]:
         text=True,
     )
     return set(result.stdout.splitlines()) - {""}
+
+
+def _compose_container_images(project_name: str) -> set[str]:
+    result = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+            "--format",
+            "{{.Image}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.splitlines()) - {""}
+
+
+def _docker_image_exists(image: str) -> bool:
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", image],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
 
 
 def _compose_published_host_ips(project_name: str) -> set[str]:

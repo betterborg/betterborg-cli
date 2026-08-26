@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -28,6 +29,9 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
 
 _COMPOSE_ENVIRONMENT_NAMES = ("PATH", "PATHEXT", "SYSTEMROOT", "LANG", "LC_ALL")
+_COMPOSE_HEALTH_TIMEOUT_SECONDS = 120
+_COMPOSE_COMMAND_TIMEOUT_SECONDS = 150
+_TIMED_OUT_RETURN_CODE = 124
 
 
 class ComposeStackError(RuntimeError):
@@ -59,6 +63,7 @@ class ComposeStack:
     docker_executable: Path
     network_name: str
     network_names: tuple[str, ...]
+    image_names: tuple[str, ...]
     worktree: Path
     runtime_directory: Path
     compose_files: tuple[Path, ...]
@@ -132,15 +137,18 @@ class HostComposeManager:
             raise ValueError("validated Compose services require exact service names")
 
         try:
-            startup_files, files, network_names = self._write_runtime_configuration(
-                docker_executable,
-                project_name,
-                source_files,
-                plan.compose_profiles,
-                plan.compose_networks,
-                plan.compose_volumes,
-                compose_services,
-                selected,
+            startup_files, files, network_names, image_names = (
+                self._write_runtime_configuration(
+                    docker_executable,
+                    project_name,
+                    source_files,
+                    plan.compose_profiles,
+                    plan.compose_networks,
+                    plan.compose_volumes,
+                    plan.compose_build_services,
+                    compose_services,
+                    selected,
+                )
             )
         except ComposeStackError as error:
             self._block_task(store, claim, owner_token, str(error))
@@ -183,6 +191,19 @@ class HostComposeManager:
                 )
                 for name in network_names
             ),
+            *(
+                ComposeResource(
+                    run_id=claim.run_id,
+                    claim_id=claim.id,
+                    task_id=claim.task_id,
+                    project_name=project_name,
+                    resource_type="image",
+                    resource_name=name,
+                    labels=labels,
+                    created_at=created_at,
+                )
+                for name in image_names
+            ),
         )
         command = _compose_base(
             docker_executable,
@@ -193,6 +214,8 @@ class HostComposeManager:
             "up",
             "--detach",
             "--wait",
+            "--wait-timeout",
+            str(_COMPOSE_HEALTH_TIMEOUT_SECONDS),
             "--remove-orphans",
             "--no-deps",
             *selected,
@@ -205,6 +228,7 @@ class HostComposeManager:
             docker_executable=docker_executable,
             network_name=network_name,
             network_names=network_names,
+            image_names=image_names,
             worktree=worktree,
             runtime_directory=runtime_directory,
             compose_files=files,
@@ -333,9 +357,15 @@ class HostComposeManager:
         profiles: Sequence[str],
         network_keys: Sequence[str],
         volume_keys: Sequence[str],
+        build_services: Sequence[str],
         compose_services: Sequence[HostService],
         selected: Sequence[str],
-    ) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[str, ...]]:
+    ) -> tuple[
+        tuple[Path, ...],
+        tuple[Path, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]:
         """Create claim-owned startup isolation and secret-free cleanup files."""
         network_keys = tuple(network_keys) or ("default",)
         network_names = tuple(
@@ -346,12 +376,18 @@ class HostComposeManager:
             key: _owned_resource_name(project_name, f"volume-{key}")
             for key in volume_keys
         }
+        owned_images = {
+            service: _owned_image_name(project_name, service)
+            for service in build_services
+            if service in selected
+        }
         ports = _service_target_ports(compose_services)
         override_text = _render_runtime_override(
             selected,
             ports,
             owned_networks,
             owned_volumes,
+            owned_images,
         )
         override_directory = self.repository_root / ".borg/state/compose" / project_name
         cleanup = override_directory / "compose.cleanup.json"
@@ -360,6 +396,7 @@ class HostComposeManager:
             selected,
             owned_networks,
             owned_volumes,
+            owned_images,
         )
         try:
             override_directory.mkdir(parents=True, exist_ok=True)
@@ -376,7 +413,12 @@ class HostComposeManager:
                     docker_executable, project_name, files, profiles
                 ),
             ) from error
-        return (*files, override), (cleanup, override), network_names
+        return (
+            (*files, override),
+            (cleanup, override),
+            network_names,
+            tuple(owned_images.values()),
+        )
 
     def _assert_services_healthy(
         self,
@@ -514,7 +556,7 @@ class HostComposeManager:
             stack.project_name,
             stack.compose_files,
             stack.profiles,
-        ) + ("down", "--volumes", "--remove-orphans", "--rmi", "local")
+        ) + ("down", "--volumes", "--remove-orphans", "--rmi", "all")
         now = self._clock()
         if command_owner is None:
             store.append_execution_event(
@@ -599,6 +641,14 @@ class HostComposeManager:
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=_COMPOSE_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                command,
+                _TIMED_OUT_RETURN_CODE,
+                "",
+                "Compose command timed out",
             )
         except OSError as error:
             return subprocess.CompletedProcess(command, 127, "", str(error))
@@ -815,11 +865,17 @@ def _owned_resource_name(project_name: str, key: str) -> str:
     return f"{project_name}_{key}"
 
 
+def _owned_image_name(project_name: str, service: str) -> str:
+    service_identity = hashlib.sha256(service.encode()).hexdigest()[:12]
+    return f"betterborg/{project_name}-{service_identity}:claim"
+
+
 def _render_runtime_override(
     services: Sequence[str],
     ports: Sequence[tuple[str, int, str]],
     networks: Mapping[str, str],
     volumes: Mapping[str, str],
+    images: Mapping[str, str],
 ) -> str:
     by_service: dict[str, list[tuple[int, str]]] = {name: [] for name in services}
     for service, target, protocol in ports:
@@ -832,6 +888,9 @@ def _render_runtime_override(
                 "    container_name: !reset null",
             )
         )
+        if service in images:
+            lines.append(f"    image: {json.dumps(images[service])}")
+            lines.append("    pull_policy: build")
         targets = tuple(dict.fromkeys(by_service[service]))
         if not targets:
             lines.append("    ports: !override []")
@@ -873,19 +932,24 @@ def _cleanup_compose_model(
     services: Sequence[str],
     networks: Mapping[str, str],
     volumes: Mapping[str, str],
+    images: Mapping[str, str],
 ) -> dict[str, object]:
     """Return only immutable project metadata needed by ``compose down``.
 
     The resolved Compose model can contain literals from service env files,
     interpolation, build arguments, and other repository-controlled fields.
     Cleanup deliberately retains none of those values.  A harmless build
-    marker preserves Compose's default project/service image identity so
-    ``down --rmi local`` can still remove locally built task images.
+    marker preserves Compose's default project/service image identity.  A
+    claim-owned image name is retained only for validated build services so
+    ``down --rmi all`` removes those exact tags without touching shared images.
     """
+    service_models: dict[str, dict[str, object]] = {
+        service: {"build": {"context": "."}} for service in services
+    }
+    for service, image in images.items():
+        service_models[service]["image"] = image
     model: dict[str, object] = {
-        "services": {
-            service: {"build": {"context": "."}} for service in services
-        },
+        "services": service_models,
         "networks": {
             key: {"name": name, "external": False}
             for key, name in networks.items()
@@ -1006,6 +1070,11 @@ def _stack_from_resources(
             if resource.resource_type == "network"
         )
         or (network,),
+        image_names=tuple(
+            resource.resource_name
+            for resource in resources
+            if resource.resource_type == "image"
+        ),
         worktree=worktree,
         runtime_directory=runtime_directory,
         compose_files=files,
@@ -1036,4 +1105,9 @@ def _command_error(prefix: str, result: subprocess.CompletedProcess[str]) -> str
     # Compose output may echo repository-controlled environment values.  The
     # durable error carries the actionable exit status, project, and argv but
     # deliberately does not persist raw stdout/stderr.
+    if result.returncode == _TIMED_OUT_RETURN_CODE:
+        return (
+            f"{prefix} (timed out after "
+            f"{_COMPOSE_COMMAND_TIMEOUT_SECONDS} seconds)"
+        )
     return f"{prefix} (exit code {result.returncode})"

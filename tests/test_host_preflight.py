@@ -162,7 +162,12 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     docker = _compose_executable(
         binary_dir,
         model={
-            "services": {"postgres": {}},
+            "services": {
+                "postgres": {
+                    "build": {"context": "."},
+                    "image": "betterborg/shared-postgres:dev",
+                }
+            },
             "networks": {"backend": {}},
             "volumes": {"database": {}},
         },
@@ -199,6 +204,7 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     assert result.compose_files == (committed_git_repo / "compose.yml",)
     assert result.compose_networks == ("backend",)
     assert result.compose_volumes == ("database",)
+    assert result.compose_build_services == ("postgres",)
     assert [(service.name, service.kind) for service in result.services] == [
         ("database", "compose"),
         ("search", "external"),

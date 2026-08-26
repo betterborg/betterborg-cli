@@ -106,6 +106,7 @@ class HostPreflightPlan:
     compose_profiles: tuple[str, ...] = ()
     compose_networks: tuple[str, ...] = ()
     compose_volumes: tuple[str, ...] = ()
+    compose_build_services: tuple[str, ...] = ()
     package_managers: tuple[str, ...] = ()
     secret_requirements: tuple[HostSecret, ...] = ()
 
@@ -181,6 +182,7 @@ class HostPreflight:
             compose_profiles,
             compose_networks,
             compose_volumes,
+            compose_build_services,
             services,
         ) = self._services(
             plan,
@@ -206,6 +208,7 @@ class HostPreflight:
             compose_profiles=tuple(compose_profiles),
             compose_networks=tuple(compose_networks),
             compose_volumes=tuple(compose_volumes),
+            compose_build_services=tuple(compose_build_services),
             package_managers=tuple(_package_managers(plan)),
             secret_requirements=tuple(secret_requirements),
         )
@@ -598,7 +601,14 @@ class HostPreflight:
         external_urls: Mapping[str, str],
         executables: list[HostExecutable],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[Path], list[str], list[str], list[str], list[HostService]]:
+    ) -> tuple[
+        list[Path],
+        list[str],
+        list[str],
+        list[str],
+        list[str],
+        list[HostService],
+    ]:
         catalog = plan.get("command_catalog")
         command_records = (
             _mappings(catalog.get("commands")) if isinstance(catalog, Mapping) else []
@@ -616,7 +626,7 @@ class HostPreflight:
                         _evidence(record, catalog_evidence)
                     )
         if not selected:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
         by_name: dict[str, list[Mapping[str, Any]]] = {}
         for record in _mappings(plan.get("service_dependencies")):
@@ -747,6 +757,7 @@ class HostPreflight:
         compose_profiles: list[str] = []
         compose_networks: list[str] = []
         compose_volumes: list[str] = []
+        compose_build_services: list[str] = []
         if compose_selected:
             compose_files, compose_profiles = self._validate_compose(
                 plan, compose_selected, failures
@@ -816,7 +827,11 @@ class HostPreflight:
                         )
                     )
                 elif compose_files:
-                    compose_networks, compose_volumes = self._compose_topology(
+                    (
+                        compose_networks,
+                        compose_volumes,
+                        compose_build_services,
+                    ) = self._compose_topology(
                         docker.path,
                         compose_files,
                         compose_profiles,
@@ -828,6 +843,7 @@ class HostPreflight:
             compose_profiles,
             compose_networks,
             compose_volumes,
+            compose_build_services,
             services,
         )
 
@@ -838,7 +854,7 @@ class HostPreflight:
         profiles: Sequence[str],
         selected: Sequence[tuple[str, Mapping[str, Any]]],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """Validate isolation once and retain only secret-free topology keys."""
         command = [
             str(docker),
@@ -879,7 +895,7 @@ class HostPreflight:
                     ),
                 )
             )
-            return [], []
+            return [], [], []
 
         try:
             model = json.loads(result.stdout)
@@ -909,6 +925,11 @@ class HostPreflight:
                 raise TypeError
             networks = [str(key) for key in network_records] or ["default"]
             volumes = [str(key) for key in volume_records]
+            build_services = [
+                name
+                for name, record in selected_records.items()
+                if record.get("build") is not None
+            ]
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             detail = str(error) or "selected service topology is incomplete"
             failures.append(
@@ -924,8 +945,8 @@ class HostPreflight:
                     ),
                 )
             )
-            return [], []
-        return networks, volumes
+            return [], [], []
+        return networks, volumes, build_services
 
     def _validate_compose(
         self,
