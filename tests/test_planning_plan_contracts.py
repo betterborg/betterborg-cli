@@ -10,6 +10,7 @@ import pytest
 
 from betterborg_cli.planning import (
     PlanValidationError,
+    build_project_pr_body,
     render_plan_markdown,
     validate_plan,
     validate_plan_json,
@@ -391,6 +392,27 @@ def test_renderer_tolerates_partial_legacy_plans() -> None:
     assert render_plan_markdown(
         {"title": "Legacy", "phases": ["bad", {"name": "old"}]}
     ) == "# Legacy\n\n## Phases\n\n### old\n"
+
+
+def test_builds_bounded_rollup_body_from_prd_and_canonical_plan() -> None:
+    body = build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+    )
+
+    assert body == (
+        "# Product need\n\nShip it.\n\n---\n\n"
+        "# Delivery plan\n\nBuild and verify it.\n"
+    )
+
+    oversized = build_project_pr_body(
+        prd_markdown="\n".join(f"line {index}: " + "x" * 90 for index in range(800)),
+        plan=None,
+        project_name="delivery",
+    )
+    assert len(oversized) <= 65_536
+    assert "truncated to fit GitHub's 65,536-character limit" in oversized
 
 
 @pytest.fixture

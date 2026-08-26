@@ -23,6 +23,11 @@ class PlanValidationError(ValueError):
 
 
 _PHASE_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+_GITHUB_PR_BODY_LIMIT = 65_536
+_TRUNCATION_MARKER = (
+    "\n\n---\n\n_(Body truncated to fit GitHub's 65,536-character limit; "
+    "the full PRD and plan remain in the repository.)_\n"
+)
 
 
 def validate_plan_json(
@@ -434,6 +439,33 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
     return "\n\n".join(blocks).strip() + "\n" if blocks else ""
 
 
+def build_project_pr_body(
+    *,
+    prd_markdown: str | None,
+    plan: Mapping[str, Any] | None,
+    project_name: str,
+) -> str:
+    """Build the bounded rollup PR body from repository-owned planning data."""
+    sections: list[str] = []
+    prd = (prd_markdown or "").strip()
+    if prd:
+        sections.append(prd)
+    plan_markdown = render_plan_markdown(plan).strip()
+    if plan_markdown:
+        sections.append(plan_markdown)
+    if not sections:
+        return f"Rollup of all completed work for Borg `{project_name}`.\n"
+
+    body = "\n\n---\n\n".join(sections).strip() + "\n"
+    if len(body) <= _GITHUB_PR_BODY_LIMIT:
+        return body
+    budget = _GITHUB_PR_BODY_LIMIT - len(_TRUNCATION_MARKER)
+    cut = body.rfind("\n", 0, budget)
+    if cut <= 0:
+        cut = budget
+    return body[:cut] + _TRUNCATION_MARKER
+
+
 def _phase_blocks(phase: Any, index: int) -> list[str]:
     if not isinstance(phase, Mapping):
         return []
@@ -547,6 +579,7 @@ def _nonempty_strings(value: Any) -> list[str]:
 
 __all__ = [
     "PlanValidationError",
+    "build_project_pr_body",
     "render_plan_markdown",
     "validate_plan",
     "validate_plan_json",
