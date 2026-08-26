@@ -301,7 +301,10 @@ class HostEnvironmentManager:
                 "claimed task has no persisted worktree"
             )
         worktree = Path(runtime.worktree_path).resolve()
-        resumed_from_coding = runtime.status is TaskRuntimeStatus.CODING
+        resumed_from_coding = runtime.status in {
+            TaskRuntimeStatus.CODING,
+            TaskRuntimeStatus.MERGING,
+        }
         if runtime.status is TaskRuntimeStatus.CLAIMED:
             runtime = store.transition_task_runtime(
                 claim.run_id,
@@ -315,6 +318,7 @@ class HostEnvironmentManager:
         elif runtime.status not in {
             TaskRuntimeStatus.ENVIRONMENT,
             TaskRuntimeStatus.CODING,
+            TaskRuntimeStatus.MERGING,
         }:
             raise EnvironmentMaterializationError(
                 "task must be claimed, resuming its environment phase, or "
@@ -817,6 +821,7 @@ class HostEnvironmentManager:
         if runtime is None or runtime.status not in {
             TaskRuntimeStatus.ENVIRONMENT,
             TaskRuntimeStatus.CODING,
+            TaskRuntimeStatus.MERGING,
         }:
             return
         reason = str(error) or error.__class__.__name__
