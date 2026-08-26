@@ -361,6 +361,17 @@ class SafeGit:
             == 0
         )
 
+    def unmerged_paths(self) -> tuple[str, ...]:
+        """Return paths whose index entries still require merge resolution."""
+        output = self.run(
+            ["diff", "--name-only", "--diff-filter=U", "-z"]
+        ).stdout
+        return tuple(path for path in output.split("\0") if path)
+
+    def has_unmerged_paths(self) -> bool:
+        """Return whether this worktree contains unresolved index entries."""
+        return bool(self.unmerged_paths())
+
     def is_clean(self, *, ignore_path: Callable[[str], bool] | None = None) -> bool:
         output = self.run(["status", "--porcelain=v1", "-z", "-uall"]).stdout
         for _entry, paths in _status_entries(output):
