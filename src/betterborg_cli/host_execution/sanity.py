@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
-from urllib.parse import quote
+from pathlib import Path
 
 from betterborg_cli.host_execution.compose import (
     ComposeStack,
@@ -21,6 +19,10 @@ from betterborg_cli.host_execution.compose import (
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
     HostEnvironmentManager,
+    command_cwd,
+    command_secret_environment,
+    declared_secret_mask_values,
+    redact_secrets,
 )
 from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError
 from betterborg_cli.host_execution.guard import (
@@ -181,10 +183,11 @@ class HostSanityPhase:
             WorktreeError,
             OSError,
             subprocess.SubprocessError,
+            ValueError,
         ) as error:
-            reason = _redact(
+            reason = redact_secrets(
                 _error_text(error),
-                tuple((secret_values or {}).values()),
+                declared_secret_mask_values(self.plan, secret_values or {}),
             )
             return self._block(context, reason, commands)
 
@@ -286,7 +289,7 @@ class HostSanityPhase:
         if active_error is not None:
             raise active_error
 
-        masks = self._mask_values(secret_values)
+        masks = declared_secret_mask_values(self.plan, secret_values)
         self._append_event(
             context,
             _SANITY_COMPLETED_EVENT,
@@ -297,7 +300,9 @@ class HostSanityPhase:
                 "environment_fingerprint": materialization.fingerprint,
                 "commands": [
                     {
-                        "argv": [_redact(arg, masks) for arg in result.command.argv],
+                        "argv": [
+                            redact_secrets(arg, masks) for arg in result.command.argv
+                        ],
                         "cwd": result.command.cwd,
                         "returncode": result.returncode,
                         "stdout": result.stdout[-4000:],
@@ -340,15 +345,16 @@ class HostSanityPhase:
         secret_values: Mapping[str, str],
     ) -> tuple[SanityCommandResult, ...]:
         results: list[SanityCommandResult] = []
-        masks = self._mask_values(secret_values)
+        masks = declared_secret_mask_values(self.plan, secret_values)
         for command in self.plan.commands:
-            cwd = _command_cwd(worktree, command.cwd)
+            cwd = command_cwd(worktree, command.cwd)
             environment = dict(self._environment)
             environment["CI"] = "true"
             environment.update(service_environment)
-            environment.update(
-                self._command_secrets(command, secret_values=secret_values)
+            command_secrets, _ = command_secret_environment(
+                self.plan, command.stage, secret_values
             )
+            environment.update(command_secrets)
             try:
                 completed = self._run(
                     list(command.argv),
@@ -362,15 +368,15 @@ class HostSanityPhase:
                 result = SanityCommandResult(
                     command,
                     completed.returncode,
-                    _redact(completed.stdout or "", masks),
-                    _redact(completed.stderr or "", masks),
+                    redact_secrets(completed.stdout or "", masks),
+                    redact_secrets(completed.stderr or "", masks),
                 )
             except subprocess.TimeoutExpired as error:
                 result = SanityCommandResult(
                     command,
                     -1,
-                    _redact(_output(error.stdout), masks),
-                    _redact(
+                    redact_secrets(_output(error.stdout), masks),
+                    redact_secrets(
                         _output(error.stderr)
                         + f"sanity command timed out after {self._timeout_seconds}s",
                         masks,
@@ -381,39 +387,12 @@ class HostSanityPhase:
                     command,
                     -1,
                     "",
-                    _redact(f"sanity command could not run: {error}", masks),
+                    redact_secrets(f"sanity command could not run: {error}", masks),
                 )
             results.append(result)
             if result.returncode != 0:
                 break
         return tuple(results)
-
-    def _command_secrets(
-        self,
-        command: HostCommand,
-        *,
-        secret_values: Mapping[str, str],
-    ) -> dict[str, str]:
-        environment: dict[str, str] = {}
-        for secret in self.plan.secret_requirements:
-            if (
-                secret.scope not in {"all", "build"}
-                or command.stage not in secret.used_by
-            ):
-                continue
-            value = secret_values.get(secret.name)
-            if value is None:
-                raise SanityPhaseError(
-                    f"build-scoped secret value is unavailable: {secret.name}"
-                )
-            environment[secret.name] = value
-        return environment
-
-    def _mask_values(self, secret_values: Mapping[str, str]) -> tuple[str, ...]:
-        declared = set(self.plan.required_secret_names)
-        return tuple(
-            value for name, value in secret_values.items() if name in declared and value
-        )
 
     def _runtime_and_worktree(
         self, context: ScheduledTaskContext, tip: MergeTip
@@ -528,16 +507,6 @@ class HostSanityPhase:
         return HostSanityResult(TaskRuntimeStatus.BLOCKED, reason, commands=commands)
 
 
-def _command_cwd(worktree: Path, value: str) -> Path:
-    portable = PurePosixPath(value)
-    if portable.is_absolute() or ".." in portable.parts:
-        raise SanityPhaseError(f"sanity command cwd is unsafe: {value!r}")
-    candidate = (worktree / portable).resolve()
-    if not candidate.is_relative_to(worktree) or not candidate.is_dir():
-        raise SanityPhaseError(f"sanity command cwd is missing: {value!r}")
-    return candidate
-
-
 def _output(value: str | bytes | None) -> str:
     if value is None:
         return ""
@@ -550,24 +519,6 @@ def _error_text(error: BaseException) -> str:
     message = str(error) or error.__class__.__name__
     notes = getattr(error, "__notes__", ())
     return "\n".join((message, *(str(note) for note in notes)))
-
-
-def _redact(value: str, mask_values: Sequence[str]) -> str:
-    variants: set[str] = set()
-    for secret in mask_values:
-        if not secret:
-            continue
-        variants.update(
-            {
-                secret,
-                json.dumps(secret)[1:-1],
-                quote(secret, safe=""),
-            }
-        )
-    redacted = value
-    for secret in sorted(variants, key=len, reverse=True):
-        redacted = redacted.replace(secret, "[REDACTED]")
-    return redacted
 
 
 __all__ = [

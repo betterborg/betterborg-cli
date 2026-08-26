@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
@@ -494,27 +495,6 @@ class HostEnvironmentManager:
             for attempt in store.list_environment_attempts(claim.task_id)
             if attempt.kind == kind
         ]
-        started_at = self._clock()
-        attempt = EnvironmentAttempt(
-            run_id=claim.run_id,
-            claim_id=claim.id,
-            task_id=claim.task_id,
-            kind=kind,
-            attempt_number=len(prior) + 1,
-            fingerprint=fingerprint,
-            status=ExecutionAttemptStatus.RUNNING,
-            commands=[list(command.argv) for command in commands],
-            started_at=started_at,
-            finished_at=None,
-        )
-        store.append_environment_attempt(
-            attempt,
-            owner_token,
-            claim.claim_token,
-            now=started_at,
-        )
-
-        started = time.monotonic()
         mask_values = tuple(
             sorted(
                 {
@@ -526,6 +506,30 @@ class HostEnvironmentManager:
                 reverse=True,
             )
         )
+        started_at = self._clock()
+        attempt = EnvironmentAttempt(
+            run_id=claim.run_id,
+            claim_id=claim.id,
+            task_id=claim.task_id,
+            kind=kind,
+            attempt_number=len(prior) + 1,
+            fingerprint=fingerprint,
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[
+                [redact_secrets(argument, mask_values) for argument in command.argv]
+                for command in commands
+            ],
+            started_at=started_at,
+            finished_at=None,
+        )
+        store.append_environment_attempt(
+            attempt,
+            owner_token,
+            claim.claim_token,
+            now=started_at,
+        )
+
+        started = time.monotonic()
         try:
             with self._guard.protect(str(claim.task_id), f"environment {kind}"):
                 if preparation_source is None:
@@ -557,7 +561,7 @@ class HostEnvironmentManager:
                     _write_marker(completion_marker, fingerprint)
         except BaseException as error:
             duration = time.monotonic() - started
-            redacted = _redact(str(error), mask_values)
+            redacted = redact_secrets(str(error), mask_values)
             store.complete_environment_attempt(
                 attempt.id,
                 owner_token,
@@ -594,7 +598,7 @@ class HostEnvironmentManager:
         before = self._tracked_state(worktree)
         results: list[dict[str, object]] = []
         for command in commands:
-            cwd = _command_cwd(worktree, command.cwd)
+            cwd = command_cwd(worktree, command.cwd)
             environment, mask_values = command_environments[command.stage]
             try:
                 completed = self._run(
@@ -609,11 +613,14 @@ class HostEnvironmentManager:
                 raise EnvironmentMaterializationError(
                     f"unable to run {command.argv[0]!r}: {error}"
                 ) from error
-            stdout = _redact(completed.stdout or "", mask_values)
-            stderr = _redact(completed.stderr or "", mask_values)
+            stdout = redact_secrets(completed.stdout or "", mask_values)
+            stderr = redact_secrets(completed.stderr or "", mask_values)
             results.append(
                 {
-                    "argv": list(command.argv),
+                    "argv": [
+                        redact_secrets(argument, mask_values)
+                        for argument in command.argv
+                    ],
                     "cwd": command.cwd,
                     "returncode": completed.returncode,
                     "stdout": stdout,
@@ -665,24 +672,13 @@ class HostEnvironmentManager:
         environments: dict[str, tuple[dict[str, str], tuple[str, ...]]] = {}
         for stage in stages:
             environment = dict(base_environment)
-            mask_values: list[str] = []
-            for secret in plan.secret_requirements:
-                if (
-                    secret.scope not in {"all", "build"}
-                    or stage not in secret.used_by
-                ):
-                    continue
-                value = secret_values.get(secret.name)
-                if value is None:
-                    raise EnvironmentMaterializationError(
-                        f"build-scoped secret value is unavailable: {secret.name}"
-                    )
-                environment[secret.name] = value
-                if value:
-                    mask_values.append(value)
+            secrets, mask_values = command_secret_environment(
+                plan, stage, secret_values
+            )
+            environment.update(secrets)
             environments[stage] = (
                 environment,
-                tuple(sorted(set(mask_values), key=len, reverse=True)),
+                mask_values,
             )
         return environments
 
@@ -849,25 +845,77 @@ def _command_payload(commands: Sequence[HostCommand]) -> list[dict[str, object]]
     ]
 
 
-def _command_cwd(worktree: Path, value: str) -> Path:
+def command_cwd(worktree: Path, value: str) -> Path:
+    """Resolve one declared command cwd without allowing checkout escape."""
     portable = PurePosixPath(value)
     if portable.is_absolute() or ".." in portable.parts or "\\" in value:
         raise EnvironmentMaterializationError(
-            f"environment command cwd is not repository-relative: {value!r}"
+            f"command cwd is not repository-relative: {value!r}"
         )
     candidate = (worktree / portable).resolve()
     if not candidate.is_relative_to(worktree) or not candidate.is_dir():
         raise EnvironmentMaterializationError(
-            f"environment command cwd is missing from worktree: {value!r}"
+            f"command cwd is missing from worktree: {value!r}"
         )
     return candidate
 
 
-def _redact(value: str, mask_values: Sequence[str]) -> str:
-    redacted = value
+def command_secret_environment(
+    plan: HostPreflightPlan,
+    stage: str,
+    secret_values: Mapping[str, str],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Return only build secrets declared for one command stage."""
+    environment: dict[str, str] = {}
+    mask_values: list[str] = []
+    for secret in plan.secret_requirements:
+        if secret.scope not in {"all", "build"} or stage not in secret.used_by:
+            continue
+        value = secret_values.get(secret.name)
+        if value is None:
+            raise EnvironmentMaterializationError(
+                f"build-scoped secret value is unavailable: {secret.name}"
+            )
+        environment[secret.name] = value
+        if value:
+            mask_values.append(value)
+    return environment, tuple(sorted(set(mask_values), key=len, reverse=True))
+
+
+def declared_secret_mask_values(
+    plan: HostPreflightPlan, secret_values: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Return supplied values for secrets declared by the validated plan."""
+    declared = set(plan.required_secret_names)
+    return tuple(
+        sorted(
+            {
+                value
+                for name, value in secret_values.items()
+                if name in declared and value
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def redact_secrets(value: str, mask_values: Sequence[str]) -> str:
+    """Redact raw, JSON-escaped, and URL-encoded forms of secret values."""
+    variants: set[str] = set()
     for secret in mask_values:
-        if secret:
-            redacted = redacted.replace(secret, "[REDACTED]")
+        if not secret:
+            continue
+        variants.update(
+            {
+                secret,
+                json.dumps(secret)[1:-1],
+                quote(secret, safe=""),
+            }
+        )
+    redacted = value
+    for secret in sorted(variants, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
 
 

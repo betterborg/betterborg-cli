@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -23,7 +23,9 @@ from test_host_merge import (
 from betterborg_cli.agent_runtime import MockAdapter
 from betterborg_cli.host_execution import (
     HostCommand,
+    HostComposeManager,
     HostEnvironmentManager,
+    HostExecutable,
     HostPreflightPlan,
     HostSanityPhase,
     HostSecret,
@@ -249,6 +251,57 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
         tip.base_commit
     )
     assert Path(runtime.worktree_path).is_dir()
+
+
+def test_compose_file_drift_durably_blocks_before_base_advancement(
+    tmp_path: Path,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    missing_compose_file = fixture.repository / "compose.yml"
+    plan = replace(
+        _plan(fixture),
+        executables=(HostExecutable("docker", Path("/validated/docker"), "fixture"),),
+        compose_files=(missing_compose_file,),
+        services=(
+            HostService(
+                name="database",
+                kind="compose",
+                evidence="fixture",
+                compose_service="database",
+            ),
+        ),
+    )
+    compose = HostComposeManager(
+        fixture.repository,
+        environment={"PATH": os.environ["PATH"]},
+        command_runner=lambda *args, **kwargs: pytest.fail(
+            "Compose must not run after validated file drift"
+        ),
+    )
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(
+            fixture, plan, repository_lock, compose, runner
+        ).run(
+            fixture.context(store),
+            tip,
+            secret_values={
+                "BUILD_TOKEN": "build-secret",
+                "AGENT_TOKEN": "agent-secret",
+            },
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "validated Compose file is missing" in result.reason
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert Path(runtime.worktree_path).is_dir()
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.base_commit
+    )
 
 
 def test_cleanup_failure_blocks_before_completion_while_locked(
