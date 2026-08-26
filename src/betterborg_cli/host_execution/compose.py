@@ -56,6 +56,7 @@ class ComposeStack:
     claim_id: UUID
     task_id: UUID
     project_name: str
+    docker_executable: Path
     network_name: str
     network_names: tuple[str, ...]
     worktree: Path
@@ -115,6 +116,7 @@ class HostComposeManager:
             return None
         if not plan.compose_files:
             raise ValueError("validated Compose services require Compose files")
+        docker_executable = _validated_docker_executable(plan)
 
         worktree = self._claimed_worktree(store, claim)
         source_files = self._worktree_compose_files(plan, worktree)
@@ -131,12 +133,14 @@ class HostComposeManager:
 
         try:
             startup_files, files, network_names = self._write_runtime_configuration(
+                docker_executable,
                 project_name,
                 source_files,
                 plan.compose_profiles,
+                plan.compose_networks,
+                plan.compose_volumes,
                 compose_services,
                 selected,
-                worktree,
             )
         except ComposeStackError as error:
             self._block_task(store, claim, owner_token, str(error))
@@ -147,6 +151,7 @@ class HostComposeManager:
             "betterborg.run_id": str(claim.run_id),
             "betterborg.claim_id": str(claim.id),
             "betterborg.task_id": str(claim.task_id),
+            "betterborg.compose.executable": str(docker_executable),
             "betterborg.compose.files": json.dumps([str(path) for path in files]),
             "betterborg.compose.profiles": json.dumps(list(plan.compose_profiles)),
             "betterborg.compose.cwd": str(runtime_directory),
@@ -180,7 +185,10 @@ class HostComposeManager:
             ),
         )
         command = _compose_base(
-            project_name, startup_files, plan.compose_profiles
+            docker_executable,
+            project_name,
+            startup_files,
+            plan.compose_profiles,
         ) + (
             "up",
             "--detach",
@@ -194,6 +202,7 @@ class HostComposeManager:
             claim_id=claim.id,
             task_id=claim.task_id,
             project_name=project_name,
+            docker_executable=docker_executable,
             network_name=network_name,
             network_names=network_names,
             worktree=worktree,
@@ -235,6 +244,7 @@ class HostComposeManager:
                         command=command,
                     )
                 self._assert_services_healthy(
+                    docker_executable,
                     project_name,
                     files,
                     plan.compose_profiles,
@@ -242,6 +252,7 @@ class HostComposeManager:
                     runtime_directory,
                 )
                 published_ports = self._published_ports(
+                    docker_executable,
                     project_name,
                     files,
                     plan.compose_profiles,
@@ -316,64 +327,17 @@ class HostComposeManager:
 
     def _write_runtime_configuration(
         self,
+        docker_executable: Path,
         project_name: str,
         files: Sequence[Path],
         profiles: Sequence[str],
+        network_keys: Sequence[str],
+        volume_keys: Sequence[str],
         compose_services: Sequence[HostService],
         selected: Sequence[str],
-        worktree: Path,
     ) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[str, ...]]:
         """Create claim-owned startup isolation and secret-free cleanup files."""
-        config_command = _compose_base(project_name, files, profiles) + (
-            "config",
-            "--format",
-            "json",
-        )
-        result = self._invoke(config_command, cwd=worktree)
-        if result.returncode != 0:
-            raise ComposeStackError(
-                _command_error("Compose configuration could not be resolved", result),
-                project_name=project_name,
-                command=config_command,
-            )
-        try:
-            model = json.loads(result.stdout)
-            service_records = model["services"]
-            network_records = model.get("networks", {})
-            volume_records = model.get("volumes", {})
-            if not isinstance(service_records, Mapping):
-                raise TypeError
-            selected_records = {
-                name: service_records[name]
-                for name in selected
-                if isinstance(service_records.get(name), Mapping)
-            }
-            if len(selected_records) != len(selected):
-                raise KeyError
-            if any(record.get("network_mode") for record in selected_records.values()):
-                raise ValueError("host or service network_mode cannot be isolated")
-            writable_binds = _writable_bind_mounts(selected_records)
-            if writable_binds:
-                raise ValueError(
-                    "writable bind mounts cannot be isolated: "
-                    + ", ".join(writable_binds)
-                )
-            if not isinstance(network_records, Mapping) or not isinstance(
-                volume_records, Mapping
-            ):
-                raise TypeError
-            # Compose creates every declared network even when --no-deps limits
-            # container startup, so every effective network must be claim-owned.
-            network_keys = tuple(str(key) for key in network_records) or ("default",)
-            volume_keys = tuple(str(key) for key in volume_records)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-            detail = str(error) or "selected service topology is incomplete"
-            raise ComposeStackError(
-                f"Compose configuration cannot be isolated: {detail}",
-                project_name=project_name,
-                command=config_command,
-            ) from error
-
+        network_keys = tuple(network_keys) or ("default",)
         network_names = tuple(
             _owned_resource_name(project_name, key) for key in network_keys
         )
@@ -408,19 +372,22 @@ class HostComposeManager:
             raise ComposeStackError(
                 f"Compose isolation override could not be written: {error}",
                 project_name=project_name,
-                command=config_command,
+                command=_compose_base(
+                    docker_executable, project_name, files, profiles
+                ),
             ) from error
         return (*files, override), (cleanup, override), network_names
 
     def _assert_services_healthy(
         self,
+        docker_executable: Path,
         project_name: str,
         files: Sequence[Path],
         profiles: Sequence[str],
         selected: Sequence[str],
         runtime_directory: Path,
     ) -> None:
-        command = _compose_base(project_name, files, profiles) + (
+        command = _compose_base(docker_executable, project_name, files, profiles) + (
             "ps",
             "--format",
             "json",
@@ -442,6 +409,7 @@ class HostComposeManager:
 
     def _published_ports(
         self,
+        docker_executable: Path,
         project_name: str,
         files: Sequence[Path],
         profiles: Sequence[str],
@@ -450,7 +418,9 @@ class HostComposeManager:
     ) -> dict[tuple[str, int, str], int]:
         published: dict[tuple[str, int, str], int] = {}
         for service_name, target, protocol in _service_target_ports(compose_services):
-            command = _compose_base(project_name, files, profiles) + (
+            command = _compose_base(
+                docker_executable, project_name, files, profiles
+            ) + (
                 "port",
                 "--protocol",
                 protocol,
@@ -540,7 +510,10 @@ class HostComposeManager:
         command_owner: tuple[TaskClaim, str] | None,
     ) -> ComposeCleanupResult:
         command = _compose_base(
-            stack.project_name, stack.compose_files, stack.profiles
+            stack.docker_executable,
+            stack.project_name,
+            stack.compose_files,
+            stack.profiles,
         ) + ("down", "--volumes", "--remove-orphans", "--rmi", "local")
         now = self._clock()
         if command_owner is None:
@@ -842,37 +815,6 @@ def _owned_resource_name(project_name: str, key: str) -> str:
     return f"{project_name}_{key}"
 
 
-def _writable_bind_mounts(
-    services: Mapping[str, Mapping[str, object]],
-) -> tuple[str, ...]:
-    violations: list[str] = []
-    for service_name, service in services.items():
-        volumes = service.get("volumes")
-        if not isinstance(volumes, Sequence) or isinstance(volumes, str | bytes):
-            continue
-        for index, volume in enumerate(volumes):
-            if not isinstance(volume, Mapping):
-                continue
-            volume_type = volume.get("type")
-            if (
-                isinstance(volume_type, str)
-                and volume_type.casefold() == "bind"
-                and not _volume_read_only(volume)
-            ):
-                violations.append(f"{service_name}.volumes[{index}]")
-    return tuple(violations)
-
-
-def _volume_read_only(volume: Mapping[object, object]) -> bool:
-    if volume.get("read_only") is True or volume.get("readonly") is True:
-        return True
-    mode = volume.get("mode")
-    if not isinstance(mode, str):
-        return False
-    modes = {part.strip().casefold() for part in mode.split(",")}
-    return bool({"ro", "readonly"} & modes)
-
-
 def _render_runtime_override(
     services: Sequence[str],
     ports: Sequence[tuple[str, int, str]],
@@ -1000,11 +942,12 @@ def _healthy_compose_services(output: str) -> dict[str, list[bool]]:
 
 
 def _compose_base(
+    docker_executable: Path,
     project_name: str,
     compose_files: Sequence[Path],
     profiles: Sequence[str],
 ) -> tuple[str, ...]:
-    command = ["docker", "compose", "--project-name", project_name]
+    command = [str(docker_executable), "compose", "--project-name", project_name]
     for path in compose_files:
         command.extend(("--file", str(path)))
     for profile in profiles:
@@ -1041,6 +984,7 @@ def _stack_from_resources(
         profiles = ()
         worktree = fallback_worktree
         runtime_directory = fallback_worktree
+    docker_executable = Path(labels.get("betterborg.compose.executable", "docker"))
     network = next(
         (
             resource.resource_name
@@ -1054,6 +998,7 @@ def _stack_from_resources(
         claim_id=first.claim_id,
         task_id=first.task_id,
         project_name=first.project_name,
+        docker_executable=docker_executable,
         network_name=network,
         network_names=tuple(
             resource.resource_name
@@ -1069,6 +1014,22 @@ def _stack_from_resources(
         environment={},
         resources=tuple(resources),
     )
+
+
+def _validated_docker_executable(plan: HostPreflightPlan) -> Path:
+    docker = next(
+        (
+            executable.path
+            for executable in plan.executables
+            if executable.name == "docker"
+        ),
+        None,
+    )
+    if docker is None or not docker.is_absolute():
+        raise ValueError(
+            "validated Compose services require an absolute Docker executable"
+        )
+    return docker
 
 
 def _command_error(prefix: str, result: subprocess.CompletedProcess[str]) -> str:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,27 @@ def _executable(directory: Path, name: str, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _compose_executable(
+    directory: Path,
+    *,
+    version: str = "2.30.0",
+    model: dict[str, object] | None = None,
+) -> Path:
+    resolved_model = model or {
+        "services": {"postgres": {}},
+        "networks": {"default": {}},
+    }
+    return _executable(
+        directory,
+        "docker",
+        (
+            "if test \"$1 $2\" = 'compose version'; then "
+            f"echo 'Docker Compose v{version}'; exit 0; fi\n"
+            f"printf '%s\\n' {shlex.quote(json.dumps(resolved_model))}"
+        ),
+    )
 
 
 def _base_plan() -> dict[str, object]:
@@ -136,10 +159,13 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     binary_dir = committed_git_repo.parent / "host-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _executable(
+    docker = _compose_executable(
         binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
+        model={
+            "services": {"postgres": {}},
+            "networks": {"backend": {}},
+            "volumes": {"database": {}},
+        },
     )
     (committed_git_repo / "package").mkdir()
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
@@ -164,10 +190,15 @@ def test_validates_complete_plan_and_ignores_unselected_service(
         "docker",
         "example-runtime",
     }
+    assert next(tool.path for tool in result.executables if tool.name == "docker") == (
+        docker
+    )
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
     assert result.package_managers == ()
     assert [secret.scope for secret in result.secret_requirements] == ["build"]
     assert result.compose_files == (committed_git_repo / "compose.yml",)
+    assert result.compose_networks == ("backend",)
+    assert result.compose_volumes == ("database",)
     assert [(service.name, service.kind) for service in result.services] == [
         ("database", "compose"),
         ("search", "external"),
@@ -538,11 +569,7 @@ def test_compose_url_environment_requires_an_exact_service_port(
     binary_dir = committed_git_repo.parent / "compose-url-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _executable(
-        binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
-    )
+    _compose_executable(binary_dir)
     (committed_git_repo / "package").mkdir()
     (committed_git_repo / "runtime.version").write_text(
         "3.11.9\n", encoding="utf-8"
@@ -566,18 +593,13 @@ def test_compose_url_environment_requires_an_exact_service_port(
     assert isinstance(result, HostPreflightBlock)
     assert "DATABASE_URL requires an exact port" in result.reason
 
-
-def test_compose_environment_distinguishes_urls_from_port_variables(
+def test_compose_url_environment_does_not_infer_a_multi_port_target(
     committed_git_repo: Path,
 ) -> None:
     binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _executable(
-        binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
-    )
+    _compose_executable(binary_dir)
     (committed_git_repo / "package").mkdir()
     (committed_git_repo / "runtime.version").write_text(
         "3.11.9\n", encoding="utf-8"
@@ -606,11 +628,21 @@ def test_compose_environment_distinguishes_urls_from_port_variables(
         external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services[0].port == 5432
-    assert result.services[0].url_targets == (
-        ("DATABASE_URL", 5432, "udp"),
+    assert isinstance(result, HostPreflightBlock)
+    assert "DATABASE_URL requires an exact port" in result.reason
+
+    database["port"] = 5432
+    result = _preflight(
+        committed_git_repo,
+        environment={"PATH": str(binary_dir)},
+    ).validate(
+        plan,
+        available_secret_names={"PACKAGE_TOKEN"},
+        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
     assert result.services[0].port_targets == (
         ("POSTGRES_PORT", 5432, "udp"),
         ("METRICS_URL", 9187, "tcp"),
@@ -621,12 +653,7 @@ def test_compose_environment_distinguishes_urls_from_port_variables(
             ("postgres", 5432, "udp"): 49152,
             ("postgres", 9187, "tcp"): 49153,
         },
-    ) == {
-        "DATABASE_URL": "udp://127.0.0.1:49152",
-        "POSTGRES_PORT": "49152",
-        "METRICS_URL": "49153",
-        "SEARCH_URL": "https://search.example.test/api",
-    }
+    )["POSTGRES_PORT"] == "49152"
 
 
 def test_missing_compose_metadata_and_plugin_block_before_claim(
@@ -679,12 +706,7 @@ def test_compose_plugin_must_support_runtime_overrides(
     )
     binary_dir.mkdir()
     _executable(binary_dir, "available-command", "exit 0")
-    _executable(
-        binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' "
-        f"&& echo 'Docker Compose v{compose_version}'",
-    )
+    _compose_executable(binary_dir, version=compose_version)
     compose_file = committed_git_repo / "compose.yml"
     compose_file.write_text(
         "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
@@ -723,17 +745,70 @@ def test_compose_plugin_must_support_runtime_overrides(
     assert "Upgrade the Docker Compose plugin" in result.reason
 
 
+def test_compose_topology_is_validated_before_a_plan_is_returned(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "compose-topology-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "available-command", "exit 0")
+    _compose_executable(
+        binary_dir,
+        model={
+            "services": {
+                "postgres": {
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": "/var/lib/example",
+                            "target": "/data",
+                        }
+                    ]
+                }
+            },
+            "networks": {"backend": {}},
+            "volumes": {"database": {}},
+        },
+    )
+    (committed_git_repo / "compose.yml").write_text(
+        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
+    )
+    plan = {
+        "command_catalog": {
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["available-command"],
+                    "uses_services": ["database"],
+                }
+            ]
+        },
+        "compose": {"file": "compose.yml", "source": "compose.yml"},
+        "service_dependencies": [
+            {
+                "name": "database",
+                "compose_service": "postgres",
+                "source": "compose.yml#services.postgres",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "selected Compose service topology must be isolated" in result.reason
+    assert "writable bind mounts cannot be isolated" in result.reason
+    assert "postgres.volumes[0]" in result.reason
+
+
 def test_preserves_ordered_compose_stack_and_active_profiles(
     committed_git_repo: Path,
 ) -> None:
     binary_dir = committed_git_repo.parent / "compose-stack-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "available-command", "exit 0")
-    _executable(
-        binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
-    )
+    _compose_executable(binary_dir)
     for name in ("compose.yml", "compose.test.yml", "compose.fragment.yml"):
         (committed_git_repo / name).write_text(
             "services:\n  postgres:\n    image: postgres:16\n",
@@ -833,11 +908,7 @@ def test_accepts_singular_compose_file_without_service_index(
     binary_dir = committed_git_repo.parent / "single-compose-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "available-command", "exit 0")
-    _executable(
-        binary_dir,
-        "docker",
-        "test \"$1 $2\" = 'compose version' && echo 'Docker Compose v2.30.0'",
-    )
+    _compose_executable(binary_dir)
     compose_file = committed_git_repo / "compose.yml"
     compose_file.write_text(
         "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"

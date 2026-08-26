@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -23,6 +24,7 @@ from betterborg_cli.host_execution import (
     HostCommand,
     HostComposeManager,
     HostEnvironmentManager,
+    HostExecutable,
     HostPreflightPlan,
     HostSecret,
     HostService,
@@ -761,7 +763,11 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
 ) -> None:
     fixture = execution_preflight_fixture()
     runner = _FakeComposeRunner()
-    plan = _compose_plan(fixture.repository)
+    validated_docker = Path("/opt/validated/bin/docker")
+    plan = replace(
+        _compose_plan(fixture.repository),
+        executables=(HostExecutable(name="docker", path=validated_docker),),
+    )
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
         stack = fixture.compose_manager(runner).start_claimed_stack(
@@ -823,6 +829,8 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
 
     assert len(succeeded) == 1 and succeeded[0].stopped is True
     assert succeeded[0].command == failed[0].command
+    assert succeeded[0].command[0] == str(validated_docker)
+    assert all(command[0] == str(validated_docker) for command in runner.commands)
     assert str(source_compose) not in succeeded[0].command
     assert all(str(path) in succeeded[0].command for path in stack.compose_files)
     assert reclaimed is not None and reclaimed.task_id == claim.task_id
@@ -1109,7 +1117,7 @@ def test_udp_compose_endpoint_preserves_protocol_and_loopback_binding(
     assert runner.port_commands[-1][protocol_index + 1] == "udp"
 
 
-def test_writable_compose_bind_mount_blocks_before_start(
+def test_startup_consumes_preflight_topology_without_revalidation(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
@@ -1125,18 +1133,16 @@ def test_writable_compose_bind_mount_blocks_before_start(
 
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
-        with pytest.raises(
-            ComposeStackError, match=r"writable bind mounts.*healthy\.volumes\[0\]"
-        ):
-            fixture.compose_manager(runner).start_claimed_stack(
-                store, plan, claim, fixture.owner_token
-            )
-        runtime = store.get_task_runtime(claim.task_id)
-        resources = store.list_compose_resources(claim.task_id)
+        stack = fixture.compose_manager(runner).start_claimed_stack(
+            store, plan, claim, fixture.owner_token
+        )
+        assert stack is not None
+        fixture.compose_manager(runner).stop_claimed_stack(
+            store, stack, claim, fixture.owner_token
+        )
 
-    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert not any("config" in command for command in runner.commands)
     assert runner.active == set()
-    assert resources == []
 
 
 def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
@@ -1301,13 +1307,14 @@ def _plan(
 
 
 def _compose_plan(repository: Path) -> HostPreflightPlan:
+    docker = Path(shutil.which("docker") or "/validated/docker")
     return HostPreflightPlan(
         repository_root=repository,
         commands=(),
         prepare_commands=(),
         materialize_commands=(),
         environment_files=(repository / "package.lock",),
-        executables=(),
+        executables=(HostExecutable(name="docker", path=docker),),
         required_secret_names=(),
         compose_files=(repository / "compose.yml",),
         services=(
@@ -1329,6 +1336,8 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
             ),
         ),
         compose_profiles=(),
+        compose_networks=("fixture",),
+        compose_volumes=("fixture-data",),
     )
 
 
@@ -1339,6 +1348,7 @@ class _FakeComposeRunner:
         self.down_commands: list[tuple[str, ...]] = []
         self.port_commands: list[tuple[str, ...]] = []
         self.environments: list[dict[str, str]] = []
+        self.commands: list[tuple[str, ...]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
         self.pause_up: set[str] = set()
@@ -1354,6 +1364,7 @@ class _FakeComposeRunner:
 
     def __call__(self, argv, **kwargs):
         command = tuple(argv)
+        self.commands.append(command)
         project = command[command.index("--project-name") + 1]
         if "up" in command and project in self.pause_up:
             self.up_entered.set()

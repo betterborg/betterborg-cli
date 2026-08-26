@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -103,6 +104,8 @@ class HostPreflightPlan:
     compose_files: tuple[Path, ...]
     services: tuple[HostService, ...]
     compose_profiles: tuple[str, ...] = ()
+    compose_networks: tuple[str, ...] = ()
+    compose_volumes: tuple[str, ...] = ()
     package_managers: tuple[str, ...] = ()
     secret_requirements: tuple[HostSecret, ...] = ()
 
@@ -173,7 +176,13 @@ class HostPreflight:
         secret_requirements = self._required_secrets(
             plan, available_secret_names, failures
         )
-        compose_files, compose_profiles, services = self._services(
+        (
+            compose_files,
+            compose_profiles,
+            compose_networks,
+            compose_volumes,
+            services,
+        ) = self._services(
             plan,
             external_urls or {},
             executables,
@@ -195,6 +204,8 @@ class HostPreflight:
             compose_files=tuple(compose_files),
             services=tuple(services),
             compose_profiles=tuple(compose_profiles),
+            compose_networks=tuple(compose_networks),
+            compose_volumes=tuple(compose_volumes),
             package_managers=tuple(_package_managers(plan)),
             secret_requirements=tuple(secret_requirements),
         )
@@ -587,7 +598,7 @@ class HostPreflight:
         external_urls: Mapping[str, str],
         executables: list[HostExecutable],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[Path], list[str], list[HostService]]:
+    ) -> tuple[list[Path], list[str], list[str], list[str], list[HostService]]:
         catalog = plan.get("command_catalog")
         command_records = (
             _mappings(catalog.get("commands")) if isinstance(catalog, Mapping) else []
@@ -605,7 +616,7 @@ class HostPreflight:
                         _evidence(record, catalog_evidence)
                     )
         if not selected:
-            return [], [], []
+            return [], [], [], [], []
 
         by_name: dict[str, list[Mapping[str, Any]]] = {}
         for record in _mappings(plan.get("service_dependencies")):
@@ -734,6 +745,8 @@ class HostPreflight:
 
         compose_files: list[Path] = []
         compose_profiles: list[str] = []
+        compose_networks: list[str] = []
+        compose_volumes: list[str] = []
         if compose_selected:
             compose_files, compose_profiles = self._validate_compose(
                 plan, compose_selected, failures
@@ -802,7 +815,117 @@ class HostPreflight:
                             ),
                         )
                     )
-        return compose_files, compose_profiles, services
+                elif compose_files:
+                    compose_networks, compose_volumes = self._compose_topology(
+                        docker.path,
+                        compose_files,
+                        compose_profiles,
+                        compose_selected,
+                        failures,
+                    )
+        return (
+            compose_files,
+            compose_profiles,
+            compose_networks,
+            compose_volumes,
+            services,
+        )
+
+    def _compose_topology(
+        self,
+        docker: Path,
+        files: Sequence[Path],
+        profiles: Sequence[str],
+        selected: Sequence[tuple[str, Mapping[str, Any]]],
+        failures: list[HostPreflightFailure],
+    ) -> tuple[list[str], list[str]]:
+        """Validate isolation once and retain only secret-free topology keys."""
+        command = [
+            str(docker),
+            "compose",
+            "--project-name",
+            "betterborg-preflight",
+        ]
+        for path in files:
+            command.extend(("--file", str(path)))
+        for profile in profiles:
+            command.extend(("--profile", profile))
+        command.extend(("config", "--format", "json"))
+        evidence = _join_evidence(
+            _evidence(service, name) for name, service in selected
+        )
+        try:
+            result = self._run(
+                command,
+                cwd=self.repository_root,
+                env=self._probe_environment(),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is None or result.returncode != 0:
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "Compose configuration must resolve before task claims"
+                    ),
+                    evidence=evidence,
+                    guidance=(
+                        "Run the validated Compose file stack with the selected "
+                        "profiles, correct its configuration, and rerun preflight."
+                    ),
+                )
+            )
+            return [], []
+
+        try:
+            model = json.loads(result.stdout)
+            service_records = model["services"]
+            network_records = model.get("networks", {})
+            volume_records = model.get("volumes", {})
+            if not isinstance(service_records, Mapping):
+                raise TypeError
+            selected_records = {
+                name: service_records[name]
+                for name, _service in selected
+                if isinstance(service_records.get(name), Mapping)
+            }
+            if len(selected_records) != len({name for name, _service in selected}):
+                raise KeyError("selected service topology is incomplete")
+            if any(record.get("network_mode") for record in selected_records.values()):
+                raise ValueError("host or service network_mode cannot be isolated")
+            writable_binds = _writable_bind_mounts(selected_records)
+            if writable_binds:
+                raise ValueError(
+                    "writable bind mounts cannot be isolated: "
+                    + ", ".join(writable_binds)
+                )
+            if not isinstance(network_records, Mapping) or not isinstance(
+                volume_records, Mapping
+            ):
+                raise TypeError
+            networks = [str(key) for key in network_records] or ["default"]
+            volumes = [str(key) for key in volume_records]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            detail = str(error) or "selected service topology is incomplete"
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "selected Compose service topology must be isolated: "
+                        f"{detail}"
+                    ),
+                    evidence=evidence,
+                    guidance=(
+                        "Remove host/service network_mode and writable bind mounts, "
+                        "ensure every selected service resolves, then rerun preflight."
+                    ),
+                )
+            )
+            return [], []
+        return networks, volumes
 
     def _validate_compose(
         self,
@@ -1056,18 +1179,6 @@ def _compose_service_url_targets(
     )
     if matching_port is not None:
         protocol = _service_protocol(matching_port.get("protocol"))
-    elif not _service_port(port):
-        first_port = next(
-            (
-                record
-                for record in port_records
-                if _service_port(record.get("port"))
-            ),
-            None,
-        )
-        if first_port is not None:
-            port = first_port.get("port")
-            protocol = _service_protocol(first_port.get("protocol"))
     if isinstance(url_env, str) and _service_port(port):
         return ((url_env, port, protocol),)
     return ()
@@ -1112,6 +1223,37 @@ def _service_port(value: object) -> bool:
 
 def _service_protocol(value: object) -> Literal["tcp", "udp"]:
     return "udp" if value == "udp" else "tcp"
+
+
+def _writable_bind_mounts(
+    services: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    for service_name, service in services.items():
+        volumes = service.get("volumes")
+        if not isinstance(volumes, Sequence) or isinstance(volumes, str | bytes):
+            continue
+        for index, volume in enumerate(volumes):
+            if not isinstance(volume, Mapping):
+                continue
+            volume_type = volume.get("type")
+            if (
+                isinstance(volume_type, str)
+                and volume_type.casefold() == "bind"
+                and not _volume_read_only(volume)
+            ):
+                violations.append(f"{service_name}.volumes[{index}]")
+    return tuple(violations)
+
+
+def _volume_read_only(volume: Mapping[object, object]) -> bool:
+    if volume.get("read_only") is True or volume.get("readonly") is True:
+        return True
+    mode = volume.get("mode")
+    if not isinstance(mode, str):
+        return False
+    modes = {part.strip().casefold() for part in mode.split(",")}
+    return bool({"ro", "readonly"} & modes)
 
 
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:
