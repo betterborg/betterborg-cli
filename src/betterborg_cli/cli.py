@@ -653,19 +653,36 @@ def execute_borg(repository_path: Path, name: str, auto_execute: bool) -> None:
                     snapshot=estimate,
                     decision=outcome,
                 )
-                store.append_execution_decision(decision)
-                click.echo(
-                    f"Recorded execution estimate {outcome} for generation "
-                    f"{generation.id}."
-                )
-            elif decision.decision not in {"approved", "bypassed"}:
-                raise RuntimeError(
-                    "current generation has an unsupported execution decision"
-                )
+                try:
+                    store.append_execution_decision(decision)
+                except sqlite3.IntegrityError:
+                    concurrent_decision = store.get_current_execution_decision(
+                        borg.id
+                    )
+                    if (
+                        concurrent_decision is None
+                        or concurrent_decision.generation_id != generation.id
+                    ):
+                        raise
+                    decision = concurrent_decision
+                    click.echo(
+                        "Using execution decision recorded by a concurrent "
+                        f"invocation for generation {generation.id}."
+                    )
+                else:
+                    click.echo(
+                        f"Recorded execution estimate {outcome} for generation "
+                        f"{generation.id}."
+                    )
             else:
                 click.echo(
                     f"Using recorded execution decision for generation "
                     f"{generation.id}."
+                )
+
+            if decision.decision not in {"approved", "bypassed"}:
+                raise RuntimeError(
+                    "current generation has an unsupported execution decision"
                 )
 
             result = _invoke_host_execution(

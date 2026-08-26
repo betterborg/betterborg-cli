@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -248,6 +249,68 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     assert decision.decision == "bypassed"
     assert decision.source == "auto_execute"
     assert decision.snapshot["generation_id"] == str(fixture.generation.id)
+
+
+def test_concurrent_decision_insert_reaches_active_host_execution(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository, paths, borg, _approval, fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name="concurrent-decision",
+        )
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    original_append = SqliteStore.append_execution_decision
+    winner = []
+
+    def lose_decision_insert(store, decision):
+        concurrent_decision = replace(
+            decision,
+            id=uuid4(),
+            source="concurrent_invocation",
+        )
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as contender:
+            original_append(contender, concurrent_decision)
+        winner.append(concurrent_decision)
+        original_append(store, decision)
+
+    active_operation_id = uuid4()
+    host_calls = []
+
+    def invoke_host(
+        _paths, store, _config, _repository_id, borg_id, generation_id
+    ):
+        host_calls.append((borg_id, generation_id))
+        assert store.get_current_execution_decision(borg_id) == winner[0]
+        result = _execution_result(ExecutionRunStatus.RUNNING)
+        result.active_operation_id = active_operation_id
+        return result
+
+    monkeypatch.setattr(
+        cli_module.SqliteStore,
+        "append_execution_decision",
+        lose_decision_insert,
+    )
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke_host)
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", "concurrent-decision", "--auto-execute"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "decision recorded by a concurrent invocation" in result.output
+    assert f"Execution already active: {active_operation_id}" in result.output
+    assert host_calls == [(borg.id, fixture.generation.id)]
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert store.get_current_execution_decision(borg.id) == winner[0]
 
 
 @pytest.mark.parametrize(
