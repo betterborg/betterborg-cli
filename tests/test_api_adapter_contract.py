@@ -109,6 +109,57 @@ def test_execution_role_advertises_command_only_after_trust(
     assert "run_command" in trusted_names
 
 
+def test_execution_role_commands_receive_run_environment(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variable = "BETTERBORG_API_AGENT_ENV_TEST"
+    monkeypatch.setenv(variable, "ambient-value")
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "run_command",
+                        {
+                            "argv": [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import os; "
+                                    f"print(os.environ[{variable!r}])"
+                                ),
+                            ]
+                        },
+                        call_id="command",
+                    )
+                ]
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "environment"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.CODING,
+        transport=transport,
+        workspace_trusted=True,
+    ).run(harness.spec(tmp_path, env={variable: "spec-value"}))
+
+    assert result.status == AgentStatus.COMPLETED
+    tool_output = json.loads(harness.extract_tool_output(transport.payloads[1]))
+    assert tool_output["returncode"] == 0
+    assert tool_output["stdout"] == "spec-value\n"
+
+
 def test_cancellation_after_in_flight_response_wins(
     tmp_path: Path,
     harness: ApiAdapterHarness,
