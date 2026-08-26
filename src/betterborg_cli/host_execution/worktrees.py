@@ -28,6 +28,7 @@ class WorktreeSpec:
 
     path: Path
     branch: str
+    task_id: UUID | None = None
 
 
 class HostWorktreeManager:
@@ -218,6 +219,7 @@ class HostWorktreeManager:
         if runtime.branch is None and runtime.worktree_path is None:
             identity = uuid4().hex[:16]
             return WorktreeSpec(
+                task_id=runtime.task_id,
                 path=self.worktree_root / stage / f"{stem}-{identity}",
                 branch=f"betterborg-tasks/{stage}/{stem}-{identity}",
             )
@@ -239,7 +241,11 @@ class HostWorktreeManager:
             raise WorktreeError(
                 f"persisted task worktree path does not match its branch: {path}"
             )
-        return WorktreeSpec(path=path, branch=runtime.branch)
+        return WorktreeSpec(
+            task_id=runtime.task_id,
+            path=path,
+            branch=runtime.branch,
+        )
 
     def _ensure_worktree(self, spec: WorktreeSpec, *, base_branch: str) -> None:
         if self._is_worktree_for_branch(spec.path, spec.branch):

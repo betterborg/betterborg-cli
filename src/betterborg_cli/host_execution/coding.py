@@ -383,6 +383,10 @@ class HostCodingPhase:
         operational_error: BaseException | None,
         cancellation_reason: str | None,
     ) -> tuple[TaskRuntimeStatus, str]:
+        if operational_error is not None:
+            return TaskRuntimeStatus.BLOCKED, str(operational_error)
+        if actual_branch != expected_branch:
+            return TaskRuntimeStatus.BLOCKED, "coding agent changed the task branch"
         if result.status is AgentStatus.CANCELLED:
             # The scheduler interruption releases active claims back to pending.
             # Persisting a terminal block here would make cancellation impossible
@@ -391,10 +395,6 @@ class HostCodingPhase:
                 TaskRuntimeStatus.CODING,
                 cancellation_reason or "coding agent was interrupted",
             )
-        if operational_error is not None:
-            return TaskRuntimeStatus.BLOCKED, str(operational_error)
-        if actual_branch != expected_branch:
-            return TaskRuntimeStatus.BLOCKED, "coding agent changed the task branch"
         if result.status is AgentStatus.FAILED:
             return TaskRuntimeStatus.FAILED, result.error or "coding agent failed"
         payload_status = (result.payload or {}).get("status")

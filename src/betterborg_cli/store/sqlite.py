@@ -2567,7 +2567,7 @@ class SqliteStore:
         self,
         attempt: EnvironmentAttempt,
         owner_token: str,
-        claim_token: str,
+        claim_token: str | None,
         *,
         now: datetime | None = None,
     ) -> None:
@@ -2592,7 +2592,7 @@ class SqliteStore:
                 (
                     str(attempt.id),
                     str(attempt.run_id),
-                    str(attempt.claim_id),
+                    str(attempt.claim_id) if attempt.claim_id is not None else None,
                     str(attempt.task_id),
                     attempt.kind,
                     attempt.attempt_number,
@@ -2700,7 +2700,7 @@ class SqliteStore:
         self,
         attempt_id: UUID,
         owner_token: str,
-        claim_token: str,
+        claim_token: str | None,
         *,
         status: ExecutionAttemptStatus | AgentStatus,
         result: dict[str, object] | None = None,
@@ -2892,7 +2892,7 @@ class SqliteStore:
         table: str,
         attempt_id: UUID,
         owner_token: str,
-        claim_token: str,
+        claim_token: str | None,
         now: datetime,
     ) -> sqlite3.Row:
         if table not in {"environment_attempts", "agent_attempts"}:
@@ -2918,15 +2918,31 @@ class SqliteStore:
         ).fetchone()
         if terminal is not None:
             raise ValueError("execution attempt has already finished")
-        self._require_live_claim(
-            connection,
-            run_id=UUID(attempt["run_id"]),
-            owner_token=owner_token,
-            claim_id=UUID(attempt["claim_id"]),
-            claim_token=claim_token,
-            task_id=UUID(attempt["task_id"]),
-            now=now,
-        )
+        if attempt["claim_id"] is None:
+            if claim_token is not None:
+                raise ExecutionOwnershipError(
+                    "run-owned environment attempt cannot use a claim token"
+                )
+            self._require_live_run(
+                connection,
+                UUID(attempt["run_id"]),
+                owner_token,
+                now=now,
+            )
+        else:
+            if claim_token is None:
+                raise ExecutionOwnershipError(
+                    "claim-owned execution attempt requires a claim token"
+                )
+            self._require_live_claim(
+                connection,
+                run_id=UUID(attempt["run_id"]),
+                owner_token=owner_token,
+                claim_id=UUID(attempt["claim_id"]),
+                claim_token=claim_token,
+                task_id=UUID(attempt["task_id"]),
+                now=now,
+            )
         return attempt
 
     @staticmethod
@@ -2979,9 +2995,34 @@ class SqliteStore:
         attempt: EnvironmentAttempt | AgentAttempt,
         *,
         owner_token: str,
-        claim_token: str,
+        claim_token: str | None,
         now: datetime,
     ) -> None:
+        if isinstance(attempt, EnvironmentAttempt) and attempt.claim_id is None:
+            if claim_token is not None:
+                raise ExecutionOwnershipError(
+                    "run-owned environment attempt cannot use a claim token"
+                )
+            run = self._require_live_run(
+                connection, attempt.run_id, owner_token, now=now
+            )
+            task = connection.execute(
+                """
+                SELECT 1 FROM task_records
+                WHERE id = ? AND generation_id = ?
+                """,
+                (str(attempt.task_id), run["generation_id"]),
+            ).fetchone()
+            if task is None:
+                raise ExecutionOwnershipError(
+                    "environment attempt task does not belong to the execution run"
+                )
+            return
+        if claim_token is None:
+            raise ExecutionOwnershipError(
+                "claim-owned execution attempt requires a claim token"
+            )
+        assert attempt.claim_id is not None
         self._require_live_claim(
             connection,
             run_id=attempt.run_id,
@@ -3702,7 +3743,7 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
     return EnvironmentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
-        claim_id=UUID(row["claim_id"]),
+        claim_id=UUID(row["claim_id"]) if row["claim_id"] is not None else None,
         task_id=UUID(row["task_id"]),
         kind=row["kind"],
         attempt_number=row["attempt_number"],

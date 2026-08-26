@@ -521,6 +521,12 @@ class HostReviewFixPhase:
         operational_error: BaseException | None,
         cancellation_reason: str | None,
     ) -> _PhaseOutcome:
+        if operational_error is not None:
+            return _blocked_outcome(runtime, str(operational_error))
+        if actual_branch != expected_branch or final_commit != expected_commit:
+            return _blocked_outcome(runtime, "review agent changed the task branch")
+        if after_status != before_status:
+            return _blocked_outcome(runtime, "review agent modified the task worktree")
         if result.status is AgentStatus.CANCELLED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.REVIEW,
@@ -528,12 +534,6 @@ class HostReviewFixPhase:
                 runtime.review_round,
                 "review",
             )
-        if operational_error is not None:
-            return _blocked_outcome(runtime, str(operational_error))
-        if actual_branch != expected_branch or final_commit != expected_commit:
-            return _blocked_outcome(runtime, "review agent changed the task branch")
-        if after_status != before_status:
-            return _blocked_outcome(runtime, "review agent modified the task worktree")
         if result.status is AgentStatus.FAILED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.FAILED,
@@ -599,13 +599,6 @@ class HostReviewFixPhase:
         operational_error: BaseException | None,
         cancellation_reason: str | None,
     ) -> _PhaseOutcome:
-        if result.status is AgentStatus.CANCELLED:
-            return _PhaseOutcome(
-                TaskRuntimeStatus.FIX,
-                cancellation_reason or "fix agent was interrupted",
-                runtime.review_round,
-                "fix",
-            )
         if operational_error is not None:
             return _PhaseOutcome(
                 TaskRuntimeStatus.BLOCKED,
@@ -615,6 +608,13 @@ class HostReviewFixPhase:
             )
         if actual_branch != expected_branch:
             reason = "fix agent changed the task branch"
+        elif result.status is AgentStatus.CANCELLED:
+            return _PhaseOutcome(
+                TaskRuntimeStatus.FIX,
+                cancellation_reason or "fix agent was interrupted",
+                runtime.review_round,
+                "fix",
+            )
         elif result.status is AgentStatus.FAILED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.FAILED,

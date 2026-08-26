@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import quote
+from uuid import UUID
 
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
@@ -278,12 +279,14 @@ class HostEnvironmentManager:
         self._run = command_runner or subprocess.run
         self._clock = clock
         self._guard = PrimaryCheckoutGuard(self.repository_root)
-        self._predispatch_prepared: set[str] = set()
 
     def prepare_reusable_caches(
         self,
+        store: SqliteStore,
         plan: HostPreflightPlan,
-        worktrees: Sequence[Path],
+        run_id: UUID,
+        owner_token: str,
+        worktrees: Sequence[tuple[UUID, Path]],
         *,
         secret_values: Mapping[str, str] | None = None,
     ) -> tuple[str, ...]:
@@ -296,45 +299,42 @@ class HostEnvironmentManager:
             return ()
 
         prepared: list[str] = []
-        for source_worktree in worktrees:
+        for task_id, source_worktree in worktrees:
             source = Path(source_worktree).resolve()
             descriptors = _environment_descriptors(plan, source)
             fingerprint = _fingerprint_descriptors(plan, descriptors)
-            if fingerprint in self._predispatch_prepared:
-                continue
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
             base_environment = self._base_command_environment(plan, cache_path)
             command_environments = self._command_environments(
                 plan, base_environment, secret_values or {}
             )
-            mask_values = tuple(
-                sorted(
-                    {
-                        value
-                        for command in plan.prepare_commands
-                        for value in command_environments[command.stage][1]
-                    },
-                    key=len,
-                    reverse=True,
-                )
-            )
             with _preparation_lock(cache_path):
                 marker = cache_path / ".betterborg-prepared"
-                if not _prepared_marker_matches(marker, fingerprint):
-                    try:
-                        self._run_preparation_commands(
-                            plan.prepare_commands,
-                            fingerprint=fingerprint,
-                            source_worktree=source,
-                            descriptors=descriptors,
-                            command_environments=command_environments,
-                            completion_marker=marker,
-                        )
-                    except BaseException as error:
-                        redacted = redact_secrets(str(error), mask_values)
-                        raise EnvironmentMaterializationError(redacted) from error
-            self._predispatch_prepared.add(fingerprint)
+                completed = store.find_completed_environment_attempt(
+                    fingerprint, kind="prepare"
+                )
+                if completed is not None and _prepared_marker_matches(
+                    marker, fingerprint
+                ):
+                    continue
+                self._record_attempt(
+                    store,
+                    None,
+                    owner_token,
+                    run_id=run_id,
+                    task_id=task_id,
+                    kind="prepare",
+                    fingerprint=fingerprint,
+                    commands=plan.prepare_commands,
+                    worktree=None,
+                    preparation_source=source,
+                    preparation_descriptors=descriptors,
+                    cache_path=cache_path,
+                    completion_marker=marker,
+                    command_environments=command_environments,
+                    prepared_before_dispatch=True,
+                )
             prepared.append(fingerprint)
         return tuple(prepared)
 
@@ -477,19 +477,6 @@ class HostEnvironmentManager:
                 marker, fingerprint
             ):
                 return True
-            if fingerprint in self._predispatch_prepared and _prepared_marker_matches(
-                marker, fingerprint
-            ):
-                self._record_predispatch_preparation(
-                    store,
-                    plan,
-                    claim,
-                    owner_token,
-                    fingerprint=fingerprint,
-                    cache_path=cache_path,
-                )
-                return True
-
             self._record_attempt(
                 store,
                 claim,
@@ -505,54 +492,6 @@ class HostEnvironmentManager:
                 command_environments=command_environments,
             )
             return False
-
-    def _record_predispatch_preparation(
-        self,
-        store: SqliteStore,
-        plan: HostPreflightPlan,
-        claim: TaskClaim,
-        owner_token: str,
-        *,
-        fingerprint: str,
-        cache_path: Path,
-    ) -> None:
-        """Attach an already-prepared run cache to its first owned consumer."""
-        prior = [
-            attempt
-            for attempt in store.list_environment_attempts(claim.task_id)
-            if attempt.kind == "prepare"
-        ]
-        recorded_at = self._clock()
-        attempt = EnvironmentAttempt(
-            run_id=claim.run_id,
-            claim_id=claim.id,
-            task_id=claim.task_id,
-            kind="prepare",
-            attempt_number=len(prior) + 1,
-            fingerprint=fingerprint,
-            status=ExecutionAttemptStatus.RUNNING,
-            commands=[list(command.argv) for command in plan.prepare_commands],
-            started_at=recorded_at,
-            finished_at=None,
-        )
-        store.append_environment_attempt(
-            attempt,
-            owner_token,
-            claim.claim_token,
-            now=recorded_at,
-        )
-        store.complete_environment_attempt(
-            attempt.id,
-            owner_token,
-            claim.claim_token,
-            status=ExecutionAttemptStatus.COMPLETED,
-            result={
-                "cache_path": str(cache_path),
-                "prepared_before_dispatch": True,
-            },
-            duration_seconds=0,
-            now=recorded_at,
-        )
 
     def _materialize_worktree(
         self,
@@ -604,9 +543,11 @@ class HostEnvironmentManager:
     def _record_attempt(
         self,
         store: SqliteStore,
-        claim: TaskClaim,
+        claim: TaskClaim | None,
         owner_token: str,
         *,
+        run_id: UUID | None = None,
+        task_id: UUID | None = None,
         kind: str,
         fingerprint: str,
         commands: Sequence[HostCommand],
@@ -618,10 +559,17 @@ class HostEnvironmentManager:
         preparation_source: Path | None = None,
         preparation_descriptors: Sequence[_EnvironmentDescriptor] = (),
         completion_marker: Path | None = None,
+        prepared_before_dispatch: bool = False,
     ) -> None:
+        if claim is not None:
+            run_id = claim.run_id
+            task_id = claim.task_id
+        if run_id is None or task_id is None:
+            raise AssertionError("environment attempt requires run and task identity")
+        claim_token = claim.claim_token if claim is not None else None
         prior = [
             attempt
-            for attempt in store.list_environment_attempts(claim.task_id)
+            for attempt in store.list_environment_attempts(task_id)
             if attempt.kind == kind
         ]
         mask_values = tuple(
@@ -637,9 +585,9 @@ class HostEnvironmentManager:
         )
         started_at = self._clock()
         attempt = EnvironmentAttempt(
-            run_id=claim.run_id,
-            claim_id=claim.id,
-            task_id=claim.task_id,
+            run_id=run_id,
+            claim_id=claim.id if claim is not None else None,
+            task_id=task_id,
             kind=kind,
             attempt_number=len(prior) + 1,
             fingerprint=fingerprint,
@@ -654,7 +602,7 @@ class HostEnvironmentManager:
         store.append_environment_attempt(
             attempt,
             owner_token,
-            claim.claim_token,
+            claim_token,
             now=started_at,
         )
 
@@ -663,9 +611,7 @@ class HostEnvironmentManager:
             if preparation_source is None:
                 if worktree is None:
                     raise AssertionError("materialization worktree is required")
-                with self._guard.protect(
-                    str(claim.task_id), f"environment {kind}"
-                ):
+                with self._guard.protect(str(task_id), f"environment {kind}"):
                     results = self._run_commands(
                         commands,
                         worktree=worktree,
@@ -689,12 +635,17 @@ class HostEnvironmentManager:
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = redact_secrets(str(error), mask_values)
+            failure_result: dict[str, object] = {
+                "cache_path": str(cache_path),
+            }
+            if prepared_before_dispatch:
+                failure_result["prepared_before_dispatch"] = True
             store.complete_environment_attempt(
                 attempt.id,
                 owner_token,
-                claim.claim_token,
+                claim_token,
                 status=ExecutionAttemptStatus.FAILED,
-                result={"cache_path": str(cache_path)},
+                result=failure_result,
                 error=redacted,
                 duration_seconds=duration,
                 now=self._clock(),
@@ -703,12 +654,18 @@ class HostEnvironmentManager:
                 raise EnvironmentMaterializationError(redacted) from error
             raise EnvironmentMaterializationError(redacted) from error
 
+        completed_result: dict[str, object] = {
+            "cache_path": str(cache_path),
+            "commands": results,
+        }
+        if prepared_before_dispatch:
+            completed_result["prepared_before_dispatch"] = True
         store.complete_environment_attempt(
             attempt.id,
             owner_token,
-            claim.claim_token,
+            claim_token,
             status=ExecutionAttemptStatus.COMPLETED,
-            result={"cache_path": str(cache_path), "commands": results},
+            result=completed_result,
             duration_seconds=time.monotonic() - started,
             now=self._clock(),
         )

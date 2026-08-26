@@ -103,6 +103,7 @@ class HostMergeResult:
     status: TaskRuntimeStatus
     reason: str
     tip: MergeTip | None = None
+    interrupted: bool = False
 
     def __post_init__(self) -> None:
         if self.status is TaskRuntimeStatus.MERGING:
@@ -110,6 +111,8 @@ class HostMergeResult:
                 raise ValueError("a successful merge result requires a tip")
         elif self.tip is not None:
             raise ValueError("a terminal merge result cannot expose a tip")
+        if self.interrupted and self.status is not TaskRuntimeStatus.BLOCKED:
+            raise ValueError("only a blocked merge result may be interrupted")
 
 
 class HostMergePhase:
@@ -214,7 +217,7 @@ class HostMergePhase:
         except PrimaryCheckoutContaminationError as error:
             outcome = HostMergeResult(TaskRuntimeStatus.BLOCKED, str(error))
 
-        if context.cancel.is_set():
+        if context.cancel.is_set() and outcome.interrupted:
             return outcome
         if outcome.status is TaskRuntimeStatus.MERGING:
             return outcome
@@ -604,13 +607,23 @@ class HostMergePhase:
         operational_error: BaseException | None,
         cancellation_reason: str | None,
     ) -> HostMergeResult:
+        if operational_error is not None:
+            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
+        try:
+            branch = current_branch(git)
+        except (HostAgentPhaseError, UnsafeGitError, OSError) as error:
+            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(error))
+        if branch != runtime.branch:
+            return HostMergeResult(
+                TaskRuntimeStatus.BLOCKED,
+                "merge agent changed the task branch",
+            )
         if result.status is AgentStatus.CANCELLED:
             return HostMergeResult(
                 TaskRuntimeStatus.BLOCKED,
                 cancellation_reason or "merge agent was interrupted",
+                interrupted=True,
             )
-        if operational_error is not None:
-            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
         if result.status is AgentStatus.FAILED:
             return HostMergeResult(
                 TaskRuntimeStatus.FAILED, result.error or "merge agent failed"

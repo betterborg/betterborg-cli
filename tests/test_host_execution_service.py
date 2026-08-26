@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import pytest
 from test_execution_preflight import FakeComposeRunner
 from test_host_scheduler import FakeClock
 
@@ -24,6 +25,7 @@ from betterborg_cli.agent_runtime import (
     MockResponse,
 )
 from betterborg_cli.host_execution import (
+    EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
     HostCommand,
@@ -58,6 +60,7 @@ from betterborg_cli.store import (
     Borg,
     BorgState,
     ComposeResource,
+    ExecutionAttemptStatus,
     ExecutionRunStatus,
     PlanApproval,
     Repository,
@@ -463,6 +466,7 @@ class _ConcreteHostFixture:
     review: MockAdapter
     merge: MockAdapter
     compose: FakeComposeRunner
+    environment: HostEnvironmentManager
     worktrees: HostWorktreeManager
     clock: FakeClock
 
@@ -720,6 +724,7 @@ def _concrete_host_fixture(
         review,
         merge,
         compose_runner,
+        environment,
         worktrees,
         clock,
     )
@@ -1079,6 +1084,178 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
             )
             == project_tip
         )
+    finally:
+        fixture.store.close()
+
+
+def test_predispatch_preparation_failure_is_a_durable_environment_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+
+    def fail_preparation(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            23,
+            "dependency setup output\n",
+            "dependency setup failed\n",
+        )
+
+    monkeypatch.setattr(fixture.environment, "_run", fail_preparation)
+    try:
+        with pytest.raises(
+            EnvironmentMaterializationError,
+            match="dependency setup failed",
+        ):
+            fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        task = fixture.tasks[0]
+        attempts = fixture.store.list_environment_attempts(task.id)
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert attempt.claim_id is None
+        assert attempt.status is ExecutionAttemptStatus.FAILED
+        assert attempt.kind == "prepare"
+        assert attempt.fingerprint.startswith("sha256:")
+        assert attempt.commands == [["git", "status", "--short"]]
+        assert attempt.error is not None
+        assert "dependency setup failed" in attempt.error
+        assert attempt.result is not None
+        assert attempt.result["prepared_before_dispatch"] is True
+        assert fixture.store.list_task_claims(attempt.run_id) == []
+        assert fixture.coding.calls == []
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_cannot_mask_primary_checkout_contamination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    repository = fixture.store.get_repository(fixture.borg.repository_id)
+    assert repository is not None
+    adapter_run = MockAdapter.run
+
+    def cancel_after_contamination(self, spec, *, cancel=None):
+        if self is not fixture.coding:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.log_path.write_text("cancelled after contamination\n", encoding="utf-8")
+        (repository.root / "agent-contamination.txt").write_text(
+            "unauthorized primary edit\n",
+            encoding="utf-8",
+        )
+        assert cancel is not None
+        cancel.cancel()
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="coding cancelled",
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", cancel_after_contamination)
+    try:
+        fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        runtime = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+        assert runtime.state_reason is not None
+        assert "primary checkout" in runtime.state_reason
+        assert "changed while it ran" in runtime.state_reason
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_cannot_mask_coding_branch_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+
+    def cancel_after_branch_change(self, spec, *, cancel=None):
+        if self is not fixture.coding:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.log_path.write_text("cancelled after branch change\n", encoding="utf-8")
+        _git(spec.cwd, "checkout", "--quiet", "-b", "agent/unauthorized")
+        assert cancel is not None
+        cancel.cancel()
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="coding cancelled",
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", cancel_after_branch_change)
+    try:
+        fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        runtime = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+        assert runtime.state_reason == "coding agent changed the task branch"
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_cannot_mask_review_worktree_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+
+    def cancel_after_mutation(self, spec, *, cancel=None):
+        if self is not fixture.review:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.log_path.write_text("cancelled after mutation\n", encoding="utf-8")
+        (spec.cwd / "unauthorized-review-edit.txt").write_text(
+            "review agents are read-only\n",
+            encoding="utf-8",
+        )
+        assert cancel is not None
+        cancel.cancel()
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="review cancelled",
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", cancel_after_mutation)
+    try:
+        fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        runtime = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+        assert runtime.state_reason == "review agent modified the task worktree"
+        assert runtime.worktree_path is not None
+        assert (
+            Path(runtime.worktree_path) / "unauthorized-review-edit.txt"
+        ).is_file()
     finally:
         fixture.store.close()
 
@@ -2132,7 +2309,7 @@ def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
 
 
 def test_reusable_cache_preparation_precedes_task_dispatch(tmp_path: Path) -> None:
-    store, borg, generation, _ = _store_fixture(tmp_path)
+    store, borg, generation, records = _store_fixture(tmp_path)
     calls: list[str] = []
     worktree = tmp_path / "prepared-worktree"
     worktree.mkdir()
@@ -2151,12 +2328,14 @@ def test_reusable_cache_preparation_precedes_task_dispatch(tmp_path: Path) -> No
     class PreparedWorktrees(_Worktrees):
         def prepare_current_task_worktrees(self, *args, **kwargs):
             super().prepare_current_task_worktrees(*args, **kwargs)
-            return [SimpleNamespace(path=worktree)]
+            return [SimpleNamespace(task_id=records[0].id, path=worktree)]
 
     @dataclass
     class PreparedRuntime(_ConcurrentRuntime):
-        def prepare_reusable_caches(self, worktrees, *, secret_values):
-            assert tuple(worktrees) == (worktree,)
+        def prepare_reusable_caches(
+            self, store, run_id, owner_token, worktrees, *, secret_values
+        ):
+            assert tuple(worktrees) == ((records[0].id, worktree),)
             calls.append("cache")
             return ("fingerprint",)
 

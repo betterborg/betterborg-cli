@@ -180,11 +180,20 @@ class HostTaskRuntime:
         )
 
     def prepare_reusable_caches(
-        self, worktrees, *, secret_values: Mapping[str, str]
+        self,
+        store: SqliteStore,
+        run_id: UUID,
+        owner_token: str,
+        worktrees,
+        *,
+        secret_values: Mapping[str, str],
     ) -> tuple[str, ...]:
         """Complete shared preparation before the scheduler may claim work."""
         return self._environment.prepare_reusable_caches(
+            store,
             self.plan,
+            run_id,
+            owner_token,
             tuple(worktrees),
             secret_values=secret_values,
         )
@@ -426,8 +435,20 @@ class HostExecutionService:
                 )
                 heartbeats.checkpoint()
                 if validated.prepare_commands:
+                    preparation_worktrees = []
+                    for spec in prepared:
+                        if not spec.path.is_dir():
+                            continue
+                        if spec.task_id is None:
+                            raise HostExecutionError(
+                                "prepared task worktree has no durable task identity"
+                            )
+                        preparation_worktrees.append((spec.task_id, spec.path))
                     runtime.prepare_reusable_caches(
-                        (spec.path for spec in prepared if spec.path.is_dir()),
+                        self._store,
+                        acquisition.run_id,
+                        owner_token,
+                        preparation_worktrees,
                         secret_values=secrets,
                     )
                 heartbeats.checkpoint()
