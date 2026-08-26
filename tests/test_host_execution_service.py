@@ -363,6 +363,7 @@ class _ConcreteHostFixture:
     coding: MockAdapter
     review: MockAdapter
     compose: _ConcreteComposeRunner
+    worktrees: HostWorktreeManager
     clock: _FakeClock
 
 
@@ -667,6 +668,7 @@ def _concrete_host_fixture(
         coding,
         review,
         compose_runner,
+        worktrees,
         clock,
     )
 
@@ -1004,6 +1006,57 @@ def test_concrete_dependent_starts_from_published_prerequisite(
         fixture.store.close()
 
 
+def test_concrete_dependency_refresh_contamination_blocks_and_preserves_worktree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        task_count=2,
+        dependency_chain=True,
+    )
+    refresh = fixture.worktrees.refresh_unstarted_task_worktree
+    repository = fixture.store.get_repository(fixture.borg.repository_id)
+    assert repository is not None
+
+    def contaminate_before_second_refresh(runtime, *, project_name):
+        if runtime.task_id == fixture.tasks[1].id:
+            (repository.root / "contamination.txt").write_text(
+                "primary checkout edit\n",
+                encoding="utf-8",
+            )
+        return refresh(runtime, project_name=project_name)
+
+    monkeypatch.setattr(
+        fixture.worktrees,
+        "refresh_unstarted_task_worktree",
+        contaminate_before_second_refresh,
+    )
+    try:
+        result = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
+
+        first = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        blocked = fixture.store.get_task_runtime(fixture.tasks[1].id)
+        assert result.status is ExecutionRunStatus.FAILED
+        assert first is not None and first.status is TaskRuntimeStatus.DONE
+        assert blocked is not None and blocked.status is TaskRuntimeStatus.BLOCKED
+        assert "primary checkout" in blocked.state_reason
+        assert "task work was preserved" in blocked.state_reason
+        assert blocked.worktree_path is not None
+        assert Path(blocked.worktree_path).is_dir()
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.compose.up_projects) == 1
+        assert fixture.compose.up_projects == fixture.compose.down_projects
+        assert fixture.compose.active == set()
+
+    finally:
+        fixture.store.close()
+
+
 def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
     fixture = _concrete_host_fixture(tmp_path, coding_delay_seconds=2)
     cancel = CancellationToken()
@@ -1221,54 +1274,68 @@ def test_cancellation_during_base_advance_preserves_durable_attestation(
 @dataclass
 class _ConcurrentRuntime:
     plan: HostPreflightPlan
-    started: threading.Barrier | None = None
-    release: threading.Event | None = None
-    block: bool = False
 
     def with_secret_values(self, secret_values):
         return self
 
     def __call__(self, context) -> TaskRuntimeStatus:
-        if self.started is not None:
-            self.started.wait(timeout=2)
-        if self.release is not None:
-            self.release.wait(timeout=2)
-        outcome = TaskRuntimeStatus.BLOCKED if self.block else TaskRuntimeStatus.DONE
-        context.transition(TaskRuntimeStatus.CLAIMED, outcome)
-        return outcome
+        context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+        return TaskRuntimeStatus.DONE
 
 
-def test_service_jobs_two_and_duplicate_callers_share_one_operation(
+def test_concrete_jobs_two_and_duplicate_callers_share_one_operation(
     tmp_path: Path,
 ) -> None:
-    store, borg, generation, _ = _store_fixture(tmp_path, task_count=2)
-    calls: list[str] = []
-    plan = _plan(tmp_path)
+    fixture = _concrete_host_fixture(tmp_path, task_count=2)
     release = threading.Event()
-    service = HostExecutionService(
-        store,
-        _Preflight(plan, calls),
-        _ConcurrentRuntime(plan, threading.Barrier(2), release),
-        worktree_manager=_Worktrees(calls),
-        compose_manager=_Compose(calls),
-        scheduler_config=HostSchedulerConfig(jobs=2, poll_interval_seconds=0.005),
-    )
+
+    def commit_after_duplicate_call(spec):
+        assert release.wait(timeout=2)
+        response = _coding_response()
+        assert response.dynamic is not None
+        return response.dynamic(spec)
+
+    fixture.coding.responses.clear()
+    for _ in fixture.tasks:
+        fixture.coding.queue(MockResponse(dynamic=commit_after_duplicate_call))
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            owner = executor.submit(service.run, borg.id, generation.id, {})
-            while not store.list_execution_runs(borg.id):
-                pass
-            duplicate = service.run(borg.id, generation.id, {})
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            owner = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+            )
+            for _ in range(200):
+                if len(fixture.coding.calls) == 2:
+                    break
+                threading.Event().wait(0.005)
+            assert len(fixture.coding.calls) == 2
+
+            duplicate = fixture.service.run(
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+            )
+            release.set()
             assert duplicate.acquired is False
             assert duplicate.active_operation_id is not None
-            release.set()
-            completed = owner.result(timeout=2)
+            assert duplicate.status is ExecutionRunStatus.RUNNING
+            completed = owner.result(timeout=3)
 
         assert completed.status is ExecutionRunStatus.COMPLETED
         assert completed.operation_id == duplicate.operation_id
-        assert len(store.list_task_claims(completed.operation_id)) == 2
+        assert len(fixture.store.list_task_claims(completed.operation_id)) == 2
+        assert len(fixture.coding.calls) == 2
+        assert len(fixture.review.calls) == 2
+        assert len(fixture.compose.up_projects) == 2
+        assert sorted(fixture.compose.up_projects) == sorted(
+            fixture.compose.down_projects
+        )
+        assert fixture.compose.active == set()
     finally:
-        store.close()
+        release.set()
+        fixture.store.close()
 
 
 def test_preflight_block_prevents_run_acquisition(tmp_path: Path) -> None:
@@ -1294,26 +1361,65 @@ def test_preflight_block_prevents_run_acquisition(tmp_path: Path) -> None:
         store.close()
 
 
-def test_blocked_task_finishes_run_without_reclaim(tmp_path: Path) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    plan = _plan(tmp_path)
+def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+
+    def leave_unfinished_work(spec):
+        unfinished = spec.cwd / "unfinished.txt"
+        unfinished.write_text("preserve me\n", encoding="utf-8")
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Work is unfinished.",
+                "changed_files": [unfinished.name],
+                "tests_run": [],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.coding.responses.clear()
+    fixture.coding.queue(MockResponse(dynamic=leave_unfinished_work))
     try:
-        result = HostExecutionService(
-            store,
-            _Preflight(plan, calls),
-            _ConcurrentRuntime(plan, block=True),
-            worktree_manager=_Worktrees(calls),
-            compose_manager=_Compose(calls),
-        ).run(borg.id, generation.id, {})
+        result = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
 
         assert result.status is ExecutionRunStatus.FAILED
-        assert store.get_task_runtime(records[0].id).status is (
-            TaskRuntimeStatus.BLOCKED
+        blocked = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        assert blocked is not None and blocked.status is TaskRuntimeStatus.BLOCKED
+        assert "without producing a commit" in blocked.state_reason
+        assert blocked.worktree_path is not None
+        worktree = Path(blocked.worktree_path)
+        assert (worktree / "unfinished.txt").read_text(encoding="utf-8") == (
+            "preserve me\n"
         )
-        assert len(store.list_task_claims(result.operation_id)) == 1
+        assert "?? unfinished.txt" in _git(worktree, "status", "--porcelain")
+        assert len(fixture.store.list_task_claims(result.operation_id)) == 1
+        assert len(fixture.coding.calls) == 1
+        assert fixture.review.calls == []
+        assert len(fixture.compose.up_projects) == 1
+        assert fixture.compose.up_projects == fixture.compose.down_projects
+        assert fixture.compose.active == set()
+
+        resumed = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
+
+        assert resumed.status is ExecutionRunStatus.FAILED
+        assert fixture.store.get_task_runtime(fixture.tasks[0].id) == blocked
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.compose.up_projects) == 1
+        assert fixture.store.list_task_claims(resumed.operation_id) == []
     finally:
-        store.close()
+        fixture.store.close()
 
 
 class _FakeClock:

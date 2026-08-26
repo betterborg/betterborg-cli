@@ -22,6 +22,7 @@ from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
     HostEnvironmentManager,
 )
+from betterborg_cli.host_execution.guard import PrimaryCheckoutContaminationError
 from betterborg_cli.host_execution.merge import HostMergePhase
 from betterborg_cli.host_execution.preflight import (
     AnalyzerPlanLoader,
@@ -462,7 +463,7 @@ class HostExecutionService:
                     context.runtime,
                     project_name=project_name,
                 )
-            except WorktreeError as error:
+            except (PrimaryCheckoutContaminationError, WorktreeError) as error:
                 context.transition(
                     TaskRuntimeStatus.CLAIMED,
                     TaskRuntimeStatus.BLOCKED,
