@@ -1038,6 +1038,7 @@ def test_distinct_dependencies_share_one_compose_service(
                 url_env="METRICS_HTTP_URL",
                 port=8081,
                 url_targets=(("METRICS_HTTP_URL", 8081, "tcp"),),
+                port_targets=(("METRICS_URL", 8081, "tcp"),),
             ),
         ),
     )
@@ -1053,11 +1054,17 @@ def test_distinct_dependencies_share_one_compose_service(
         )
 
     assert runner.started_services[stack.project_name] == ("healthy",)
-    assert set(stack.environment) == {"SERVICE_URL", "METRICS_HTTP_URL"}
+    assert set(stack.environment) == {
+        "SERVICE_URL",
+        "METRICS_HTTP_URL",
+        "METRICS_URL",
+    }
     assert all(
         value.startswith("http://127.0.0.1:")
-        for value in stack.environment.values()
+        for name, value in stack.environment.items()
+        if name != "METRICS_URL"
     )
+    assert stack.environment["METRICS_URL"].isdigit()
     assert {
         command[-1] for command in runner.port_commands
     } == {"8080", "8081"}

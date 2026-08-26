@@ -269,7 +269,17 @@ class HostComposeManager:
                         "network_name": network_name,
                         "network_names": list(network_names),
                         "services": list(selected),
-                        "url_env_names": sorted(environment),
+                        "url_env_names": sorted(
+                            service.url_env
+                            for service in plan.services
+                            if service.url_env in environment
+                        ),
+                        "port_env_names": sorted(
+                            env_name
+                            for service in plan.services
+                            for env_name, _port, _protocol in service.port_targets
+                            if env_name in environment
+                        ),
                     },
                 )
             except ExecutionOwnershipError as error:
@@ -722,7 +732,7 @@ def service_url_environment(
     published_ports: Mapping[tuple[str, int] | tuple[str, int, str], int]
     | None = None,
 ) -> dict[str, str]:
-    """Return only URL variables declared by the validated service plan."""
+    """Return endpoint variables declared by the validated service plan."""
     environment: dict[str, str] = {}
     for service in services:
         if (
@@ -751,6 +761,15 @@ def service_url_environment(
                         target_port=target_port,
                         protocol=protocol,
                     )
+            for env_name, target_port, protocol in service.port_targets:
+                published = _published_port(
+                    published_ports,
+                    service.compose_service,
+                    target_port,
+                    protocol,
+                )
+                if published is not None:
+                    environment[env_name] = str(published)
     return environment
 
 
@@ -801,6 +820,10 @@ def _service_target_ports(
         targets.extend(
             (service.compose_service, port, protocol)
             for _env_name, port, protocol in service.url_targets
+        )
+        targets.extend(
+            (service.compose_service, port, protocol)
+            for _env_name, port, protocol in service.port_targets
         )
         if service.port is not None:
             protocol = next(

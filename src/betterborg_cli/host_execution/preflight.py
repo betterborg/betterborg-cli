@@ -75,6 +75,7 @@ class HostService:
     url_env: str | None = None
     port: int | None = None
     url_targets: tuple[tuple[str, int, Literal["tcp", "udp"]], ...] = ()
+    port_targets: tuple[tuple[str, int, Literal["tcp", "udp"]], ...] = ()
     url: str | None = field(default=None, repr=False)
 
 
@@ -648,6 +649,7 @@ class HostPreflight:
             if has_compose:
                 assert isinstance(compose_service, str)
                 url_targets = _compose_service_url_targets(service)
+                port_targets = _compose_service_port_targets(service)
                 if has_url_env and not any(
                     target_env == url_env
                     for target_env, _port, _protocol in url_targets
@@ -686,6 +688,7 @@ class HostPreflight:
                             else None
                         ),
                         url_targets=url_targets,
+                        port_targets=port_targets,
                     )
                 )
             elif has_url_env:
@@ -1039,7 +1042,6 @@ def _string_sequence(value: object) -> bool:
 def _compose_service_url_targets(
     service: Mapping[str, Any],
 ) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
-    targets: list[tuple[str, int, Literal["tcp", "udp"]]] = []
     url_env = service.get("url_env")
     port = service.get("port")
     protocol: Literal["tcp", "udp"] = "tcp"
@@ -1067,12 +1069,25 @@ def _compose_service_url_targets(
             port = first_port.get("port")
             protocol = _service_protocol(first_port.get("protocol"))
     if isinstance(url_env, str) and _service_port(port):
-        targets.append((url_env, port, protocol))
+        return ((url_env, port, protocol),)
+    return ()
 
+
+def _compose_service_port_targets(
+    service: Mapping[str, Any],
+) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
+    targets: list[tuple[str, int, Literal["tcp", "udp"]]] = []
+    url_env = service.get("url_env")
+    port_records = _mappings(service.get("ports"))
     for record in port_records:
         port_env = record.get("env")
         port_value = record.get("port")
-        if isinstance(port_env, str) and port_env and _service_port(port_value):
+        if (
+            isinstance(port_env, str)
+            and port_env
+            and port_env != url_env
+            and _service_port(port_value)
+        ):
             targets.append(
                 (
                     port_env,
