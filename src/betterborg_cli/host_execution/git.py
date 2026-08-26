@@ -29,6 +29,7 @@ _SAFE_SUBCOMMANDS = frozenset(
         "merge",
         "merge-base",
         "merge-tree",
+        "push",
         "rev-list",
         "rev-parse",
         "show",
@@ -141,6 +142,24 @@ def _assert_safe_fetch_args(arguments: Sequence[str]) -> None:
             raise UnsafeGitError("fetch ref deletion is blocked")
 
 
+def _assert_safe_push_args(arguments: Sequence[str]) -> None:
+    """Allow one non-force publication shape for a project base branch."""
+    if len(arguments) != 3 or arguments[1] != "origin":
+        raise UnsafeGitError(
+            "push is limited to one project branch on the origin remote"
+        )
+    source, separator, destination = arguments[2].partition(":")
+    if (
+        separator != ":"
+        or source != destination
+        or not source.startswith("refs/heads/project/")
+        or source == "refs/heads/project/"
+    ):
+        raise UnsafeGitError(
+            "push requires matching project branch source and destination refs"
+        )
+
+
 def _assert_safe_worktree_args(arguments: Sequence[str]) -> None:
     if len(arguments) < 2 or arguments[1] not in {"add", "list", "remove"}:
         raise UnsafeGitError("only worktree add, list, and remove are allowed")
@@ -200,6 +219,8 @@ def assert_safe_git_args(arguments: Sequence[str]) -> None:
         _assert_safe_branch_args(arguments)
     if subcommand == "fetch":
         _assert_safe_fetch_args(arguments)
+    if subcommand == "push":
+        _assert_safe_push_args(arguments)
     if subcommand == "worktree":
         _assert_safe_worktree_args(arguments)
     if subcommand == "merge" and any(
@@ -394,6 +415,19 @@ class SafeGit:
     def create_branch(self, branch: str, start_point: str) -> None:
         """Create a branch without checking it out or moving another ref."""
         self.run(["branch", branch, start_point])
+
+    def push_project_branch(
+        self, branch: str, *, timeout: float | None = 60
+    ) -> subprocess.CompletedProcess[str]:
+        """Non-force push one local ``project/*`` branch to the same origin ref."""
+        if not branch.startswith("project/") or not self.is_valid_branch_name(branch):
+            raise UnsafeGitError(f"invalid project branch for push: {branch!r}")
+        reference = f"refs/heads/{branch}"
+        return self.run(
+            ["push", "origin", f"{reference}:{reference}"],
+            check=False,
+            timeout=timeout,
+        )
 
     def add_worktree(self, path: Path, branch: str, *, base: str) -> None:
         if self.branch_exists(branch):

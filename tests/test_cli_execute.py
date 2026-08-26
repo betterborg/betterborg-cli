@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,6 +120,51 @@ def _trust(
     monkeypatch.setenv("XDG_STATE_HOME", str(root.parent / "machine-state"))
     trusted = cli_runner.invoke(cli, ["trust", "--yes"])
     assert trusted.exit_code == 0, trusted.output
+
+
+def _create_project_branch(root: Path, name: str) -> str:
+    branch = f"project/{name}"
+    subprocess.run(
+        ["git", "-C", str(root), "branch", branch, "HEAD"],
+        check=True,
+    )
+    return _project_branch_sha(root, name)
+
+
+def _project_branch_sha(root: Path, name: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"project/{name}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _add_bare_origin(root: Path, name: str) -> Path:
+    remote = root.parent / f"{name}-origin.git"
+    subprocess.run(["git", "init", "--quiet", "--bare", str(remote)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    return remote
+
+
+def _remote_project_sha(remote: Path, name: str) -> str | None:
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(remote),
+            "rev-parse",
+            "--verify",
+            f"refs/heads/project/{name}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
@@ -249,6 +295,261 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     assert decision.decision == "bypassed"
     assert decision.source == "auto_execute"
     assert decision.snapshot["generation_id"] == str(fixture.generation.id)
+
+
+def test_execute_without_push_succeeds_without_a_remote(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "local-only"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute"])
+
+    assert result.exit_code == 0, result.output
+    assert ": completed" in result.output
+    assert "Pushed" not in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_push_option_publishes_completed_project_branch_non_force(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "push-success"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--push"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert ": completed" in result.output
+    assert f"Pushed project/{name} to origin." in result.output
+    assert _remote_project_sha(remote, name) == local_sha
+
+
+def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "missing-remote"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(
+        cli, ["execute", name, "--auto-execute", "--push"]
+    )
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "Local execution completed, but push" in result.output
+    assert "origin" in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_push_denies_remote_rewind_instead_of_forcing_project_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "non-force"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    reference = f"refs/heads/project/{name}"
+    subprocess.run(
+        ["git", "-C", str(committed_git_repo), "push", "origin", reference],
+        check=True,
+        capture_output=True,
+    )
+    tree = subprocess.run(
+        ["git", "-C", str(committed_git_repo), "rev-parse", f"{reference}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    remote_sha = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "commit-tree",
+            tree,
+            "-p",
+            local_sha,
+        ],
+        check=True,
+        capture_output=True,
+        input="remote-only commit\n",
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "push",
+            "origin",
+            f"{remote_sha}:{reference}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(
+        cli, ["execute", name, "--auto-execute", "--push"]
+    )
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "non-fast-forward" in result.output or "fetch first" in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+    assert _remote_project_sha(remote, name) == remote_sha
+
+
+def test_push_credential_failure_preserves_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "credential-failure"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    credential_denial = committed_git_repo.parent / "deny-ssh-credential"
+    credential_denial.write_text(
+        "#!/bin/sh\n"
+        "echo 'git@localhost: Permission denied (publickey).' >&2\n"
+        "exit 255\n",
+        encoding="utf-8",
+    )
+    credential_denial.chmod(0o755)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "remote",
+            "set-url",
+            "origin",
+            f"ssh://git@localhost{remote}",
+        ],
+        check=True,
+    )
+    monkeypatch.setenv("GIT_SSH_COMMAND", str(credential_denial))
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(
+        cli, ["execute", name, "--auto-execute", "--push"]
+    )
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "Permission denied (publickey)" in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+    assert _remote_project_sha(remote, name) is None
+
+
+def test_push_waits_for_local_execution_to_complete(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "active-execution"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _create_project_branch(committed_git_repo, name)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    active = _execution_result(ExecutionRunStatus.RUNNING)
+    active.active_operation_id = uuid4()
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: active,
+    )
+
+    result = cli_runner.invoke(
+        cli, ["execute", name, "--auto-execute", "--push"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Execution already active: {active.active_operation_id}" in result.output
+    assert "push" not in result.output.casefold()
 
 
 def test_concurrent_decision_insert_reaches_active_host_execution(
