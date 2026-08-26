@@ -20,6 +20,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -410,6 +411,11 @@ class HostReviewFixPhase:
                 provider=adapter.name,
                 model=model,
             )
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase=phase,
+        )
         try:
             final_commit = git.head_sha()
             actual_branch = current_branch(git)
@@ -433,6 +439,7 @@ class HostReviewFixPhase:
                 before_status=before_status,
                 after_status=after_status,
                 operational_error=operational_error,
+                cancellation_reason=cancellation_reason,
             )
         else:
             outcome = self._classify_fix(
@@ -445,6 +452,7 @@ class HostReviewFixPhase:
                 git=git,
                 after_status=after_status,
                 operational_error=operational_error,
+                cancellation_reason=cancellation_reason,
             )
 
         durable_result = dict(result.payload or {})
@@ -511,11 +519,12 @@ class HostReviewFixPhase:
         before_status: str,
         after_status: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> _PhaseOutcome:
         if result.status is AgentStatus.CANCELLED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.REVIEW,
-                "review agent was interrupted",
+                cancellation_reason or "review agent was interrupted",
                 runtime.review_round,
                 "review",
             )
@@ -588,11 +597,12 @@ class HostReviewFixPhase:
         git: SafeGit,
         after_status: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> _PhaseOutcome:
         if result.status is AgentStatus.CANCELLED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.FIX,
-                "fix agent was interrupted",
+                cancellation_reason or "fix agent was interrupted",
                 runtime.review_round,
                 "fix",
             )

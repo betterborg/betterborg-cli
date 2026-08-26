@@ -20,6 +20,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -246,6 +247,12 @@ class HostCodingPhase:
                 model=self._config.model,
             )
 
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase="coding",
+        )
+
         try:
             final_head = worktree_git.head_sha()
             branch = current_branch(worktree_git)
@@ -262,6 +269,7 @@ class HostCodingPhase:
             actual_branch=branch,
             git=worktree_git,
             operational_error=operational_error,
+            cancellation_reason=cancellation_reason,
         )
         durable_result = dict(result.payload or {})
         durable_result["_betterborg"] = {
@@ -373,12 +381,16 @@ class HostCodingPhase:
         actual_branch: str,
         git: SafeGit,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> tuple[TaskRuntimeStatus, str]:
         if result.status is AgentStatus.CANCELLED:
             # The scheduler interruption releases active claims back to pending.
             # Persisting a terminal block here would make cancellation impossible
             # to resume because terminal claims are released immediately.
-            return TaskRuntimeStatus.CODING, "coding agent was interrupted"
+            return (
+                TaskRuntimeStatus.CODING,
+                cancellation_reason or "coding agent was interrupted",
+            )
         if operational_error is not None:
             return TaskRuntimeStatus.BLOCKED, str(operational_error)
         if actual_branch != expected_branch:

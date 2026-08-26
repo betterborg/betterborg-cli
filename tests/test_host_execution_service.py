@@ -13,7 +13,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, MockResponse
+from betterborg_cli.agent_runtime import (
+    AgentResult,
+    AgentStatus,
+    CancellationToken,
+    MockAdapter,
+    MockResponse,
+)
 from betterborg_cli.host_execution import (
     HostCodingConfig,
     HostCodingPhase,
@@ -1179,6 +1185,59 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
         fixture.store.close()
 
 
+def test_concrete_retry_exhaustion_stops_and_resumes_coding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+
+    def exhaust_coding(self, spec, *, cancel=None):
+        if self is not fixture.coding:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.write_text("transient retries exhausted\n", encoding="utf-8")
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="transient retry exhausted: provider unavailable",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", exhaust_coding)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        attempts = fixture.store.list_agent_attempts(task.id)
+        assert cancel.is_set()
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == "coding"
+        assert len(attempts) == 1 and attempts[0].status.value == "cancelled"
+        assert "transient retry exhausted" in (
+            attempts[0].result["_betterborg"]["outcome_reason"]
+        )
+
+        monkeypatch.setattr(MockAdapter, "run", adapter_run)
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+        assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+        assert len(fixture.coding.calls) == 2
+        assert len(fixture.review.calls) == 1
+    finally:
+        fixture.store.close()
+
+
 def test_concrete_review_cancellation_resumes_without_replaying_coding(
     tmp_path: Path,
 ) -> None:
@@ -1231,6 +1290,61 @@ def test_concrete_review_cancellation_resumes_without_replaying_coding(
         assert fixture.store.get_task_runtime(task.id).status is (
             TaskRuntimeStatus.DONE
         )
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 2
+    finally:
+        fixture.store.close()
+
+
+def test_concrete_retry_exhaustion_stops_and_resumes_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+
+    def exhaust_review(self, spec, *, cancel=None):
+        if self is not fixture.review:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.write_text("transient retries exhausted\n", encoding="utf-8")
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="transient retry exhausted: provider unavailable",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", exhaust_review)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        attempts = fixture.store.list_agent_attempts(task.id)
+        assert cancel.is_set()
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == "review"
+        assert sorted(
+            (attempt.phase, attempt.status.value) for attempt in attempts
+        ) == [
+            ("coding", "completed"),
+            ("review", "cancelled"),
+        ]
+
+        monkeypatch.setattr(MockAdapter, "run", adapter_run)
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+        assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
         assert len(fixture.coding.calls) == 1
         assert len(fixture.review.calls) == 2
     finally:
@@ -1351,6 +1465,103 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
         assert len(fixture.coding.calls) == 1
         assert len(fixture.review.calls) == 4
         assert finding in fixture.review.calls[2].user_prompt
+    finally:
+        fixture.store.close()
+
+
+def test_concrete_retry_exhaustion_stops_and_resumes_fix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    finding = "feature must include the reviewed fix"
+    adapter_run = MockAdapter.run
+
+    def commit_fix(spec):
+        fixed = spec.cwd / "retry-fix.txt"
+        fixed.write_text("fixed after retry exhaustion\n", encoding="utf-8")
+        _git(spec.cwd, "add", fixed.name)
+        _git(spec.cwd, "commit", "--quiet", "-m", "fix after retry exhaustion")
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Fixed the review finding.",
+                "changed_files": [fixed.name],
+                "tests_run": ["integration"],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.review.responses.clear()
+    fixture.review.queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "issues_found",
+                "summary": "The implementation needs a fix.",
+                "issues_file": ".betterborg-task/issues.md",
+                "findings": [finding],
+            }
+        )
+    ).queue(MockResponse(dynamic=commit_fix)).queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "approved",
+                "summary": "The resumed fix is approved.",
+                "issues_file": "",
+                "findings": [],
+            }
+        )
+    )
+
+    def exhaust_fix(self, spec, *, cancel=None):
+        if self is not fixture.review or not self.calls:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.write_text("transient retries exhausted\n", encoding="utf-8")
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="transient retry exhausted: provider unavailable",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", exhaust_fix)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        attempts = fixture.store.list_agent_attempts(task.id)
+        assert cancel.is_set()
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == "fix"
+        assert sorted(
+            (attempt.phase, attempt.status.value) for attempt in attempts
+        ) == [
+            ("coding", "completed"),
+            ("fix", "cancelled"),
+            ("review", "completed"),
+        ]
+
+        monkeypatch.setattr(MockAdapter, "run", adapter_run)
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+        assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 4
     finally:
         fixture.store.close()
 
