@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import os
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +12,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
+
+from test_execution_preflight import FakeComposeRunner
+from test_host_scheduler import FakeClock
 
 from betterborg_cli.agent_runtime import (
     AgentResult,
@@ -39,6 +42,7 @@ from betterborg_cli.host_execution import (
     HostSanityPhase,
     HostSanityResult,
     HostSchedulerConfig,
+    HostSecret,
     HostService,
     HostTaskRuntime,
     HostWorktreeManager,
@@ -211,9 +215,11 @@ class _Review:
         self,
         calls: list[str],
         expected_environment: dict[str, str] | None = None,
+        expected_agent_environment: dict[str, str] | None = None,
     ) -> None:
         self.calls = calls
         self.expected_environment = expected_environment
+        self.expected_agent_environment = expected_agent_environment
 
     def run(
         self,
@@ -227,6 +233,9 @@ class _Review:
             assert environment["SERVICE_URL"] == "http://127.0.0.1"
         else:
             assert environment == self.expected_environment
+        if self.expected_agent_environment is not None:
+            assert review_environment == self.expected_agent_environment
+            assert fix_environment == self.expected_agent_environment
         self.calls.append("review")
         context.transition(TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.MERGING)
         return TaskRuntimeStatus.MERGING
@@ -292,6 +301,90 @@ def _git(root: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _advance_project_file(
+    repository: Path,
+    branch: str,
+    filename: str,
+    content: str,
+    index_path: Path,
+) -> str:
+    """Create one project-branch commit without touching the primary checkout."""
+    base_commit = _git(repository, "rev-parse", branch)
+    environment = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
+    subprocess.run(
+        ["git", "-C", str(repository), "read-tree", base_commit],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    blob = subprocess.run(
+        ["git", "-C", str(repository), "hash-object", "-w", "--stdin"],
+        input=content,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            blob,
+            filename,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    tree = subprocess.run(
+        ["git", "-C", str(repository), "write-tree"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+    commit = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "commit-tree",
+            tree,
+            "-p",
+            base_commit,
+            "-m",
+            "advance project for merge conflict",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "update-ref",
+            f"refs/heads/{branch}",
+            commit,
+            base_commit,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    index_path.unlink(missing_ok=True)
+    return commit
 
 
 def _concrete_task(
@@ -368,64 +461,10 @@ class _ConcreteHostFixture:
     service: HostExecutionService
     coding: MockAdapter
     review: MockAdapter
-    compose: _ConcreteComposeRunner
+    merge: MockAdapter
+    compose: FakeComposeRunner
     worktrees: HostWorktreeManager
-    clock: _FakeClock
-
-
-class _ConcreteComposeRunner:
-    def __init__(self) -> None:
-        self.active: set[str] = set()
-        self.up_projects: list[str] = []
-        self.down_projects: list[str] = []
-        self.fail_teardown = False
-        self._lock = threading.Lock()
-
-    def __call__(self, argv, **kwargs):
-        command = tuple(argv)
-        project = command[command.index("--project-name") + 1]
-        with self._lock:
-            if "config" in command:
-                return subprocess.CompletedProcess(
-                    argv,
-                    0,
-                    json.dumps(
-                        {
-                            "services": {"healthy": {"networks": {"default": None}}},
-                            "networks": {"default": {}},
-                        }
-                    ),
-                    "",
-                )
-            if "up" in command:
-                self.active.add(project)
-                self.up_projects.append(project)
-                return subprocess.CompletedProcess(argv, 0, "started\n", "")
-            if "ps" in command:
-                records = (
-                    [
-                        {
-                            "Service": "healthy",
-                            "State": "running",
-                            "Health": "healthy",
-                        }
-                    ]
-                    if project in self.active
-                    else []
-                )
-                return subprocess.CompletedProcess(argv, 0, json.dumps(records), "")
-            if "port" in command:
-                port = 41000 + sum(project.encode()) % 20000
-                return subprocess.CompletedProcess(argv, 0, f"127.0.0.1:{port}\n", "")
-            if "down" in command:
-                self.down_projects.append(project)
-                if self.fail_teardown:
-                    return subprocess.CompletedProcess(
-                        argv, 1, "", "injected Compose teardown failure"
-                    )
-                self.active.discard(project)
-                return subprocess.CompletedProcess(argv, 0, "stopped\n", "")
-        return subprocess.CompletedProcess(argv, 2, "", "unexpected command")
+    clock: FakeClock
 
 
 def _concrete_host_fixture(
@@ -569,7 +608,7 @@ def _concrete_host_fixture(
     _git(repository_root, "add", ".")
     _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
 
-    clock = _FakeClock()
+    clock = FakeClock()
     plan = HostPreflightPlan(
         repository_root=repository_root,
         commands=(HostCommand("test", ("git", "status", "--short"), "."),),
@@ -593,7 +632,7 @@ def _concrete_host_fixture(
         compose_networks=("default",),
     )
     environment = HostEnvironmentManager(repository_root, clock=clock)
-    compose_runner = _ConcreteComposeRunner()
+    compose_runner = FakeComposeRunner()
     compose = HostComposeManager(
         repository_root,
         command_runner=compose_runner,
@@ -626,6 +665,7 @@ def _concrete_host_fixture(
                 delay_seconds=review_delay_seconds,
             )
         )
+    merge = MockAdapter()
     repository_lock = threading.RLock()
     runtime = HostTaskRuntime(
         plan,
@@ -643,7 +683,7 @@ def _concrete_host_fixture(
         ),
         merge=HostMergePhase(
             repository_root,
-            MockAdapter(),
+            merge,
             config=HostMergeConfig(model="merge-model"),
             repository_lock=lambda: repository_lock,
         ),
@@ -678,6 +718,7 @@ def _concrete_host_fixture(
         service,
         coding,
         review,
+        merge,
         compose_runner,
         worktrees,
         clock,
@@ -909,6 +950,75 @@ def test_external_only_service_url_reaches_every_agent_phase(tmp_path: Path) -> 
         store.close()
 
 
+def test_command_stage_agent_secret_reaches_every_agent_phase(tmp_path: Path) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    token = "agent-token"
+    plan = replace(
+        _plan(tmp_path),
+        required_secret_names=("AGENT_TOKEN",),
+        secret_requirements=(
+            HostSecret(
+                name="AGENT_TOKEN",
+                scope="agent",
+                used_by=("test",),
+                evidence="validated command-stage fixture",
+            ),
+        ),
+    )
+    service_environment = {
+        "CACHE": "prepared",
+        "SERVICE_URL": "http://127.0.0.1",
+    }
+    agent_environment = {"AGENT_TOKEN": token}
+    compose = _Compose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=_Environment(calls),
+        compose_manager=compose,
+        coding=_Coding(calls, {**service_environment, **agent_environment}),
+        review_fix=_Review(
+            calls,
+            service_environment,
+            expected_agent_environment=agent_environment,
+        ),
+        merge=_Merge(calls, {**service_environment, **agent_environment}),
+        sanity=_Sanity(calls),
+    )
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+        ).run(
+            borg.id,
+            generation.id,
+            {},
+            secret_values={"AGENT_TOKEN": token},
+        )
+
+        assert result.status is ExecutionRunStatus.COMPLETED, (
+            store.get_task_runtime(records[0].id).state_reason
+        )
+        assert store.get_task_runtime(records[0].id).status is TaskRuntimeStatus.DONE
+        assert calls == [
+            "preflight",
+            "worktrees",
+            "environment",
+            "services-start",
+            "coding",
+            "review",
+            "merge",
+            "services-stop",
+            "sanity",
+        ]
+    finally:
+        store.close()
+
+
 def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
     tmp_path: Path,
 ) -> None:
@@ -1024,7 +1134,7 @@ def test_concrete_reused_stack_teardown_failure_prevents_base_advance(
     repository = fixture.store.get_repository(fixture.borg.repository_id)
     assert repository is not None
     base_commit = _git(repository.root, "rev-parse", "main")
-    fixture.compose.fail_teardown = True
+    fixture.compose.fail_all_down = True
     try:
         result = fixture.service.run(
             fixture.borg.id,
@@ -1120,11 +1230,7 @@ def test_concrete_cancellation_resumes_the_active_phase(tmp_path: Path) -> None:
                 {},
                 cancel=cancel,
             )
-            for _ in range(200):
-                if fixture.coding.calls:
-                    break
-                threading.Event().wait(0.005)
-            assert fixture.coding.calls
+            assert fixture.coding.wait_for_response_consumption(timeout=1)
             cancel.cancel()
             cancelled = running.result(timeout=3)
 
@@ -1566,6 +1672,125 @@ def test_concrete_retry_exhaustion_stops_and_resumes_fix(
         fixture.store.close()
 
 
+def test_concrete_retry_exhaustion_stops_and_resumes_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+    repository = fixture.store.get_repository(fixture.borg.repository_id)
+    assert repository is not None
+
+    def commit_conflicting_task(spec):
+        (spec.cwd / "README.md").write_text(
+            "# Fixture\n\ntask version\n",
+            encoding="utf-8",
+        )
+        _git(spec.cwd, "add", "README.md")
+        _git(spec.cwd, "commit", "--quiet", "-m", "change task readme")
+        _advance_project_file(
+            repository.root,
+            f"project/{fixture.borg.name}",
+            "README.md",
+            "# Fixture\n\nproject version\n",
+            tmp_path / "project-branch.index",
+        )
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Created a conflicting task change.",
+                "changed_files": ["README.md"],
+                "tests_run": ["integration"],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.coding.responses.clear()
+    fixture.coding.queue(MockResponse(dynamic=commit_conflicting_task))
+
+    def exhaust_merge(self, spec, *, cancel=None):
+        if self is not fixture.merge:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.write_text("transient retries exhausted\n", encoding="utf-8")
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="transient retry exhausted: provider unavailable",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", exhaust_merge)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        attempts = fixture.store.list_agent_attempts(task.id)
+        assert cancel.is_set()
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == "merging"
+        assert sorted(
+            (attempt.phase, attempt.status.value) for attempt in attempts
+        ) == [
+            ("coding", "completed"),
+            ("merge", "cancelled"),
+            ("review", "completed"),
+        ]
+
+        def resolve_conflict(spec):
+            (spec.cwd / "README.md").write_text(
+                "# Fixture\n\ntask and project versions\n",
+                encoding="utf-8",
+            )
+            _git(spec.cwd, "add", "README.md")
+            _git(spec.cwd, "commit", "--quiet", "-m", "resolve readme conflict")
+            return MockResponse(
+                payload={
+                    "task_file": ".betterborg-task/task.md",
+                    "status": "completed",
+                    "summary": "Resolved the project conflict.",
+                    "changed_files": ["README.md"],
+                    "tests_run": ["integration"],
+                    "follow_ups": [],
+                    "blockers": [],
+                }
+            )
+
+        monkeypatch.setattr(MockAdapter, "run", adapter_run)
+        fixture.merge.queue(MockResponse(dynamic=resolve_conflict))
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(task.id).state_reason
+        )
+        assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 1
+        assert len(fixture.merge.calls) == 2
+        assert sorted(
+            (attempt.phase, attempt.status.value)
+            for attempt in fixture.store.list_agent_attempts(task.id)
+        ) == [
+            ("coding", "completed"),
+            ("merge", "cancelled"),
+            ("merge", "completed"),
+            ("review", "completed"),
+        ]
+    finally:
+        fixture.store.close()
+
+
 def test_cancellation_during_base_advance_preserves_durable_attestation(
     tmp_path: Path,
     monkeypatch,
@@ -1796,25 +2021,11 @@ def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
         fixture.store.close()
 
 
-class _FakeClock:
-    def __init__(self) -> None:
-        self.now = datetime(2026, 8, 26, 12, tzinfo=UTC)
-        self.lock = threading.Lock()
-
-    def __call__(self) -> datetime:
-        with self.lock:
-            return self.now
-
-    def advance(self, delta: timedelta) -> None:
-        with self.lock:
-            self.now += delta
-
-
 def test_setup_heartbeats_keep_the_execution_lease_owned(tmp_path: Path) -> None:
     store, borg, generation, _ = _store_fixture(tmp_path)
     calls: list[str] = []
     plan = _plan(tmp_path)
-    clock = _FakeClock()
+    clock = FakeClock()
 
     class SlowWorktrees(_Worktrees):
         def prepare_current_task_worktrees(self, *args, **kwargs):

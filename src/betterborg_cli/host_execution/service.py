@@ -226,7 +226,7 @@ class HostTaskRuntime:
                 context,
                 environment={
                     **service_environment,
-                    **self._agent_secrets("coding"),
+                    **self._agent_secrets(),
                 },
             )
             if (
@@ -244,14 +244,28 @@ class HostTaskRuntime:
                     resume_phase=TaskRuntimeStatus.FIX.value,
                 )
                 status = TaskRuntimeStatus.FIX
+            elif (
+                status is TaskRuntimeStatus.REVIEW
+                and context.claim.resume_phase == TaskRuntimeStatus.MERGING.value
+            ):
+                # A reclaimed merge-agent attempt can leave Git's conflict
+                # state intact. Coding attestation still verifies the approved
+                # task commit, but the completed review must not inspect or
+                # replay that later merge work before merge resumes.
+                context.transition(
+                    TaskRuntimeStatus.REVIEW,
+                    TaskRuntimeStatus.MERGING,
+                    resume_phase=TaskRuntimeStatus.MERGING.value,
+                )
+                status = TaskRuntimeStatus.MERGING
             if context.cancel.is_set():
                 return self._durable_status(context)
             if status in {TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.FIX}:
                 status = self._review_fix.run(
                     context,
                     environment=service_environment,
-                    review_environment=self._agent_secrets("review"),
-                    fix_environment=self._agent_secrets("fix"),
+                    review_environment=self._agent_secrets(),
+                    fix_environment=self._agent_secrets(),
                 )
             if context.cancel.is_set():
                 return self._durable_status(context)
@@ -266,7 +280,7 @@ class HostTaskRuntime:
                         context,
                         environment={
                             **service_environment,
-                            **self._agent_secrets("merge"),
+                            **self._agent_secrets(),
                         },
                     )
                     if merge_result.tip is not None and not context.cancel.is_set():
@@ -304,12 +318,10 @@ class HostTaskRuntime:
 
         return published_status or self._durable_status(context)
 
-    def _agent_secrets(self, phase: str) -> dict[str, str]:
+    def _agent_secrets(self) -> dict[str, str]:
         environment: dict[str, str] = {}
         for secret in self.plan.secret_requirements:
             if secret.scope not in {"all", "agent"}:
-                continue
-            if phase not in secret.used_by and "agent" not in secret.used_by:
                 continue
             value = self._secret_values.get(secret.name)
             if value is None:

@@ -23,6 +23,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -528,6 +529,11 @@ class HostMergePhase:
                 model=self._config.model,
             )
 
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase="merge",
+        )
         outcome = self._classify_agent(
             result,
             runtime=runtime,
@@ -536,6 +542,7 @@ class HostMergePhase:
             approved_commit=approved_commit,
             base_commit=base_commit,
             operational_error=operational_error,
+            cancellation_reason=cancellation_reason,
         )
         durable_result = dict(result.payload or {})
         durable_result["_betterborg"] = {
@@ -595,10 +602,12 @@ class HostMergePhase:
         approved_commit: str,
         base_commit: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> HostMergeResult:
         if result.status is AgentStatus.CANCELLED:
             return HostMergeResult(
-                TaskRuntimeStatus.BLOCKED, "merge agent was interrupted"
+                TaskRuntimeStatus.BLOCKED,
+                cancellation_reason or "merge agent was interrupted",
             )
         if operational_error is not None:
             return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
