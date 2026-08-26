@@ -125,17 +125,18 @@ class HostSanityPhase:
         secret_values: Mapping[str, str] | None = None,
     ) -> HostSanityResult:
         """Sanity-check and publish ``tip``, or durably block the task."""
-        commands: tuple[SanityCommandResult, ...] = ()
+        commands: list[SanityCommandResult] = []
         try:
             runtime, worktree = self._runtime_and_worktree(context, tip)
             with self._guard.protect(self._task_ref(context), "sanity"):
                 with self._repository_lock():
-                    published, commands = self._run_locked(
+                    published = self._run_locked(
                         context,
                         runtime,
                         worktree,
                         tip,
                         secret_values or {},
+                        commands,
                     )
                     cleanup_runtime = context.store.get_task_runtime(
                         context.claim.task_id
@@ -173,13 +174,13 @@ class HostSanityPhase:
                 _error_text(error),
                 declared_secret_mask_values(self.plan, secret_values or {}),
             )
-            return self._block(context, reason, commands)
+            return self._block(context, reason, tuple(commands))
 
         return HostSanityResult(
             TaskRuntimeStatus.DONE,
             f"sanity passed and advanced {tip.project_branch} to {published}",
             published,
-            commands,
+            tuple(commands),
         )
 
     def _run_locked(
@@ -189,7 +190,8 @@ class HostSanityPhase:
         worktree: Path,
         tip: MergeTip,
         secret_values: Mapping[str, str],
-    ) -> tuple[str, tuple[SanityCommandResult, ...]]:
+        command_results: list[SanityCommandResult],
+    ) -> str:
         current_base = self._resolve_project_tip(tip.project_branch)
         if current_base == tip.commit_sha:
             if not self._advance_was_attested(context, tip):
@@ -201,7 +203,7 @@ class HostSanityPhase:
                 if not worktree.is_dir():
                     raise SanityPhaseError("merged task worktree is not a directory")
                 self._verify_tip(runtime, worktree, tip)
-            return tip.commit_sha, ()
+            return tip.commit_sha
         if current_base != tip.base_commit:
             raise SanityPhaseError(
                 "project base moved after the merge tip was produced; rerun the "
@@ -237,6 +239,7 @@ class HostSanityPhase:
                 service_environment=service_environment,
                 secret_values=secret_values,
             )
+            command_results.extend(commands)
             failure = next(
                 (result for result in commands if result.returncode != 0), None
             )
@@ -320,7 +323,7 @@ class HostSanityPhase:
                 "commit_sha": tip.commit_sha,
             },
         )
-        return tip.commit_sha, commands
+        return tip.commit_sha
 
     def _run_commands(
         self,

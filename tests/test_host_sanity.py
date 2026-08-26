@@ -259,6 +259,10 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
 
     def runner(argv, **kwargs):  # noqa: ANN001, ANN003
         calls.append(tuple(argv))
+        if argv == ["catalog-install"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="installed", stderr=""
+            )
         return subprocess.CompletedProcess(
             argv, 7, stdout=f"failed with {secret}", stderr=""
         )
@@ -275,7 +279,16 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
     assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
     assert secret not in result.reason
     assert "[REDACTED]" in result.reason
-    assert calls == [("catalog-install",)]
+    assert calls == [("catalog-install",), ("catalog-test",)]
+    assert len(result.commands) == 2
+    successful_command, failed_command = result.commands
+    assert successful_command.command.argv == ("catalog-install",)
+    assert successful_command.returncode == 0
+    assert successful_command.stdout == "installed"
+    assert failed_command.command.argv == ("catalog-test",)
+    assert failed_command.returncode == 7
+    assert failed_command.stdout == "failed with [REDACTED]"
+    assert failed_command.stderr == ""
     assert len(compose.started) == 1
     assert compose.stopped == [compose.stack]
     assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
