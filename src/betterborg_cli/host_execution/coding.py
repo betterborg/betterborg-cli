@@ -374,12 +374,15 @@ class HostCodingPhase:
         git: SafeGit,
         operational_error: BaseException | None,
     ) -> tuple[TaskRuntimeStatus, str]:
+        if result.status is AgentStatus.CANCELLED:
+            # The scheduler interruption releases active claims back to pending.
+            # Persisting a terminal block here would make cancellation impossible
+            # to resume because terminal claims are released immediately.
+            return TaskRuntimeStatus.CODING, "coding agent was interrupted"
         if operational_error is not None:
             return TaskRuntimeStatus.BLOCKED, str(operational_error)
         if actual_branch != expected_branch:
             return TaskRuntimeStatus.BLOCKED, "coding agent changed the task branch"
-        if result.status is AgentStatus.CANCELLED:
-            return TaskRuntimeStatus.BLOCKED, "coding agent was interrupted"
         if result.status is AgentStatus.FAILED:
             return TaskRuntimeStatus.FAILED, result.error or "coding agent failed"
         payload_status = (result.payload or {}).get("status")

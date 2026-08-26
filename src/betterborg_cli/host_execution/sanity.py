@@ -123,9 +123,11 @@ class HostSanityPhase:
         tip: MergeTip,
         *,
         secret_values: Mapping[str, str] | None = None,
+        existing_stack: ComposeStack | None = None,
     ) -> HostSanityResult:
         """Sanity-check and publish ``tip``, or durably block the task."""
         commands: list[SanityCommandResult] = []
+        stack_to_stop = existing_stack
         try:
             runtime, worktree = self._runtime_and_worktree(context, tip)
             with self._guard.protect(self._task_ref(context), "sanity"):
@@ -137,7 +139,16 @@ class HostSanityPhase:
                         tip,
                         secret_values or {},
                         commands,
+                        existing_stack=existing_stack,
                     )
+                    if stack_to_stop is not None:
+                        self._compose_manager.stop_claimed_stack(
+                            context.store,
+                            stack_to_stop,
+                            context.claim,
+                            context.owner_token,
+                        )
+                        stack_to_stop = None
                     cleanup_runtime = context.store.get_task_runtime(
                         context.claim.task_id
                     )
@@ -170,8 +181,23 @@ class HostSanityPhase:
             subprocess.SubprocessError,
             ValueError,
         ) as error:
+            cleanup_detail = ""
+            if stack_to_stop is not None:
+                try:
+                    self._compose_manager.stop_claimed_stack(
+                        context.store,
+                        stack_to_stop,
+                        context.claim,
+                        context.owner_token,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_detail = (
+                        "; task-owned Compose cleanup also failed: "
+                        f"{cleanup_error}"
+                    )
+                stack_to_stop = None
             reason = redact_secrets(
-                _error_text(error),
+                _error_text(error) + cleanup_detail,
                 declared_secret_mask_values(self.plan, secret_values or {}),
             )
             return self._block(context, reason, tuple(commands))
@@ -191,6 +217,8 @@ class HostSanityPhase:
         tip: MergeTip,
         secret_values: Mapping[str, str],
         command_results: list[SanityCommandResult],
+        *,
+        existing_stack: ComposeStack | None,
     ) -> str:
         current_base = self._resolve_project_tip(tip.project_branch)
         if current_base == tip.commit_sha:
@@ -220,16 +248,18 @@ class HostSanityPhase:
             context.owner_token,
             secret_values=secret_values,
         )
-        stack: ComposeStack | None = None
+        stack = existing_stack
+        owns_stack = existing_stack is None
         commands: tuple[SanityCommandResult, ...] = ()
         active_error: BaseException | None = None
         try:
-            stack = self._compose_manager.start_claimed_stack(
-                context.store,
-                self.plan,
-                context.claim,
-                context.owner_token,
-            )
+            if stack is None:
+                stack = self._compose_manager.start_claimed_stack(
+                    context.store,
+                    self.plan,
+                    context.claim,
+                    context.owner_token,
+                )
             service_environment = service_url_environment(self.plan.services)
             if stack is not None:
                 service_environment.update(stack.environment)
@@ -259,7 +289,7 @@ class HostSanityPhase:
         except BaseException as error:
             active_error = error
         finally:
-            if stack is not None:
+            if owns_stack and stack is not None:
                 try:
                     self._compose_manager.stop_claimed_stack(
                         context.store,

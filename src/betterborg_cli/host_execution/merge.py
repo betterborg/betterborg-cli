@@ -213,6 +213,8 @@ class HostMergePhase:
         except PrimaryCheckoutContaminationError as error:
             outcome = HostMergeResult(TaskRuntimeStatus.BLOCKED, str(error))
 
+        if context.cancel.is_set():
+            return outcome
         if outcome.status is TaskRuntimeStatus.MERGING:
             return outcome
         return self._transition(context, outcome.status, outcome.reason)
@@ -594,12 +596,12 @@ class HostMergePhase:
         base_commit: str,
         operational_error: BaseException | None,
     ) -> HostMergeResult:
-        if operational_error is not None:
-            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
         if result.status is AgentStatus.CANCELLED:
             return HostMergeResult(
                 TaskRuntimeStatus.BLOCKED, "merge agent was interrupted"
             )
+        if operational_error is not None:
+            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
         if result.status is AgentStatus.FAILED:
             return HostMergeResult(
                 TaskRuntimeStatus.FAILED, result.error or "merge agent failed"

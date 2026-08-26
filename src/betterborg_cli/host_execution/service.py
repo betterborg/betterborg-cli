@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from threading import Event, Lock, Thread
 from typing import Any
 from uuid import UUID
 
@@ -70,6 +72,74 @@ class HostExecutionResult:
         return self.scheduler.status if self.scheduler is not None else None
 
 
+class _SetupLeaseHeartbeats:
+    """Keep run ownership live until the scheduler takes over heartbeats."""
+
+    def __init__(
+        self,
+        store: SqliteStore,
+        run_id: UUID,
+        owner_token: str,
+        config: HostSchedulerConfig,
+        clock,
+        *,
+        started_at: datetime,
+    ) -> None:
+        self._store = store
+        self._run_id = run_id
+        self._owner_token = owner_token
+        self._config = config
+        self._clock = clock
+        self._next = started_at + config.heartbeat_interval
+        self._stop = Event()
+        self._lock = Lock()
+        self._error: BaseException | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="betterborg-setup-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        self._renew_through(self._clock())
+        if self._error is not None:
+            raise self._error
+
+    def checkpoint(self) -> None:
+        """Surface heartbeat failures between setup stages."""
+        self._renew_through(self._clock())
+        if self._error is not None:
+            raise self._error
+
+    def _run(self) -> None:
+        poll_seconds = min(
+            self._config.heartbeat_interval.total_seconds(), 0.1
+        )
+        while not self._stop.wait(poll_seconds):
+            try:
+                self._renew_through(self._clock())
+            except BaseException as error:
+                self._error = error
+                self._stop.set()
+                return
+
+    def _renew_through(self, now: datetime) -> None:
+        with self._lock:
+            while self._error is None and self._next <= now:
+                self._store.renew_execution_run(
+                    self._run_id,
+                    self._owner_token,
+                    lease_duration=self._config.lease_duration,
+                    now=self._next,
+                )
+                self._next += self._config.heartbeat_interval
+
+
 class HostTaskRuntime:
     """Run every concrete phase for one scheduler-owned task claim."""
 
@@ -84,6 +154,7 @@ class HostTaskRuntime:
         merge: HostMergePhase,
         sanity: HostSanityPhase,
         secret_values: Mapping[str, str] | None = None,
+        publication_lock: Any | None = None,
     ) -> None:
         self.plan = plan
         self._environment = environment_manager
@@ -93,6 +164,7 @@ class HostTaskRuntime:
         self._merge = merge
         self._sanity = sanity
         self._secret_values = dict(secret_values or {})
+        self._publication_lock = publication_lock or Lock()
 
     def with_secret_values(
         self, secret_values: Mapping[str, str]
@@ -106,6 +178,17 @@ class HostTaskRuntime:
             review_fix=self._review_fix,
             merge=self._merge,
             sanity=self._sanity,
+            secret_values=secret_values,
+            publication_lock=self._publication_lock,
+        )
+
+    def prepare_reusable_caches(
+        self, worktrees, *, secret_values: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        """Complete shared preparation before the scheduler may claim work."""
+        return self._environment.prepare_reusable_caches(
+            self.plan,
+            tuple(worktrees),
             secret_values=secret_values,
         )
 
@@ -123,6 +206,7 @@ class HostTaskRuntime:
             return self._durable_status(context)
 
         stack = None
+        published_status: TaskRuntimeStatus | None = None
         try:
             stack = self._compose.start_claimed_stack(
                 context.store,
@@ -148,15 +232,26 @@ class HostTaskRuntime:
                     review_environment=self._agent_secrets("review"),
                     fix_environment=self._agent_secrets("fix"),
                 )
-            merge_result = None
             if status is TaskRuntimeStatus.MERGING:
-                merge_result = self._merge.run(
-                    context,
-                    environment={
-                        **service_environment,
-                        **self._agent_secrets("merge"),
-                    },
-                )
+                # One project ref is shared by every task.  Keep merge-tip
+                # production and sanity/base advancement in one process-local
+                # critical section so jobs=2 cannot publish a stale tip.
+                with self._publication_lock:
+                    merge_result = self._merge.run(
+                        context,
+                        environment={
+                            **service_environment,
+                            **self._agent_secrets("merge"),
+                        },
+                    )
+                    if merge_result.tip is not None:
+                        published_status = self._sanity.run(
+                            context,
+                            merge_result.tip,
+                            secret_values=self._secret_values,
+                            existing_stack=stack,
+                        ).status
+                        stack = None
         except ComposeStackError:
             return self._durable_status(context)
         except EnvironmentMaterializationError as error:
@@ -182,13 +277,7 @@ class HostTaskRuntime:
                     context.owner_token,
                 )
 
-        if merge_result is None or merge_result.tip is None:
-            return self._durable_status(context)
-        return self._sanity.run(
-            context,
-            merge_result.tip,
-            secret_values=self._secret_values,
-        ).status
+        return published_status or self._durable_status(context)
 
     def _agent_secrets(self, phase: str) -> dict[str, str]:
         environment: dict[str, str] = {}
@@ -258,13 +347,13 @@ class HostExecutionService:
         runtime = self._runtime.with_secret_values(secrets)
 
         cleanup = list(self._cleanup_stale())
+        config = self._scheduler_config or HostSchedulerConfig()
+        acquired_at = self._now()
         acquisition = self._store.acquire_execution_run(
             borg_id,
             generation_id,
-            lease_duration=(
-                self._scheduler_config or HostSchedulerConfig()
-            ).lease_duration,
-            now=self._now(),
+            lease_duration=config.lease_duration,
+            now=acquired_at,
         )
         scheduler = HostTaskScheduler(
             self._store,
@@ -279,8 +368,17 @@ class HostExecutionService:
             borg = self._store.get_borg(borg_id)
             if borg is None:
                 raise HostExecutionError(f"Borg {borg_id} not found")
+            heartbeats = _SetupLeaseHeartbeats(
+                self._store,
+                acquisition.run_id,
+                owner_token,
+                config,
+                self._now,
+                started_at=acquired_at,
+            )
+            heartbeats.start()
             try:
-                self._worktrees.prepare_current_task_worktrees(
+                prepared = self._worktrees.prepare_current_task_worktrees(
                     self._store,
                     run_id=acquisition.run_id,
                     owner_token=owner_token,
@@ -288,15 +386,38 @@ class HostExecutionService:
                     project_name=borg.name,
                     now=self._now(),
                 )
-            except BaseException:
-                self._store.interrupt_execution_run(
+                heartbeats.checkpoint()
+                if validated.prepare_commands:
+                    runtime.prepare_reusable_caches(
+                        (spec.path for spec in prepared if spec.path.is_dir()),
+                        secret_values=secrets,
+                    )
+                heartbeats.checkpoint()
+            except BaseException as setup_error:
+                try:
+                    heartbeats.stop()
+                except BaseException as heartbeat_error:
+                    setup_error.add_note(
+                        f"setup heartbeat shutdown failed: {heartbeat_error}"
+                    )
+                self._interrupt_failed_setup(
                     acquisition.run_id,
                     owner_token,
-                    reason="host execution setup failed",
-                    now=self._now(),
+                    cleanup,
+                    setup_error,
                 )
-                cleanup.extend(self._cleanup_stale())
                 raise
+            else:
+                try:
+                    heartbeats.stop()
+                except BaseException as setup_error:
+                    self._interrupt_failed_setup(
+                        acquisition.run_id,
+                        owner_token,
+                        cleanup,
+                        setup_error,
+                    )
+                    raise
 
         scheduled = scheduler.run_acquired(
             generation_id,
@@ -312,5 +433,26 @@ class HostExecutionService:
             return ()
         return self._compose.cleanup_stale_projects(self._store, resources)
 
-    def _now(self):  # noqa: ANN202 - store accepts None as its real-time clock.
-        return self._clock() if self._clock is not None else None
+    def _interrupt_failed_setup(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        cleanup: list[ComposeCleanupResult],
+        error: BaseException,
+    ) -> None:
+        try:
+            self._store.interrupt_execution_run(
+                run_id,
+                owner_token,
+                reason="host execution setup failed",
+                now=self._now(),
+            )
+        except BaseException as interrupt_error:
+            error.add_note(f"setup run interruption failed: {interrupt_error}")
+        try:
+            cleanup.extend(self._cleanup_stale())
+        except BaseException as cleanup_error:
+            error.add_note(f"setup stale cleanup failed: {cleanup_error}")
+
+    def _now(self) -> datetime:
+        return self._clock() if self._clock is not None else datetime.now(UTC)

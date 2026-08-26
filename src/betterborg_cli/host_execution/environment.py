@@ -278,6 +278,65 @@ class HostEnvironmentManager:
         self._run = command_runner or subprocess.run
         self._clock = clock
         self._guard = PrimaryCheckoutGuard(self.repository_root)
+        self._predispatch_prepared: set[str] = set()
+
+    def prepare_reusable_caches(
+        self,
+        plan: HostPreflightPlan,
+        worktrees: Sequence[Path],
+        *,
+        secret_values: Mapping[str, str] | None = None,
+    ) -> tuple[str, ...]:
+        """Prepare every distinct task fingerprint before claims may dispatch."""
+        if plan.repository_root.resolve() != self.repository_root:
+            raise EnvironmentMaterializationError(
+                "preflight plan belongs to a different repository"
+            )
+        if not plan.prepare_commands:
+            return ()
+
+        prepared: list[str] = []
+        for source_worktree in worktrees:
+            source = Path(source_worktree).resolve()
+            descriptors = _environment_descriptors(plan, source)
+            fingerprint = _fingerprint_descriptors(plan, descriptors)
+            if fingerprint in self._predispatch_prepared:
+                continue
+            cache_path = self._cache_path(fingerprint)
+            cache_path.mkdir(parents=True, exist_ok=True)
+            base_environment = self._base_command_environment(plan, cache_path)
+            command_environments = self._command_environments(
+                plan, base_environment, secret_values or {}
+            )
+            mask_values = tuple(
+                sorted(
+                    {
+                        value
+                        for command in plan.prepare_commands
+                        for value in command_environments[command.stage][1]
+                    },
+                    key=len,
+                    reverse=True,
+                )
+            )
+            with _preparation_lock(cache_path):
+                marker = cache_path / ".betterborg-prepared"
+                if not _prepared_marker_matches(marker, fingerprint):
+                    try:
+                        self._run_preparation_commands(
+                            plan.prepare_commands,
+                            fingerprint=fingerprint,
+                            source_worktree=source,
+                            descriptors=descriptors,
+                            command_environments=command_environments,
+                            completion_marker=marker,
+                        )
+                    except BaseException as error:
+                        redacted = redact_secrets(str(error), mask_values)
+                        raise EnvironmentMaterializationError(redacted) from error
+            self._predispatch_prepared.add(fingerprint)
+            prepared.append(fingerprint)
+        return tuple(prepared)
 
     def materialize_claimed_task(
         self,
@@ -412,6 +471,18 @@ class HostEnvironmentManager:
                 marker, fingerprint
             ):
                 return True
+            if fingerprint in self._predispatch_prepared and _prepared_marker_matches(
+                marker, fingerprint
+            ):
+                self._record_predispatch_preparation(
+                    store,
+                    plan,
+                    claim,
+                    owner_token,
+                    fingerprint=fingerprint,
+                    cache_path=cache_path,
+                )
+                return True
 
             self._record_attempt(
                 store,
@@ -428,6 +499,54 @@ class HostEnvironmentManager:
                 command_environments=command_environments,
             )
             return False
+
+    def _record_predispatch_preparation(
+        self,
+        store: SqliteStore,
+        plan: HostPreflightPlan,
+        claim: TaskClaim,
+        owner_token: str,
+        *,
+        fingerprint: str,
+        cache_path: Path,
+    ) -> None:
+        """Attach an already-prepared run cache to its first owned consumer."""
+        prior = [
+            attempt
+            for attempt in store.list_environment_attempts(claim.task_id)
+            if attempt.kind == "prepare"
+        ]
+        recorded_at = self._clock()
+        attempt = EnvironmentAttempt(
+            run_id=claim.run_id,
+            claim_id=claim.id,
+            task_id=claim.task_id,
+            kind="prepare",
+            attempt_number=len(prior) + 1,
+            fingerprint=fingerprint,
+            status=ExecutionAttemptStatus.RUNNING,
+            commands=[list(command.argv) for command in plan.prepare_commands],
+            started_at=recorded_at,
+            finished_at=None,
+        )
+        store.append_environment_attempt(
+            attempt,
+            owner_token,
+            claim.claim_token,
+            now=recorded_at,
+        )
+        store.complete_environment_attempt(
+            attempt.id,
+            owner_token,
+            claim.claim_token,
+            status=ExecutionAttemptStatus.COMPLETED,
+            result={
+                "cache_path": str(cache_path),
+                "prepared_before_dispatch": True,
+            },
+            duration_seconds=0,
+            now=recorded_at,
+        )
 
     def _materialize_worktree(
         self,
@@ -535,34 +654,32 @@ class HostEnvironmentManager:
 
         started = time.monotonic()
         try:
-            with self._guard.protect(str(claim.task_id), f"environment {kind}"):
-                if preparation_source is None:
-                    if worktree is None:
-                        raise AssertionError(
-                            "materialization worktree is required"
-                        )
+            if preparation_source is None:
+                if worktree is None:
+                    raise AssertionError("materialization worktree is required")
+                with self._guard.protect(
+                    str(claim.task_id), f"environment {kind}"
+                ):
                     results = self._run_commands(
                         commands,
                         worktree=worktree,
                         command_environments=command_environments,
                     )
-                else:
-                    if worktree is not None:
-                        raise AssertionError(
-                            "preparation cannot use a caller-provided worktree"
-                        )
-                    with self._preparation_worktree(
-                        fingerprint,
-                        preparation_source,
-                        preparation_descriptors,
-                    ) as preparation_worktree:
-                        results = self._run_commands(
-                            commands,
-                            worktree=preparation_worktree,
-                            command_environments=command_environments,
-                        )
-                if completion_marker is not None:
-                    _write_marker(completion_marker, fingerprint)
+                    if completion_marker is not None:
+                        _write_marker(completion_marker, fingerprint)
+            else:
+                if worktree is not None:
+                    raise AssertionError(
+                        "preparation cannot use a caller-provided worktree"
+                    )
+                results = self._run_preparation_commands(
+                    commands,
+                    fingerprint=fingerprint,
+                    source_worktree=preparation_source,
+                    descriptors=preparation_descriptors,
+                    command_environments=command_environments,
+                    completion_marker=completion_marker,
+                )
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = redact_secrets(str(error), mask_values)
@@ -589,6 +706,31 @@ class HostEnvironmentManager:
             duration_seconds=time.monotonic() - started,
             now=self._clock(),
         )
+
+    def _run_preparation_commands(
+        self,
+        commands: Sequence[HostCommand],
+        *,
+        fingerprint: str,
+        source_worktree: Path,
+        descriptors: Sequence[_EnvironmentDescriptor],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
+        completion_marker: Path | None,
+    ) -> list[dict[str, object]]:
+        with self._guard.protect(fingerprint, "environment prepare"):
+            with self._preparation_worktree(
+                fingerprint, source_worktree, descriptors
+            ) as preparation_worktree:
+                results = self._run_commands(
+                    commands,
+                    worktree=preparation_worktree,
+                    command_environments=command_environments,
+                )
+            if completion_marker is not None:
+                _write_marker(completion_marker, fingerprint)
+            return results
 
     def _run_commands(
         self,

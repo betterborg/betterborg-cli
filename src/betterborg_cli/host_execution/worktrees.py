@@ -64,6 +64,11 @@ class HostWorktreeManager:
         target = self._resolve(self.source_branch)
         if current == target:
             return branch
+        if self._git.is_ancestor(target, current):
+            # Sanity advances the project branch without moving the configured
+            # source branch.  That published descendant is the correct base for
+            # later tasks and for a resumed generation.
+            return branch
         if not self._git.is_ancestor(current, target):
             raise WorktreeError(
                 f"project base {branch!r} diverged from {self.source_branch!r}"

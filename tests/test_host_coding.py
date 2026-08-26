@@ -553,11 +553,12 @@ def test_interrupted_coding_attempt_is_immutable_and_resumable(
         attempt = store.list_agent_attempts(fixture.task.id)[0]
         runtime = store.get_task_runtime(fixture.task.id)
 
-    assert status is TaskRuntimeStatus.BLOCKED
-    assert runtime is not None and "interrupted" in runtime.state_reason
+    assert status is TaskRuntimeStatus.CODING
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
     assert attempt.status is ExecutionAttemptStatus.CANCELLED
     assert attempt.finished_at is not None
-    assert attempt.result["_betterborg"]["outcome_status"] == "blocked"
+    assert attempt.result["_betterborg"]["outcome_status"] == "coding"
+    assert "interrupted" in attempt.result["_betterborg"]["outcome_reason"]
 
 
 def test_completed_attempt_resumes_transition_without_agent_replay(
@@ -799,7 +800,7 @@ def test_review_pass_cap_blocks_after_persisting_last_findings(
     assert len(fix.calls) == 1
 
 
-def test_cancelled_review_blocks_resumably_with_immutable_attempt(
+def test_cancelled_review_remains_resumable_with_immutable_attempt(
     tmp_path: Path,
 ) -> None:
     fixture = _coding_fixture(tmp_path)
@@ -819,11 +820,11 @@ def test_cancelled_review_blocks_resumably_with_immutable_attempt(
         runtime = store.get_task_runtime(fixture.task.id)
         attempt = store.list_agent_attempts(fixture.task.id)[-1]
 
-    assert status is TaskRuntimeStatus.BLOCKED
+    assert status is TaskRuntimeStatus.REVIEW
     assert runtime is not None and runtime.resume_phase == "review"
-    assert "interrupted" in runtime.state_reason
     assert attempt.status is ExecutionAttemptStatus.CANCELLED
-    assert attempt.result["_betterborg"]["outcome_status"] == "blocked"
+    assert attempt.result["_betterborg"]["outcome_status"] == "review"
+    assert "interrupted" in attempt.result["_betterborg"]["outcome_reason"]
     artifact_dir = fixture.repository / attempt.result["_betterborg"]["artifact_dir"]
     assert not (artifact_dir / "artifact-manifest.json").stat().st_mode & stat.S_IWUSR
 
