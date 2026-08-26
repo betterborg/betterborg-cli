@@ -399,6 +399,7 @@ def _concrete_task(
     position: int,
     *,
     dependencies: tuple[str, ...] = (),
+    persisted_position: int | None = None,
 ) -> TaskRecord:
     stem = f"{position:02d}-integrated-task"
     body = {
@@ -422,7 +423,9 @@ def _concrete_task(
         task_ref=f"07-host-execution/{stem}",
         stage=body["stage"],
         stem=stem,
-        position=position,
+        position=(
+            persisted_position if persisted_position is not None else position
+        ),
         title=body["title"],
         complexity=TaskComplexity.SMALL,
         digest=digest,
@@ -481,6 +484,7 @@ def _concrete_host_fixture(
     coding_delay_seconds: float = 0,
     review_delay_seconds: float = 0,
     dependency_chain: bool = False,
+    prerequisite_at_later_position: bool = False,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
@@ -515,6 +519,11 @@ def _concrete_host_fixture(
         manifest={},
     )
     generation_id = uuid4()
+    if prerequisite_at_later_position:
+        if task_count != 2 or not dependency_chain:
+            raise ValueError(
+                "a later-position prerequisite requires a two-task dependency chain"
+            )
     task_list: list[TaskRecord] = []
     for position in range(1, task_count + 1):
         task_list.append(
@@ -525,6 +534,9 @@ def _concrete_host_fixture(
                 dependencies=(task_list[-1].task_ref,)
                 if dependency_chain and task_list
                 else (),
+                persisted_position=(3 - position)
+                if prerequisite_at_later_position
+                else None,
             )
         )
     tasks = tuple(task_list)
@@ -563,7 +575,7 @@ def _concrete_host_fixture(
                 "position": task.position,
                 "task_ref": task.task_ref,
             }
-            for task in tasks
+            for task in sorted(tasks, key=lambda task: task.position)
         ],
     }
     generation = TaskGeneration(
@@ -1368,6 +1380,65 @@ def test_concrete_dependent_starts_from_published_prerequisite(
                     "--is-ancestor",
                     first.branch,
                     second.branch,
+                ],
+                check=False,
+            ).returncode
+            == 0
+        )
+    finally:
+        fixture.store.close()
+
+
+def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        task_count=2,
+        dependency_chain=True,
+        prerequisite_at_later_position=True,
+    )
+    prerequisite, dependent = fixture.tasks
+    try:
+        result = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
+
+        assert dependent.position < prerequisite.position
+        assert dependent.stem > prerequisite.stem
+        preparations = [
+            attempt
+            for attempt in fixture.store.list_environment_attempts(dependent.id)
+            if attempt.kind == "prepare"
+        ]
+        assert len(preparations) == 1
+        preparation = preparations[0]
+        assert preparation.claim_id is None
+        assert preparation.result is not None
+        assert preparation.result["prepared_before_dispatch"] is True
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        dependent_runtime = fixture.store.get_task_runtime(dependent.id)
+        prerequisite_runtime = fixture.store.get_task_runtime(prerequisite.id)
+        assert dependent_runtime is not None and dependent_runtime.branch is not None
+        assert prerequisite_runtime is not None
+        assert prerequisite_runtime.branch is not None
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository.root),
+                    "merge-base",
+                    "--is-ancestor",
+                    prerequisite_runtime.branch,
+                    dependent_runtime.branch,
                 ],
                 check=False,
             ).returncode

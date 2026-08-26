@@ -502,9 +502,17 @@ class HostExecutionService:
     ) -> TaskRuntimeStatus:
         """Refresh a never-started claim before entering concrete phases."""
         task_id = context.claim.task_id
-        unstarted = not self._store.list_environment_attempts(
-            task_id
-        ) and not self._store.list_agent_attempts(task_id)
+        # Run-owned cache preparation happens before dispatch and does not
+        # establish task-local state.  Only claim-owned setup or agent work
+        # makes a later claim a resume that must preserve its checkout.
+        claim_environment_attempts = (
+            attempt
+            for attempt in self._store.list_environment_attempts(task_id)
+            if attempt.claim_id is not None
+        )
+        unstarted = not any(claim_environment_attempts) and not (
+            self._store.list_agent_attempts(task_id)
+        )
         if unstarted:
             try:
                 self._worktrees.refresh_unstarted_task_worktree(
