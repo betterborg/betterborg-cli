@@ -231,42 +231,15 @@ class HostTaskRuntime:
             if context.cancel.is_set():
                 return self._durable_status(context)
 
-            status = self._coding.run(
-                context,
-                environment={
-                    **service_environment,
-                    **self._agent_secrets(),
-                },
-            )
-            if (
-                status is TaskRuntimeStatus.REVIEW
-                and context.claim.resume_phase == TaskRuntimeStatus.FIX.value
-            ):
-                # Rematerialization stages every reclaimed agent phase through
-                # CODING so the completed coding commit can be re-attested.
-                # Restore an interrupted FIX before checking cancellation or
-                # entering the review/fix loop; its rejecting review belongs to
-                # the preceding round and must not be replayed at this round.
-                context.transition(
-                    TaskRuntimeStatus.REVIEW,
-                    TaskRuntimeStatus.FIX,
-                    resume_phase=TaskRuntimeStatus.FIX.value,
+            status = self._restore_resume_phase(context)
+            if status is TaskRuntimeStatus.CODING:
+                status = self._coding.run(
+                    context,
+                    environment={
+                        **service_environment,
+                        **self._agent_secrets(),
+                    },
                 )
-                status = TaskRuntimeStatus.FIX
-            elif (
-                status is TaskRuntimeStatus.REVIEW
-                and context.claim.resume_phase == TaskRuntimeStatus.MERGING.value
-            ):
-                # A reclaimed merge-agent attempt can leave Git's conflict
-                # state intact. Coding attestation still verifies the approved
-                # task commit, but the completed review must not inspect or
-                # replay that later merge work before merge resumes.
-                context.transition(
-                    TaskRuntimeStatus.REVIEW,
-                    TaskRuntimeStatus.MERGING,
-                    resume_phase=TaskRuntimeStatus.MERGING.value,
-                )
-                status = TaskRuntimeStatus.MERGING
             if context.cancel.is_set():
                 return self._durable_status(context)
             if status in {TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.FIX}:
@@ -326,6 +299,47 @@ class HostTaskRuntime:
                 )
 
         return published_status or self._durable_status(context)
+
+    @staticmethod
+    def _restore_resume_phase(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+        """Route reclaimed work to the phase that owns its durable attestation."""
+        resume_phase = context.claim.resume_phase
+        if resume_phase in {
+            TaskRuntimeStatus.ENVIRONMENT.value,
+            TaskRuntimeStatus.CODING.value,
+        }:
+            return TaskRuntimeStatus.CODING
+
+        later_phase = {
+            TaskRuntimeStatus.REVIEW.value: TaskRuntimeStatus.REVIEW,
+            TaskRuntimeStatus.FIX.value: TaskRuntimeStatus.FIX,
+            TaskRuntimeStatus.MERGING.value: TaskRuntimeStatus.MERGING,
+        }.get(resume_phase)
+        if later_phase is None:
+            context.transition(
+                TaskRuntimeStatus.CODING,
+                TaskRuntimeStatus.BLOCKED,
+                resume_phase=resume_phase,
+                state_reason=f"unsupported task resume phase: {resume_phase}",
+            )
+            return TaskRuntimeStatus.BLOCKED
+
+        # Environment rematerialization stages every reclaimed task through
+        # CODING. Later phases may legitimately have advanced HEAD beyond the
+        # original coding commit, so restore the durable route without replaying
+        # coding. Review/fix and merge validate their own exact attestations.
+        context.transition(
+            TaskRuntimeStatus.CODING,
+            TaskRuntimeStatus.REVIEW,
+            resume_phase=later_phase.value,
+        )
+        if later_phase in {TaskRuntimeStatus.FIX, TaskRuntimeStatus.MERGING}:
+            context.transition(
+                TaskRuntimeStatus.REVIEW,
+                later_phase,
+                resume_phase=later_phase.value,
+            )
+        return later_phase
 
     def _agent_secrets(self) -> dict[str, str]:
         environment: dict[str, str] = {}

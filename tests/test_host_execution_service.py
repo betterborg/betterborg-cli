@@ -1896,6 +1896,175 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
         fixture.store.close()
 
 
+def test_cancellation_after_fix_resumes_from_fixed_commit(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    def commit_fix_then_cancel(spec):  # noqa: ANN001
+        fixed = spec.cwd / "review-fix.txt"
+        fixed.write_text("fixed before cancellation\n", encoding="utf-8")
+        _git(spec.cwd, "add", fixed.name)
+        _git(spec.cwd, "commit", "--quiet", "-m", "fix review finding")
+        fixture.review.queue(
+            MockResponse(
+                payload={
+                    "task_file": ".betterborg-task/task.md",
+                    "status": "approved",
+                    "summary": "The fixed commit is approved after resume.",
+                    "issues_file": "",
+                    "findings": [],
+                }
+            )
+        )
+        cancel.cancel()
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Committed the requested fix.",
+                "changed_files": [fixed.name],
+                "tests_run": ["integration"],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.review.responses.clear()
+    fixture.review.queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "issues_found",
+                "summary": "The implementation needs a fix.",
+                "issues_file": ".betterborg-task/issues.md",
+                "findings": ["commit the reviewed fix"],
+            }
+        )
+    ).queue(MockResponse(dynamic=commit_fix_then_cancel))
+
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == TaskRuntimeStatus.REVIEW.value
+        assert runtime.worktree_path is not None
+        fixed_commit = _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
+        assert sorted(
+            (attempt.phase, attempt.review_round, attempt.status.value)
+            for attempt in fixture.store.list_agent_attempts(task.id)
+        ) == [
+            ("coding", 0, "completed"),
+            ("fix", 1, "completed"),
+            ("review", 0, "completed"),
+        ]
+
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(task.id).state_reason
+        )
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 3
+        approved = [
+            attempt
+            for attempt in fixture.store.list_agent_attempts(task.id)
+            if attempt.phase == "review"
+            and attempt.status is ExecutionAttemptStatus.COMPLETED
+            and (attempt.result or {}).get("status") == "approved"
+        ]
+        assert approved[-1].result["_betterborg"]["commit_sha"] == fixed_commit
+    finally:
+        fixture.store.close()
+
+
+def test_cancelled_fix_commit_is_not_a_resume_attestation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    adapter_run = MockAdapter.run
+    fixture.review.responses.clear()
+    fixture.review.queue(
+        MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "issues_found",
+                "summary": "The implementation needs a fix.",
+                "issues_file": ".betterborg-task/issues.md",
+                "findings": ["commit the reviewed fix"],
+            }
+        )
+    )
+
+    def cancel_after_fix_commit(self, spec, *, cancel=None):  # noqa: ANN001
+        if self is not fixture.review or not self.calls:
+            return adapter_run(self, spec, cancel=cancel)
+        self.calls.append(spec)
+        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.log_path.write_text("cancelled after fix commit\n", encoding="utf-8")
+        changed = spec.cwd / "unattested-fix.txt"
+        changed.write_text("must not be trusted\n", encoding="utf-8")
+        _git(spec.cwd, "add", changed.name)
+        _git(spec.cwd, "commit", "--quiet", "-m", "unattested cancelled fix")
+        assert cancel is not None
+        cancel.cancel()
+        return AgentResult(
+            status=AgentStatus.CANCELLED,
+            log_path=spec.log_path,
+            error="fix cancelled after producing an unattested commit",
+        )
+
+    monkeypatch.setattr(MockAdapter, "run", cancel_after_fix_commit)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == TaskRuntimeStatus.FIX.value
+        assert sorted(
+            (attempt.phase, attempt.status.value)
+            for attempt in fixture.store.list_agent_attempts(task.id)
+        ) == [
+            ("coding", "completed"),
+            ("fix", "cancelled"),
+            ("review", "completed"),
+        ]
+
+        monkeypatch.setattr(MockAdapter, "run", adapter_run)
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        blocked = fixture.store.get_task_runtime(task.id)
+        assert resumed.status is ExecutionRunStatus.FAILED
+        assert blocked is not None and blocked.status is TaskRuntimeStatus.BLOCKED
+        assert blocked.state_reason == (
+            "declared coding/fix commit no longer matches task worktree"
+        )
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 2
+    finally:
+        fixture.store.close()
+
+
 def test_concrete_retry_exhaustion_stops_and_resumes_fix(
     tmp_path: Path,
     monkeypatch,
@@ -2108,6 +2277,98 @@ def test_concrete_retry_exhaustion_stops_and_resumes_merge(
             ("merge", "completed"),
             ("review", "completed"),
         ]
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_after_merge_tip_resumes_from_merge_attestation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    cancel = CancellationToken()
+    repository = fixture.store.get_repository(fixture.borg.repository_id)
+    assert repository is not None
+
+    def commit_task_and_advance_project(spec):  # noqa: ANN001
+        response = _coding_response()
+        assert response.dynamic is not None
+        completed = response.dynamic(spec)
+        _advance_project_file(
+            repository.root,
+            f"project/{fixture.borg.name}",
+            "project-base.txt",
+            "advanced while task was in progress\n",
+            tmp_path / "post-coding-project.index",
+        )
+        return completed
+
+    fixture.coding.responses.clear()
+    fixture.coding.queue(MockResponse(dynamic=commit_task_and_advance_project))
+    merge_phase = fixture.service._runtime._merge
+    merge_run = merge_phase.run
+    produced_tips: list[MergeTip] = []
+
+    def cancel_after_merge_tip(context, **kwargs):  # noqa: ANN001, ANN003
+        result = merge_run(context, **kwargs)
+        assert result.tip is not None
+        produced_tips.append(result.tip)
+        cancel.cancel()
+        return result
+
+    monkeypatch.setattr(merge_phase, "run", cancel_after_merge_tip)
+    try:
+        cancelled = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+            cancel=cancel,
+        )
+
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == TaskRuntimeStatus.MERGING.value
+        assert runtime.worktree_path is not None
+        assert len(produced_tips) == 1
+        tip = produced_tips[0]
+        assert tip.commit_sha != tip.approved_commit
+        assert _git(Path(runtime.worktree_path), "rev-parse", "HEAD") == tip.commit_sha
+        completed_merges = fixture.store.list_task_execution_events(
+            task.id,
+            kind="merge.completed",
+        )
+        assert len(completed_merges) == 1
+        assert completed_merges[0].payload["commit_sha"] == tip.commit_sha
+
+        monkeypatch.setattr(merge_phase, "run", merge_run)
+        fixture.clock.advance(timedelta(seconds=1))
+        resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(task.id).state_reason
+        )
+        assert len(fixture.coding.calls) == 1
+        assert len(fixture.review.calls) == 1
+        assert fixture.merge.calls == []
+        assert (
+            _git(
+                repository.root,
+                "rev-parse",
+                f"project/{fixture.borg.name}",
+            )
+            == tip.commit_sha
+        )
+        assert (
+            len(
+                fixture.store.list_task_execution_events(
+                    task.id,
+                    kind="merge.completed",
+                )
+            )
+            == 1
+        )
     finally:
         fixture.store.close()
 

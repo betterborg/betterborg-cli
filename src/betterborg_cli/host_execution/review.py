@@ -713,7 +713,10 @@ class HostReviewFixPhase:
     ) -> tuple[str, str]:
         attestations: list[tuple[str, str]] = []
         for attempt in context.store.list_agent_attempts(context.claim.task_id):
-            if attempt.phase not in {"coding", "fix"}:
+            if (
+                attempt.phase not in {"coding", "fix"}
+                or attempt.status is not ExecutionAttemptStatus.COMPLETED
+            ):
                 continue
             metadata = (attempt.result or {}).get("_betterborg")
             if not isinstance(metadata, Mapping):
