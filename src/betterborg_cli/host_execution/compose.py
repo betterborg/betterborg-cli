@@ -12,10 +12,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
+from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.preflight import HostPreflightPlan, HostService
 from betterborg_cli.store import (
     ComposeResource,
     ExecutionEvent,
+    ExecutionOwnershipError,
     SqliteStore,
     TaskClaim,
     TaskRuntimeStatus,
@@ -57,6 +59,7 @@ class ComposeStack:
     network_name: str
     network_names: tuple[str, ...]
     worktree: Path
+    runtime_directory: Path
     compose_files: tuple[Path, ...]
     profiles: tuple[str, ...]
     services: tuple[str, ...]
@@ -114,7 +117,7 @@ class HostComposeManager:
             raise ValueError("validated Compose services require Compose files")
 
         worktree = self._claimed_worktree(store, claim)
-        files = self._worktree_compose_files(plan, worktree)
+        source_files = self._worktree_compose_files(plan, worktree)
         project_name = compose_project_name(claim)
         selected = tuple(
             dict.fromkeys(
@@ -127,9 +130,9 @@ class HostComposeManager:
             raise ValueError("validated Compose services require exact service names")
 
         try:
-            override, network_names = self._write_runtime_override(
+            files, network_names = self._write_runtime_configuration(
                 project_name,
-                files,
+                source_files,
                 plan.compose_profiles,
                 compose_services,
                 selected,
@@ -138,7 +141,7 @@ class HostComposeManager:
         except ComposeStackError as error:
             self._block_task(store, claim, owner_token, str(error))
             raise
-        files = (*files, override)
+        runtime_directory = files[0].parent
         network_name = network_names[0]
         labels = {
             "betterborg.run_id": str(claim.run_id),
@@ -146,7 +149,8 @@ class HostComposeManager:
             "betterborg.task_id": str(claim.task_id),
             "betterborg.compose.files": json.dumps([str(path) for path in files]),
             "betterborg.compose.profiles": json.dumps(list(plan.compose_profiles)),
-            "betterborg.compose.cwd": str(worktree),
+            "betterborg.compose.cwd": str(runtime_directory),
+            "betterborg.compose.worktree": str(worktree),
             "com.docker.compose.project": project_name,
         }
         created_at = self._clock()
@@ -183,23 +187,6 @@ class HostComposeManager:
             "--no-deps",
             *selected,
         )
-        for resource in resources:
-            store.add_compose_resource(
-                resource,
-                owner_token,
-                claim.claim_token,
-                now=created_at,
-            )
-        self._append_owned_event(
-            store,
-            claim,
-            owner_token,
-            "compose.starting",
-            project_name,
-            command,
-            now=created_at,
-        )
-
         stack = ComposeStack(
             run_id=claim.run_id,
             claim_id=claim.id,
@@ -208,68 +195,114 @@ class HostComposeManager:
             network_name=network_name,
             network_names=network_names,
             worktree=worktree,
+            runtime_directory=runtime_directory,
             compose_files=files,
             profiles=plan.compose_profiles,
             services=selected,
             environment={},
             resources=resources,
         )
-        result = self._invoke(command, cwd=worktree)
-        if result.returncode != 0:
-            error = _command_error("Compose services did not become healthy", result)
-            self._block_task(store, claim, owner_token, error)
-            cleanup = self._stop_project(store, stack, command_owner=None)
-            if cleanup.error is not None:
-                error = f"{error}; cleanup also failed: {cleanup.error}"
-            raise ComposeStackError(
-                error,
-                project_name=project_name,
-                command=command,
-            )
+        persisted = False
+        with path_lock(self._lifecycle_lock(stack)):
+            try:
+                for resource in resources:
+                    store.add_compose_resource(
+                        resource,
+                        owner_token,
+                        claim.claim_token,
+                        now=created_at,
+                    )
+                    persisted = True
+                self._append_owned_event(
+                    store,
+                    claim,
+                    owner_token,
+                    "compose.starting",
+                    project_name,
+                    command,
+                    now=created_at,
+                )
 
-        try:
-            published_ports = self._published_ports(
-                project_name,
-                files,
-                plan.compose_profiles,
-                compose_services,
-                worktree,
-            )
-        except ComposeStackError as error:
-            self._block_task(store, claim, owner_token, str(error))
-            cleanup = self._stop_project(store, stack, command_owner=None)
-            message = str(error)
-            if cleanup.error is not None:
-                message = f"{message}; cleanup also failed: {cleanup.error}"
-            raise ComposeStackError(
-                message,
-                project_name=error.project_name,
-                command=error.command,
-            ) from error
-        environment = service_url_environment(
-            plan.services,
-            published_ports=published_ports,
-        )
-        stack = replace(stack, environment=environment)
+                result = self._invoke(command, cwd=runtime_directory)
+                if result.returncode != 0:
+                    raise ComposeStackError(
+                        _command_error(
+                            "Compose services did not become healthy", result
+                        ),
+                        project_name=project_name,
+                        command=command,
+                    )
+                self._assert_services_healthy(
+                    project_name,
+                    files,
+                    plan.compose_profiles,
+                    selected,
+                    runtime_directory,
+                )
+                published_ports = self._published_ports(
+                    project_name,
+                    files,
+                    plan.compose_profiles,
+                    compose_services,
+                    runtime_directory,
+                )
+                environment = service_url_environment(
+                    plan.services,
+                    published_ports=published_ports,
+                )
+                stack = replace(stack, environment=environment)
 
-        self._append_owned_event(
-            store,
-            claim,
-            owner_token,
-            "compose.ready",
-            project_name,
-            command,
-            now=self._clock(),
-            extra={
-                "network_name": network_name,
-                "network_names": list(network_names),
-                "services": list(selected),
-                "url_env_names": sorted(environment),
-            },
-        )
+                # This guarded write is the final ownership fence.  Reconciliation
+                # cannot run project teardown concurrently because it takes the
+                # same claim-owned lifecycle lock before invoking Compose.
+                self._append_owned_event(
+                    store,
+                    claim,
+                    owner_token,
+                    "compose.ready",
+                    project_name,
+                    command,
+                    now=self._clock(),
+                    extra={
+                        "network_name": network_name,
+                        "network_names": list(network_names),
+                        "services": list(selected),
+                        "url_env_names": sorted(environment),
+                    },
+                )
+            except ExecutionOwnershipError as error:
+                cleanup = (
+                    self._stop_project_locked(store, stack, command_owner=None)
+                    if persisted
+                    else None
+                )
+                message = "Compose ownership expired during startup"
+                if cleanup is not None and cleanup.error is not None:
+                    message = f"{message}; cleanup also failed: {cleanup.error}"
+                raise ComposeStackError(
+                    message,
+                    project_name=project_name,
+                    command=command,
+                ) from error
+            except ComposeStackError as error:
+                try:
+                    self._block_task(store, claim, owner_token, str(error))
+                except ExecutionOwnershipError:
+                    pass
+                cleanup = self._stop_project_locked(
+                    store, stack, command_owner=None
+                )
+                message = str(error)
+                if cleanup.error is not None:
+                    message = f"{message}; cleanup also failed: {cleanup.error}"
+                raise ComposeStackError(
+                    message,
+                    project_name=error.project_name,
+                    command=error.command,
+                ) from error
         return stack
 
-    def _write_runtime_override(
+    def _write_runtime_configuration(
         self,
         project_name: str,
         files: Sequence[Path],
@@ -277,8 +310,8 @@ class HostComposeManager:
         compose_services: Sequence[HostService],
         selected: Sequence[str],
         worktree: Path,
-    ) -> tuple[Path, tuple[str, ...]]:
-        """Resolve topology and write a claim-local isolation override."""
+    ) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+        """Resolve mutable task inputs into claim-owned Compose files."""
         config_command = _compose_base(project_name, files, profiles) + (
             "config",
             "--format",
@@ -345,9 +378,14 @@ class HostComposeManager:
             owned_volumes,
         )
         override_directory = self.repository_root / ".borg/state/compose" / project_name
+        resolved = override_directory / "compose.resolved.json"
         override = override_directory / "compose.override.yml"
         try:
             override_directory.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(
+                json.dumps(model, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             override.write_text(override_text, encoding="utf-8")
         except OSError as error:
             raise ComposeStackError(
@@ -355,7 +393,35 @@ class HostComposeManager:
                 project_name=project_name,
                 command=config_command,
             ) from error
-        return override, network_names
+        return (resolved, override), network_names
+
+    def _assert_services_healthy(
+        self,
+        project_name: str,
+        files: Sequence[Path],
+        profiles: Sequence[str],
+        selected: Sequence[str],
+        runtime_directory: Path,
+    ) -> None:
+        command = _compose_base(project_name, files, profiles) + (
+            "ps",
+            "--format",
+            "json",
+            *selected,
+        )
+        result = self._invoke(command, cwd=runtime_directory)
+        healthy = _healthy_compose_services(result.stdout)
+        if result.returncode != 0 or any(
+            not healthy.get(service) or not all(healthy[service])
+            for service in selected
+        ):
+            raise ComposeStackError(
+                _command_error(
+                    "Every selected Compose service must report healthy", result
+                ),
+                project_name=project_name,
+                command=command,
+            )
 
     def _published_ports(
         self,
@@ -442,6 +508,20 @@ class HostComposeManager:
         *,
         command_owner: tuple[TaskClaim, str] | None,
     ) -> ComposeCleanupResult:
+        with path_lock(self._lifecycle_lock(stack)):
+            return self._stop_project_locked(
+                store,
+                stack,
+                command_owner=command_owner,
+            )
+
+    def _stop_project_locked(
+        self,
+        store: SqliteStore,
+        stack: ComposeStack,
+        *,
+        command_owner: tuple[TaskClaim, str] | None,
+    ) -> ComposeCleanupResult:
         command = _compose_base(
             stack.project_name, stack.compose_files, stack.profiles
         ) + ("down", "--volumes", "--remove-orphans", "--rmi", "local")
@@ -471,7 +551,7 @@ class HostComposeManager:
                 now=now,
             )
 
-        result = self._invoke(command, cwd=stack.worktree)
+        result = self._invoke(command, cwd=stack.runtime_directory)
         if result.returncode != 0:
             error = _command_error("Compose teardown failed", result)
             failure_recorded = store.record_compose_cleanup_failure(
@@ -513,6 +593,10 @@ class HostComposeManager:
             command,
             True,
         )
+
+    @staticmethod
+    def _lifecycle_lock(stack: ComposeStack) -> Path:
+        return stack.runtime_directory / ".betterborg-lifecycle.lock"
 
     def _invoke(
         self, command: tuple[str, ...], *, cwd: Path
@@ -829,6 +913,38 @@ def _parse_published_port(output: str) -> int | None:
     return port if 0 < port <= 65535 else None
 
 
+def _healthy_compose_services(output: str) -> dict[str, list[bool]]:
+    records: list[object]
+    try:
+        decoded = json.loads(output)
+    except json.JSONDecodeError:
+        records = []
+        for line in output.splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                return {}
+    else:
+        if isinstance(decoded, list):
+            records = decoded
+        else:
+            records = [decoded]
+
+    services: dict[str, list[bool]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            return {}
+        service = record.get("Service")
+        state = record.get("State")
+        health = record.get("Health")
+        if not all(isinstance(value, str) for value in (service, state, health)):
+            return {}
+        services.setdefault(service, []).append(
+            state.casefold() == "running" and health.casefold() == "healthy"
+        )
+    return services
+
+
 def _compose_base(
     project_name: str,
     compose_files: Sequence[Path],
@@ -861,7 +977,8 @@ def _stack_from_resources(
             for value in json.loads(labels["betterborg.compose.files"])
         )
         profiles = tuple(json.loads(labels["betterborg.compose.profiles"]))
-        worktree = Path(labels["betterborg.compose.cwd"])
+        runtime_directory = Path(labels["betterborg.compose.cwd"])
+        worktree = Path(labels.get("betterborg.compose.worktree", runtime_directory))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         # Schema-v6 resources predate the runtime metadata labels.  Their exact
         # project identity remains sufficient for a project-scoped teardown;
@@ -869,6 +986,7 @@ def _stack_from_resources(
         files = ()
         profiles = ()
         worktree = fallback_worktree
+        runtime_directory = fallback_worktree
     network = next(
         (
             resource.resource_name
@@ -890,6 +1008,7 @@ def _stack_from_resources(
         )
         or (network,),
         worktree=worktree,
+        runtime_directory=runtime_directory,
         compose_files=files,
         profiles=profiles,
         services=(),

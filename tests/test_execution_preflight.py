@@ -770,6 +770,12 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
         assert stack is not None
         artifact = stack.worktree / "completed-work.txt"
         artifact.write_text("preserved\n", encoding="utf-8")
+        source_compose = stack.worktree / "compose.yml"
+        source_compose.unlink()
+        assert all(
+            path.parent == stack.runtime_directory and path.is_file()
+            for path in stack.compose_files
+        )
         expired_run = store.get_execution_run(fixture.run_id)
         assert expired_run is not None
         expired_at = expired_run.lease_expires_at + timedelta(seconds=1)
@@ -817,6 +823,8 @@ def test_expired_compose_cleanup_failure_blocks_reclaim_until_retry(
 
     assert len(succeeded) == 1 and succeeded[0].stopped is True
     assert succeeded[0].command == failed[0].command
+    assert str(source_compose) not in succeeded[0].command
+    assert all(str(path) in succeeded[0].command for path in stack.compose_files)
     assert reclaimed is not None and reclaimed.task_id == claim.task_id
     assert artifact.read_text(encoding="utf-8") == "preserved\n"
 
@@ -867,6 +875,78 @@ def test_replayed_cleanup_failure_does_not_block_reclaimed_task(
     assert len(replayed) == 1 and replayed[0].stopped is True
     assert runtime is not None and runtime.status is TaskRuntimeStatus.CLAIMED
     assert failure_events == []
+
+
+def test_expiry_during_compose_startup_serializes_cleanup_and_fences_ready(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        run = store.get_execution_run(fixture.run_id)
+        assert run is not None
+    project = (
+        f"borg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
+    )
+    runner.pause_up.add(project)
+
+    def start_stack():
+        with SqliteStore.open(fixture.database) as store:
+            return fixture.compose_manager(runner).start_claimed_stack(
+                store,
+                _compose_plan(fixture.repository),
+                claim,
+                fixture.owner_token,
+            )
+
+    def cleanup(resources):
+        with SqliteStore.open(fixture.database) as store:
+            return fixture.compose_manager(runner).cleanup_stale_projects(
+                store, resources
+            )
+
+    expired_at = run.lease_expires_at + timedelta(seconds=1)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        start_future = executor.submit(start_stack)
+        assert runner.up_entered.wait(timeout=5)
+        with SqliteStore.open(fixture.database) as store:
+            stale = store.reconcile_expired_execution_runs(now=expired_at)
+            replacement = store.acquire_execution_run(
+                run.borg_id,
+                run.generation_id,
+                lease_duration=timedelta(hours=1),
+                now=expired_at,
+            )
+            assert replacement.owner_token is not None
+
+        cleanup_future = executor.submit(cleanup, stale)
+        assert not runner.down_entered.wait(timeout=0.2)
+        runner.release_up.set()
+        with pytest.raises(
+            ComposeStackError, match="ownership expired during startup"
+        ):
+            start_future.result(timeout=5)
+        outcomes = cleanup_future.result(timeout=5)
+
+    with SqliteStore.open(fixture.database) as store:
+        reclaimed = store.claim_dependency_ready_task(
+            replacement.run_id,
+            replacement.owner_token,
+            lease_duration=timedelta(minutes=30),
+            now=expired_at + timedelta(seconds=1),
+        )
+        ready_events = [
+            event
+            for event in store.list_execution_events(fixture.run_id)
+            if event.kind == "compose.ready"
+        ]
+
+    assert outcomes[0].stopped is True
+    assert runner.active == set()
+    assert len(runner.down_commands) >= 1
+    assert ready_events == []
+    assert reclaimed is not None and reclaimed.task_id == claim.task_id
 
 
 def test_compose_subprocess_environment_excludes_host_credentials(
@@ -990,6 +1070,35 @@ def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
     assert runner.active == set()
     assert runner.down_commands[-1][3] == expected_project
     assert {"compose.starting", "compose.stopping", "compose.stopped"} <= events
+    assert "compose.ready" not in events
+
+
+def test_compose_service_without_health_status_never_becomes_ready(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    runner = _FakeComposeRunner()
+    runner.service_health["healthy"] = ""
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with pytest.raises(
+            ComposeStackError,
+            match="Every selected Compose service must report healthy",
+        ):
+            fixture.compose_manager(runner).start_claimed_stack(
+                store,
+                _compose_plan(fixture.repository),
+                claim,
+                fixture.owner_token,
+            )
+        runtime = store.get_task_runtime(claim.task_id)
+        events = {
+            event.kind for event in store.list_execution_events(fixture.run_id)
+        }
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert runner.active == set()
     assert "compose.ready" not in events
 
 
@@ -1117,6 +1226,11 @@ class _FakeComposeRunner:
         self.environments: list[dict[str, str]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
+        self.pause_up: set[str] = set()
+        self.up_entered = threading.Event()
+        self.release_up = threading.Event()
+        self.down_entered = threading.Event()
+        self.service_health: dict[str, str] = {"healthy": "healthy"}
         self.config_services: dict[str, dict[str, object]] = {
             "healthy": {"networks": {"default": None}},
             "unused": {"networks": {"default": None}},
@@ -1126,6 +1240,14 @@ class _FakeComposeRunner:
     def __call__(self, argv, **kwargs):
         command = tuple(argv)
         project = command[command.index("--project-name") + 1]
+        if "up" in command and project in self.pause_up:
+            self.up_entered.set()
+            if not self.release_up.wait(timeout=10):
+                return subprocess.CompletedProcess(
+                    argv, 12, "", "timed out waiting for test startup release"
+                )
+        if "down" in command:
+            self.down_entered.set()
         with self._lock:
             self.environments.append(dict(kwargs["env"]))
             if "config" in command:
@@ -1149,6 +1271,19 @@ class _FakeComposeRunner:
                 self.active.add(project)
                 self.started_services[project] = services
                 return subprocess.CompletedProcess(argv, 0, "healthy\n", "")
+            if "ps" in command:
+                records = [
+                    {
+                        "Service": service,
+                        "State": "running",
+                        "Health": self.service_health.get(service, ""),
+                    }
+                    for service in self.started_services.get(project, ())
+                    if project in self.active
+                ]
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps(records), ""
+                )
             if "port" in command:
                 self.port_commands.append(command)
                 port = 41000 + sum(project.encode()) % 20000
@@ -1157,6 +1292,15 @@ class _FakeComposeRunner:
                 )
             if "down" in command:
                 self.down_commands.append(command)
+                file_paths = [
+                    Path(command[index + 1])
+                    for index, value in enumerate(command[:-1])
+                    if value == "--file"
+                ]
+                if any(not path.is_file() for path in file_paths):
+                    return subprocess.CompletedProcess(
+                        argv, 11, "", "Compose file disappeared"
+                    )
                 if project in self.fail_down:
                     return subprocess.CompletedProcess(
                         argv, 9, "", "simulated teardown failure"

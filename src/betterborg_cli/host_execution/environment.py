@@ -7,7 +7,6 @@ import json
 import os
 import stat
 import subprocess
-import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -15,11 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
-    import msvcrt
-else:  # pragma: no branch - exactly one platform lock implementation is loaded
-    import fcntl
-
+from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
@@ -34,8 +29,6 @@ from betterborg_cli.store import (
 from betterborg_cli.store.models import utcnow
 
 _CACHE_CONTRACT_VERSION = 1
-_PREPARATION_LOCKS: dict[str, threading.Lock] = {}
-_PREPARATION_LOCKS_GUARD = threading.Lock()
 _SAFE_HOST_ENVIRONMENT = (
     "LANG",
     "LC_ALL",
@@ -901,43 +894,8 @@ def _invalidate_marker(marker: Path) -> None:
 
 @contextmanager
 def _preparation_lock(cache_path: Path) -> Iterator[None]:
-    key = str(cache_path.resolve())
-    with _PREPARATION_LOCKS_GUARD:
-        process_lock = _PREPARATION_LOCKS.setdefault(key, threading.Lock())
-    with process_lock:
-        lock_path = cache_path / ".betterborg-preparation.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as lock_file:
-            _lock_file(lock_file)
-            try:
-                yield
-            finally:
-                _unlock_file(lock_file)
-
-
-def _lock_file(lock_file) -> None:
-    if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
-        lock_file.seek(0, os.SEEK_END)
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-        while True:
-            try:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                return
-            except OSError:
-                time.sleep(0.05)
-    else:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(lock_file) -> None:
-    if os.name == "nt":  # pragma: no cover - exercised on Windows hosts
-        lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with path_lock(cache_path / ".betterborg-preparation.lock"):
+        yield
 
 
 @contextmanager
