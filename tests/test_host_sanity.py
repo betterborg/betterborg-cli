@@ -58,6 +58,11 @@ class _RecordingCompose:
         self.started.append(claim)
         return self.stack
 
+    def start_claimed_sanity_stack(  # noqa: ANN001
+        self, store, plan, claim, owner_token
+    ):
+        return self.start_claimed_stack(store, plan, claim, owner_token)
+
     def stop_claimed_stack(  # noqa: ANN001
         self, store, stack, claim, owner_token
     ) -> None:

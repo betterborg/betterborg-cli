@@ -133,8 +133,9 @@ class HostSanityPhase:
             with self._guard.protect(self._task_ref(context), "sanity"):
                 with self._repository_lock():
                     # From this point the locked sanity gate owns the supplied
-                    # task stack.  It tears the stack down before recording
-                    # sanity success or advancing the shared project base.
+                    # agent-phase stack.  It retires that stack before starting
+                    # a fresh sanity stack, and tears the fresh stack down before
+                    # recording success or advancing the shared project base.
                     locked_stack = stack_to_stop
                     stack_to_stop = None
                     published = self._run_locked(
@@ -217,7 +218,8 @@ class HostSanityPhase:
         *,
         existing_stack: ComposeStack | None,
     ) -> str:
-        stack = existing_stack
+        prior_stack = existing_stack
+        sanity_stack = None
         commands: tuple[SanityCommandResult, ...] = ()
         materialization = None
         already_advanced = False
@@ -247,6 +249,17 @@ class HostSanityPhase:
                     raise SanityPhaseError("merged task worktree is missing")
                 self._verify_tip(runtime, worktree, tip)
 
+                # Agent phases may have changed build inputs or mutated service
+                # state.  Remove their images, volumes, and containers before
+                # rematerializing and rebuilding services from the merged tip.
+                if prior_stack is not None:
+                    self._compose_manager.stop_claimed_stack(
+                        context.store,
+                        prior_stack,
+                        context.claim,
+                        context.owner_token,
+                    )
+                    prior_stack = None
                 materialization = self._environment_manager.materialize_claimed_task(
                     context.store,
                     self.plan,
@@ -254,16 +267,15 @@ class HostSanityPhase:
                     context.owner_token,
                     secret_values=secret_values,
                 )
-                if stack is None:
-                    stack = self._compose_manager.start_claimed_stack(
-                        context.store,
-                        self.plan,
-                        context.claim,
-                        context.owner_token,
-                    )
+                sanity_stack = self._compose_manager.start_claimed_sanity_stack(
+                    context.store,
+                    self.plan,
+                    context.claim,
+                    context.owner_token,
+                )
                 service_environment = service_url_environment(self.plan.services)
-                if stack is not None:
-                    service_environment.update(stack.environment)
+                if sanity_stack is not None:
+                    service_environment.update(sanity_stack.environment)
                 commands = self._run_commands(
                     worktree,
                     materialization_environment=materialization.environment,
@@ -290,11 +302,12 @@ class HostSanityPhase:
         except BaseException as error:
             active_error = error
         finally:
-            if stack is not None:
+            stack_to_stop = sanity_stack or prior_stack
+            if stack_to_stop is not None:
                 try:
                     self._compose_manager.stop_claimed_stack(
                         context.store,
-                        stack,
+                        stack_to_stop,
                         context.claim,
                         context.owner_token,
                     )

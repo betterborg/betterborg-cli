@@ -114,6 +114,39 @@ class HostComposeManager:
         owner_token: str,
     ) -> ComposeStack | None:
         """Start selected Compose services and return their consumer contract."""
+        return self._start_claimed_stack(
+            store,
+            plan,
+            claim,
+            owner_token,
+            project_name=compose_project_name(claim),
+        )
+
+    def start_claimed_sanity_stack(
+        self,
+        store: SqliteStore,
+        plan: HostPreflightPlan,
+        claim: TaskClaim,
+        owner_token: str,
+    ) -> ComposeStack | None:
+        """Start a fresh sanity-only project for the merged task tip."""
+        return self._start_claimed_stack(
+            store,
+            plan,
+            claim,
+            owner_token,
+            project_name=f"{compose_project_name(claim)}-sanity",
+        )
+
+    def _start_claimed_stack(
+        self,
+        store: SqliteStore,
+        plan: HostPreflightPlan,
+        claim: TaskClaim,
+        owner_token: str,
+        *,
+        project_name: str,
+    ) -> ComposeStack | None:
         compose_services = tuple(
             service for service in plan.services if service.kind == "compose"
         )
@@ -125,7 +158,6 @@ class HostComposeManager:
 
         worktree = self._claimed_worktree(store, claim)
         source_files = self._worktree_compose_files(plan, worktree)
-        project_name = compose_project_name(claim)
         selected = tuple(
             dict.fromkeys(
                 service.compose_service

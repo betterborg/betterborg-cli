@@ -278,7 +278,10 @@ class _Sanity:
     ) -> HostSanityResult:
         if existing_stack is not None:
             self.calls.append("services-stop")
+            self.calls.append("services-start")
         self.calls.append("sanity")
+        if existing_stack is not None:
+            self.calls.append("services-stop")
         context.transition(TaskRuntimeStatus.MERGING, TaskRuntimeStatus.DONE)
         return HostSanityResult(TaskRuntimeStatus.DONE, "published", "c")
 
@@ -765,7 +768,9 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             "review",
             "merge",
             "services-stop",
+            "services-start",
             "sanity",
+            "services-stop",
         ]
     finally:
         store.close()
@@ -1018,7 +1023,9 @@ def test_command_stage_agent_secret_reaches_every_agent_phase(tmp_path: Path) ->
             "review",
             "merge",
             "services-stop",
+            "services-start",
             "sanity",
+            "services-stop",
         ]
     finally:
         store.close()
@@ -1046,11 +1053,11 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
             call.env["SERVICE_URL"].startswith("http://127.0.0.1:")
             for call in fixture.coding.calls
         )
-        assert len(fixture.compose.up_projects) == 2
+        assert len(fixture.compose.up_projects) == 4
         assert sorted(fixture.compose.up_projects) == sorted(
             fixture.compose.down_projects
         )
-        assert len(set(fixture.compose.up_projects)) == 2
+        assert len(set(fixture.compose.up_projects)) == 4
         assert fixture.compose.active == set()
         environment_attempts = [
             attempt
@@ -1260,6 +1267,72 @@ def test_cancellation_cannot_mask_review_worktree_mutation(
         fixture.store.close()
 
 
+def test_concrete_sanity_restarts_compose_after_merged_descriptor_change(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+
+    def change_compose_descriptor(spec):  # noqa: ANN001
+        descriptor = spec.cwd / "compose.yml"
+        descriptor.write_text(
+            "services:\n  healthy:\n    image: fixture-after-coding\n",
+            encoding="utf-8",
+        )
+        _git(spec.cwd, "add", descriptor.name)
+        _git(spec.cwd, "commit", "--quiet", "-m", "change service descriptor")
+        return MockResponse(
+            payload={
+                "task_file": ".betterborg-task/task.md",
+                "status": "completed",
+                "summary": "Changed the service descriptor.",
+                "changed_files": [descriptor.name],
+                "tests_run": ["integration"],
+                "follow_ups": [],
+                "blockers": [],
+            }
+        )
+
+    fixture.coding.responses.clear()
+    fixture.coding.queue(MockResponse(dynamic=change_compose_descriptor))
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert len(fixture.compose.up_projects) == 2
+        assert fixture.compose.up_projects[0] != fixture.compose.up_projects[1]
+        assert fixture.compose.up_projects[1].endswith("-sanity")
+        lifecycle = [
+            "down" if "down" in command else "up"
+            for command in fixture.compose.commands
+            if "up" in command or "down" in command
+        ]
+        assert lifecycle == ["up", "down", "up", "down"]
+        assert all(
+            "--volumes" in command and command[-2:] == ("--rmi", "all")
+            for command in fixture.compose.down_commands
+        )
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository.root),
+                    "show",
+                    f"project/{fixture.borg.name}:compose.yml",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            == "services:\n  healthy:\n    image: fixture-after-coding\n"
+        )
+        assert fixture.compose.active == set()
+    finally:
+        fixture.store.close()
+
+
 def test_concrete_dependent_starts_from_published_prerequisite(
     tmp_path: Path,
 ) -> None:
@@ -1304,7 +1377,7 @@ def test_concrete_dependent_starts_from_published_prerequisite(
         fixture.store.close()
 
 
-def test_concrete_reused_stack_teardown_failure_prevents_base_advance(
+def test_concrete_agent_stack_teardown_failure_prevents_base_advance(
     tmp_path: Path,
 ) -> None:
     fixture = _concrete_host_fixture(tmp_path)
@@ -1387,7 +1460,7 @@ def test_concrete_dependency_refresh_contamination_blocks_and_preserves_worktree
         assert blocked.worktree_path is not None
         assert Path(blocked.worktree_path).is_dir()
         assert len(fixture.coding.calls) == 1
-        assert len(fixture.compose.up_projects) == 1
+        assert len(fixture.compose.up_projects) == 2
         assert fixture.compose.up_projects == fixture.compose.down_projects
         assert fixture.compose.active == set()
 
@@ -2104,7 +2177,7 @@ def test_concrete_jobs_two_and_duplicate_callers_share_one_operation(
         assert len(fixture.store.list_task_claims(completed.operation_id)) == 2
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 2
-        assert len(fixture.compose.up_projects) == 2
+        assert len(fixture.compose.up_projects) == 4
         assert sorted(fixture.compose.up_projects) == sorted(
             fixture.compose.down_projects
         )
