@@ -680,10 +680,11 @@ class HostEnvironmentManager:
             command.stage
             for command in (*plan.prepare_commands, *plan.materialize_commands)
         }
+        mask_values = declared_secret_mask_values(plan, secret_values)
         environments: dict[str, tuple[dict[str, str], tuple[str, ...]]] = {}
         for stage in stages:
             environment = dict(base_environment)
-            secrets, mask_values = command_secret_environment(
+            secrets, _ = command_secret_environment(
                 plan, stage, secret_values
             )
             environment.update(secrets)

@@ -626,6 +626,69 @@ def test_build_secret_is_not_exposed_outside_used_by_stage(
     assert captured.read_text(encoding="utf-8") == "unset\n"
 
 
+def test_build_secret_is_redacted_outside_used_by_stage(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    token = 'token"with/slash space?x=1&y=2'
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="materialize",
+        secrets=(
+            HostSecret(
+                name="PACKAGE_TOKEN",
+                scope="build",
+                used_by=("test",),
+                evidence="fixture",
+            ),
+        ),
+    )
+    plan = replace(
+        plan,
+        materialize_commands=(
+            replace(plan.materialize_commands[0], argv=("materialize", token)),
+        ),
+    )
+
+    def emit_secret(argv, *, env, **kwargs):  # noqa: ANN001, ANN003
+        assert "PACKAGE_TOKEN" not in env
+        output = "\n".join(
+            (token, json.dumps(token)[1:-1], quote(token, safe=""))
+        )
+        return subprocess.CompletedProcess(argv, 0, output, output)
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={"PATH": os.environ["PATH"]},
+        command_runner=emit_secret,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager.materialize_claimed_task(
+            store,
+            plan,
+            claim,
+            fixture.owner_token,
+            secret_values={"PACKAGE_TOKEN": token},
+        )
+        attempt = store.list_environment_attempts(claim.task_id)[-1]
+
+    persisted = json.dumps(
+        {
+            "commands": attempt.commands,
+            "error": attempt.error,
+            "result": attempt.result,
+        }
+    )
+    assert token not in persisted
+    assert json.dumps(token)[1:-1] not in persisted
+    assert quote(token, safe="") not in persisted
+    assert "[REDACTED]" in persisted
+
+
 def test_tracked_changes_are_rejected_and_task_work_is_preserved(
     execution_preflight_fixture,
 ) -> None:
