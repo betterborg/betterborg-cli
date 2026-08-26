@@ -107,6 +107,14 @@ def version() -> None:
     click.echo(f"borg {__version__}")
 
 
+@cli.command(name="mcp")
+def run_mcp_server() -> None:
+    """Expose BetterBorg workflows over MCP stdio."""
+    from betterborg_cli.mcp_server import run_stdio_server
+
+    run_stdio_server()
+
+
 def _stdin_is_interactive() -> bool:
     return click.get_text_stream("stdin").isatty()
 
@@ -1479,6 +1487,7 @@ def _continue_planning(
     name: str,
     *,
     change_note: str | None = None,
+    io: InteractiveIO | None = None,
 ) -> Borg:
     """Load and drain one initial or change-request planning lifecycle."""
     paths = RepoPaths.discover(repository_path)
@@ -1528,14 +1537,14 @@ def _continue_planning(
                     paths,
                     interactive=_stdin_is_interactive(),
                 )
-                io = _interactive_io()
+                planning_io = io or _interactive_io()
                 if borg.state is BorgState.DRAFT:
                     borg = ArchitectLoop(
                         repository,
                         borg,
                         store,
                         agent,
-                        io=io,
+                        io=planning_io,
                     ).run().borg
                 borg = TechLeadLoop(
                     repository,
@@ -1543,7 +1552,7 @@ def _continue_planning(
                     store,
                     agent,
                     architect_agent=agent,
-                    io=io,
+                    io=planning_io,
                 ).run().borg
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
