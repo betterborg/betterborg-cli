@@ -132,6 +132,11 @@ class HostSanityPhase:
             runtime, worktree = self._runtime_and_worktree(context, tip)
             with self._guard.protect(self._task_ref(context), "sanity"):
                 with self._repository_lock():
+                    # From this point the locked sanity gate owns the supplied
+                    # task stack.  It tears the stack down before recording
+                    # sanity success or advancing the shared project base.
+                    locked_stack = stack_to_stop
+                    stack_to_stop = None
                     published = self._run_locked(
                         context,
                         runtime,
@@ -139,16 +144,8 @@ class HostSanityPhase:
                         tip,
                         secret_values or {},
                         commands,
-                        existing_stack=existing_stack,
+                        existing_stack=locked_stack,
                     )
-                    if stack_to_stop is not None:
-                        self._compose_manager.stop_claimed_stack(
-                            context.store,
-                            stack_to_stop,
-                            context.claim,
-                            context.owner_token,
-                        )
-                        stack_to_stop = None
                     cleanup_runtime = context.store.get_task_runtime(
                         context.claim.task_id
                     )
@@ -220,76 +217,80 @@ class HostSanityPhase:
         *,
         existing_stack: ComposeStack | None,
     ) -> str:
-        current_base = self._resolve_project_tip(tip.project_branch)
-        if current_base == tip.commit_sha:
-            if not self._advance_was_attested(context, tip):
-                raise SanityPhaseError(
-                    "project base is already at the merge tip without a durable "
-                    "BetterBorg advancement attestation"
-                )
-            if worktree.exists():
-                if not worktree.is_dir():
-                    raise SanityPhaseError("merged task worktree is not a directory")
-                self._verify_tip(runtime, worktree, tip)
-            return tip.commit_sha
-        if current_base != tip.base_commit:
-            raise SanityPhaseError(
-                "project base moved after the merge tip was produced; rerun the "
-                "merge phase before sanity"
-            )
-        if not worktree.is_dir():
-            raise SanityPhaseError("merged task worktree is missing")
-        self._verify_tip(runtime, worktree, tip)
-
-        materialization = self._environment_manager.materialize_claimed_task(
-            context.store,
-            self.plan,
-            context.claim,
-            context.owner_token,
-            secret_values=secret_values,
-        )
         stack = existing_stack
-        owns_stack = existing_stack is None
         commands: tuple[SanityCommandResult, ...] = ()
+        materialization = None
+        already_advanced = False
         active_error: BaseException | None = None
         try:
-            if stack is None:
-                stack = self._compose_manager.start_claimed_stack(
+            current_base = self._resolve_project_tip(tip.project_branch)
+            if current_base == tip.commit_sha:
+                if not self._advance_was_attested(context, tip):
+                    raise SanityPhaseError(
+                        "project base is already at the merge tip without a durable "
+                        "BetterBorg advancement attestation"
+                    )
+                if worktree.exists():
+                    if not worktree.is_dir():
+                        raise SanityPhaseError(
+                            "merged task worktree is not a directory"
+                        )
+                    self._verify_tip(runtime, worktree, tip)
+                already_advanced = True
+            else:
+                if current_base != tip.base_commit:
+                    raise SanityPhaseError(
+                        "project base moved after the merge tip was produced; rerun "
+                        "the merge phase before sanity"
+                    )
+                if not worktree.is_dir():
+                    raise SanityPhaseError("merged task worktree is missing")
+                self._verify_tip(runtime, worktree, tip)
+
+                materialization = self._environment_manager.materialize_claimed_task(
                     context.store,
                     self.plan,
                     context.claim,
                     context.owner_token,
+                    secret_values=secret_values,
                 )
-            service_environment = service_url_environment(self.plan.services)
-            if stack is not None:
-                service_environment.update(stack.environment)
-            commands = self._run_commands(
-                worktree,
-                materialization_environment=materialization.environment,
-                service_environment=service_environment,
-                secret_values=secret_values,
-            )
-            command_results.extend(commands)
-            failure = next(
-                (result for result in commands if result.returncode != 0), None
-            )
-            if failure is not None:
-                detail = failure.stderr.strip() or failure.stdout.strip()
-                raise SanityPhaseError(
-                    "sanity command failed with exit code "
-                    f"{failure.returncode}: {shlex.join(failure.command.argv)}"
-                    + (f": {detail[-4000:]}" if detail else "")
+                if stack is None:
+                    stack = self._compose_manager.start_claimed_stack(
+                        context.store,
+                        self.plan,
+                        context.claim,
+                        context.owner_token,
+                    )
+                service_environment = service_url_environment(self.plan.services)
+                if stack is not None:
+                    service_environment.update(stack.environment)
+                commands = self._run_commands(
+                    worktree,
+                    materialization_environment=materialization.environment,
+                    service_environment=service_environment,
+                    secret_values=secret_values,
                 )
-            if not commands:
-                raise SanityPhaseError("sanity command catalog is empty")
-            if not SafeGit(worktree).is_clean():
-                raise SanityPhaseError(
-                    "sanity commands changed tracked or untracked task files"
+                command_results.extend(commands)
+                failure = next(
+                    (result for result in commands if result.returncode != 0), None
                 )
+                if failure is not None:
+                    detail = failure.stderr.strip() or failure.stdout.strip()
+                    raise SanityPhaseError(
+                        "sanity command failed with exit code "
+                        f"{failure.returncode}: {shlex.join(failure.command.argv)}"
+                        + (f": {detail[-4000:]}" if detail else "")
+                    )
+                if not commands:
+                    raise SanityPhaseError("sanity command catalog is empty")
+                if not SafeGit(worktree).is_clean():
+                    raise SanityPhaseError(
+                        "sanity commands changed tracked or untracked task files"
+                    )
         except BaseException as error:
             active_error = error
         finally:
-            if owns_stack and stack is not None:
+            if stack is not None:
                 try:
                     self._compose_manager.stop_claimed_stack(
                         context.store,
@@ -306,6 +307,10 @@ class HostSanityPhase:
                         )
         if active_error is not None:
             raise active_error
+        if already_advanced:
+            return tip.commit_sha
+        if materialization is None:
+            raise SanityPhaseError("sanity materialization did not complete")
 
         masks = declared_secret_mask_values(self.plan, secret_values)
         self._append_event(

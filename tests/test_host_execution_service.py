@@ -372,6 +372,7 @@ class _ConcreteComposeRunner:
         self.active: set[str] = set()
         self.up_projects: list[str] = []
         self.down_projects: list[str] = []
+        self.fail_teardown = False
         self._lock = threading.Lock()
 
     def __call__(self, argv, **kwargs):
@@ -411,8 +412,12 @@ class _ConcreteComposeRunner:
                 port = 41000 + sum(project.encode()) % 20000
                 return subprocess.CompletedProcess(argv, 0, f"127.0.0.1:{port}\n", "")
             if "down" in command:
-                self.active.discard(project)
                 self.down_projects.append(project)
+                if self.fail_teardown:
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "injected Compose teardown failure"
+                    )
+                self.active.discard(project)
                 return subprocess.CompletedProcess(argv, 0, "stopped\n", "")
         return subprocess.CompletedProcess(argv, 2, "", "unexpected command")
 
@@ -1002,6 +1007,46 @@ def test_concrete_dependent_starts_from_published_prerequisite(
             ).returncode
             == 0
         )
+    finally:
+        fixture.store.close()
+
+
+def test_concrete_reused_stack_teardown_failure_prevents_base_advance(
+    tmp_path: Path,
+) -> None:
+    fixture = _concrete_host_fixture(tmp_path)
+    repository = fixture.store.get_repository(fixture.borg.repository_id)
+    assert repository is not None
+    base_commit = _git(repository.root, "rev-parse", "main")
+    fixture.compose.fail_teardown = True
+    try:
+        result = fixture.service.run(
+            fixture.borg.id,
+            fixture.generation.id,
+            {},
+        )
+
+        runtime = fixture.store.get_task_runtime(fixture.tasks[0].id)
+        assert result.status is ExecutionRunStatus.FAILED
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+        assert "Compose teardown failed" in runtime.state_reason
+        assert _git(
+            repository.root,
+            "rev-parse",
+            f"project/{fixture.borg.name}",
+        ) == base_commit
+        assert fixture.store.list_task_execution_events(
+            fixture.tasks[0].id,
+            kind="sanity.completed",
+        ) == []
+        assert fixture.store.list_task_execution_events(
+            fixture.tasks[0].id,
+            kind="base.advance_started",
+        ) == []
+        assert set(fixture.compose.down_projects) == set(
+            fixture.compose.up_projects
+        )
+        assert fixture.compose.active == set(fixture.compose.up_projects)
     finally:
         fixture.store.close()
 
