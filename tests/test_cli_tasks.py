@@ -192,6 +192,46 @@ def test_task_list_json_describes_only_verified_current_records(
     }
 
 
+def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch,
+) -> None:
+    _database, _superseded, current, _preparing = _multiple_generations(
+        committed_git_repo, planning_cli_repository, approved_task_generation
+    )
+    monkeypatch.chdir(committed_git_repo)
+
+    terminal = cli_runner.invoke(cli, ["task", "estimate", "inspect-tasks"])
+    machine = cli_runner.invoke(
+        cli, ["task", "estimate", "inspect-tasks", "--json"]
+    )
+
+    assert terminal.exit_code == 0, terminal.output
+    assert terminal.output.startswith("DUMMY DATA")
+    assert f"Execution estimate for Borg 'inspect-tasks': {current.generation.id}" in (
+        terminal.output
+    )
+    assert "Task mix: 1 small, 0 medium, 0 large, 0 unsized" in terminal.output
+    assert "Total agent work (not calendar time): P50 30.0m, P80 1.0h" in (
+        terminal.output
+    )
+    assert "n=0, source=dummy_prior" in terminal.output
+    assert "API estimate: unknown" in terminal.output
+    assert "Billing mode unknown for: coding, review" in terminal.output
+
+    assert machine.exit_code == 0, machine.output
+    estimate = json.loads(machine.output)
+    assert estimate["generation_id"] == str(current.generation.id)
+    assert estimate["sample_size"] == 0
+    assert estimate["billing"]["api"]["estimate"] is None
+    assert estimate["billing"]["api"]["unknown"] is True
+    assert estimate["billing"]["subscription"]["usd"] is None
+    assert estimate["provenance"]["prior_label"].startswith("DUMMY DATA")
+
+
 def test_task_list_terminal_and_json_share_runtime_totals(
     cli_runner: CliRunner,
     committed_git_repo: Path,

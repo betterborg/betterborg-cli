@@ -764,6 +764,33 @@ class TaskRuntimeRow:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskCompletionSample:
+    """Measured agent work from one locally completed generated task."""
+
+    generation_id: UUID
+    task_id: UUID
+    complexity: TaskComplexity
+    duration_seconds: float | None
+    coding_usage: AgentUsage | None
+    review_usage: AgentUsage | None
+
+    def __post_init__(self) -> None:
+        for name in ("generation_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task completion sample {name} must be a UUID")
+        if not isinstance(self.complexity, TaskComplexity):
+            raise TypeError(
+                "task completion sample complexity must be a TaskComplexity"
+            )
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("task completion sample duration must not be negative")
+        for name in ("coding_usage", "review_usage"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, AgentUsage):
+                raise TypeError(f"task completion sample {name} must be AgentUsage")
+
+
+@dataclass(frozen=True, slots=True)
 class TaskClaim:
     """A lease-owned claim granting one run authority over one task."""
 

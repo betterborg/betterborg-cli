@@ -43,6 +43,7 @@ from betterborg_cli.store.models import (
     RepositoryPackage,
     TaskBatch,
     TaskClaim,
+    TaskCompletionSample,
     TaskComplexity,
     TaskDependency,
     TaskFinding,
@@ -2509,6 +2510,79 @@ class SqliteStore:
             )
         return rows
 
+    def list_task_completion_samples(self) -> list[TaskCompletionSample]:
+        """Return repository-local coding/review work for completed tasks.
+
+        Fix attempts are review-loop agent work. Merge, environment, waits, and
+        incomplete attempts are intentionally outside this total-agent-work
+        sample. Missing durations or token fields remain unknown rather than
+        being converted to zero or a partial measurement.
+        """
+        with self.locked_connection() as connection:
+            task_rows = connection.execute(
+                """
+                SELECT task.id, task.generation_id, task.complexity
+                FROM task_records AS task
+                JOIN task_runtimes AS runtime
+                  ON runtime.task_id = task.id
+                 AND runtime.generation_id = task.generation_id
+                WHERE runtime.status = 'done'
+                ORDER BY task.created_at, task.id
+                """
+            ).fetchall()
+            attempt_rows = connection.execute(
+                """
+                SELECT attempt.*,
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
+                FROM agent_attempts AS attempt
+                JOIN task_runtimes AS runtime
+                  ON runtime.task_id = attempt.task_id
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = attempt.id
+                 AND terminal.kind IN (
+                    'agent.attempt_finished', 'agent.attempt_interrupted'
+                 )
+                WHERE runtime.status = 'done'
+                  AND attempt.phase IN ('coding', 'review', 'fix')
+                ORDER BY attempt.started_at, attempt.id
+                """
+            ).fetchall()
+
+        attempts_by_task: dict[str, list[AgentAttempt]] = {
+            row["id"]: [] for row in task_rows
+        }
+        for row in attempt_rows:
+            attempt = _row_to_agent_attempt(row)
+            if attempt.status is ExecutionAttemptStatus.COMPLETED:
+                attempts_by_task[str(attempt.task_id)].append(attempt)
+
+        samples = []
+        for row in task_rows:
+            attempts = attempts_by_task[row["id"]]
+            durations = [attempt.duration_seconds for attempt in attempts]
+            duration = (
+                float(sum(durations))
+                if durations and all(value is not None for value in durations)
+                else None
+            )
+            coding = [attempt for attempt in attempts if attempt.phase == "coding"]
+            review = [
+                attempt for attempt in attempts if attempt.phase in {"review", "fix"}
+            ]
+            samples.append(
+                TaskCompletionSample(
+                    generation_id=UUID(row["generation_id"]),
+                    task_id=UUID(row["id"]),
+                    complexity=TaskComplexity(row["complexity"]),
+                    duration_seconds=duration,
+                    coding_usage=_strict_attempt_usage(coding),
+                    review_usage=_strict_attempt_usage(review),
+                )
+            )
+        return samples
+
     def append_task_claim(self, claim: TaskClaim) -> None:
         """Persist a run's lease-backed claim on a generated task."""
         with self.transaction() as connection:
@@ -3802,6 +3876,26 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         ),
         started_at=datetime.fromisoformat(row["started_at"]),
         finished_at=finished_at,
+    )
+
+
+def _strict_attempt_usage(attempts: list[AgentAttempt]) -> AgentUsage | None:
+    """Sum complete usage without turning an absent field into a partial total."""
+    if not attempts or any(attempt.usage is None for attempt in attempts):
+        return None
+    usages = [attempt.usage for attempt in attempts if attempt.usage is not None]
+
+    def total(name: str) -> int | float | None:
+        values = [getattr(usage, name) for usage in usages]
+        return sum(values) if all(value is not None for value in values) else None
+
+    return AgentUsage(
+        cost_usd=total("cost_usd"),
+        tokens_input=total("tokens_input"),
+        tokens_output=total("tokens_output"),
+        tokens_cache_read=total("tokens_cache_read"),
+        tokens_cache_write=total("tokens_cache_write"),
+        num_turns=total("num_turns"),
     )
 
 
