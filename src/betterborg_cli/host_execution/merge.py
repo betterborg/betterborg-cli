@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +55,8 @@ _MERGE_IDENTITY = {
 }
 _MERGE_STARTED_EVENT = "merge.started"
 _MERGE_COMPLETED_EVENT = "merge.completed"
+
+RepositoryLockFactory = Callable[[], AbstractContextManager[None]]
 
 
 class MergePhaseError(RuntimeError):
@@ -126,7 +128,7 @@ class HostMergePhase:
         adapter: AgentAdapter,
         *,
         config: HostMergeConfig,
-        repository_lock: AbstractContextManager[None],
+        repository_lock: RepositoryLockFactory,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         self._paths = RepoPaths.discover(self.repository_root)
@@ -134,10 +136,8 @@ class HostMergePhase:
             raise MergePhaseError(
                 "merge phase must be bound to the primary Git checkout"
             )
-        if not hasattr(repository_lock, "__enter__") or not hasattr(
-            repository_lock, "__exit__"
-        ):
-            raise TypeError("repository lock must be a context manager")
+        if not callable(repository_lock):
+            raise TypeError("repository lock must be a context manager factory")
         self._adapter = adapter
         self._config = config
         self._repository_lock = repository_lock
@@ -231,7 +231,7 @@ class HostMergePhase:
         merge_head = self._merge_head(git)
         unresolved = git.unmerged_paths()
         if merge_head is not None:
-            with self._repository_lock:
+            with self._repository_lock():
                 base_commit = self._resolve_project_tip(project_branch)
                 starting_commit = git.head_sha()
                 if merge_head != base_commit:
@@ -282,7 +282,7 @@ class HostMergePhase:
                 "refusing to merge"
             )
 
-        with self._repository_lock:
+        with self._repository_lock():
             base_commit = self._resolve_project_tip(project_branch)
             current = git.head_sha()
             agent_used = self._attested_tip_agent_used(
@@ -326,6 +326,13 @@ class HostMergePhase:
                         commit_sha=current,
                     )
                 return outcome
+            merge_date = f"@{int(context.clock().timestamp())} +0000"
+            expected_commit = self._expected_clean_merge_commit(
+                git,
+                starting_commit=current,
+                base_commit=base_commit,
+                merge_date=merge_date,
+            )
             self._record_merge_event(
                 context,
                 kind=_MERGE_STARTED_EVENT,
@@ -334,11 +341,26 @@ class HostMergePhase:
                 task_branch=runtime.branch or "",
                 starting_commit=current,
                 base_commit=base_commit,
+                expected_commit=expected_commit,
+                merge_date=merge_date,
+            )
+            merge_environment = self._merge_environment()
+            merge_environment.update(
+                {
+                    "GIT_AUTHOR_DATE": merge_date,
+                    "GIT_COMMITTER_DATE": merge_date,
+                }
             )
             merged = git.run(
-                ["merge", "--no-edit", base_commit],
+                [
+                    "merge",
+                    "--no-edit",
+                    "-m",
+                    self._clean_merge_message(base_commit),
+                    base_commit,
+                ],
                 check=False,
-                env=self._merge_environment(),
+                env=merge_environment,
             )
             unresolved = git.unmerged_paths()
             if merged.returncode == 0 and not unresolved:
@@ -351,6 +373,10 @@ class HostMergePhase:
                     agent_used=False,
                 )
                 assert outcome.tip is not None
+                if outcome.tip.commit_sha != expected_commit:
+                    raise MergePhaseError(
+                        "clean merge did not create its pre-attested commit"
+                    )
                 self._record_merge_event(
                     context,
                     kind=_MERGE_COMPLETED_EVENT,
@@ -603,7 +629,7 @@ class HostMergePhase:
         base_commit: str,
         agent_used: bool,
     ) -> HostMergeResult:
-        with self._repository_lock:
+        with self._repository_lock():
             return self._verified_tip_locked(
                 git,
                 runtime,
@@ -779,7 +805,72 @@ class HostMergePhase:
                 attested_base, target_base
             ):
                 return False
+        started = self._host_merge_attestation(
+            context,
+            kind=_MERGE_STARTED_EVENT,
+            approved_commit=approved_commit,
+            project_branch=project_branch,
+            task_branch=task_branch,
+            expected_commit=commit_sha,
+        )
+        if started is not None:
+            attested_base = started.get("base_commit")
+            if isinstance(attested_base, str) and git.is_ancestor(
+                attested_base, target_base
+            ):
+                return False
         return None
+
+    def _expected_clean_merge_commit(
+        self,
+        git: SafeGit,
+        *,
+        starting_commit: str,
+        base_commit: str,
+        merge_date: str,
+    ) -> str | None:
+        """Create the exact clean merge object before its branch can move."""
+        if git.is_ancestor(starting_commit, base_commit):
+            return base_commit
+        merged_tree = git.run(
+            ["merge-tree", "--write-tree", starting_commit, base_commit],
+            check=False,
+        )
+        if merged_tree.returncode == 1:
+            return None
+        tree_sha = merged_tree.stdout.splitlines()[0].strip()
+        if merged_tree.returncode != 0 or not tree_sha:
+            detail = (merged_tree.stderr or merged_tree.stdout).strip()[-4000:]
+            raise MergePhaseError(
+                "Git could not prepare the clean merge attestation: " + detail
+            )
+        environment = self._merge_environment()
+        environment.update(
+            {
+                "GIT_AUTHOR_DATE": merge_date,
+                "GIT_COMMITTER_DATE": merge_date,
+            }
+        )
+        expected = git.run(
+            [
+                "commit-tree",
+                tree_sha,
+                "-p",
+                starting_commit,
+                "-p",
+                base_commit,
+                "-m",
+                self._clean_merge_message(base_commit),
+            ],
+            env=environment,
+        ).stdout.strip()
+        if not expected:
+            raise MergePhaseError("Git did not create a clean merge attestation")
+        return expected
+
+    @staticmethod
+    def _clean_merge_message(base_commit: str) -> str:
+        return f"Merge project base {base_commit}"
 
     def _completed_merge_attestation(
         self,
@@ -822,8 +913,12 @@ class HostMergePhase:
         starting_commit: str,
         base_commit: str,
         commit_sha: str | None = None,
+        expected_commit: str | None = None,
+        merge_date: str | None = None,
     ) -> None:
         recorded_at = context.clock()
+        if merge_date is None:
+            merge_date = f"@{int(recorded_at.timestamp())} +0000"
         context.store.append_claim_execution_event(
             ExecutionEvent(
                 run_id=context.claim.run_id,
@@ -837,6 +932,8 @@ class HostMergePhase:
                     "starting_commit": starting_commit,
                     "base_commit": base_commit,
                     "commit_sha": commit_sha,
+                    "expected_commit": expected_commit,
+                    "merge_date": merge_date,
                 },
                 created_at=recorded_at,
             ),
