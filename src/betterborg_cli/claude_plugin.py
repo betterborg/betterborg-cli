@@ -455,6 +455,8 @@ def _owned_marketplace_source(entry: dict[str, Any], expected: Path) -> bool:
 
 
 def _plugin_state(value: Any) -> _PluginState:
+    installed = False
+    enabled = False
     for entry in _records(value, "plugins"):
         identifier = entry.get("id") or entry.get("plugin")
         name = entry.get("name")
@@ -462,11 +464,15 @@ def _plugin_state(value: Any) -> _PluginState:
         if identifier == PLUGIN_ID or (
             name == PLUGIN_NAME and marketplace == MARKETPLACE_NAME
         ):
-            enabled = entry.get("enabled")
-            if enabled is None:
-                enabled = entry.get("status") == "enabled"
-            return _PluginState(installed=True, enabled=bool(enabled))
-    return _PluginState(installed=False, enabled=False)
+            scope = entry.get("scope")
+            if not isinstance(scope, str) or scope.casefold() != "user":
+                continue
+            installed = True
+            entry_enabled = entry.get("enabled")
+            if entry_enabled is None:
+                entry_enabled = entry.get("status") == "enabled"
+            enabled = enabled or bool(entry_enabled)
+    return _PluginState(installed=installed, enabled=enabled)
 
 
 def _validate_and_digest_bundle(source: Any) -> str:

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
+import sys
 from importlib import resources
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
@@ -17,8 +20,13 @@ from betterborg_cli.claude_plugin import (
     ClaudePluginInstallation,
     ClaudePluginStatus,
     install_claude_plugin,
+    verify_borg_mcp,
 )
 from betterborg_cli.cli import cli
+from betterborg_cli.plugin_activation import (
+    PluginActivationPreflight,
+    PluginActivationStatus,
+)
 
 
 def _executable(path: Path, body: str) -> Path:
@@ -34,6 +42,7 @@ class _FakeClaude:
         self.marketplace_source: str | None = None
         self.installed = False
         self.enabled = False
+        self.other_installations: list[dict[str, object]] = []
         self.fail_once: tuple[str, ...] | None = None
 
     def __call__(self, command, **_kwargs):
@@ -52,9 +61,11 @@ class _FakeClaude:
                 )
             return self._json(command, {"marketplaces": entries})
         if call == ("plugin", "list", "--json"):
-            entries = []
+            entries = list(self.other_installations)
             if self.installed:
-                entries.append({"id": PLUGIN_ID, "enabled": self.enabled})
+                entries.append(
+                    {"id": PLUGIN_ID, "scope": "user", "enabled": self.enabled}
+                )
             return self._json(command, {"plugins": entries})
         if call[:3] == ("plugin", "marketplace", "add"):
             self.marketplace_source = call[3]
@@ -160,6 +171,54 @@ def test_reinstall_is_a_verified_no_op(tmp_path: Path) -> None:
         ("plugin", "list", "--json"),
     ]
     assert len(spawns) == 1
+
+
+@pytest.mark.parametrize("scope", ["project", "local"])
+def test_other_scope_installation_does_not_replace_user_installation(
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    fake = _FakeClaude()
+    fake.other_installations = [
+        {"id": PLUGIN_ID, "scope": scope, "enabled": True}
+    ]
+
+    result, _ = _install(tmp_path, fake)
+
+    assert result.status is ClaudePluginStatus.INSTALLED
+    assert ("plugin", "install", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert fake.installed is True
+
+
+def test_mixed_scope_installations_reconcile_user_enabled_state(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    fake.other_installations = [
+        {"id": PLUGIN_ID, "scope": "project", "enabled": True}
+    ]
+    fake.enabled = False
+    fake.calls.clear()
+
+    result, _ = _install(tmp_path, fake)
+
+    assert first.status is ClaudePluginStatus.INSTALLED
+    assert result.status is ClaudePluginStatus.INSTALLED
+    assert ("plugin", "install", PLUGIN_ID, "--scope", "user") not in fake.calls
+    assert ("plugin", "enable", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert fake.enabled is True
+
+
+def test_verify_borg_mcp_spawns_installed_cli() -> None:
+    executable = Path(sys.executable).with_name("borg").resolve(strict=True)
+    preflight = PluginActivationPreflight(
+        status=PluginActivationStatus.READY,
+        executable=executable,
+        version="borg test",
+    )
+
+    verify_borg_mcp(preflight, os.environ)
 
 
 def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
