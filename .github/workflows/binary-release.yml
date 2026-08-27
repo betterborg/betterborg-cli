@@ -99,7 +99,14 @@ jobs:
             "$MANYLINUX_IMAGE" \
             bash -euxo pipefail -c '
               /opt/python/cp313-cp313/bin/python -m venv /tmp/betterborg-build
-              /tmp/betterborg-build/bin/pip install --requirement requirements-dev.lock
+              /tmp/betterborg-build/bin/pip download \
+                --only-binary=:all: \
+                --destination-directory /tmp/betterborg-wheels \
+                --requirement requirements-binary.lock
+              /tmp/betterborg-build/bin/pip install \
+                --no-index \
+                --find-links /tmp/betterborg-wheels \
+                --requirement requirements-binary.lock
               /tmp/betterborg-build/bin/pip install --no-build-isolation --no-deps .
               /tmp/betterborg-build/bin/pyinstaller \
                 --clean --noconfirm --distpath /tmp/dist betterborg.spec

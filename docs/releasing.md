@@ -76,6 +76,9 @@ Linux binaries are built natively on `ubuntu-24.04` and
 `ubuntu-24.04-arm` inside the architecture-matched PyPA `manylinux2014`
 container. That documented old-glibc runner has glibc 2.17; do not replace it
 with the host Python or a newer manylinux image without a compatibility review.
+The build resolves `requirements-binary.lock` using wheels only before
+installation, so it fails rather than compiling a dependency against an
+incompatible glibc.
 Darwin ARM64 uses `macos-14`, and Darwin x86_64 uses `macos-15-intel`; none of
 the four deliverables is cross-compiled.
 

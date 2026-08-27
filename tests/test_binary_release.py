@@ -14,6 +14,7 @@ REPOSITORY_ROOT = Path(__file__).parents[1]
 BINARY_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/binary-release.yml"
 RELEASE_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/ci.yml"
+BINARY_LOCK = REPOSITORY_ROOT / "requirements-binary.lock"
 
 
 def _load_script(name: str):
@@ -178,6 +179,11 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
         assert f"runner: {runner}" in workflow
     assert "manylinux2014_aarch64" in workflow
     assert "manylinux2014_x86_64" in workflow
+    assert "--only-binary=:all:" in workflow
+    assert workflow.count("--requirement requirements-binary.lock") == 2
+    assert "--no-index" in workflow
+    assert "--find-links /tmp/betterborg-wheels" in workflow
+    assert "--requirement requirements-dev.lock" not in workflow
     assert 'test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"' in workflow
     assert 'version)" = "borg $REVIEWED_VERSION"' in workflow
     assert "scripts/release_artifacts.py checksum" in workflow
@@ -185,6 +191,13 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     assert workflow.count("uses: actions/attest@v4") == 2
     assert workflow.count("id-token: write") == 2
     assert workflow.count("attestations: write") == 2
+
+
+def test_linux_binary_lock_selects_old_glibc_cryptography_wheel() -> None:
+    lock = BINARY_LOCK.read_text(encoding="utf-8")
+
+    assert "cryptography==50.0.0" in lock
+    assert "cryptography==50.0.1" not in lock
 
 
 def test_protected_ordering_and_nonpublishing_ci_path() -> None:
