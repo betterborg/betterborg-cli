@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 from importlib import resources
@@ -12,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from plugin_test_support import copy_resource, executable
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.claude_plugin import (
@@ -26,14 +26,8 @@ from betterborg_cli.cli import cli
 from betterborg_cli.plugin_activation import (
     PluginActivationPreflight,
     PluginActivationStatus,
+    PluginActivationVerificationError,
 )
-
-
-def _executable(path: Path, body: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
 
 
 class _FakeClaude:
@@ -129,8 +123,8 @@ class _FakeClaude:
 
 def _host(tmp_path: Path, fake: _FakeClaude):
     bin_dir = tmp_path / "host-bin"
-    borg = _executable(bin_dir / "borg", "printf 'borg 0.1.0\\n'")
-    claude = _executable(bin_dir / "claude", "exit 0")
+    borg = executable(bin_dir / "borg", "printf 'borg 0.1.0\\n'")
+    claude = executable(bin_dir / "claude", "exit 0")
 
     def lookup(name: str, *, path: str):
         assert path == str(bin_dir)
@@ -287,7 +281,7 @@ def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
     first, _ = _install(tmp_path, fake)
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "upgraded-marketplace"
-    _copy_resource(source, upgraded)
+    copy_resource(source, upgraded)
     manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.2.0"
@@ -319,7 +313,7 @@ def test_owned_bundle_change_requires_a_new_plugin_version(tmp_path: Path) -> No
     ).read_text(encoding="utf-8")
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     changed = tmp_path / "same-version-marketplace"
-    _copy_resource(source, changed)
+    copy_resource(source, changed)
     command = changed / "plugins/borg/commands/borg.md"
     command.write_text(command.read_text() + "\nChanged content.\n")
     fake.calls.clear()
@@ -344,7 +338,7 @@ def test_owned_upgrade_requires_claude_to_report_the_new_version(
     assert first.bundle_path is not None
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "uncached-upgrade-marketplace"
-    _copy_resource(source, upgraded)
+    copy_resource(source, upgraded)
     manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.2.0"
@@ -437,7 +431,7 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     original_marker = first.bundle_path.joinpath(".betterborg-owned.json").read_text()
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "broken-upgrade"
-    _copy_resource(source, upgraded)
+    copy_resource(source, upgraded)
     command = upgraded / "plugins/borg/commands/borg.md"
     command.write_text(command.read_text() + "\nUpgrade content.\n")
     manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
@@ -466,7 +460,7 @@ def test_failed_upgrade_reports_no_op_plugin_rollback(tmp_path: Path) -> None:
     assert first.bundle_path is not None
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "rollback-no-op"
-    _copy_resource(source, upgraded)
+    copy_resource(source, upgraded)
     manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.2.0"
@@ -505,7 +499,7 @@ def test_failed_bundle_promotion_immediately_restores_previous_bundle(
     original_marker = first.bundle_path.joinpath(".betterborg-owned.json").read_text()
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "promotion-failure"
-    _copy_resource(source, upgraded)
+    copy_resource(source, upgraded)
     manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.2.0"
@@ -544,7 +538,7 @@ def test_failed_fresh_activation_removes_host_and_bundle_state(
     fake = _FakeClaude()
 
     def fail_verification(*_args) -> None:
-        raise ValueError("injected MCP failure")
+        raise PluginActivationVerificationError("injected MCP failure")
 
     result, spawns = _install(
         tmp_path,
@@ -663,7 +657,7 @@ def test_missing_persistent_borg_does_not_list_or_mutate_claude(
     tmp_path: Path,
 ) -> None:
     fake = _FakeClaude()
-    claude = _executable(tmp_path / "bin/claude", "exit 0")
+    claude = executable(tmp_path / "bin/claude", "exit 0")
 
     def lookup(name: str, **_kwargs):
         return str(claude) if name == "claude" else None
@@ -696,13 +690,3 @@ def test_cli_reports_success_and_reload_guidance(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "Installed and enabled" in result.output
     assert "/reload-plugins" in result.output
-
-
-def _copy_resource(source, destination: Path) -> None:
-    destination.mkdir()
-    for child in source.iterdir():
-        target = destination / child.name
-        if child.is_dir():
-            _copy_resource(child, target)
-        else:
-            target.write_bytes(child.read_bytes())

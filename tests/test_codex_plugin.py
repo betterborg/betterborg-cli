@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import stat
 import subprocess
 from importlib import resources
 from pathlib import Path
 
 from click.testing import CliRunner
+from plugin_test_support import copy_resource, executable
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.cli import cli
@@ -21,18 +21,12 @@ from betterborg_cli.codex_plugin import (
 )
 
 
-def _executable(path: Path, body: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
-
-
 class _FakeCodex:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.marketplace_source: str | None = None
         self.installed = False
+        self.enabled = False
         self.installed_version: str | None = None
         self.other_marketplaces: list[dict[str, object]] = []
         self.other_plugins: list[dict[str, object]] = []
@@ -69,7 +63,7 @@ class _FakeCodex:
                         "marketplaceName": MARKETPLACE_NAME,
                         "version": self.installed_version,
                         "installed": True,
-                        "enabled": True,
+                        "enabled": self.enabled,
                     }
                 )
             elif self.marketplace_source is not None:
@@ -90,9 +84,11 @@ class _FakeCodex:
             self.marketplace_source = call[3]
         elif call == ("plugin", "add", PLUGIN_ID, "--json"):
             self.installed = True
+            self.enabled = True
             self.installed_version = self._available_version()
         elif call == ("plugin", "remove", PLUGIN_ID, "--json"):
             self.installed = False
+            self.enabled = False
             self.installed_version = None
         elif call == (
             "plugin",
@@ -121,8 +117,8 @@ class _FakeCodex:
 
 def _host(tmp_path: Path):
     bin_dir = tmp_path / "host-bin"
-    borg = _executable(bin_dir / "borg", "printf 'borg 0.1.0\\n'")
-    codex = _executable(bin_dir / "codex", "exit 0")
+    borg = executable(bin_dir / "borg", "printf 'borg 0.1.0\\n'")
+    codex = executable(bin_dir / "codex", "exit 0")
 
     def lookup(name: str, *, path: str):
         assert path == str(bin_dir)
@@ -281,6 +277,32 @@ def test_owned_stale_install_is_recovered_with_remove_add(tmp_path: Path) -> Non
     assert ("plugin", "add", PLUGIN_ID, "--json") in fake.calls
 
 
+def test_installed_but_disabled_plugin_is_reenabled_with_remove_add(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeCodex()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    fake.enabled = False
+    fake.calls.clear()
+
+    result, spawns = _install(tmp_path, fake)
+
+    assert result.status is CodexPluginStatus.INSTALLED
+    assert result.ready is True
+    assert fake.enabled is True
+    assert ("plugin", "remove", PLUGIN_ID, "--json") in fake.calls
+    assert ("plugin", "add", PLUGIN_ID, "--json") in fake.calls
+    assert (
+        "plugin",
+        "marketplace",
+        "remove",
+        MARKETPLACE_NAME,
+        "--json",
+    ) not in fake.calls
+    assert len(spawns) == 1
+
+
 def test_failed_upgrade_restores_prior_bundle_and_host_state(
     tmp_path: Path,
 ) -> None:
@@ -391,7 +413,7 @@ def test_missing_persistent_borg_does_not_list_or_mutate_codex(
     tmp_path: Path,
 ) -> None:
     fake = _FakeCodex()
-    codex = _executable(tmp_path / "bin/codex", "exit 0")
+    codex = executable(tmp_path / "bin/codex", "exit 0")
 
     def lookup(name: str, **_kwargs):
         return str(codex) if name == "codex" else None
@@ -429,19 +451,9 @@ def test_cli_reports_codex_success_and_new_thread_guidance(monkeypatch) -> None:
 def _upgraded_bundle(tmp_path: Path, name: str, version: str) -> Path:
     source = resources.files("betterborg_cli.codex_plugin_bundle") / "marketplace"
     destination = tmp_path / name
-    _copy_resource(source, destination)
+    copy_resource(source, destination)
     manifest = destination / "plugins/borg/.codex-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = version
     manifest.write_text(json.dumps(value), encoding="utf-8")
     return destination
-
-
-def _copy_resource(source, destination: Path) -> None:
-    destination.mkdir()
-    for child in source.iterdir():
-        target = destination / child.name
-        if child.is_dir():
-            _copy_resource(child, target)
-        else:
-            target.write_bytes(child.read_bytes())
