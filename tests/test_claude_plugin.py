@@ -76,6 +76,20 @@ class _FakeClaude:
             self.enabled = True
         elif call == ("plugin", "disable", PLUGIN_ID, "--scope", "user"):
             self.enabled = False
+        elif call == ("plugin", "uninstall", PLUGIN_ID, "--scope", "user"):
+            self.installed = False
+            self.enabled = False
+        elif call == (
+            "plugin",
+            "marketplace",
+            "remove",
+            MARKETPLACE_NAME,
+            "--scope",
+            "user",
+        ):
+            self.marketplace_source = None
+            self.installed = False
+            self.enabled = False
         elif call in {
             ("plugin", "marketplace", "update", MARKETPLACE_NAME),
             ("plugin", "update", PLUGIN_ID, "--scope", "user"),
@@ -112,12 +126,13 @@ def _host(tmp_path: Path, fake: _FakeClaude):
 
 def _install(tmp_path: Path, fake: _FakeClaude, **kwargs):
     environment, lookup, verify, spawns = _host(tmp_path, fake)
+    mcp_verifier = kwargs.pop("mcp_verifier", verify)
     result = install_claude_plugin(
         launch_environment=environment,
         data_home=tmp_path / "data",
         executable_lookup=lookup,
         command_runner=fake,
-        mcp_verifier=verify,
+        mcp_verifier=mcp_verifier,
         **kwargs,
     )
     return result, spawns
@@ -290,6 +305,106 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     assert ("plugin", "disable", PLUGIN_ID, "--scope", "user") in fake.calls
     assert spawns == []
     assert list(first.bundle_path.parent.joinpath("backups").glob("failed-*"))
+
+
+def test_failed_fresh_activation_removes_host_and_bundle_state(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeClaude()
+
+    def fail_verification(*_args) -> None:
+        raise ValueError("injected MCP failure")
+
+    result, spawns = _install(
+        tmp_path,
+        fake,
+        mcp_verifier=fail_verification,
+    )
+
+    bundle = tmp_path / "data/betterborg/claude/marketplace"
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "rolled back" in (result.reason or "")
+    assert result.bundle_path is None
+    assert fake.marketplace_source is None
+    assert fake.installed is False
+    assert fake.enabled is False
+    assert ("plugin", "uninstall", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert (
+        "plugin",
+        "marketplace",
+        "remove",
+        MARKETPLACE_NAME,
+        "--scope",
+        "user",
+    ) in fake.calls
+    assert not bundle.exists()
+    assert not tmp_path.joinpath("data").exists()
+    assert spawns == []
+
+
+def test_failed_enable_repair_restores_disabled_state(tmp_path: Path) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    original_marker = first.bundle_path.joinpath(".betterborg-owned.json").read_text()
+    fake.enabled = False
+    fake.calls.clear()
+
+    def fail_verification(*_args) -> None:
+        raise ValueError("injected MCP failure")
+
+    result, spawns = _install(
+        tmp_path,
+        fake,
+        mcp_verifier=fail_verification,
+    )
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "rolled back" in (result.reason or "")
+    assert fake.marketplace_source == str(first.bundle_path)
+    assert fake.installed is True
+    assert fake.enabled is False
+    assert ("plugin", "disable", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert first.bundle_path.joinpath(".betterborg-owned.json").read_text() == (
+        original_marker
+    )
+    assert spawns == []
+
+
+def test_failed_missing_plugin_repair_uninstalls_only_new_user_plugin(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    fake.installed = False
+    fake.enabled = False
+    fake.calls.clear()
+
+    def fail_verification(*_args) -> None:
+        raise ValueError("injected MCP failure")
+
+    result, spawns = _install(
+        tmp_path,
+        fake,
+        mcp_verifier=fail_verification,
+    )
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert fake.marketplace_source == str(first.bundle_path)
+    assert fake.installed is False
+    assert fake.enabled is False
+    assert ("plugin", "uninstall", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert (
+        "plugin",
+        "marketplace",
+        "remove",
+        MARKETPLACE_NAME,
+        "--scope",
+        "user",
+    ) not in fake.calls
+    assert first.bundle_path.is_dir()
+    assert spawns == []
 
 
 def test_absent_claude_returns_guidance_without_files_or_mcp_spawn(

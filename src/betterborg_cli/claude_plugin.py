@@ -68,12 +68,20 @@ class _BundleChange:
     digest: str
     changed: bool
     previous: Path | None = None
+    created_parents: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class _PluginState:
     installed: bool
     enabled: bool
+
+
+@dataclass(slots=True)
+class _HostChanges:
+    marketplace_added: bool = False
+    plugin_installed: bool = False
+    plugin_enabled: bool = False
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -191,6 +199,7 @@ def install_claude_plugin(
             reason=str(error),
         )
 
+    host_changes = _HostChanges()
     try:
         if registered is None:
             _run(
@@ -206,6 +215,7 @@ def install_claude_plugin(
                 environment,
                 command_runner,
             )
+            host_changes.marketplace_added = True
         elif change.changed:
             _run(
                 (
@@ -232,6 +242,7 @@ def install_claude_plugin(
                 environment,
                 command_runner,
             )
+            host_changes.plugin_installed = True
         elif change.changed:
             _run(
                 (
@@ -259,6 +270,7 @@ def install_claude_plugin(
                 environment,
                 command_runner,
             )
+            host_changes.plugin_enabled = True
 
         verified = _plugin_state(
             _json_command(
@@ -280,6 +292,7 @@ def install_claude_plugin(
             command_runner=command_runner,
             marketplace_preexisting=registered is not None,
             plugin_before=before,
+            host_changes=host_changes,
         )
         reason = f"Claude plugin activation failed and was rolled back: {error}"
         if rollback_error is not None:
@@ -521,6 +534,11 @@ def _bundle_files(source: Any, prefix: str = "") -> list[tuple[str, bytes]]:
 
 
 def _materialize_bundle(source: Any, destination: Path, digest: str) -> _BundleChange:
+    created_parents = []
+    parent = destination.parent
+    while not parent.exists():
+        created_parents.append(parent)
+        parent = parent.parent
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         ownership = _ownership(destination)
@@ -557,6 +575,7 @@ def _materialize_bundle(source: Any, destination: Path, digest: str) -> _BundleC
             digest=digest,
             changed=True,
             previous=previous,
+            created_parents=tuple(created_parents),
         )
     finally:
         if staging.exists():
@@ -597,24 +616,35 @@ def _rollback(
     command_runner: CommandRunner,
     marketplace_preexisting: bool,
     plugin_before: _PluginState,
+    host_changes: _HostChanges,
 ) -> str | None:
     errors: list[str] = []
+    restored_previous = False
     if change.changed and change.previous is not None:
         failed_name = f"failed-{change.digest[:12]}-{uuid4().hex[:8]}"
         failed = change.previous.parent / failed_name
         try:
             change.path.rename(failed)
             change.previous.rename(change.path)
+            restored_previous = True
         except OSError as error:
             errors.append(str(error))
-    if marketplace_preexisting and change.changed and change.previous is not None:
-        commands = [
-            (claude, "plugin", "marketplace", "update", MARKETPLACE_NAME),
-        ]
-        if plugin_before.installed:
+    if marketplace_preexisting and restored_previous:
+        try:
+            _run(
+                (claude, "plugin", "marketplace", "update", MARKETPLACE_NAME),
+                environment,
+                command_runner,
+            )
+        except _ClaudeCommandError as error:
+            errors.append(str(error))
+    if plugin_before.installed:
+        commands = []
+        if restored_previous:
             commands.append(
                 (claude, "plugin", "update", PLUGIN_ID, "--scope", "user")
             )
+        if restored_previous or host_changes.plugin_enabled:
             commands.append(
                 (
                     claude,
@@ -629,5 +659,43 @@ def _rollback(
             try:
                 _run(command, environment, command_runner)
             except _ClaudeCommandError as error:
+                errors.append(str(error))
+    elif host_changes.plugin_installed:
+        try:
+            _run(
+                (claude, "plugin", "uninstall", PLUGIN_ID, "--scope", "user"),
+                environment,
+                command_runner,
+            )
+        except _ClaudeCommandError as error:
+            errors.append(str(error))
+    if host_changes.marketplace_added:
+        try:
+            _run(
+                (
+                    claude,
+                    "plugin",
+                    "marketplace",
+                    "remove",
+                    MARKETPLACE_NAME,
+                    "--scope",
+                    "user",
+                ),
+                environment,
+                command_runner,
+            )
+        except _ClaudeCommandError as error:
+            errors.append(str(error))
+    if change.changed and change.previous is None:
+        try:
+            shutil.rmtree(change.path)
+        except OSError as error:
+            errors.append(str(error))
+        for parent in change.created_parents:
+            try:
+                parent.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
                 errors.append(str(error))
     return "; ".join(errors) or None
