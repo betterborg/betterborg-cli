@@ -10,19 +10,15 @@ from importlib import resources
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from plugin_test_support import copy_resource, executable
 
-from betterborg_cli import cli as cli_module
 from betterborg_cli.claude_plugin import (
     MARKETPLACE_NAME,
     PLUGIN_ID,
-    ClaudePluginInstallation,
     ClaudePluginStatus,
     install_claude_plugin,
     verify_borg_mcp,
 )
-from betterborg_cli.cli import cli
 from betterborg_cli.plugin_activation import (
     PluginActivationPreflight,
     PluginActivationStatus,
@@ -646,7 +642,7 @@ def test_absent_claude_returns_guidance_without_files_or_mcp_spawn(
         mcp_verifier=lambda *args: spawns.append(args),
     )
 
-    assert result.status is ClaudePluginStatus.SETUP_REQUIRED
+    assert result.status is ClaudePluginStatus.DEFERRED
     assert "Install Claude Code" in (result.guidance or "")
     assert commands == []
     assert spawns == []
@@ -673,20 +669,3 @@ def test_missing_persistent_borg_does_not_list_or_mutate_claude(
     assert "uv tool install betterborg-cli" in (result.guidance or "")
     assert fake.calls == [("--version",)]
     assert not tmp_path.joinpath("data").exists()
-
-
-def test_cli_reports_success_and_reload_guidance(monkeypatch) -> None:
-    monkeypatch.setattr(
-        cli_module,
-        "install_claude_plugin",
-        lambda: ClaudePluginInstallation(
-            status=ClaudePluginStatus.INSTALLED,
-            reload_guidance="Run /reload-plugins now.",
-        ),
-    )
-
-    result = CliRunner().invoke(cli, ["plugin", "install", "claude"])
-
-    assert result.exit_code == 0
-    assert "Installed and enabled" in result.output
-    assert "/reload-plugins" in result.output

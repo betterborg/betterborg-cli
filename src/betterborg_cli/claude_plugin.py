@@ -55,6 +55,7 @@ class ClaudePluginStatus(StrEnum):
 
     INSTALLED = "installed"
     UNCHANGED = "unchanged"
+    DEFERRED = "deferred"
     SETUP_REQUIRED = "setup_required"
     COLLISION = "collision"
     FAILED = "failed"
@@ -106,6 +107,7 @@ def install_claude_plugin(
     executable_lookup: ExecutableLookup = shutil.which,
     command_runner: CommandRunner = subprocess.run,
     mcp_verifier: McpVerifier | None = None,
+    preflight: PluginActivationPreflight | None = None,
 ) -> ClaudePluginInstallation:
     """Install and verify BetterBorg's user-scoped Claude Code plugin.
 
@@ -119,7 +121,7 @@ def install_claude_plugin(
     claude = executable_lookup("claude", path=path)
     if claude is None:
         return ClaudePluginInstallation(
-            status=ClaudePluginStatus.SETUP_REQUIRED,
+            status=ClaudePluginStatus.DEFERRED,
             reason="Claude Code was not found on the host launch PATH.",
             guidance=(
                 "Install Claude Code, ensure `claude` is on the host launch PATH, "
@@ -155,10 +157,11 @@ def install_claude_plugin(
             ),
         )
 
-    preflight = preflight_plugin_activation(
-        launch_environment=environment,
-        executable_lookup=executable_lookup,
-    )
+    if preflight is None:
+        preflight = preflight_plugin_activation(
+            launch_environment=environment,
+            executable_lookup=executable_lookup,
+        )
     if not preflight.ready:
         return ClaudePluginInstallation(
             status=ClaudePluginStatus.SETUP_REQUIRED,

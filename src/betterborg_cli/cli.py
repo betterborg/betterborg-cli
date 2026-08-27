@@ -18,8 +18,6 @@ from betterborg_cli import __version__
 from betterborg_cli.agent_runtime import BillingMode
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
-from betterborg_cli.claude_plugin import install_claude_plugin
-from betterborg_cli.codex_plugin import install_codex_plugin
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
     estimate_generation,
@@ -62,6 +60,10 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     render_task_markdown,
     task_markdown_digest,
+)
+from betterborg_cli.plugins import (
+    SUPPORTED_PLUGIN_HOSTS,
+    PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
@@ -111,43 +113,38 @@ def run_mcp_server() -> None:
 
 
 @cli.group()
-def plugin() -> None:
+def plugins() -> None:
     """Install BetterBorg integrations for supported agent hosts."""
 
 
-@plugin.command(name="install")
-@click.argument(
-    "host", type=click.Choice(("claude", "codex"), case_sensitive=False)
+@plugins.command(name="install")
+@click.option(
+    "--all",
+    "all_hosts",
+    is_flag=True,
+    help="Install integrations for every supported host (the default).",
 )
-def install_plugin(host: str) -> None:
-    """Install the BetterBorg plugin for HOST."""
-    normalized_host = host.casefold()
-    if normalized_host == "claude":
-        result = install_claude_plugin()
-        host_name = "Claude Code"
-    elif normalized_host == "codex":
-        result = install_codex_plugin()
-        host_name = "Codex"
-    else:  # Defensive: Click currently enforces the supported hosts.
-        raise click.ClickException(f"unsupported plugin host: {host}")
+@click.option(
+    "--host",
+    type=click.Choice(SUPPORTED_PLUGIN_HOSTS, case_sensitive=False),
+    help="Install only the selected host integration.",
+)
+def install_plugins(all_hosts: bool, host: str | None) -> None:
+    """Install BetterBorg plugins after verifying the persistent CLI."""
+    if all_hosts and host is not None:
+        raise click.UsageError("--all and --host cannot be used together")
+    selected = SUPPORTED_PLUGIN_HOSTS if host is None else (host.casefold(),)
+    result = PluginInstaller().install(selected)
+    names = {"claude": "Claude Code", "codex": "Codex"}
+    for host_result in result.hosts:
+        click.echo(
+            f"{names[host_result.host]}: {host_result.status.value} — "
+            f"{host_result.detail}"
+        )
+        if host_result.guidance:
+            click.echo(f"  {host_result.guidance}")
     if not result.ready:
-        detail = result.reason or f"{host_name} plugin activation failed"
-        if result.guidance:
-            detail = f"{detail}\n{result.guidance}"
-        raise click.ClickException(detail)
-    if normalized_host == "claude" and result.status.value == "unchanged":
-        click.echo("Claude Code plugin is already installed and enabled.")
-    elif normalized_host == "claude":
-        click.echo("Installed and enabled the BetterBorg plugin for Claude Code.")
-    elif result.status.value == "unchanged":
-        click.echo("Codex plugin is already installed.")
-    else:
-        click.echo("Installed the BetterBorg plugin for Codex.")
-    guidance = getattr(result, "reload_guidance", None) or getattr(
-        result, "new_thread_guidance", None
-    )
-    if guidance:
-        click.echo(guidance)
+        raise click.exceptions.Exit(1)
 
 
 def _stdin_is_interactive() -> bool:

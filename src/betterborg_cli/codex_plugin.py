@@ -49,6 +49,7 @@ class CodexPluginStatus(StrEnum):
 
     INSTALLED = "installed"
     UNCHANGED = "unchanged"
+    DEFERRED = "deferred"
     SETUP_REQUIRED = "setup_required"
     COLLISION = "collision"
     FAILED = "failed"
@@ -101,6 +102,7 @@ def install_codex_plugin(
     executable_lookup: ExecutableLookup = shutil.which,
     command_runner: CommandRunner = subprocess.run,
     mcp_verifier: McpVerifier | None = None,
+    preflight: PluginActivationPreflight | None = None,
 ) -> CodexPluginInstallation:
     """Install and verify BetterBorg's user-scoped Codex plugin.
 
@@ -114,7 +116,7 @@ def install_codex_plugin(
     codex = executable_lookup("codex", path=path)
     if codex is None:
         return CodexPluginInstallation(
-            status=CodexPluginStatus.SETUP_REQUIRED,
+            status=CodexPluginStatus.DEFERRED,
             reason="Codex was not found on the host launch PATH.",
             guidance=(
                 "Install Codex, ensure `codex` is on the host launch PATH, and "
@@ -122,10 +124,11 @@ def install_codex_plugin(
             ),
         )
 
-    preflight = preflight_plugin_activation(
-        launch_environment=environment,
-        executable_lookup=executable_lookup,
-    )
+    if preflight is None:
+        preflight = preflight_plugin_activation(
+            launch_environment=environment,
+            executable_lookup=executable_lookup,
+        )
     if not preflight.ready:
         return CodexPluginInstallation(
             status=CodexPluginStatus.SETUP_REQUIRED,
