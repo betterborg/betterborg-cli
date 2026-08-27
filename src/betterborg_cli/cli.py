@@ -19,6 +19,7 @@ from betterborg_cli.agent_runtime import BillingMode
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
 from betterborg_cli.claude_plugin import install_claude_plugin
+from betterborg_cli.codex_plugin import install_codex_plugin
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
     estimate_generation,
@@ -115,23 +116,38 @@ def plugin() -> None:
 
 
 @plugin.command(name="install")
-@click.argument("host", type=click.Choice(("claude",), case_sensitive=False))
+@click.argument(
+    "host", type=click.Choice(("claude", "codex"), case_sensitive=False)
+)
 def install_plugin(host: str) -> None:
-    """Install and explicitly enable the plugin for HOST."""
-    if host.casefold() != "claude":  # Defensive: Click currently enforces this.
+    """Install the BetterBorg plugin for HOST."""
+    normalized_host = host.casefold()
+    if normalized_host == "claude":
+        result = install_claude_plugin()
+        host_name = "Claude Code"
+    elif normalized_host == "codex":
+        result = install_codex_plugin()
+        host_name = "Codex"
+    else:  # Defensive: Click currently enforces the supported hosts.
         raise click.ClickException(f"unsupported plugin host: {host}")
-    result = install_claude_plugin()
     if not result.ready:
-        detail = result.reason or "Claude plugin activation failed"
+        detail = result.reason or f"{host_name} plugin activation failed"
         if result.guidance:
             detail = f"{detail}\n{result.guidance}"
         raise click.ClickException(detail)
-    if result.status.value == "unchanged":
+    if normalized_host == "claude" and result.status.value == "unchanged":
         click.echo("Claude Code plugin is already installed and enabled.")
-    else:
+    elif normalized_host == "claude":
         click.echo("Installed and enabled the BetterBorg plugin for Claude Code.")
-    if result.reload_guidance:
-        click.echo(result.reload_guidance)
+    elif result.status.value == "unchanged":
+        click.echo("Codex plugin is already installed.")
+    else:
+        click.echo("Installed the BetterBorg plugin for Codex.")
+    guidance = getattr(result, "reload_guidance", None) or getattr(
+        result, "new_thread_guidance", None
+    )
+    if guidance:
+        click.echo(guidance)
 
 
 def _stdin_is_interactive() -> bool:
