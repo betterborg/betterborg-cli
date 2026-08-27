@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Build the local one-file ``borg`` executable with all package assets."""
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files
 
-datas = collect_data_files("betterborg_cli") + copy_metadata("betterborg")
+datas = collect_data_files("betterborg_cli")
 
 analysis = Analysis(
     ["src/betterborg_cli/__main__.py"],

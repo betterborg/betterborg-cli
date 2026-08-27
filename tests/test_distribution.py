@@ -183,6 +183,14 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
     assert all(
         asset in bundled for asset in PACKAGE_ASSETS if not asset.endswith(".py")
     )
+    assert not any(
+        name.startswith("betterborg-") and ".dist-info/" in name
+        for name in bundled
+    )
+    assert not any(
+        name.endswith("direct_url.json") or "__editable__" in name
+        for name in bundled
+    )
 
 
 def _minimal_version_tree(tmp_path: Path) -> Path:
@@ -225,7 +233,8 @@ def test_version_check_rejects_plugin_mismatch(
     root = _minimal_version_tree(tmp_path)
     path = root / manifest
     value = json.loads(path.read_text(encoding="utf-8"))
-    value["version"] = "9.9.9"
+    mismatched_version = "0.0.0" if __version__ != "0.0.0" else "0.0.1"
+    value["version"] = mismatched_version
     path.write_text(json.dumps(value), encoding="utf-8")
 
     completed = subprocess.run(
@@ -237,4 +246,4 @@ def test_version_check_rejects_plugin_mismatch(
 
     assert completed.returncode == 1
     assert manifest in completed.stderr
-    assert "expected '0.1.0'" in completed.stderr
+    assert f"expected {__version__!r}" in completed.stderr
