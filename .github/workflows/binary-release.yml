@@ -92,6 +92,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           MANYLINUX_IMAGE: ${{ matrix.image }}
         run: |
+          mkdir release
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io" \
             --workdir /io \
@@ -110,7 +111,6 @@ jobs:
               /tmp/betterborg-build/bin/pip install --no-build-isolation --no-deps .
               /tmp/betterborg-build/bin/pyinstaller \
                 --clean --noconfirm --distpath /tmp/dist betterborg.spec
-              mkdir -p release
               mv /tmp/dist/borg "release/$ARTIFACT"
             '
 

@@ -184,6 +184,11 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     assert "--no-index" in workflow
     assert "--find-links /tmp/betterborg-wheels" in workflow
     assert "--requirement requirements-dev.lock" not in workflow
+    linux_build = workflow.split(
+        "- name: Build Linux one-file binary on glibc 2.17", maxsplit=1
+    )[1].split("- name: Smoke Darwin binary version", maxsplit=1)[0]
+    assert linux_build.index("mkdir release") < linux_build.index("docker run")
+    assert "mkdir -p release" not in linux_build
     assert 'test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"' in workflow
     assert 'version)" = "borg $REVIEWED_VERSION"' in workflow
     assert "scripts/release_artifacts.py checksum" in workflow
