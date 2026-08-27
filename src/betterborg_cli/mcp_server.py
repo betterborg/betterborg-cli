@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,25 +11,24 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
-from betterborg_cli.execution_estimate import (
-    EXECUTION_ESTIMATE_VERSION,
-    estimate_generation,
-    phase_billing_from_config,
-)
 from betterborg_cli.host_execution import HostPreflightBlock
 from betterborg_cli.onboarding import CreateService
-from betterborg_cli.planning import SupervisorLoop, TaskPublisher
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
     BorgState,
-    ExecutionDecision,
     ExecutionRunStatus,
     SqliteStore,
     TaskRuntimeCost,
     TaskRuntimeRow,
+)
+from betterborg_cli.workflow_service import (
+    ExecutionDecisionRequest,
+    approve_plan_workflow,
+    execute_workflow,
+    validated_current_plan_attempt,
 )
 from betterborg_cli.workspace_trust import require_workspace_trust
 
@@ -310,45 +308,16 @@ def _plan_actions(name: str, state: BorgState) -> tuple[NextAction, ...]:
 
 
 def _approve_plan(paths: RepoPaths, name: str) -> tuple[Any, Any, Path, Any]:
-    from betterborg_cli import cli as cli_module
-
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
-        borg = store.get_borg_by_name(repository.id, name)
-        if borg is None:
-            raise ValueError(f"Borg {name!r} does not exist")
-        approval, plan_path = cli_module._bind_plan_approval(paths, store, borg)
-        borg = store.get_borg(borg.id)
-        if borg is None:
-            raise RuntimeError(f"Borg {name!r} disappeared during approval")
-        if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
-            agent = select_agent(
-                config, ApiAgentRole.PLANNING, paths, interactive=False
-            )
-            borg = SupervisorLoop(
-                repository,
-                borg,
-                store,
-                agent,
-                pm_agent=agent,
-                approved_plan=approval.manifest["plan"],
-                plan_approval=approval,
-            ).run().borg
-        publication = None
-        if borg.state is BorgState.READY_TO_EXECUTE:
-            publication = TaskPublisher(repository, store).reconcile(borg.id)
-            if publication is None:
-                raise RuntimeError(
-                    f"Borg {name!r} is ready to execute but has no current tasks"
-                )
-        elif borg.state is not BorgState.BLOCKED:
-            raise RuntimeError(
-                f"decomposition stopped in unexpected state {borg.state.value!r}"
-            )
-    return borg, approval, plan_path, publication
+    result = approve_plan_workflow(
+        paths,
+        config,
+        name,
+        planning_agent=lambda: select_agent(
+            config, ApiAgentRole.PLANNING, paths, interactive=False
+        ),
+    )
+    return result.borg, result.approval, result.plan_path, result.publication
 
 
 @server.tool(name="plan")
@@ -388,7 +357,7 @@ def plan(
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")
-            attempt = cli_module._validated_current_plan_attempt(paths, store, borg)
+            attempt = validated_current_plan_attempt(paths, store, borg)
         return WorkflowResult(
             status=borg.state.value,
             next_actions=_plan_actions(name, borg.state),
@@ -472,91 +441,39 @@ def _execute(name: str, auto_execute: bool) -> WorkflowResult:
 
     paths = _paths(trusted=True)
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
-        borg = store.get_borg_by_name(repository.id, name)
-        if borg is None:
-            raise ValueError(f"Borg {name!r} does not exist")
-        if borg.state is not BorgState.READY_TO_EXECUTE:
-            raise ValueError(f"Borg {name!r} is not ready to execute")
-        publication = TaskPublisher(repository, store).inspect_current_task_files(
-            borg.id
-        )
-        generation = publication.generation
-        decision = store.get_current_execution_decision(borg.id)
-        estimate = decision.snapshot if decision is not None else estimate_generation(
-            generation.id,
-            [item.task for item in publication.files],
-            store.list_task_completion_samples(),
-            phase_billing_from_config(config),
-        )
-        if decision is None and not auto_execute:
-            return WorkflowResult(
-                status="estimate_approval_required",
-                artifacts=tuple(
-                    Artifact(kind="task", path=_relative(paths, item.path))
-                    for item in publication.files
+    workflow = execute_workflow(
+        paths,
+        config,
+        name,
+        decide=lambda _estimate: (
+            ExecutionDecisionRequest("mcp_auto_execute", "bypassed")
+            if auto_execute
+            else None
+        ),
+        invoke_host=cli_module._invoke_host_execution,
+    )
+    publication = workflow.publication
+    generation = publication.generation
+    estimate = workflow.estimate
+    result = workflow.host_result
+    if result is None:
+        return WorkflowResult(
+            status="estimate_approval_required",
+            artifacts=tuple(
+                Artifact(kind="task", path=_relative(paths, item.path))
+                for item in publication.files
+            ),
+            next_actions=(
+                NextAction(
+                    tool="execute",
+                    arguments={"name": name, "auto_execute": True},
                 ),
-                next_actions=(
-                    NextAction(
-                        tool="execute",
-                        arguments={"name": name, "auto_execute": True},
-                    ),
-                ),
-                data={
-                    "borg": name,
-                    "generation_id": str(generation.id),
-                    "estimate": estimate,
-                },
-            )
-        if decision is None:
-            approval = next(
-                (
-                    item
-                    for item in store.list_plan_approvals(borg.id)
-                    if item.id == generation.plan_approval_id
-                ),
-                None,
-            )
-            batch = next(
-                (
-                    item
-                    for item in store.list_task_batches(borg.id)
-                    if item.id == generation.batch_id
-                ),
-                None,
-            )
-            if approval is None or batch is None:
-                raise RuntimeError("current task generation has no approval or batch")
-            decision = ExecutionDecision(
-                borg_id=borg.id,
-                generation_id=generation.id,
-                approved_plan_digest=approval.plan_digest,
-                task_batch_digest=batch.digest,
-                estimate_version=EXECUTION_ESTIMATE_VERSION,
-                source="mcp_auto_execute",
-                snapshot=estimate,
-                decision="bypassed",
-            )
-            try:
-                store.append_execution_decision(decision)
-            except sqlite3.IntegrityError:
-                decision = store.get_current_execution_decision(borg.id)
-                if decision is None or decision.generation_id != generation.id:
-                    raise
-        if decision.decision not in {"approved", "bypassed"}:
-            raise RuntimeError(
-                "current generation has an unsupported execution decision"
-            )
-        result = cli_module._invoke_host_execution(
-            paths,
-            store,
-            config,
-            repository.id,
-            borg.id,
-            generation.id,
+            ),
+            data={
+                "borg": name,
+                "generation_id": str(generation.id),
+                "estimate": estimate,
+            },
         )
 
     if isinstance(result.preflight, HostPreflightBlock):

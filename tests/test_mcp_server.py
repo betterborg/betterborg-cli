@@ -380,6 +380,153 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     ]
 
 
+def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    monkeypatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-start")
+    plan = planning_plan_response(summary="MCP plan is ready.")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required?",
+                        "why": "The answer controls the test matrix.",
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted: paths,
+    )
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
+
+    waiting = _structured(
+        _call_tool("plan", {"name": "mcp-start", "action": "start"})
+    )
+
+    assert waiting["status"] == BorgState.ARCHITECT_AWAITING_ANSWERS.value
+    assert waiting["data"]["questions"] == [
+        {
+            "id": "q1",
+            "question": "Which platforms are required?",
+            "why": "The answer controls the test matrix.",
+        }
+    ]
+    assert waiting["next_actions"] == [
+        {
+            "tool": "plan",
+            "arguments": {"name": "mcp-start", "action": "start"},
+        }
+    ]
+
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=plan))
+    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    started = _structured(
+        _call_tool(
+            "plan",
+            {
+                "name": "mcp-start",
+                "action": "start",
+                "answers": ["Linux, macOS, and Windows."],
+            },
+        )
+    )
+    shown = _structured(
+        _call_tool("plan", {"name": "mcp-start", "action": "show"})
+    )
+
+    assert started["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+    assert [action["arguments"]["action"] for action in started["next_actions"]] == [
+        "show",
+        "approve",
+    ]
+    assert shown["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+    assert shown["data"] == {"borg": "mcp-start", "plan": plan}
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "mcp-start")
+        assert borg is not None
+        questions = store.list_planning_questions(borg.id)
+    assert questions[0].answers == [
+        {"q_id": "q1", "answer": "Linux, macOS, and Windows."}
+    ]
+
+
+def test_plan_change_validates_note_and_preserves_service_history(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    monkeypatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-change")
+    original = planning_plan_response(summary="Original MCP plan.")
+    revised = planning_plan_response(summary="Revised MCP plan.")
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        original,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
+
+    started = _structured(
+        _call_tool("plan", {"name": "mcp-change", "action": "start"})
+    )
+    assert started["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+
+    invalid = _call_tool(
+        "plan",
+        {"name": "mcp-change", "action": "change", "note": "   "},
+    )
+    assert invalid.isError is True
+    assert "plan change note must not be empty" in invalid.content[0].text
+
+    adapter.queue(MockResponse(payload=revised))
+    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    changed = _structured(
+        _call_tool(
+            "plan",
+            {
+                "name": "mcp-change",
+                "action": "change",
+                "note": "  Add staged rollout checks.  ",
+            },
+        )
+    )
+    shown = _structured(
+        _call_tool("plan", {"name": "mcp-change", "action": "show"})
+    )
+
+    assert changed["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+    assert shown["data"]["plan"] == revised
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "mcp-change")
+        assert borg is not None
+        attempts = store.list_planning_attempts(borg.id)
+        requests = store.list_plan_change_requests(borg.id)
+    assert [item.note for item in requests] == ["Add staged rollout checks."]
+    assert [
+        item.result["summary"]
+        for item in attempts
+        if item.phase == "architect_plan" and item.result is not None
+    ] == ["Original MCP plan.", "Revised MCP plan."]
+
+
 def test_plan_approval_automatically_decomposes_without_another_gate(
     committed_git_repo: Path,
     planning_cli_repository,
