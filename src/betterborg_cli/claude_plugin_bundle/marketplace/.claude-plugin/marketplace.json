@@ -1,0 +1,13 @@
+{
+  "name": "betterborg",
+  "owner": {
+    "name": "BetterBorg"
+  },
+  "plugins": [
+    {
+      "name": "borg",
+      "source": "./plugins/borg",
+      "description": "Plan and execute repository work with BetterBorg"
+    }
+  ]
+}

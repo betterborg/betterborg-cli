@@ -18,6 +18,7 @@ from betterborg_cli import __version__
 from betterborg_cli.agent_runtime import BillingMode
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
+from betterborg_cli.claude_plugin import install_claude_plugin
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
     estimate_generation,
@@ -106,6 +107,31 @@ def run_mcp_server() -> None:
     from betterborg_cli.mcp_server import run_stdio_server
 
     run_stdio_server()
+
+
+@cli.group()
+def plugin() -> None:
+    """Install BetterBorg integrations for supported agent hosts."""
+
+
+@plugin.command(name="install")
+@click.argument("host", type=click.Choice(("claude",), case_sensitive=False))
+def install_plugin(host: str) -> None:
+    """Install and explicitly enable the plugin for HOST."""
+    if host.casefold() != "claude":  # Defensive: Click currently enforces this.
+        raise click.ClickException(f"unsupported plugin host: {host}")
+    result = install_claude_plugin()
+    if not result.ready:
+        detail = result.reason or "Claude plugin activation failed"
+        if result.guidance:
+            detail = f"{detail}\n{result.guidance}"
+        raise click.ClickException(detail)
+    if result.status.value == "unchanged":
+        click.echo("Claude Code plugin is already installed and enabled.")
+    else:
+        click.echo("Installed and enabled the BetterBorg plugin for Claude Code.")
+    if result.reload_guidance:
+        click.echo(result.reload_guidance)
 
 
 def _stdin_is_interactive() -> bool:

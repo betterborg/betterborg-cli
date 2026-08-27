@@ -48,7 +48,14 @@ version = { attr = "betterborg_cli.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-betterborg_cli = ["store/migrations/*.sql"]
+betterborg_cli = [
+  "store/migrations/*.sql",
+  "claude_plugin_bundle/marketplace/.claude-plugin/*.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/.claude-plugin/*.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/.mcp.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/commands/*.md",
+  "claude_plugin_bundle/marketplace/plugins/borg/skills/*/*.md",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
