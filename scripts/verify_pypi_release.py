@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import subprocess
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
 PROVIDER_VARIABLE = "OPENAI_API_KEY"
 OTHER_PROVIDER_VARIABLE = "ANTHROPIC_API_KEY"
+PYPI_RELEASE_URL = "https://pypi.org/pypi/betterborg/{version}/json"
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -119,21 +122,98 @@ def _uvx_command(version: str, *borg_arguments: str) -> list[str]:
     ]
 
 
+def _expected_distribution_names(version: str) -> set[str]:
+    return {
+        f"betterborg-{version}-py3-none-any.whl",
+        f"betterborg-{version}.tar.gz",
+    }
+
+
+def _local_distribution_digests(
+    version: str, artifact_directory: Path
+) -> dict[str, str]:
+    digests: dict[str, str] = {}
+    for filename in sorted(_expected_distribution_names(version)):
+        path = artifact_directory / filename
+        try:
+            body = path.read_bytes()
+        except OSError:
+            _fail(f"reviewed distribution is missing or unreadable: {filename}")
+        digests[filename] = hashlib.sha256(body).hexdigest()
+    return digests
+
+
+def _public_distribution_digests(version: str) -> dict[str, str]:
+    quoted_version = urllib.parse.quote(version, safe="")
+    request = urllib.request.Request(
+        PYPI_RELEASE_URL.format(version=quoted_version),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+    except (OSError, ValueError):
+        _fail("could not retrieve public PyPI release metadata")
+
+    try:
+        payload = json.loads(body)
+        files = payload["urls"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        _fail("public PyPI release metadata is malformed")
+    if not isinstance(files, list):
+        _fail("public PyPI release metadata is malformed")
+
+    digests: dict[str, str] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            _fail("public PyPI release metadata is malformed")
+        filename = item.get("filename")
+        item_digests = item.get("digests")
+        digest = item_digests.get("sha256") if isinstance(item_digests, dict) else None
+        if not isinstance(filename, str) or not isinstance(digest, str):
+            _fail("public PyPI release metadata is malformed")
+        normalized_digest = digest.casefold()
+        valid_digest = len(normalized_digest) == 64 and all(
+            character in "0123456789abcdef" for character in normalized_digest
+        )
+        if not valid_digest or filename in digests:
+            _fail("public PyPI release metadata is malformed")
+        digests[filename] = normalized_digest
+    return digests
+
+
+def _verify_public_digests(version: str, artifact_directory: Path) -> None:
+    reviewed = _local_distribution_digests(version, artifact_directory)
+    public = _public_distribution_digests(version)
+    if public.keys() != reviewed.keys():
+        _fail("public PyPI artifact names do not match the reviewed distributions")
+    for filename, reviewed_digest in reviewed.items():
+        if public[filename] != reviewed_digest:
+            _fail(
+                f"public PyPI digest mismatch for {filename}; "
+                "the version is immutable, so prepare a new version"
+            )
+
+
 def verify_release(
     version: str,
     fixture_root: Path,
+    artifact_directory: Path = Path("dist"),
     *,
     attempts: int = 12,
     retry_delay: float = 10.0,
 ) -> None:
-    """Run version and init smoke checks against one exact PyPI version."""
+    """Compare artifacts and run smoke checks against one exact PyPI version."""
+    if attempts < 1:
+        _fail("attempts must be at least one")
+    _verify_public_digests(version, artifact_directory)
+
     credential = os.environ.get(PROVIDER_VARIABLE, "")
     if len(credential) < 12:
         _fail(
             f"{PROVIDER_VARIABLE} is missing or too short for the protected smoke"
         )
-    if attempts < 1:
-        _fail("attempts must be at least one")
 
     fixture_root.mkdir(parents=True, exist_ok=False)
     captures: list[CommandCapture] = []
@@ -191,7 +271,6 @@ def verify_release(
             _fail(f"{label} failed with exit code {completed.returncode}")
 
     child_environment = dict(safe_environment)
-    child_environment[PROVIDER_VARIABLE] = credential
     child_environment["XDG_STATE_HOME"] = str(fixture_root / ".release-state")
     child_environment["NO_COLOR"] = "1"
 
@@ -216,12 +295,14 @@ def verify_release(
     else:
         _fail("exact-version uvx check did not observe the reviewed public release")
 
+    init_environment = dict(child_environment)
+    init_environment[PROVIDER_VARIABLE] = credential
     initialized = _run(
         _uvx_command(version, "init", "--yes", "--json"),
         label="fixture repository init",
         captures=captures,
         cwd=fixture_root,
-        env=child_environment,
+        env=init_environment,
     )
     _assert_no_credential_leak(credential, captures, (fixture_root,))
     if initialized.returncode != 0:
@@ -237,6 +318,12 @@ def verify_release(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="exact reviewed PyPI version")
+    parser.add_argument(
+        "--artifacts",
+        type=Path,
+        default=Path("dist"),
+        help="directory containing the reviewed wheel and source distribution",
+    )
     parser.add_argument("--attempts", type=int, default=12)
     parser.add_argument("--retry-delay", type=float, default=10.0)
     arguments = parser.parse_args()
@@ -245,6 +332,7 @@ def main() -> int:
             verify_release(
                 arguments.version,
                 Path(temporary) / "fixture",
+                arguments.artifacts,
                 attempts=arguments.attempts,
                 retry_delay=arguments.retry_delay,
             )

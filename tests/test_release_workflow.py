@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -49,6 +51,50 @@ LEAK_TEST_REPRESENTATIONS = (
         base64.urlsafe_b64encode(LEAK_TEST_CREDENTIAL.encode()).rstrip(b"="),
     ),
 )
+
+
+class _RegistryResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._body = json.dumps(payload).encode()
+
+    def __enter__(self) -> _RegistryResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _release_artifacts(directory: Path, version: str) -> dict[str, bytes]:
+    distributions = {
+        f"betterborg-{version}-py3-none-any.whl": b"fixture wheel bytes",
+        f"betterborg-{version}.tar.gz": b"fixture source distribution bytes",
+    }
+    directory.mkdir()
+    for filename, body in distributions.items():
+        (directory / filename).write_bytes(body)
+    return distributions
+
+
+def _registry_payload(
+    distributions: dict[str, bytes],
+    *,
+    digest_overrides: dict[str, str] | None = None,
+) -> dict[str, object]:
+    overrides = digest_overrides or {}
+    return {
+        "urls": [
+            {
+                "filename": filename,
+                "digests": {
+                    "sha256": overrides.get(filename, hashlib.sha256(body).hexdigest())
+                },
+            }
+            for filename, body in distributions.items()
+        ]
+    }
 
 
 def _workflow_text() -> str:
@@ -104,7 +150,11 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     credential = "release-secret-value-12345"
+    version = "1.2.3"
+    artifacts = tmp_path / "artifacts"
+    distributions = _release_artifacts(artifacts, version)
     calls: list[tuple[list[str], dict[str, str] | None]] = []
+    requests = []
 
     def fake_run(command, **kwargs):
         child_environment = kwargs.get("env")
@@ -117,14 +167,28 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
             stdout = b""
         return subprocess.CompletedProcess(command, 0, stdout, b"")
 
+    def fake_urlopen(request, *, timeout):
+        requests.append((request, timeout))
+        return _RegistryResponse(_registry_payload(distributions))
+
     monkeypatch.setenv("OPENAI_API_KEY", credential)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-be-forwarded")
     monkeypatch.setattr(verify_pypi_release.subprocess, "run", fake_run)
+    monkeypatch.setattr(verify_pypi_release.urllib.request, "urlopen", fake_urlopen)
 
     verify_pypi_release.verify_release(
-        "1.2.3", tmp_path / "fixture", attempts=1, retry_delay=0
+        version,
+        tmp_path / "fixture",
+        artifacts,
+        attempts=1,
+        retry_delay=0,
     )
 
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert request.full_url == "https://pypi.org/pypi/betterborg/1.2.3/json"
+    assert request.get_method() == "GET"
+    assert timeout == 30
     uvx_calls = [call for call in calls if call[0][0] == "uvx"]
     assert [command for command, _environment in uvx_calls] == [
         ["uvx", "--refresh", "--from", "betterborg==1.2.3", "borg", "version"],
@@ -139,12 +203,91 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
             "--json",
         ],
     ]
-    for _command, environment in uvx_calls:
-        assert environment is not None
-        assert environment["OPENAI_API_KEY"] == credential
+    version_environment = uvx_calls[0][1]
+    init_environment = uvx_calls[1][1]
+    assert version_environment is not None
+    assert init_environment is not None
+    assert "OPENAI_API_KEY" not in version_environment
+    assert init_environment["OPENAI_API_KEY"] == credential
+    for environment in (version_environment, init_environment):
         assert "ANTHROPIC_API_KEY" not in environment
         assert Path(environment["XDG_STATE_HOME"]).is_relative_to(
             tmp_path / "fixture"
+        )
+    assert all(
+        not ({"publish", "upload", "twine"} & set(command))
+        for command, _environment in calls
+    )
+
+
+def test_release_smoke_rejects_a_public_digest_mismatch_before_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = "1.2.3"
+    artifacts = tmp_path / "artifacts"
+    distributions = _release_artifacts(artifacts, version)
+    wheel = f"betterborg-{version}-py3-none-any.whl"
+    payload = _registry_payload(distributions, digest_overrides={wheel: "0" * 64})
+
+    monkeypatch.setattr(
+        verify_pypi_release.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _RegistryResponse(payload),
+    )
+    monkeypatch.setattr(
+        verify_pypi_release.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "no command may run after an immutable digest mismatch"
+        ),
+    )
+
+    with pytest.raises(
+        verify_pypi_release.ReleaseVerificationError,
+        match="digest mismatch.*immutable.*new version",
+    ):
+        verify_pypi_release.verify_release(
+            version,
+            tmp_path / "fixture",
+            artifacts,
+            attempts=1,
+            retry_delay=0,
+        )
+
+
+def test_release_smoke_rejects_wrong_version_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = "1.2.3"
+    artifacts = tmp_path / "artifacts"
+    distributions = _release_artifacts(artifacts, version)
+
+    def fake_run(command, **_kwargs):
+        stdout = b"borg 1.2.2\n" if command[-1:] == ["version"] else b""
+        return subprocess.CompletedProcess(command, 0, stdout, b"")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "release-secret-value-12345")
+    monkeypatch.setattr(verify_pypi_release.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        verify_pypi_release.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _RegistryResponse(
+            _registry_payload(distributions)
+        ),
+    )
+
+    with pytest.raises(
+        verify_pypi_release.ReleaseVerificationError,
+        match="exact-version uvx check",
+    ):
+        verify_pypi_release.verify_release(
+            version,
+            tmp_path / "fixture",
+            artifacts,
+            attempts=1,
+            retry_delay=0,
         )
 
 
@@ -198,6 +341,10 @@ def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:
         "Workflow filename: `release.yml`",
         "GitHub environment: `pypi`",
         "OPENAI_API_KEY",
+        "reviewed `vVERSION` tag",
+        "Re-run failed jobs",
+        "compares their SHA-256 digests",
+        "existing publication is the reviewed release",
         "do not delete, replace, or retry with the same version",
         "new version",
     ):
