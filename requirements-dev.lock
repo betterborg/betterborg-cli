@@ -1,6 +1,6 @@
 # Fully pinned development environment for Python 3.11+.
 # Regenerate with:
-#   uv pip compile pyproject.toml --all-groups --output-file requirements-dev.lock
+#   uv pip compile pyproject.toml --group dev --output-file requirements-dev.lock
 build==1.2.2.post1
 click==8.1.8
 colorama==0.4.6; platform_system == "Windows"
