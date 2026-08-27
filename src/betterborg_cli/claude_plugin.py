@@ -75,6 +75,7 @@ class _BundleChange:
 class _PluginState:
     installed: bool
     enabled: bool
+    version: str | None
 
 
 @dataclass(slots=True)
@@ -155,7 +156,7 @@ def install_claude_plugin(
         else bundle_source
     )
     try:
-        digest = _validate_and_digest_bundle(source)
+        digest, version = _validate_and_digest_bundle(source)
     except (OSError, ValueError) as error:
         return ClaudePluginInstallation(
             status=ClaudePluginStatus.FAILED,
@@ -185,7 +186,7 @@ def install_claude_plugin(
             command_runner,
         )
         before = _plugin_state(plugins)
-        change = _materialize_bundle(source, marketplace_path, digest)
+        change = _materialize_bundle(source, marketplace_path, digest, version)
     except _CollisionError as error:
         return ClaudePluginInstallation(
             status=ClaudePluginStatus.COLLISION,
@@ -282,6 +283,11 @@ def install_claude_plugin(
         if not verified.installed or not verified.enabled:
             raise _ClaudeCommandError(
                 f"Claude did not report {PLUGIN_ID} as installed and enabled."
+            )
+        if verified.version != version:
+            reported = verified.version or "an unknown version"
+            raise _ClaudeCommandError(
+                f"Claude reported {PLUGIN_ID} at {reported}, expected {version}."
             )
         (mcp_verifier or verify_borg_mcp)(preflight, environment)
     except (OSError, ValueError, _ClaudeCommandError) as error:
@@ -470,6 +476,7 @@ def _owned_marketplace_source(entry: dict[str, Any], expected: Path) -> bool:
 def _plugin_state(value: Any) -> _PluginState:
     installed = False
     enabled = False
+    version = None
     for entry in _records(value, "plugins"):
         identifier = entry.get("id") or entry.get("plugin")
         name = entry.get("name")
@@ -485,10 +492,12 @@ def _plugin_state(value: Any) -> _PluginState:
             if entry_enabled is None:
                 entry_enabled = entry.get("status") == "enabled"
             enabled = enabled or bool(entry_enabled)
-    return _PluginState(installed=installed, enabled=enabled)
+            if isinstance(entry.get("version"), str):
+                version = entry["version"]
+    return _PluginState(installed=installed, enabled=enabled, version=version)
 
 
-def _validate_and_digest_bundle(source: Any) -> str:
+def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     required = (
         ".claude-plugin/marketplace.json",
         "plugins/borg/.claude-plugin/plugin.json",
@@ -511,8 +520,15 @@ def _validate_and_digest_bundle(source: Any) -> str:
         raise ValueError("marketplace name is not stable")
     if manifest.get("name") != PLUGIN_NAME:
         raise ValueError("plugin name is not stable")
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("plugin version must be a non-empty string")
     if mcp != {"mcpServers": {"borg": {"command": "borg", "args": ["mcp"]}}}:
         raise ValueError("MCP registration must execute `borg mcp`")
+    return _bundle_digest(source), version
+
+
+def _bundle_digest(source: Any) -> str:
     digest = hashlib.sha256()
     for relative, body in _bundle_files(source):
         digest.update(relative.encode())
@@ -533,7 +549,12 @@ def _bundle_files(source: Any, prefix: str = "") -> list[tuple[str, bytes]]:
     return sorted(files)
 
 
-def _materialize_bundle(source: Any, destination: Path, digest: str) -> _BundleChange:
+def _materialize_bundle(
+    source: Any,
+    destination: Path,
+    digest: str,
+    version: str,
+) -> _BundleChange:
     created_parents = []
     parent = destination.parent
     while not parent.exists():
@@ -547,15 +568,30 @@ def _materialize_bundle(source: Any, destination: Path, digest: str) -> _BundleC
                 f"Claude bundle path {destination} already exists without "
                 "BetterBorg ownership metadata; it was left untouched."
             )
-        if ownership.get("digest") == digest:
+        materialized_digest = _bundle_digest(destination)
+        if ownership.get("digest") == digest and materialized_digest == digest:
             return _BundleChange(path=destination, digest=digest, changed=False)
+        if ownership.get("digest") != digest and materialized_digest != digest:
+            previous_version = ownership.get("version")
+            if not isinstance(previous_version, str):
+                previous_version = _bundle_version(destination)
+            if previous_version == version:
+                raise ValueError(
+                    f"Claude plugin bundle content changed without a version bump "
+                    f"from {version}."
+                )
 
     staging = destination.parent / f".marketplace-staging-{uuid4().hex}"
     try:
         _copy_tree(source, staging)
         staging.joinpath(_OWNER_FILE).write_text(
             json.dumps(
-                {"schema": _OWNER_SCHEMA, "owner": "betterborg-cli", "digest": digest},
+                {
+                    "schema": _OWNER_SCHEMA,
+                    "owner": "betterborg-cli",
+                    "digest": digest,
+                    "version": version,
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -590,6 +626,16 @@ def _copy_tree(source: Any, destination: Path) -> None:
             _copy_tree(child, target)
         elif child.is_file():
             target.write_bytes(child.read_bytes())
+
+
+def _bundle_version(source: Any) -> str | None:
+    manifest = source / "plugins/borg/.claude-plugin/plugin.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    version = value.get("version") if isinstance(value, dict) else None
+    return version if isinstance(version, str) else None
 
 
 def _ownership(path: Path) -> dict[str, Any] | None:

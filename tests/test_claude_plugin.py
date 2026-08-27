@@ -42,6 +42,8 @@ class _FakeClaude:
         self.marketplace_source: str | None = None
         self.installed = False
         self.enabled = False
+        self.installed_version: str | None = None
+        self.retain_version_on_update = False
         self.other_installations: list[dict[str, object]] = []
         self.fail_once: tuple[str, ...] | None = None
 
@@ -64,7 +66,12 @@ class _FakeClaude:
             entries = list(self.other_installations)
             if self.installed:
                 entries.append(
-                    {"id": PLUGIN_ID, "scope": "user", "enabled": self.enabled}
+                    {
+                        "id": PLUGIN_ID,
+                        "version": self.installed_version,
+                        "scope": "user",
+                        "enabled": self.enabled,
+                    }
                 )
             return self._json(command, {"plugins": entries})
         if call[:3] == ("plugin", "marketplace", "add"):
@@ -72,6 +79,7 @@ class _FakeClaude:
         elif call == ("plugin", "install", PLUGIN_ID, "--scope", "user"):
             self.installed = True
             self.enabled = True
+            self.installed_version = self._available_version()
         elif call == ("plugin", "enable", PLUGIN_ID, "--scope", "user"):
             self.enabled = True
         elif call == ("plugin", "disable", PLUGIN_ID, "--scope", "user"):
@@ -79,6 +87,7 @@ class _FakeClaude:
         elif call == ("plugin", "uninstall", PLUGIN_ID, "--scope", "user"):
             self.installed = False
             self.enabled = False
+            self.installed_version = None
         elif call == (
             "plugin",
             "marketplace",
@@ -90,11 +99,16 @@ class _FakeClaude:
             self.marketplace_source = None
             self.installed = False
             self.enabled = False
-        elif call in {
-            ("plugin", "marketplace", "update", MARKETPLACE_NAME),
-            ("plugin", "update", PLUGIN_ID, "--scope", "user"),
-        }:
+            self.installed_version = None
+        elif call == ("plugin", "marketplace", "update", MARKETPLACE_NAME):
             pass
+        elif call == ("plugin", "update", PLUGIN_ID, "--scope", "user"):
+            available = self._available_version()
+            if (
+                available != self.installed_version
+                and not self.retain_version_on_update
+            ):
+                self.installed_version = available
         else:
             raise AssertionError(f"unexpected Claude command: {call}")
         return subprocess.CompletedProcess(command, 0, "ok\n", "")
@@ -102,6 +116,14 @@ class _FakeClaude:
     @staticmethod
     def _json(command, value):
         return subprocess.CompletedProcess(command, 0, json.dumps(value), "")
+
+    def _available_version(self) -> str:
+        assert self.marketplace_source is not None
+        manifest = (
+            Path(self.marketplace_source)
+            / "plugins/borg/.claude-plugin/plugin.json"
+        )
+        return json.loads(manifest.read_text(encoding="utf-8"))["version"]
 
 
 def _host(tmp_path: Path, fake: _FakeClaude):
@@ -266,6 +288,88 @@ def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
     assert ("plugin", "update", PLUGIN_ID, "--scope", "user") in fake.calls
 
 
+def test_owned_bundle_change_requires_a_new_plugin_version(tmp_path: Path) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    original_command = first.bundle_path.joinpath(
+        "plugins/borg/commands/borg.md"
+    ).read_text(encoding="utf-8")
+    source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
+    changed = tmp_path / "same-version-marketplace"
+    _copy_resource(source, changed)
+    command = changed / "plugins/borg/commands/borg.md"
+    command.write_text(command.read_text() + "\nChanged content.\n")
+    fake.calls.clear()
+
+    result, spawns = _install(tmp_path, fake, bundle_source=changed)
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "without a version bump from 0.1.0" in (result.reason or "")
+    assert first.bundle_path.joinpath("plugins/borg/commands/borg.md").read_text(
+        encoding="utf-8"
+    ) == original_command
+    assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) not in fake.calls
+    assert ("plugin", "update", PLUGIN_ID, "--scope", "user") not in fake.calls
+    assert spawns == []
+
+
+def test_owned_upgrade_requires_claude_to_report_the_new_version(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
+    upgraded = tmp_path / "uncached-upgrade-marketplace"
+    _copy_resource(source, upgraded)
+    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["version"] = "0.2.0"
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    fake.retain_version_on_update = True
+    fake.calls.clear()
+
+    result, spawns = _install(tmp_path, fake, bundle_source=upgraded)
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "reported borg@betterborg at 0.1.0, expected 0.2.0" in (
+        result.reason or ""
+    )
+    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
+        "0.1.0"
+    )
+    assert fake.installed_version == "0.1.0"
+    assert spawns == []
+
+
+@pytest.mark.parametrize("damage", ["changed", "deleted"])
+def test_reinstall_repairs_materialized_bundle_contents(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    command = first.bundle_path / "plugins/borg/commands/borg.md"
+    expected = command.read_text(encoding="utf-8")
+    if damage == "changed":
+        command.write_text("altered\n", encoding="utf-8")
+    else:
+        command.unlink()
+    fake.calls.clear()
+
+    result, spawns = _install(tmp_path, fake)
+
+    assert result.status is ClaudePluginStatus.INSTALLED
+    assert command.read_text(encoding="utf-8") == expected
+    assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) in fake.calls
+    assert ("plugin", "update", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert fake.installed_version == "0.1.0"
+    assert len(spawns) == 1
+
+
 def test_foreign_marketplace_collision_is_left_untouched(tmp_path: Path) -> None:
     fake = _FakeClaude()
     fake.marketplace_source = str(tmp_path / "someone-elses-marketplace")
@@ -291,6 +395,10 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     _copy_resource(source, upgraded)
     command = upgraded / "plugins/borg/commands/borg.md"
     command.write_text(command.read_text() + "\nUpgrade content.\n")
+    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["version"] = "0.2.0"
+    manifest.write_text(json.dumps(value), encoding="utf-8")
     fake.enabled = False
     fake.fail_once = ("plugin", "update", PLUGIN_ID, "--scope", "user")
 
