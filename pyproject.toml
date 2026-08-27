@@ -37,6 +37,8 @@ dev = [
   "build>=1.2,<2",
   "pytest>=8,<9",
   "ruff>=0.12,<1",
+  "setuptools>=77",
+  "wheel",
 ]
 
 [tool.setuptools.dynamic]
