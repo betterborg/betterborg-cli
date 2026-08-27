@@ -9,7 +9,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import anyio
 import pytest
@@ -28,6 +28,7 @@ from betterborg_cli.store import (
     AgentAttempt,
     Borg,
     BorgState,
+    ExecutionEvent,
     ExecutionRun,
     ExecutionRunStatus,
     PlanApproval,
@@ -83,6 +84,32 @@ def _list_tools():
             return await session.list_tools()
 
     return anyio.run(list_tools).tools
+
+
+def _list_resource_templates():
+    async def list_resource_templates():
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+        ) as session:
+            return await session.list_resource_templates()
+
+    return anyio.run(list_resource_templates).resourceTemplates
+
+
+def _read_resource(uri: str) -> dict:
+    async def read_resource():
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+        ) as session:
+            return await session.read_resource(uri)
+
+    result = anyio.run(read_resource)
+    assert len(result.contents) == 1
+    content = result.contents[0]
+    assert isinstance(content, mcp_types.TextResourceContents)
+    return json.loads(content.text)
 
 
 def _structured(result) -> dict:
@@ -311,6 +338,121 @@ def test_tool_inventory_has_typed_results_and_no_removed_gates() -> None:
     assert "confirmed" not in create_schema["properties"]
     execute_schema = next(tool.inputSchema for tool in tools if tool.name == "execute")
     assert "auto_execute" not in execute_schema["properties"]
+
+
+def test_progress_resources_reconnect_and_resume_durable_execution_events(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch,
+) -> None:
+    paths, borg, current, _publication = _published_runtime(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+    )
+    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted, io=None: paths)
+
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        operation = store.list_execution_runs(borg.id)[0]
+        attempt = next(
+            item
+            for item in store.list_agent_attempts(current.task.id)
+            if item.phase == "phase-1"
+        )
+        started = operation.started_at
+        acquired = ExecutionEvent(
+            id=UUID("00000000-0000-0000-0000-000000000101"),
+            run_id=operation.id,
+            kind="run.acquired",
+            payload={"message": "Execution started"},
+            created_at=started,
+        )
+        attempted = ExecutionEvent(
+            id=UUID("00000000-0000-0000-0000-000000000102"),
+            run_id=operation.id,
+            task_id=current.task.id,
+            attempt_id=attempt.id,
+            kind="agent.progress",
+            payload={"summary": "Coding attempt completed"},
+            created_at=started + timedelta(seconds=1),
+        )
+        store.append_execution_event(acquired)
+        store.append_execution_event(attempted)
+
+    templates = _list_resource_templates()
+    assert [(item.name, item.uriTemplate) for item in templates] == [
+        ("operation_progress", "betterborg://progress/{operation_id}"),
+        (
+            "operation_progress_after",
+            "betterborg://progress/{operation_id}/after/{event_id}",
+        ),
+    ]
+
+    initial = _read_resource(f"betterborg://progress/{operation.id}")
+    assert initial == {
+        "events": [
+            {
+                "event_id": str(acquired.id),
+                "operation_id": str(operation.id),
+                "borg": "mcp-runtime",
+                "task": None,
+                "phase": "execution",
+                "message": "Execution started",
+                "completed": 0,
+                "total": 1,
+            },
+            {
+                "event_id": str(attempted.id),
+                "operation_id": str(operation.id),
+                "borg": "mcp-runtime",
+                "task": "T-MCP-1",
+                "phase": "phase-1",
+                "message": "Coding attempt completed",
+                "completed": 0,
+                "total": 1,
+            },
+        ]
+    }
+
+    completed = ExecutionEvent(
+        id=UUID("00000000-0000-0000-0000-000000000103"),
+        run_id=operation.id,
+        task_id=current.task.id,
+        kind="task.phase_transitioned",
+        payload={
+            "from": "merging",
+            "to": "done",
+            "message": "Task completed",
+        },
+        created_at=started + timedelta(seconds=2),
+    )
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        store.append_execution_event(completed)
+
+    resumed = _read_resource(
+        f"betterborg://progress/{operation.id}/after/{attempted.id}"
+    )
+    assert resumed == {
+        "events": [
+            {
+                "event_id": str(completed.id),
+                "operation_id": str(operation.id),
+                "borg": "mcp-runtime",
+                "task": "T-MCP-1",
+                "phase": "done",
+                "message": "Task completed",
+                "completed": 1,
+                "total": 1,
+            }
+        ]
+    }
+    reconnected = _read_resource(f"betterborg://progress/{operation.id}")
+    assert [event["event_id"] for event in reconnected["events"]] == [
+        str(acquired.id),
+        str(attempted.id),
+        str(completed.id),
+    ]
 
 
 def _additional_properties(value) -> list[object]:
