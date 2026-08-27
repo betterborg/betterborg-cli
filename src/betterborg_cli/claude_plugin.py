@@ -322,9 +322,13 @@ def install_claude_plugin(
             plugin_before=before,
             host_changes=host_changes,
         )
-        reason = f"Claude plugin activation failed and was rolled back: {error}"
-        if rollback_error is not None:
-            reason += f" Rollback also failed: {rollback_error}"
+        if rollback_error is None:
+            reason = f"Claude plugin activation failed and was rolled back: {error}"
+        else:
+            reason = (
+                f"Claude plugin activation failed: {error} "
+                f"Rollback also failed: {rollback_error}"
+            )
         return ClaudePluginInstallation(
             status=ClaudePluginStatus.FAILED,
             preflight=preflight,
@@ -793,4 +797,50 @@ def _rollback(
                 pass
             except OSError as error:
                 errors.append(str(error))
+
+    try:
+        marketplaces = _json_command(
+            (claude, "plugin", "marketplace", "list", "--json"),
+            environment,
+            command_runner,
+        )
+    except _ClaudeCommandError as error:
+        errors.append(f"could not verify the restored marketplace state: {error}")
+    else:
+        marketplace_after = _marketplace_entry(marketplaces)
+        if marketplace_preexisting:
+            if marketplace_after is None:
+                errors.append(
+                    f"Claude no longer reports marketplace {MARKETPLACE_NAME!r}"
+                )
+            elif not _owned_marketplace_source(marketplace_after, change.path):
+                errors.append(
+                    f"Claude reports marketplace {MARKETPLACE_NAME!r} from an "
+                    "unexpected source after rollback"
+                )
+        elif marketplace_after is not None:
+            errors.append(
+                f"Claude still reports marketplace {MARKETPLACE_NAME!r} after "
+                "rollback"
+            )
+
+    try:
+        plugins = _json_command(
+            (claude, "plugin", "list", "--json"),
+            environment,
+            command_runner,
+        )
+    except _ClaudeCommandError as error:
+        errors.append(f"could not verify the restored plugin state: {error}")
+    else:
+        plugin_after = _plugin_state(plugins)
+        if plugin_after != plugin_before:
+            errors.append(
+                f"Claude reports {PLUGIN_ID} after rollback as "
+                f"installed={plugin_after.installed}, enabled={plugin_after.enabled}, "
+                f"version={plugin_after.version!r}; expected "
+                f"installed={plugin_before.installed}, "
+                f"enabled={plugin_before.enabled}, "
+                f"version={plugin_before.version!r}"
+            )
     return "; ".join(errors) or None

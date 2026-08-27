@@ -460,6 +460,41 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     assert list(first.bundle_path.parent.joinpath("backups").glob("failed-*"))
 
 
+def test_failed_upgrade_reports_no_op_plugin_rollback(tmp_path: Path) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
+    upgraded = tmp_path / "rollback-no-op"
+    _copy_resource(source, upgraded)
+    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["version"] = "0.2.0"
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    def fail_verification(*_args) -> None:
+        fake.retain_version_on_update = True
+        raise ValueError("injected MCP failure")
+
+    result, spawns = _install(
+        tmp_path,
+        fake,
+        bundle_source=upgraded,
+        mcp_verifier=fail_verification,
+    )
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "Rollback also failed" in (result.reason or "")
+    assert "version='0.2.0'; expected" in (result.reason or "")
+    assert "version='0.1.0'" in (result.reason or "")
+    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
+        "0.1.0"
+    )
+    assert fake.installed_version == "0.2.0"
+    assert spawns == []
+
+
 def test_failed_bundle_promotion_immediately_restores_previous_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
