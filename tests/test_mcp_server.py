@@ -91,6 +91,36 @@ def _structured(result) -> dict:
     return result.structuredContent
 
 
+def test_empty_elicitation_capability_supports_legacy_form_mode() -> None:
+    params = mcp_types.InitializeRequestParams.model_validate(
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"elicitation": {}},
+            "clientInfo": {"name": "legacy-form-client", "version": "1.0"},
+        }
+    )
+    context = SimpleNamespace(
+        session=SimpleNamespace(client_params=params),
+    )
+
+    assert mcp_server.McpInteractiveIO.supported(context) is True
+
+
+def test_url_only_elicitation_capability_does_not_support_forms() -> None:
+    params = mcp_types.InitializeRequestParams.model_validate(
+        {
+            "protocolVersion": mcp_types.LATEST_PROTOCOL_VERSION,
+            "capabilities": {"elicitation": {"url": {}}},
+            "clientInfo": {"name": "url-only-client", "version": "1.0"},
+        }
+    )
+    context = SimpleNamespace(
+        session=SimpleNamespace(client_params=params),
+    )
+
+    assert mcp_server.McpInteractiveIO.supported(context) is False
+
+
 def _task_body() -> dict:
     return {
         "stage": "01-foundation",

@@ -455,7 +455,13 @@ class McpInteractiveIO(InteractiveIO):
         params = context.session.client_params
         if params is None or params.capabilities.elicitation is None:
             return False
-        return params.capabilities.elicitation.form is not None
+        capability = params.capabilities.elicitation
+        # MCP 2025-06-18 only defined form elicitation and advertised support
+        # with an empty object. Newer clients can identify form and URL modes
+        # separately, so URL-only support must still be rejected here.
+        return capability.form is not None or (
+            capability.form is None and capability.url is None
+        )
 
     def _message(self, message: str) -> str:
         if not self._rendered:
