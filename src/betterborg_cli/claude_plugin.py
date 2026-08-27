@@ -449,12 +449,17 @@ def _data_root(environment: Mapping[str, str], explicit: Path | None) -> Path:
         return Path(explicit).expanduser().resolve(strict=False)
     if environment.get("XDG_DATA_HOME"):
         return Path(environment["XDG_DATA_HOME"]).expanduser().resolve(strict=False)
-    home = environment.get("HOME")
-    if not home:
-        raise ValueError(
-            "HOME or XDG_DATA_HOME is required to install the Claude plugin"
-        )
-    return Path(home).expanduser().resolve(strict=False) / ".local" / "share"
+    home = environment.get("HOME") or environment.get("USERPROFILE")
+    if home:
+        home_path = Path(home).expanduser().resolve(strict=False)
+    else:
+        try:
+            home_path = Path.home().resolve(strict=False)
+        except RuntimeError as error:
+            raise ValueError(
+                "Unable to determine the user home for the Claude plugin"
+            ) from error
+    return home_path / ".local" / "share"
 
 
 def _records(value: Any, collection: str) -> list[dict[str, Any]]:

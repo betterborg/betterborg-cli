@@ -193,6 +193,27 @@ def test_fresh_activation_materializes_registers_enables_and_spawns_mcp(
     assert "/reload-plugins" in result.reload_guidance
 
 
+def test_native_windows_user_profile_selects_owned_data_root(tmp_path: Path) -> None:
+    fake = _FakeClaude()
+    environment, lookup, verify, spawns = _host(tmp_path, fake)
+    profile = tmp_path / "windows-profile"
+    environment.pop("HOME")
+    environment["USERPROFILE"] = str(profile)
+
+    result = install_claude_plugin(
+        launch_environment=environment,
+        executable_lookup=lookup,
+        command_runner=fake,
+        mcp_verifier=verify,
+    )
+
+    expected = profile / ".local/share/betterborg/claude/marketplace"
+    assert result.status is ClaudePluginStatus.INSTALLED
+    assert result.bundle_path == expected
+    assert fake.marketplace_source == str(expected)
+    assert len(spawns) == 1
+
+
 def test_reinstall_is_a_verified_no_op(tmp_path: Path) -> None:
     fake = _FakeClaude()
     first, _ = _install(tmp_path, fake)
