@@ -118,8 +118,10 @@ def test_protected_job_depends_on_exact_reviewed_artifacts() -> None:
     assert "needs: [validate-release]" in workflow
     assert "inputs.publish && github.ref == 'refs/heads/main'" in workflow
     assert "name: pypi" in workflow
-    assert workflow.count("id-token: write") == 1
-    assert workflow.index("id-token: write") > workflow.index("publish-pypi:")
+    assert workflow.count("id-token: write") == 2
+    pypi_oidc = workflow.index("id-token: write", workflow.index("publish-pypi:"))
+    binary_oidc = workflow.index("id-token: write", pypi_oidc + 1)
+    assert pypi_oidc < workflow.index("build-binaries:") < binary_oidc
     assert "pypa/gh-action-pypi-publish@release/v1" in workflow
     assert "packages-dir: dist/" in workflow
     assert "skip-existing: false" in workflow

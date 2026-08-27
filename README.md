@@ -37,8 +37,9 @@ local one-file `dist/borg` executable with the same package assets; neither
 target publishes an artifact.
 
 Release maintainers use the protected, manual process in
-[the PyPI release runbook](docs/releasing.md). Its default validation path does
-not publish.
+[the release runbook](docs/releasing.md). Its default validation path does not
+publish. The protected path verifies PyPI before building attested one-file
+binaries for Darwin and Linux on ARM64 and x86_64.
 
 `borg version` and `borg --help` are bootstrap commands. They do not create or
 initialize a repository.

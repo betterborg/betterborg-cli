@@ -1,9 +1,11 @@
-# PyPI release runbook
+# PyPI and standalone binary release runbook
 
 The `.github/workflows/release.yml` workflow is manual and defaults to a
 nonpublishing validation run. Public upload requires the `publish` input, a
 run from `main`, and approval of the protected `pypi` GitHub environment.
-Ordinary pushes and pull requests never invoke this workflow.
+Ordinary pushes and pull requests never invoke this workflow; CI calls the
+same reusable four-platform binary workflow with publication and attestations
+disabled.
 
 ## One-time protected setup
 
@@ -45,7 +47,7 @@ different commit under the reviewed tag's version.
 
 ## Run or resume the merged workflow
 
-1. After `.github/workflows/release.yml` is merged, open **Release to PyPI** in
+1. After `.github/workflows/release.yml` is merged, open **Release BetterBorg** in
    GitHub Actions, choose **Run workflow**, select `main`, enter the exact
    reviewed version, leave `publish` disabled, and require **Validate release
    without publishing** to pass.
@@ -58,6 +60,30 @@ different commit under the reviewed tag's version.
    runs `uvx --refresh --from 'betterborg==VERSION' borg version` and `borg
    init --yes --json` from that exact distribution in a disposable, committed
    Git fixture.
+4. The PyPI verification gate must succeed before any standalone build starts.
+   The reusable build workflow then produces and version-smokes
+   `borg-darwin-arm64`, `borg-darwin-x86_64`, `borg-linux-arm64`, and
+   `borg-linux-x86_64`, writes one `.sha256` sidecar per binary, and generates
+   `release-manifest.json`. Each protected binary/checksum pair and the
+   manifest receives a GitHub artifact attestation.
+5. The final job reads the existing `vVERSION` GitHub Release before changing
+   it. It compares every existing asset byte-for-byte by SHA-256, uploads only
+   missing assets to a matching draft, and publishes the complete draft. It
+   never overwrites an asset. A complete matching published release is a
+   successful resume and needs no mutation.
+
+Linux binaries are built natively on `ubuntu-24.04` and
+`ubuntu-24.04-arm` inside the architecture-matched PyPA `manylinux2014`
+container. That documented old-glibc runner has glibc 2.17; do not replace it
+with the host Python or a newer manylinux image without a compatibility review.
+Darwin ARM64 uses `macos-14`, and Darwin x86_64 uses `macos-15-intel`; none of
+the four deliverables is cross-compiled.
+
+The reusable workflow grants `id-token: write` and `attestations: write` only
+to its build and manifest jobs. The PyPI job is the only other OIDC consumer.
+Only the final, publish-enabled reconciliation job receives `contents: write`;
+the fixture validation path remains read-only and cannot create a GitHub
+Release.
 
 If a run is interrupted before the upload step starts, use **Re-run failed
 jobs** on the same workflow run after confirming its SHA and inputs. If any
@@ -99,3 +125,38 @@ version, review and tag that commit, rerun the nonpublishing validation, and
 publish the new version. A transient version or init check may be rerun only as
 read-only verification after the artifact digests have matched; it never
 authorizes another upload for the existing version.
+
+## Binary recovery and rollback
+
+For an interrupted binary build, use **Re-run failed jobs** only after the PyPI
+digests have been verified again. Builds are replaceable workflow artifacts;
+the GitHub Release assets are not. Before approving a resume, download the
+`binary-release-VERSION` workflow artifact and confirm that it contains exactly
+the four binaries, their four checksum sidecars, and `release-manifest.json`.
+The manifest records `schema_version`, `version`, and, for each target, its
+`filename`, `os`, `arch`, `sha256`, and byte `size`.
+
+If reconciliation stopped after creating or partially filling a draft, rerun
+the final job. Matching remote digests are retained and only absent assets are
+uploaded. If any draft digest differs, delete nothing and overwrite nothing:
+preserve the draft for investigation and prepare a new reviewed version. If a
+published release is partial, it is also immutable and requires a new version.
+
+After publication, verify a downloaded binary before use:
+
+```console
+sha256sum --check borg-OPERATING_SYSTEM-ARCHITECTURE.sha256
+gh attestation verify borg-OPERATING_SYSTEM-ARCHITECTURE \
+  --repo betterborg/betterborg-cli
+./borg-OPERATING_SYSTEM-ARCHITECTURE version
+```
+
+On Darwin, use `shasum -a 256 -c` in place of `sha256sum --check`. The version
+output must be exactly `borg VERSION`.
+
+There is no destructive rollback for PyPI or GitHub Release bytes. For a
+release defect, stop promoting the affected version, direct existing binary
+users to the last known-good attested version, and fix forward with a new
+reviewed version and tag. Do not delete assets, replace a tag, upload with
+`--clobber`, or reuse the affected version. Record both versions and all
+digests in the incident notes so the rollback decision remains auditable.
