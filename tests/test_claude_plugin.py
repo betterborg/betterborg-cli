@@ -460,6 +460,49 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     assert list(first.bundle_path.parent.joinpath("backups").glob("failed-*"))
 
 
+def test_failed_bundle_promotion_immediately_restores_previous_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClaude()
+    first, _ = _install(tmp_path, fake)
+    assert first.bundle_path is not None
+    original_marker = first.bundle_path.joinpath(".betterborg-owned.json").read_text()
+    source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
+    upgraded = tmp_path / "promotion-failure"
+    _copy_resource(source, upgraded)
+    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["version"] = "0.2.0"
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+    original_rename = Path.rename
+
+    def fail_staging_promotion(path: Path, target: Path) -> Path:
+        if path.name.startswith(".marketplace-staging-"):
+            raise OSError("injected staging promotion failure")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staging_promotion)
+    fake.calls.clear()
+
+    result, spawns = _install(tmp_path, fake, bundle_source=upgraded)
+
+    assert result.status is ClaudePluginStatus.FAILED
+    assert "injected staging promotion failure" in (result.reason or "")
+    assert first.bundle_path.joinpath(".betterborg-owned.json").read_text() == (
+        original_marker
+    )
+    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
+        "0.1.0"
+    )
+    assert fake.marketplace_source == str(first.bundle_path)
+    assert fake.installed_version == "0.1.0"
+    assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) not in fake.calls
+    assert ("plugin", "update", PLUGIN_ID, "--scope", "user") not in fake.calls
+    assert spawns == []
+
+
 def test_failed_fresh_activation_removes_host_and_bundle_state(
     tmp_path: Path,
 ) -> None:

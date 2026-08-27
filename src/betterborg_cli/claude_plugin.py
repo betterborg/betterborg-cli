@@ -642,7 +642,19 @@ def _materialize_bundle(
             old_digest = _ownership(destination)["digest"][:12]
             previous = backups / f"marketplace-{old_digest}-{uuid4().hex[:8]}"
             destination.rename(previous)
-        staging.rename(destination)
+        try:
+            staging.rename(destination)
+        except OSError as promotion_error:
+            if previous is not None:
+                try:
+                    previous.rename(destination)
+                except OSError as restoration_error:
+                    raise OSError(
+                        f"Could not promote the staged Claude marketplace "
+                        f"bundle ({promotion_error}) or restore the previous "
+                        f"bundle ({restoration_error})."
+                    ) from promotion_error
+            raise
         return _BundleChange(
             path=destination,
             digest=digest,
