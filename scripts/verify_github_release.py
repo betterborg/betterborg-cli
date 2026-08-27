@@ -419,15 +419,18 @@ def _download_snapshot(
     for name, digest in _attestation_subject_digests(version, assets).items():
         if _has_attestation(repository, digest):
             path = assets.get(name)
-            if path is not None:
-                try:
-                    _verify_attestation(repository, path)
-                except GitHubReleaseVerificationError as error:
-                    _fail(
-                        f"attestation digest or provenance mismatch for {name}; "
-                        "the release cannot be accepted: "
-                        f"{error}"
-                    )
+            if path is None:
+                # API presence alone does not establish signature or signer trust.
+                # gh needs the subject bytes for cryptographic verification.
+                continue
+            try:
+                _verify_attestation(repository, path)
+            except GitHubReleaseVerificationError as error:
+                _fail(
+                    f"attestation digest or provenance mismatch for {name}; "
+                    "the release cannot be accepted: "
+                    f"{error}"
+                )
             attestations.add(name)
 
     return ReleaseSnapshot(remote_tag, draft, assets, frozenset(attestations))

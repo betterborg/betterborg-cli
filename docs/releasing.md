@@ -91,11 +91,13 @@ Release.
 ## Authorize and verify the binary publication
 
 The binary publication is authorized only through the reviewed workflow run.
-The operator must be a BetterBorg release maintainer, must be allowed to
-dispatch Actions on `betterborg/betterborg-cli`, and must be a required
-reviewer for the protected `pypi` environment. Before approving or resuming,
-confirm that `vVERSION` is the reviewed tag, that its peeled commit is the run
-SHA on `main`, that the nonpublishing run passed, and that the requested version
+Two authorized BetterBorg release maintainers must participate: a dispatching
+operator who is allowed to run Actions on `betterborg/betterborg-cli`, and a
+different required reviewer for the protected `pypi` environment. Prevent
+self-review remains enabled, so the dispatching operator must not approve
+their own deployment. Before the reviewer approves, both maintainers confirm
+that `vVERSION` is the reviewed tag, that its peeled commit is the run SHA on
+`main`, that the nonpublishing run passed, and that the requested version
 matches the tag and source. Authenticate `gh` to the public repository with
 read access so the post-publish verifier can inspect release assets and
 artifact attestations. If a fine-grained token is used, grant repository
@@ -103,13 +105,17 @@ contents read and attestations read, but no write permission. Do not use an
 administrator bypass or a personal token with release-write scope for
 verification.
 
-To start the binary path, dispatch **Release BetterBorg** for that exact
-reviewed version with `publish` enabled and approve the protected environment.
-To resume an interrupted run, use **Re-run failed jobs** on the same run only
-after reconfirming its inputs, SHA, tag, and any assets already visible on the
-draft. Do not dispatch a newer `main` commit for the old version. The PyPI gate
-must remain successful before the four-platform build and the final GitHub
-Release reconciliation run.
+To start the binary path, the dispatching operator runs **Release BetterBorg**
+for that exact reviewed version with `publish` enabled. The different required
+reviewer independently checks the run SHA, tag, version, inputs, and trusted
+publisher identity, then approves the protected environment. To resume an
+interrupted run, the dispatching operator uses **Re-run failed jobs** on the
+same run only after both maintainers reconfirm its inputs, SHA, tag, and any
+assets already visible on the draft; the different required reviewer approves
+the protected deployment if GitHub requests approval again. Do not dispatch a
+newer `main` commit for the old version. The PyPI gate must remain successful
+before the four-platform build and the final GitHub Release reconciliation
+run.
 
 After the final job succeeds, run the read-only public verification from the
 reviewed checkout:

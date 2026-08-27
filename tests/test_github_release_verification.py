@@ -168,7 +168,7 @@ def test_published_partial_release_is_terminal(
     ("missing", "draft"),
     [(None, False), ("borg-linux-x86_64", True)],
 )
-def test_live_verification_finds_preexisting_attestations_read_only(
+def test_live_verification_credits_only_cryptographically_verified_attestations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     missing: str | None,
@@ -225,6 +225,7 @@ def test_live_verification_finds_preexisting_attestations_read_only(
         assert result.complete is False
         assert result.remaining == (
             f"upload release asset {missing}",
+            f"publish GitHub artifact attestation for {missing}",
             "publish the draft GitHub Release",
         )
     attestation_queries = [
@@ -255,3 +256,60 @@ def test_live_verification_finds_preexisting_attestations_read_only(
         for command in commands
         if command[1:3] == ["attestation", "verify"]
     )
+
+
+def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, names = _release_fixture(tmp_path / "source")
+    missing = "borg-linux-x86_64"
+    rejected = "borg-darwin-arm64"
+    bodies = {
+        name: (fixture / "assets" / name).read_bytes()
+        for name in names
+    }
+
+    def fake_run(command, **kwargs):
+        release_api = "repos/betterborg/betterborg-cli/releases/tags/v1.2.3"
+        if command[1:3] == ["api", release_api]:
+            payload = {
+                "tag_name": "v1.2.3",
+                "draft": True,
+                "assets": [
+                    {"name": name, "url": f"asset-api/{name}"}
+                    for name in names
+                    if name != missing
+                ],
+            }
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, json.dumps(payload), ""
+            )
+        if command[1:2] == ["api"] and command[2].startswith("asset-api/"):
+            name = command[2].removeprefix("asset-api/")
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, bodies[name], b""
+            )
+        if command[1:2] == ["api"] and "/attestations/sha256:" in command[2]:
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, json.dumps({"attestations": [{}]}), ""
+            )
+        if command[1:3] == ["attestation", "verify"]:
+            path = Path(command[3])
+            return verify_github_release.subprocess.CompletedProcess(
+                command,
+                1 if path.name == rejected else 0,
+                "" if path.name == rejected else "verified",
+                "signer workflow mismatch" if path.name == rejected else "",
+            )
+        pytest.fail(f"unexpected command: {command}")
+
+    monkeypatch.setattr(verify_github_release.subprocess, "run", fake_run)
+
+    with pytest.raises(
+        verify_github_release.GitHubReleaseVerificationError,
+        match=f"attestation digest or provenance mismatch for {rejected}",
+    ):
+        verify_github_release.verify_release(
+            "1.2.3", "betterborg/betterborg-cli"
+        )

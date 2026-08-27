@@ -337,6 +337,8 @@ def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:
 
     for required in (
         "required reviewer",
+        "dispatching operator must not approve their own deployment",
+        "different required reviewer",
         "PyPI project: `betterborg`",
         "GitHub owner: `betterborg`",
         "GitHub repository: `betterborg-cli`",
