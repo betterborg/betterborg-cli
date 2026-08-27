@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import click
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
@@ -35,34 +35,36 @@ from betterborg_cli.store import (
 from betterborg_cli.workspace_trust import require_workspace_trust
 
 
-@dataclass(frozen=True, slots=True)
-class Artifact:
+class ProtocolModel(BaseModel):
+    """Immutable base for values serialized as MCP structured content."""
+
+    model_config = ConfigDict(frozen=True)
+
+
+class Artifact(ProtocolModel):
     """One repository-relative durable workflow output."""
 
     kind: str
     path: str
 
 
-@dataclass(frozen=True, slots=True)
-class NextAction:
+class NextAction(ProtocolModel):
     """One typed follow-on MCP invocation."""
 
     tool: str
-    arguments: dict[str, Any] = field(default_factory=dict)
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
-class WorkflowResult:
+class WorkflowResult(ProtocolModel):
     """Common typed result retained across every MCP workflow tool."""
 
     status: str
     artifacts: tuple[Artifact, ...] = ()
     next_actions: tuple[NextAction, ...] = ()
-    data: dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimeCost:
+class RuntimeCost(ProtocolModel):
     """MCP representation of the shared billing-aware task cost."""
 
     api_spend_usd: float | None
@@ -70,8 +72,7 @@ class RuntimeCost:
     subscription_included: bool
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimeTask:
+class RuntimeTask(ProtocolModel):
     """Exact phase-07 runtime projection for one current task."""
 
     generation_id: str
@@ -90,8 +91,7 @@ class RuntimeTask:
     cost: RuntimeCost
 
 
-@dataclass(frozen=True, slots=True)
-class TaskListResult:
+class TaskListResult(ProtocolModel):
     """Typed current-generation task listing."""
 
     status: str
@@ -125,13 +125,16 @@ def _relative(paths: RepoPaths, path: Path) -> str:
 
 
 def _analysis_artifacts(paths: RepoPaths, result: Any) -> tuple[Artifact, ...]:
-    artifacts = [Artifact("score", _relative(paths, result.score_path))]
+    artifacts = [Artifact(kind="score", path=_relative(paths, result.score_path))]
     artifacts.extend(
-        Artifact(f"{prompt.role}_prompt", _relative(paths, prompt.path))
+        Artifact(
+            kind=f"{prompt.role}_prompt",
+            path=_relative(paths, prompt.path),
+        )
         for prompt in result.prompts
     )
     artifacts.extend(
-        Artifact("improvement_prd", _relative(paths, prd.path))
+        Artifact(kind="improvement_prd", path=_relative(paths, prd.path))
         for prd in result.improvement_prds
     )
     return tuple(artifacts)
@@ -140,8 +143,8 @@ def _analysis_artifacts(paths: RepoPaths, result: Any) -> tuple[Artifact, ...]:
 def _theme_actions(paths: RepoPaths, result: Any) -> tuple[NextAction, ...]:
     return tuple(
         NextAction(
-            "create",
-            {
+            tool="create",
+            arguments={
                 "name": prd.suggested_borg_name,
                 "source": _relative(paths, prd.path),
             },
@@ -227,8 +230,12 @@ def create(
 
     if result.confirmed:
         status = "confirmed"
-        artifacts = (Artifact("prd", _relative(paths, result.prd_path)),)
-        actions = (NextAction("plan", {"name": name, "action": "start"}),)
+        artifacts = (
+            Artifact(kind="prd", path=_relative(paths, result.prd_path)),
+        )
+        actions = (
+            NextAction(tool="plan", arguments={"name": name, "action": "start"}),
+        )
     elif result.questions:
         status = "needs_input"
         artifacts = ()
@@ -286,16 +293,18 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
 
 def _plan_actions(name: str, state: BorgState) -> tuple[NextAction, ...]:
     if state is BorgState.ARCHITECT_AWAITING_ANSWERS:
-        return (NextAction("plan", {"name": name, "action": "start"}),)
+        return (
+            NextAction(tool="plan", arguments={"name": name, "action": "start"}),
+        )
     if state is BorgState.PLAN_APPROVAL_PENDING:
         return (
-            NextAction("plan", {"name": name, "action": "show"}),
-            NextAction("plan", {"name": name, "action": "approve"}),
+            NextAction(tool="plan", arguments={"name": name, "action": "show"}),
+            NextAction(tool="plan", arguments={"name": name, "action": "approve"}),
         )
     if state is BorgState.READY_TO_EXECUTE:
         return (
-            NextAction("task_list", {"name": name}),
-            NextAction("execute", {"name": name}),
+            NextAction(tool="task_list", arguments={"name": name}),
+            NextAction(tool="execute", arguments={"name": name}),
         )
     return ()
 
@@ -355,10 +364,12 @@ def plan(
     paths = _paths(trusted=action != "show")
     if action == "approve":
         borg, approval, plan_path, publication = _approve_plan(paths, name)
-        artifacts = [Artifact("approved_plan", _relative(paths, plan_path))]
+        artifacts = [
+            Artifact(kind="approved_plan", path=_relative(paths, plan_path))
+        ]
         if publication is not None:
             artifacts.extend(
-                Artifact("task", _relative(paths, item.path))
+                Artifact(kind="task", path=_relative(paths, item.path))
                 for item in publication.files
             )
         return WorkflowResult(
@@ -449,10 +460,10 @@ def task_list(name: str) -> TaskListResult:
         ),
         tasks=tuple(_runtime_task(row) for row in rows),
         artifacts=tuple(
-            Artifact("task", _relative(paths, item.path))
+            Artifact(kind="task", path=_relative(paths, item.path))
             for item in publication.files
         ),
-        next_actions=(NextAction("execute", {"name": name}),),
+        next_actions=(NextAction(tool="execute", arguments={"name": name}),),
     )
 
 
@@ -485,11 +496,14 @@ def _execute(name: str, auto_execute: bool) -> WorkflowResult:
             return WorkflowResult(
                 status="estimate_approval_required",
                 artifacts=tuple(
-                    Artifact("task", _relative(paths, item.path))
+                    Artifact(kind="task", path=_relative(paths, item.path))
                     for item in publication.files
                 ),
                 next_actions=(
-                    NextAction("execute", {"name": name, "auto_execute": True}),
+                    NextAction(
+                        tool="execute",
+                        arguments={"name": name, "auto_execute": True},
+                    ),
                 ),
                 data={
                     "borg": name,
@@ -564,11 +578,11 @@ def _execute(name: str, auto_execute: bool) -> WorkflowResult:
         reason = None
     actions = ()
     if result.status not in {ExecutionRunStatus.COMPLETED}:
-        actions = (NextAction("execute", {"name": name}),)
+        actions = (NextAction(tool="execute", arguments={"name": name}),)
     return WorkflowResult(
         status=status,
         artifacts=tuple(
-            Artifact("task", _relative(paths, item.path))
+            Artifact(kind="task", path=_relative(paths, item.path))
             for item in publication.files
         ),
         next_actions=actions,
