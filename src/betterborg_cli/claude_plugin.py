@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -30,6 +31,10 @@ RELOAD_GUIDANCE = (
 
 _OWNER_FILE = ".betterborg-owned.json"
 _OWNER_SCHEMA = 1
+_MINIMUM_SAFE_CLAUDE_VERSION = (2, 1, 212)
+_MINIMUM_SAFE_CLAUDE_VERSION_TEXT = ".".join(
+    str(part) for part in _MINIMUM_SAFE_CLAUDE_VERSION
+)
 
 
 class ClaudePluginStatus(StrEnum):
@@ -127,7 +132,9 @@ def install_claude_plugin(
             ),
         )
     try:
-        _run((str(Path(claude)), "--version"), environment, command_runner)
+        version_result = _run(
+            (str(Path(claude)), "--version"), environment, command_runner
+        )
     except _ClaudeCommandError as error:
         return ClaudePluginInstallation(
             status=ClaudePluginStatus.SETUP_REQUIRED,
@@ -135,6 +142,21 @@ def install_claude_plugin(
             guidance=(
                 "Repair or update Claude Code, then confirm `claude --version` "
                 "succeeds."
+            ),
+        )
+    claude_version = _parse_claude_version(version_result.stdout)
+    if claude_version is None or claude_version < _MINIMUM_SAFE_CLAUDE_VERSION:
+        reported = version_result.stdout.strip() or "an unknown version"
+        return ClaudePluginInstallation(
+            status=ClaudePluginStatus.SETUP_REQUIRED,
+            reason=(
+                f"Claude Code reported {reported!r}; version "
+                f"{_MINIMUM_SAFE_CLAUDE_VERSION_TEXT} or newer is required for "
+                "collision-safe plugin rollback."
+            ),
+            guidance=(
+                "Update Claude Code, then confirm `claude --version` reports "
+                f"{_MINIMUM_SAFE_CLAUDE_VERSION_TEXT} or newer."
             ),
         )
 
@@ -396,6 +418,16 @@ def _run(
             f"{completed.returncode}: {detail}"
         )
     return completed
+
+
+def _parse_claude_version(output: str) -> tuple[int, int, int] | None:
+    match = re.search(
+        r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![-+\d.])",
+        output,
+    )
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
 def _json_command(

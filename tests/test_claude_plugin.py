@@ -39,6 +39,7 @@ def _executable(path: Path, body: str) -> Path:
 class _FakeClaude:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.version = "2.1.212 (Claude Code)"
         self.marketplace_source: str | None = None
         self.installed = False
         self.enabled = False
@@ -54,7 +55,7 @@ class _FakeClaude:
             self.fail_once = None
             return subprocess.CompletedProcess(command, 9, "", "injected failure")
         if call == ("--version",):
-            return subprocess.CompletedProcess(command, 0, "2.1.0\n", "")
+            return subprocess.CompletedProcess(command, 0, self.version + "\n", "")
         if call == ("plugin", "marketplace", "list", "--json"):
             entries = []
             if self.marketplace_source is not None:
@@ -380,6 +381,29 @@ def test_foreign_marketplace_collision_is_left_untouched(tmp_path: Path) -> None
     assert "left untouched" in (result.reason or "")
     assert not tmp_path.joinpath("data").exists()
     assert fake.marketplace_source == str(tmp_path / "someone-elses-marketplace")
+    assert spawns == []
+
+
+def test_affected_claude_version_leaves_foreign_same_named_plugin_untouched(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeClaude()
+    fake.version = "2.1.211 (Claude Code)"
+    foreign = {
+        "id": "borg@foreign-marketplace",
+        "scope": "user",
+        "enabled": True,
+    }
+    fake.other_installations = [foreign]
+
+    result, spawns = _install(tmp_path, fake)
+
+    assert result.status is ClaudePluginStatus.SETUP_REQUIRED
+    assert "collision-safe plugin rollback" in (result.reason or "")
+    assert "2.1.212 or newer" in (result.guidance or "")
+    assert fake.calls == [("--version",)]
+    assert fake.other_installations == [foreign]
+    assert not tmp_path.joinpath("data").exists()
     assert spawns == []
 
 
