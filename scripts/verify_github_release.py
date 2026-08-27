@@ -30,7 +30,8 @@ class ReleaseSnapshot:
     tag: str
     draft: bool
     assets: dict[str, Path]
-    attestations: frozenset[str]
+    verified_attestations: frozenset[str]
+    published_attestations: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -273,20 +274,33 @@ def verify_snapshot(
     if not missing:
         _validate_complete_assets(version, snapshot.assets)
 
-    unexpected_attestations = snapshot.attestations - expected_set
+    unexpected_attestations = (
+        snapshot.verified_attestations | snapshot.published_attestations
+    ) - expected_set
     if unexpected_attestations:
         _fail(
             "verification fixture has attestations for unexpected assets: "
             f"{sorted(unexpected_attestations)}"
         )
     missing_attestations = tuple(
-        name for name in expected if name not in snapshot.attestations
+        name for name in expected if name not in snapshot.published_attestations
+    )
+    unverified_attestations = tuple(
+        name
+        for name in expected
+        if name in snapshot.assets
+        and name in snapshot.published_attestations
+        and name not in snapshot.verified_attestations
     )
 
     remaining = [f"upload release asset {name}" for name in missing]
     remaining.extend(
         f"publish GitHub artifact attestation for {name}"
         for name in missing_attestations
+    )
+    remaining.extend(
+        f"verify GitHub artifact attestation for {name}"
+        for name in unverified_attestations
     )
     if snapshot.draft:
         remaining.append("publish the draft GitHub Release")
@@ -310,28 +324,51 @@ def _run(command: list[str], *, binary: bool = False) -> bytes | str:
 
 
 def _release_metadata(repository: str, tag: str) -> dict[str, object] | None:
-    command = ["gh", "api", f"repos/{repository}/releases/tags/{tag}"]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
+    output = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/releases?per_page=100",
+            "--paginate",
+            "--slurp",
+        ]
     )
-    if completed.returncode != 0:
-        try:
-            error = json.loads(completed.stderr)
-        except json.JSONDecodeError:
-            error = {}
-        if error.get("status") == "404" or "HTTP 404" in completed.stderr:
-            return None
-        _fail("could not inspect the GitHub Release with gh api")
+    assert isinstance(output, str)
     try:
-        payload = json.loads(completed.stdout)
+        pages = json.loads(output)
     except json.JSONDecodeError:
         _fail("GitHub Release metadata is malformed")
-    if not isinstance(payload, dict):
+    if not isinstance(pages, list) or not all(
+        isinstance(page, list) for page in pages
+    ):
         _fail("GitHub Release metadata is malformed")
-    return payload
+
+    matches: list[dict[str, object]] = []
+    for page in pages:
+        for release in page:
+            if not isinstance(release, dict):
+                _fail("GitHub Release metadata is malformed")
+            if release.get("tag_name") == tag:
+                matches.append(release)
+    if len(matches) > 1:
+        _fail(f"multiple GitHub Releases use tag {tag}")
+    return matches[0] if matches else None
+
+
+def _source_digest(repository: str, tag: str) -> str:
+    output = _run(["gh", "api", f"repos/{repository}/commits/{tag}"])
+    assert isinstance(output, str)
+    try:
+        digest = json.loads(output)["sha"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        _fail("reviewed release tag metadata is malformed")
+    if (
+        not isinstance(digest, str)
+        or len(digest) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        _fail("reviewed release tag metadata is malformed")
+    return digest
 
 
 def _has_attestation(repository: str, digest: str) -> bool:
@@ -349,7 +386,11 @@ def _has_attestation(repository: str, digest: str) -> bool:
     return bool(attestations)
 
 
-def _verify_attestation(repository: str, path: Path) -> None:
+def _verify_attestation(
+    repository: str,
+    path: Path,
+    source_digest: str,
+) -> None:
     output = _run(
         [
             "gh",
@@ -360,6 +401,10 @@ def _verify_attestation(repository: str, path: Path) -> None:
             repository,
             "--signer-workflow",
             f"{repository}/.github/workflows/binary-release.yml",
+            "--source-digest",
+            source_digest,
+            "--source-ref",
+            "refs/heads/main",
         ]
     )
     assert isinstance(output, str)
@@ -374,6 +419,7 @@ def _download_snapshot(
     payload = _release_metadata(repository, tag)
     if payload is None:
         return None
+    source_digest = _source_digest(repository, tag)
     try:
         remote_tag = payload["tag_name"]
         draft = payload["draft"]
@@ -415,25 +461,34 @@ def _download_snapshot(
         path.write_bytes(body)
         assets[name] = path
 
-    attestations: set[str] = set()
+    verified_attestations: set[str] = set()
+    published_attestations: set[str] = set()
     for name, digest in _attestation_subject_digests(version, assets).items():
         if _has_attestation(repository, digest):
+            published_attestations.add(name)
             path = assets.get(name)
             if path is None:
                 # API presence alone does not establish signature or signer trust.
-                # gh needs the subject bytes for cryptographic verification.
+                # Record publication so recovery does not recreate it; verify it
+                # once the reviewed workflow uploads the subject bytes.
                 continue
             try:
-                _verify_attestation(repository, path)
+                _verify_attestation(repository, path, source_digest)
             except GitHubReleaseVerificationError as error:
                 _fail(
                     f"attestation digest or provenance mismatch for {name}; "
                     "the release cannot be accepted: "
                     f"{error}"
                 )
-            attestations.add(name)
+            verified_attestations.add(name)
 
-    return ReleaseSnapshot(remote_tag, draft, assets, frozenset(attestations))
+    return ReleaseSnapshot(
+        remote_tag,
+        draft,
+        assets,
+        frozenset(verified_attestations),
+        frozenset(published_attestations),
+    )
 
 
 def _fixture_snapshot(path: Path) -> ReleaseSnapshot | None:
@@ -467,7 +522,14 @@ def _fixture_snapshot(path: Path) -> ReleaseSnapshot | None:
         }
     except OSError as error:
         _fail(f"could not read release fixture assets: {error}")
-    return ReleaseSnapshot(tag, draft, assets, frozenset(attestations))
+    fixture_attestations = frozenset(attestations)
+    return ReleaseSnapshot(
+        tag,
+        draft,
+        assets,
+        fixture_attestations,
+        fixture_attestations,
+    )
 
 
 def verify_release(

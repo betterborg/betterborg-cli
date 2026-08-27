@@ -98,12 +98,12 @@ self-review remains enabled, so the dispatching operator must not approve
 their own deployment. Before the reviewer approves, both maintainers confirm
 that `vVERSION` is the reviewed tag, that its peeled commit is the run SHA on
 `main`, that the nonpublishing run passed, and that the requested version
-matches the tag and source. Authenticate `gh` to the public repository with
-read access so the post-publish verifier can inspect release assets and
-artifact attestations. If a fine-grained token is used, grant repository
-contents read and attestations read, but no write permission. Do not use an
-administrator bypass or a personal token with release-write scope for
-verification.
+matches the tag and source. Authenticate `gh` as a maintainer with push access
+to the public repository so the post-publish verifier can see an interrupted
+draft, but give its token only read access. If a fine-grained token is used,
+grant repository contents read and attestations read, but no write permission.
+Do not use an administrator bypass or a personal token with release-write
+scope for verification.
 
 To start the binary path, the dispatching operator runs **Release BetterBorg**
 for that exact reviewed version with `publish` enabled. The different required
@@ -131,15 +131,19 @@ binaries, their four `.sha256` sidecars, and `release-manifest.json`. It checks
 the manifest's recorded version, target metadata, sizes, and binary digests;
 checks every checksum sidecar; and verifies the provenance of every asset with
 `gh attestation verify`, pinned to
-`betterborg/betterborg-cli/.github/workflows/binary-release.yml`. It performs
-no create, upload, edit, delete, or overwrite operation. Exit status `0` means
+`betterborg/betterborg-cli/.github/workflows/binary-release.yml`, the peeled
+`vVERSION` commit, and `refs/heads/main`. It performs no create, upload, edit,
+delete, or overwrite operation. Exit status `0` means
 the published release is complete, `2` means a draft or its attestations are
 partial and the output lists the publication steps that remain, and `1` means
 verification is terminal or could not establish trust.
 
 For exit status `2`, perform only the listed steps through the same reviewed
 workflow run, then rerun verification. A matching draft may upload missing
-assets and then publish. If the release is already public but an attestation is
+assets and then publish. An attestation that already exists for a missing
+asset's reviewed digest is not republished; after upload, rerun the verifier so
+it can cryptographically verify the attestation against the asset bytes and
+reviewed source. If the release is already public but an attestation is
 missing, stop promotion and have a release maintainer complete the attestation
 for the unchanged digest through the protected release process. Never replace
 an asset to repair an attestation.

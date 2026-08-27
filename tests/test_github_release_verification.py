@@ -168,7 +168,7 @@ def test_published_partial_release_is_terminal(
     ("missing", "draft"),
     [(None, False), ("borg-linux-x86_64", True)],
 )
-def test_live_verification_credits_only_cryptographically_verified_attestations(
+def test_live_verification_finds_drafts_and_recognizes_published_attestations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     missing: str | None,
@@ -183,7 +183,7 @@ def test_live_verification_credits_only_cryptographically_verified_attestations(
 
     def fake_run(command, **kwargs):
         commands.append(command)
-        release_api = "repos/betterborg/betterborg-cli/releases/tags/v1.2.3"
+        release_api = "repos/betterborg/betterborg-cli/releases?per_page=100"
         if command[1:3] == ["api", release_api]:
             payload = {
                 "tag_name": "v1.2.3",
@@ -195,7 +195,14 @@ def test_live_verification_credits_only_cryptographically_verified_attestations(
                 ],
             }
             return verify_github_release.subprocess.CompletedProcess(
-                command, 0, json.dumps(payload), ""
+                command, 0, json.dumps([[], [payload]]), ""
+            )
+        if command[1:3] == [
+            "api",
+            "repos/betterborg/betterborg-cli/commits/v1.2.3",
+        ]:
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, json.dumps({"sha": "a" * 40}), ""
             )
         if command[1:2] == ["api"] and command[2].startswith("asset-api/"):
             name = command[2].removeprefix("asset-api/")
@@ -225,7 +232,6 @@ def test_live_verification_credits_only_cryptographically_verified_attestations(
         assert result.complete is False
         assert result.remaining == (
             f"upload release asset {missing}",
-            f"publish GitHub artifact attestation for {missing}",
             "publish the draft GitHub Release",
         )
     attestation_queries = [
@@ -235,6 +241,20 @@ def test_live_verification_credits_only_cryptographically_verified_attestations(
         and "/attestations/sha256:" in command[2]
     ]
     assert len(attestation_queries) == 9
+    assert [
+        command
+        for command in commands
+        if command[1:3]
+        == ["api", "repos/betterborg/betterborg-cli/releases?per_page=100"]
+    ] == [
+        [
+            "gh",
+            "api",
+            "repos/betterborg/betterborg-cli/releases?per_page=100",
+            "--paginate",
+            "--slurp",
+        ]
+    ]
     verification_commands = [
         command
         for command in commands
@@ -248,10 +268,14 @@ def test_live_verification_credits_only_cryptographically_verified_attestations(
         for command in commands
     )
     assert all(
-        command[-2:]
+        command[-6:]
         == [
             "--signer-workflow",
             "betterborg/betterborg-cli/.github/workflows/binary-release.yml",
+            "--source-digest",
+            "a" * 40,
+            "--source-ref",
+            "refs/heads/main",
         ]
         for command in commands
         if command[1:3] == ["attestation", "verify"]
@@ -271,7 +295,7 @@ def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
     }
 
     def fake_run(command, **kwargs):
-        release_api = "repos/betterborg/betterborg-cli/releases/tags/v1.2.3"
+        release_api = "repos/betterborg/betterborg-cli/releases?per_page=100"
         if command[1:3] == ["api", release_api]:
             payload = {
                 "tag_name": "v1.2.3",
@@ -283,7 +307,14 @@ def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
                 ],
             }
             return verify_github_release.subprocess.CompletedProcess(
-                command, 0, json.dumps(payload), ""
+                command, 0, json.dumps([[payload]]), ""
+            )
+        if command[1:3] == [
+            "api",
+            "repos/betterborg/betterborg-cli/commits/v1.2.3",
+        ]:
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, json.dumps({"sha": "b" * 40}), ""
             )
         if command[1:2] == ["api"] and command[2].startswith("asset-api/"):
             name = command[2].removeprefix("asset-api/")
