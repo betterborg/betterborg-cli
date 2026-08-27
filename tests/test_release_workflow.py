@@ -7,6 +7,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,31 @@ assert _VERIFY_SPEC is not None and _VERIFY_SPEC.loader is not None
 verify_pypi_release = importlib.util.module_from_spec(_VERIFY_SPEC)
 sys.modules[_VERIFY_SPEC.name] = verify_pypi_release
 _VERIFY_SPEC.loader.exec_module(verify_pypi_release)
+
+LEAK_TEST_CREDENTIAL = "release/secret+value?12345"
+LEAK_TEST_REPRESENTATIONS = (
+    ("raw", LEAK_TEST_CREDENTIAL.encode()),
+    (
+        "percent-encoded",
+        urllib.parse.quote(LEAK_TEST_CREDENTIAL, safe="").encode(),
+    ),
+    (
+        "standard-base64-padded",
+        base64.b64encode(LEAK_TEST_CREDENTIAL.encode()),
+    ),
+    (
+        "standard-base64-unpadded",
+        base64.b64encode(LEAK_TEST_CREDENTIAL.encode()).rstrip(b"="),
+    ),
+    (
+        "urlsafe-base64-padded",
+        base64.urlsafe_b64encode(LEAK_TEST_CREDENTIAL.encode()),
+    ),
+    (
+        "urlsafe-base64-unpadded",
+        base64.urlsafe_b64encode(LEAK_TEST_CREDENTIAL.encode()).rstrip(b"="),
+    ),
+)
 
 
 def _workflow_text() -> str:
@@ -122,13 +148,27 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
         )
 
 
+def test_credential_markers_cover_every_distinct_representation() -> None:
+    expected = {encoded for _name, encoded in LEAK_TEST_REPRESENTATIONS}
+
+    assert len(expected) == 6
+    assert (
+        set(verify_pypi_release._credential_markers(LEAK_TEST_CREDENTIAL))
+        == expected
+    )
+
+
 @pytest.mark.parametrize("location", ["stdout", "stderr", "fixture"])
+@pytest.mark.parametrize(
+    "encoded",
+    [encoded for _name, encoded in LEAK_TEST_REPRESENTATIONS],
+    ids=[name for name, _encoded in LEAK_TEST_REPRESENTATIONS],
+)
 def test_release_smoke_rejects_credential_leaks(
     tmp_path: Path,
     location: str,
+    encoded: bytes,
 ) -> None:
-    credential = "release-secret-value-12345"
-    encoded = base64.urlsafe_b64encode(credential.encode())
     stdout = encoded if location == "stdout" else b""
     stderr = encoded if location == "stderr" else b""
     fixture = tmp_path / "fixture"
@@ -138,13 +178,13 @@ def test_release_smoke_rejects_credential_leaks(
 
     with pytest.raises(verify_pypi_release.ReleaseVerificationError) as raised:
         verify_pypi_release._assert_no_credential_leak(
-            credential,
+            LEAK_TEST_CREDENTIAL,
             [verify_pypi_release.CommandCapture("test command", stdout, stderr)],
             (fixture,),
         )
 
     assert location in str(raised.value)
-    assert credential not in str(raised.value)
+    assert LEAK_TEST_CREDENTIAL not in str(raised.value)
 
 
 def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:
