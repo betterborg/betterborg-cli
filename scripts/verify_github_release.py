@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -72,6 +73,24 @@ def _read_manifest(path: Path) -> dict[str, object]:
     return recorded
 
 
+def _read_checksum_digest(path: Path, filename: str) -> str:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        _mismatch(f"checksum sidecar for {filename} is malformed")
+    except OSError as error:
+        _fail(f"could not read release checksum {path}: {error}")
+    suffix = f"  {filename}\n"
+    digest = content[:64]
+    if (
+        len(content) != 64 + len(suffix)
+        or content[64:] != suffix
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        _mismatch(f"checksum sidecar for {filename} is malformed")
+    return digest
+
+
 def _validate_available_assets(
     version: str,
     assets: dict[str, Path],
@@ -134,16 +153,63 @@ def _validate_available_assets(
                 _mismatch(f"release-manifest.json does not match {target.filename}")
 
         if checksum is not None:
-            try:
-                content = checksum.read_text(encoding="utf-8")
-            except OSError as error:
-                _fail(f"could not read release checksum {checksum}: {error}")
+            checksum_digest = _read_checksum_digest(checksum, target.filename)
             expected_digest = binary_digest or manifest_digest
-            if expected_digest is not None:
-                expected = f"{expected_digest}  {target.filename}\n"
-                if content != expected:
-                    _mismatch(f"checksum sidecar does not match {target.filename}")
+            if expected_digest is not None and checksum_digest != expected_digest:
+                _mismatch(f"checksum sidecar does not match {target.filename}")
     return recorded
+
+
+def _attestation_subject_digests(
+    version: str,
+    assets: dict[str, Path],
+) -> dict[str, str]:
+    """Return every attestation subject digest derivable from partial assets."""
+    recorded = _validate_available_assets(version, assets)
+    digests = {name: sha256(path) for name, path in assets.items()}
+
+    for index, target in enumerate(TARGETS):
+        checksum_name = f"{target.filename}.sha256"
+        binary_digest = digests.get(target.filename)
+        checksum = assets.get(checksum_name)
+        if binary_digest is None and checksum is not None:
+            binary_digest = _read_checksum_digest(checksum, target.filename)
+        if binary_digest is None and recorded is not None:
+            entries = recorded["artifacts"]
+            assert isinstance(entries, list)
+            entry = entries[index]
+            assert isinstance(entry, dict)
+            manifest_digest = entry["sha256"]
+            assert isinstance(manifest_digest, str)
+            binary_digest = manifest_digest
+        if binary_digest is None:
+            continue
+        digests.setdefault(target.filename, binary_digest)
+        checksum_body = f"{binary_digest}  {target.filename}\n".encode()
+        digests.setdefault(checksum_name, hashlib.sha256(checksum_body).hexdigest())
+
+    if "release-manifest.json" not in digests and all(
+        target.filename in assets for target in TARGETS
+    ):
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "version": version,
+            "artifacts": [
+                {
+                    "filename": target.filename,
+                    "os": target.operating_system,
+                    "arch": target.architecture,
+                    "sha256": digests[target.filename],
+                    "size": assets[target.filename].stat().st_size,
+                }
+                for target in TARGETS
+            ],
+        }
+        manifest_body = (
+            json.dumps(manifest, indent=2, sort_keys=False) + "\n"
+        ).encode()
+        digests["release-manifest.json"] = hashlib.sha256(manifest_body).hexdigest()
+    return digests
 
 
 def _validate_complete_assets(version: str, assets: dict[str, Path]) -> None:
@@ -322,7 +388,6 @@ def _download_snapshot(
         _fail("GitHub Release metadata is malformed")
 
     assets: dict[str, Path] = {}
-    attestations: set[str] = set()
     for metadata in remote_assets:
         try:
             name = metadata["name"]
@@ -350,16 +415,19 @@ def _download_snapshot(
         path.write_bytes(body)
         assets[name] = path
 
-        digest = sha256(path)
+    attestations: set[str] = set()
+    for name, digest in _attestation_subject_digests(version, assets).items():
         if _has_attestation(repository, digest):
-            try:
-                _verify_attestation(repository, path)
-            except GitHubReleaseVerificationError as error:
-                _fail(
-                    f"attestation digest or provenance mismatch for {name}; "
-                    "the release cannot be accepted: "
-                    f"{error}"
-                )
+            path = assets.get(name)
+            if path is not None:
+                try:
+                    _verify_attestation(repository, path)
+                except GitHubReleaseVerificationError as error:
+                    _fail(
+                        f"attestation digest or provenance mismatch for {name}; "
+                        "the release cannot be accepted: "
+                        f"{error}"
+                    )
             attestations.add(name)
 
     return ReleaseSnapshot(remote_tag, draft, assets, frozenset(attestations))

@@ -127,7 +127,11 @@ def test_digest_mismatch_fixture_is_terminal_and_requires_a_new_version(
     fixture, _names = _release_fixture(tmp_path / mismatch, draft=True)
     (fixture / "assets" / "borg-darwin-x86_64.sha256").unlink()
     if mismatch == "checksum":
-        (fixture / "assets" / "borg-linux-arm64").write_bytes(b"changed bytes")
+        (fixture / "assets" / "release-manifest.json").unlink()
+        (fixture / "assets" / "borg-linux-arm64").unlink()
+        (fixture / "assets" / "borg-linux-arm64.sha256").write_text(
+            "not a canonical checksum\n", encoding="utf-8"
+        )
     else:
         manifest_path = fixture / "assets" / "release-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -160,9 +164,15 @@ def test_published_partial_release_is_terminal(
     assert "prepare a new version" in captured.err
 
 
-def test_live_verification_pins_read_only_commands_and_signer_workflow(
+@pytest.mark.parametrize(
+    ("missing", "draft"),
+    [(None, False), ("borg-linux-x86_64", True)],
+)
+def test_live_verification_finds_preexisting_attestations_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    missing: str | None,
+    draft: bool,
 ) -> None:
     fixture, names = _release_fixture(tmp_path / "source")
     bodies = {
@@ -177,9 +187,11 @@ def test_live_verification_pins_read_only_commands_and_signer_workflow(
         if command[1:3] == ["api", release_api]:
             payload = {
                 "tag_name": "v1.2.3",
-                "draft": False,
+                "draft": draft,
                 "assets": [
-                    {"name": name, "url": f"asset-api/{name}"} for name in names
+                    {"name": name, "url": f"asset-api/{name}"}
+                    for name in names
+                    if name != missing
                 ],
             }
             return verify_github_release.subprocess.CompletedProcess(
@@ -206,14 +218,29 @@ def test_live_verification_pins_read_only_commands_and_signer_workflow(
         "1.2.3", "betterborg/betterborg-cli"
     )
 
-    assert result.complete is True
-    assert result.remaining == ()
+    if missing is None:
+        assert result.complete is True
+        assert result.remaining == ()
+    else:
+        assert result.complete is False
+        assert result.remaining == (
+            f"upload release asset {missing}",
+            "publish the draft GitHub Release",
+        )
+    attestation_queries = [
+        command
+        for command in commands
+        if command[1:2] == ["api"]
+        and "/attestations/sha256:" in command[2]
+    ]
+    assert len(attestation_queries) == 9
     verification_commands = [
         command
         for command in commands
         if command[1:3] == ["attestation", "verify"]
     ]
-    assert len(verification_commands) == 9
+    expected_verifications = 8 if missing is not None else 9
+    assert len(verification_commands) == expected_verifications
     assert all(
         command[1] in {"api", "attestation"}
         and not ({"create", "upload", "edit", "delete"} & set(command))
