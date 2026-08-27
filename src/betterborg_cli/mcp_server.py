@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Literal
+from uuid import UUID
 
 import click
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +14,7 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.host_execution import HostPreflightBlock
 from betterborg_cli.onboarding import CreateService
+from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
@@ -21,8 +23,10 @@ from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
     SqliteStore,
+    TaskComplexity,
     TaskRuntimeCost,
     TaskRuntimeRow,
+    TaskRuntimeStatus,
 )
 from betterborg_cli.workflow_service import (
     ExecutionDecisionRequest,
@@ -36,30 +40,333 @@ from betterborg_cli.workspace_trust import require_workspace_trust
 class ProtocolModel(BaseModel):
     """Immutable base for values serialized as MCP structured content."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class Artifact(ProtocolModel):
-    """One repository-relative durable workflow output."""
-
-    kind: str
+class ScoreArtifact(ProtocolModel):
+    kind: Literal["score"]
     path: str
 
 
-class NextAction(ProtocolModel):
-    """One typed follow-on MCP invocation."""
-
-    tool: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
+class PromptArtifact(ProtocolModel):
+    kind: Literal["coding_prompt", "review_prompt", "merge_prompt"]
+    path: str
 
 
-class WorkflowResult(ProtocolModel):
-    """Common typed result retained across every MCP workflow tool."""
+class ImprovementPrdArtifact(ProtocolModel):
+    kind: Literal["improvement_prd"]
+    path: str
 
-    status: str
-    artifacts: tuple[Artifact, ...] = ()
-    next_actions: tuple[NextAction, ...] = ()
-    data: dict[str, Any] = Field(default_factory=dict)
+
+class PrdArtifact(ProtocolModel):
+    kind: Literal["prd"]
+    path: str
+
+
+class ApprovedPlanArtifact(ProtocolModel):
+    kind: Literal["approved_plan"]
+    path: str
+
+
+class TaskArtifact(ProtocolModel):
+    kind: Literal["task"]
+    path: str
+
+
+AnalysisArtifact = ScoreArtifact | PromptArtifact | ImprovementPrdArtifact
+PlanArtifact = ApprovedPlanArtifact | TaskArtifact
+
+
+class CreateActionArguments(ProtocolModel):
+    name: str
+    source: str
+
+
+class PlanActionArguments(ProtocolModel):
+    name: str
+    action: Literal["start", "show", "approve"]
+
+
+class TaskListActionArguments(ProtocolModel):
+    name: str
+
+
+class ExecuteActionArguments(ProtocolModel):
+    name: str
+    auto_execute: bool = False
+
+
+class CreateNextAction(ProtocolModel):
+    tool: Literal["create"]
+    arguments: CreateActionArguments
+
+
+class PlanNextAction(ProtocolModel):
+    tool: Literal["plan"]
+    arguments: PlanActionArguments
+
+
+class TaskListNextAction(ProtocolModel):
+    tool: Literal["task_list"]
+    arguments: TaskListActionArguments
+
+
+class ExecuteNextAction(ProtocolModel):
+    tool: Literal["execute"]
+    arguments: ExecuteActionArguments
+
+
+class InitializeData(ProtocolModel):
+    repository_id: UUID
+    analysis_id: UUID
+    score: float = Field(ge=0, le=5)
+
+
+class AnalyzeData(ProtocolModel):
+    repository_id: UUID
+    analysis_id: UUID
+    score: float = Field(ge=0, le=5)
+    previous_score: float = Field(ge=0, le=5)
+    delta: float
+
+
+class CreateData(ProtocolModel):
+    borg: str
+    borg_id: UUID
+    questions: tuple[str, ...]
+    draft_markdown: str | None
+
+
+class PlanningQuestionData(ProtocolModel):
+    id: str
+    question: str
+    why: str | None = None
+    hint: str | None = None
+
+
+class PlanRepository(ProtocolModel):
+    id: str
+    role: Literal["primary", "secondary"] | None = None
+
+
+class PlanFile(ProtocolModel):
+    path: str
+    role: Literal["new", "modified", "deleted", "read"]
+    repo: str | None = None
+    description: str | None = None
+
+
+class PlanContract(ProtocolModel):
+    kind: Literal[
+        "db_migration",
+        "api_endpoint",
+        "type",
+        "function_signature",
+        "config",
+        "event",
+        "other",
+    ]
+    spec: str
+    repo: str | None = None
+
+
+class PlanPhase(ProtocolModel):
+    name: str
+    title: str
+    goal: str
+    technical_approach: str
+    repositories: tuple[str, ...] = ()
+    files_touched: tuple[PlanFile, ...]
+    contracts: tuple[PlanContract, ...] = ()
+    test_strategy: str
+    acceptance_criteria: tuple[str, ...]
+    dependencies_on: tuple[str, ...] = ()
+    deliverables: tuple[str, ...]
+    constraints: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+
+
+class PlanCodePointer(ProtocolModel):
+    path: str
+    why: str
+
+
+class PlanDocument(ProtocolModel):
+    title: str
+    repositories: tuple[PlanRepository, ...] = ()
+    summary: str
+    overall_approach: str
+    phases: tuple[PlanPhase, ...]
+    code_pointers: tuple[PlanCodePointer, ...] = ()
+    risks: tuple[str, ...] = ()
+    open_questions: tuple[str, ...] = ()
+
+
+class PlanProgressData(ProtocolModel):
+    borg: str
+    questions: tuple[PlanningQuestionData, ...]
+
+
+class PlanShowData(ProtocolModel):
+    borg: str
+    plan: PlanDocument
+
+
+class PlanApprovalData(ProtocolModel):
+    borg: str
+    plan_digest: str
+
+
+PlanData = PlanProgressData | PlanShowData | PlanApprovalData
+
+
+class EstimateRangeData(ProtocolModel):
+    p50: float | None
+    p80: float | None
+    unit: Literal["seconds", "USD"]
+
+
+class TaskMixData(ProtocolModel):
+    small: int = Field(ge=0)
+    medium: int = Field(ge=0)
+    large: int = Field(ge=0)
+    unsized: int = Field(ge=0)
+
+
+class PhaseSampleData(ProtocolModel):
+    coding: int = Field(ge=0)
+    review: int = Field(ge=0)
+    merge: int = Field(ge=0)
+
+
+class PhaseSourceData(ProtocolModel):
+    coding: Literal["dummy_prior", "dummy_prior+local", "local", "unknown"]
+    review: Literal["dummy_prior", "dummy_prior+local", "local", "unknown"]
+    merge: Literal["dummy_prior", "dummy_prior+local", "local", "unknown"]
+
+
+class ComplexityEstimateData(ProtocolModel):
+    complexity: TaskComplexity
+    task_count: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
+    token_sample_size: PhaseSampleData
+    token_source: PhaseSourceData
+    source: Literal["dummy_prior", "dummy_prior+local", "local", "unknown"]
+    time: EstimateRangeData
+
+
+class TimeEstimateData(EstimateRangeData):
+    unit: Literal["seconds"]
+    kind: Literal["total_agent_work"]
+    calendar_time: Literal[False]
+    unknown_tasks: int = Field(ge=0)
+
+
+class ApiModelData(ProtocolModel):
+    phase: Literal["coding", "review", "merge"]
+    provider: str
+    model: str
+
+
+class ApiBillingData(ProtocolModel):
+    estimate: EstimateRangeData | None
+    unknown: bool
+    models: tuple[ApiModelData, ...]
+    pricing_catalog_version: str
+    pricing_sources: dict[str, str]
+
+
+class SubscriptionBillingData(ProtocolModel):
+    included: bool
+    phases: tuple[Literal["coding", "review", "merge"], ...]
+    usd: None
+
+
+class BillingEstimateData(ProtocolModel):
+    api: ApiBillingData
+    subscription: SubscriptionBillingData
+    unknown_phases: tuple[Literal["coding", "review", "merge"], ...]
+
+
+class EstimateProvenanceData(ProtocolModel):
+    prior_version: str
+    prior_label: str
+    local_blend_sample_count: int = Field(ge=1)
+
+
+class ExecutionEstimateData(ProtocolModel):
+    generation_id: UUID
+    task_mix: TaskMixData
+    estimable_tasks: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
+    per_complexity: tuple[ComplexityEstimateData, ...]
+    time: TimeEstimateData
+    billing: BillingEstimateData
+    provenance: EstimateProvenanceData
+
+
+class ExecuteData(ProtocolModel):
+    borg: str
+    generation_id: UUID
+    operation_id: UUID | None = None
+    active_operation_id: UUID | None = None
+    reason: str | None = None
+    estimate: ExecutionEstimateData
+
+
+class InitializeResult(ProtocolModel):
+    status: Literal["initialized", "already_initialized"]
+    artifacts: tuple[AnalysisArtifact, ...] = ()
+    next_actions: tuple[CreateNextAction, ...] = ()
+    data: InitializeData
+
+
+class AnalyzeResult(ProtocolModel):
+    status: Literal["completed"]
+    artifacts: tuple[AnalysisArtifact, ...]
+    next_actions: tuple[CreateNextAction, ...]
+    data: AnalyzeData
+
+
+class CreateResult(ProtocolModel):
+    status: Literal["confirmed", "needs_input", "draft"]
+    artifacts: tuple[PrdArtifact, ...] = ()
+    next_actions: tuple[PlanNextAction, ...] = ()
+    data: CreateData
+
+
+class PlanResult(ProtocolModel):
+    status: Literal[
+        "draft",
+        "architect_working",
+        "architect_awaiting_answers",
+        "tech_review_working",
+        "plan_approval_pending",
+        "pm_working",
+        "supervisor_working",
+        "tasks_approval_pending",
+        "executing",
+        "done",
+        "blocked",
+    ]
+    artifacts: tuple[PlanArtifact, ...] = ()
+    next_actions: tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]
+    data: PlanData
+
+
+class ExecuteResult(ProtocolModel):
+    status: Literal[
+        "estimate_approval_required",
+        "blocked",
+        "active",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+    ]
+    artifacts: tuple[TaskArtifact, ...]
+    next_actions: tuple[ExecuteNextAction, ...]
+    data: ExecuteData
 
 
 class RuntimeCost(ProtocolModel):
@@ -73,15 +380,15 @@ class RuntimeCost(ProtocolModel):
 class RuntimeTask(ProtocolModel):
     """Exact phase-07 runtime projection for one current task."""
 
-    generation_id: str
-    task_id: str
+    generation_id: UUID
+    task_id: UUID
     task_ref: str
     stage: str
     stem: str
     position: int
     title: str
-    complexity: str
-    status: str
+    complexity: TaskComplexity
+    status: TaskRuntimeStatus
     state_reason: str | None
     review_round: int
     attempt_count: int
@@ -92,14 +399,14 @@ class RuntimeTask(ProtocolModel):
 class TaskListResult(ProtocolModel):
     """Typed current-generation task listing."""
 
-    status: str
+    status: Literal["completed"]
     borg: str
-    generation_id: str
+    generation_id: UUID
     generation_digest: str
     approved_plan_digest: str | None
     tasks: tuple[RuntimeTask, ...]
-    artifacts: tuple[Artifact, ...]
-    next_actions: tuple[NextAction, ...]
+    artifacts: tuple[TaskArtifact, ...]
+    next_actions: tuple[ExecuteNextAction, ...]
 
 
 server = FastMCP(
@@ -122,37 +429,44 @@ def _relative(paths: RepoPaths, path: Path) -> str:
     return path.resolve().relative_to(paths.root).as_posix()
 
 
-def _analysis_artifacts(paths: RepoPaths, result: Any) -> tuple[Artifact, ...]:
-    artifacts = [Artifact(kind="score", path=_relative(paths, result.score_path))]
+def _analysis_artifacts(
+    paths: RepoPaths, result: Any
+) -> tuple[AnalysisArtifact, ...]:
+    artifacts: list[AnalysisArtifact] = [
+        ScoreArtifact(kind="score", path=_relative(paths, result.score_path))
+    ]
     artifacts.extend(
-        Artifact(
+        PromptArtifact(
             kind=f"{prompt.role}_prompt",
             path=_relative(paths, prompt.path),
         )
         for prompt in result.prompts
     )
     artifacts.extend(
-        Artifact(kind="improvement_prd", path=_relative(paths, prd.path))
+        ImprovementPrdArtifact(
+            kind="improvement_prd",
+            path=_relative(paths, prd.path),
+        )
         for prd in result.improvement_prds
     )
     return tuple(artifacts)
 
 
-def _theme_actions(paths: RepoPaths, result: Any) -> tuple[NextAction, ...]:
+def _theme_actions(paths: RepoPaths, result: Any) -> tuple[CreateNextAction, ...]:
     return tuple(
-        NextAction(
+        CreateNextAction(
             tool="create",
-            arguments={
-                "name": prd.suggested_borg_name,
-                "source": _relative(paths, prd.path),
-            },
+            arguments=CreateActionArguments(
+                name=prd.suggested_borg_name,
+                source=_relative(paths, prd.path),
+            )
         )
         for prd in result.improvement_prds
     )
 
 
 @server.tool(name="init")
-def initialize() -> WorkflowResult:
+def initialize() -> InitializeResult:
     """Initialize and analyze the server's current Git repository."""
     paths = _paths(trusted=True)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -163,20 +477,20 @@ def initialize() -> WorkflowResult:
                 config, ApiAgentRole.ANALYSIS, paths, interactive=False
             ),
         ).initialize()
-    return WorkflowResult(
+    return InitializeResult(
         status="initialized" if result.initialized else "already_initialized",
         artifacts=_analysis_artifacts(paths, result),
         next_actions=_theme_actions(paths, result),
-        data={
-            "repository_id": str(result.repository.id),
-            "analysis_id": str(result.analysis.id),
-            "score": result.analysis.overall_score,
-        },
+        data=InitializeData(
+            repository_id=result.repository.id,
+            analysis_id=result.analysis.id,
+            score=result.analysis.overall_score,
+        ),
     )
 
 
 @server.tool(name="analyze")
-def analyze() -> WorkflowResult:
+def analyze() -> AnalyzeResult:
     """Re-analyze the initialized current Git repository."""
     paths = _paths(trusted=True)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -187,17 +501,17 @@ def analyze() -> WorkflowResult:
                 config, ApiAgentRole.ANALYSIS, paths, interactive=False
             ),
         ).analyze()
-    return WorkflowResult(
+    return AnalyzeResult(
         status="completed",
         artifacts=_analysis_artifacts(paths, result),
         next_actions=_theme_actions(paths, result),
-        data={
-            "repository_id": str(result.repository.id),
-            "analysis_id": str(result.analysis.id),
-            "score": result.analysis.overall_score,
-            "previous_score": result.previous_analysis.overall_score,
-            "delta": result.analysis.score_delta,
-        },
+        data=AnalyzeData(
+            repository_id=result.repository.id,
+            analysis_id=result.analysis.id,
+            score=result.analysis.overall_score,
+            previous_score=result.previous_analysis.overall_score,
+            delta=result.analysis.score_delta,
+        ),
     )
 
 
@@ -206,7 +520,7 @@ def create(
     name: str,
     source: str | None = None,
     confirmed: bool = False,
-) -> WorkflowResult:
+) -> CreateResult:
     """Create a Borg PRD, optionally confirming the returned draft."""
     paths = _paths(trusted=True)
     config = load_repository_config(paths)
@@ -229,10 +543,13 @@ def create(
     if result.confirmed:
         status = "confirmed"
         artifacts = (
-            Artifact(kind="prd", path=_relative(paths, result.prd_path)),
+            PrdArtifact(kind="prd", path=_relative(paths, result.prd_path)),
         )
         actions = (
-            NextAction(tool="plan", arguments={"name": name, "action": "start"}),
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="start")
+            ),
         )
     elif result.questions:
         status = "needs_input"
@@ -242,16 +559,16 @@ def create(
         status = "draft"
         artifacts = ()
         actions = ()
-    return WorkflowResult(
+    return CreateResult(
         status=status,
         artifacts=artifacts,
         next_actions=actions,
-        data={
-            "borg": name,
-            "borg_id": str(result.borg.id),
-            "questions": list(result.questions),
-            "draft_markdown": result.body_md,
-        },
+        data=CreateData(
+            borg=name,
+            borg_id=result.borg.id,
+            questions=result.questions,
+            draft_markdown=result.body_md,
+        ),
     )
 
 
@@ -289,20 +606,37 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
     return borg, questions
 
 
-def _plan_actions(name: str, state: BorgState) -> tuple[NextAction, ...]:
+def _plan_actions(
+    name: str, state: BorgState
+) -> tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]:
     if state is BorgState.ARCHITECT_AWAITING_ANSWERS:
         return (
-            NextAction(tool="plan", arguments={"name": name, "action": "start"}),
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="start")
+            ),
         )
     if state is BorgState.PLAN_APPROVAL_PENDING:
         return (
-            NextAction(tool="plan", arguments={"name": name, "action": "show"}),
-            NextAction(tool="plan", arguments={"name": name, "action": "approve"}),
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="show")
+            ),
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="approve")
+            ),
         )
     if state is BorgState.READY_TO_EXECUTE:
         return (
-            NextAction(tool="task_list", arguments={"name": name}),
-            NextAction(tool="execute", arguments={"name": name}),
+            TaskListNextAction(
+                tool="task_list",
+                arguments=TaskListActionArguments(name=name),
+            ),
+            ExecuteNextAction(
+                tool="execute",
+                arguments=ExecuteActionArguments(name=name),
+            ),
         )
     return ()
 
@@ -326,7 +660,7 @@ def plan(
     action: Literal["start", "show", "change", "approve"] = "start",
     note: str | None = None,
     answers: list[str] | None = None,
-) -> WorkflowResult:
+) -> PlanResult:
     """Start, inspect, change, or approve a plan; approval decomposes tasks."""
     from betterborg_cli import cli as cli_module
 
@@ -334,18 +668,21 @@ def plan(
     if action == "approve":
         borg, approval, plan_path, publication = _approve_plan(paths, name)
         artifacts = [
-            Artifact(kind="approved_plan", path=_relative(paths, plan_path))
+            ApprovedPlanArtifact(
+                kind="approved_plan",
+                path=_relative(paths, plan_path),
+            )
         ]
         if publication is not None:
             artifacts.extend(
-                Artifact(kind="task", path=_relative(paths, item.path))
+                TaskArtifact(kind="task", path=_relative(paths, item.path))
                 for item in publication.files
             )
-        return WorkflowResult(
-            status=borg.state.value,
+        return PlanResult(
+            status=borg.state,
             artifacts=tuple(artifacts),
             next_actions=_plan_actions(name, borg.state),
-            data={"borg": name, "plan_digest": approval.plan_digest},
+            data=PlanApprovalData(borg=name, plan_digest=approval.plan_digest),
         )
 
     if action == "show":
@@ -358,10 +695,13 @@ def plan(
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")
             attempt = validated_current_plan_attempt(paths, store, borg)
-        return WorkflowResult(
-            status=borg.state.value,
+        return PlanResult(
+            status=borg.state,
             next_actions=_plan_actions(name, borg.state),
-            data={"borg": name, "plan": attempt.result},
+            data=PlanShowData(
+                borg=name,
+                plan=PlanDocument.model_validate(attempt.result),
+            ),
         )
 
     if action == "change" and (note is None or not note.strip()):
@@ -374,14 +714,25 @@ def plan(
             io=_planning_io(answers),
         )
         questions: list[dict[str, Any]] = []
-    except click.ClickException:
+    except click.ClickException as error:
+        cause = error.__cause__
+        if not isinstance(cause, ArchitectCancelled) or str(cause) != (
+            "Architect questions are awaiting answers"
+        ):
+            raise
         borg, questions = _planning_state(paths, name)
         if borg.state is not BorgState.ARCHITECT_AWAITING_ANSWERS:
             raise
-    return WorkflowResult(
-        status=borg.state.value,
+    return PlanResult(
+        status=borg.state,
         next_actions=_plan_actions(name, borg.state),
-        data={"borg": name, "questions": questions},
+        data=PlanProgressData(
+            borg=name,
+            questions=tuple(
+                PlanningQuestionData.model_validate(question)
+                for question in questions
+            ),
+        ),
     )
 
 
@@ -429,14 +780,19 @@ def task_list(name: str) -> TaskListResult:
         ),
         tasks=tuple(_runtime_task(row) for row in rows),
         artifacts=tuple(
-            Artifact(kind="task", path=_relative(paths, item.path))
+            TaskArtifact(kind="task", path=_relative(paths, item.path))
             for item in publication.files
         ),
-        next_actions=(NextAction(tool="execute", arguments={"name": name}),),
+        next_actions=(
+            ExecuteNextAction(
+                tool="execute",
+                arguments=ExecuteActionArguments(name=name),
+            ),
+        ),
     )
 
 
-def _execute(name: str, auto_execute: bool) -> WorkflowResult:
+def _execute(name: str, auto_execute: bool) -> ExecuteResult:
     from betterborg_cli import cli as cli_module
 
     paths = _paths(trusted=True)
@@ -457,23 +813,25 @@ def _execute(name: str, auto_execute: bool) -> WorkflowResult:
     estimate = workflow.estimate
     result = workflow.host_result
     if result is None:
-        return WorkflowResult(
+        return ExecuteResult(
             status="estimate_approval_required",
             artifacts=tuple(
-                Artifact(kind="task", path=_relative(paths, item.path))
+                TaskArtifact(kind="task", path=_relative(paths, item.path))
                 for item in publication.files
             ),
             next_actions=(
-                NextAction(
+                ExecuteNextAction(
                     tool="execute",
-                    arguments={"name": name, "auto_execute": True},
+                    arguments=ExecuteActionArguments(
+                        name=name, auto_execute=True
+                    )
                 ),
             ),
-            data={
-                "borg": name,
-                "generation_id": str(generation.id),
-                "estimate": estimate,
-            },
+            data=ExecuteData(
+                borg=name,
+                generation_id=generation.id,
+                estimate=ExecutionEstimateData.model_validate(estimate),
+            ),
         )
 
     if isinstance(result.preflight, HostPreflightBlock):
@@ -495,27 +853,32 @@ def _execute(name: str, auto_execute: bool) -> WorkflowResult:
         reason = None
     actions = ()
     if result.status not in {ExecutionRunStatus.COMPLETED}:
-        actions = (NextAction(tool="execute", arguments={"name": name}),)
-    return WorkflowResult(
+        actions = (
+            ExecuteNextAction(
+                tool="execute",
+                arguments=ExecuteActionArguments(name=name),
+            ),
+        )
+    return ExecuteResult(
         status=status,
         artifacts=tuple(
-            Artifact(kind="task", path=_relative(paths, item.path))
+            TaskArtifact(kind="task", path=_relative(paths, item.path))
             for item in publication.files
         ),
         next_actions=actions,
-        data={
-            "borg": name,
-            "generation_id": str(generation.id),
-            "operation_id": operation_id,
-            "active_operation_id": active_operation_id,
-            "reason": reason,
-            "estimate": estimate,
-        },
+        data=ExecuteData(
+            borg=name,
+            generation_id=generation.id,
+            operation_id=operation_id,
+            active_operation_id=active_operation_id,
+            reason=reason,
+            estimate=ExecutionEstimateData.model_validate(estimate),
+        ),
     )
 
 
 @server.tool(name="execute")
-def execute(name: str, auto_execute: bool = False) -> WorkflowResult:
+def execute(name: str, auto_execute: bool = False) -> ExecuteResult:
     """Estimate or run the assembled host execution service."""
     return _execute(name, auto_execute)
 

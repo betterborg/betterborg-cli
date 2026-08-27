@@ -198,6 +198,7 @@ def _published_runtime(
 
 def test_tool_inventory_has_typed_results_and_no_removed_gates() -> None:
     tools = _list_tools()
+    schemas = {tool.name: tool.outputSchema for tool in tools}
 
     assert [tool.name for tool in tools] == [
         "init",
@@ -211,6 +212,39 @@ def test_tool_inventory_has_typed_results_and_no_removed_gates() -> None:
     assert {"approve_task", "task_approve", "decompose"}.isdisjoint(
         tool.name for tool in tools
     )
+    assert {
+        name: schema["title"] for name, schema in schemas.items() if schema is not None
+    } == {
+        "init": "InitializeResult",
+        "analyze": "AnalyzeResult",
+        "create": "CreateResult",
+        "plan": "PlanResult",
+        "task_list": "TaskListResult",
+        "execute": "ExecuteResult",
+    }
+    assert schemas["init"]["$defs"]["InitializeData"]["properties"][
+        "repository_id"
+    ]["format"] == "uuid"
+    assert schemas["analyze"]["$defs"]["AnalyzeData"]["properties"]["score"] == {
+        "maximum": 5,
+        "minimum": 0,
+        "title": "Score",
+        "type": "number",
+    }
+    assert schemas["create"]["$defs"]["CreateData"]["properties"]["borg_id"][
+        "format"
+    ] == "uuid"
+    assert schemas["plan"]["$defs"]["PlanDocument"][
+        "additionalProperties"
+    ] is False
+    assert schemas["execute"]["$defs"]["ExecutionEstimateData"][
+        "additionalProperties"
+    ] is False
+    assert not any(
+        value is True
+        for schema in schemas.values()
+        for value in _additional_properties(schema)
+    )
     plan_schema = next(tool.inputSchema for tool in tools if tool.name == "plan")
     assert plan_schema["properties"]["action"]["enum"] == [
         "start",
@@ -218,6 +252,23 @@ def test_tool_inventory_has_typed_results_and_no_removed_gates() -> None:
         "change",
         "approve",
     ]
+
+
+def _additional_properties(value) -> list[object]:
+    if isinstance(value, dict):
+        current = (
+            [value["additionalProperties"]]
+            if "additionalProperties" in value
+            else []
+        )
+        return current + [
+            item
+            for child in value.values()
+            for item in _additional_properties(child)
+        ]
+    if isinstance(value, list):
+        return [item for child in value for item in _additional_properties(child)]
+    return []
 
 
 def test_init_and_analyze_use_repository_service_with_typed_actions(
@@ -230,8 +281,8 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
     prompt = paths.prompts_dir / "coding.md"
     improvement = paths.improvement_prds_dir / "runtime.md"
     repository = SimpleNamespace(id=uuid4())
-    analysis = SimpleNamespace(id=uuid4(), overall_score=81.5, score_delta=4.0)
-    previous = SimpleNamespace(overall_score=77.5)
+    analysis = SimpleNamespace(id=uuid4(), overall_score=4.5, score_delta=0.5)
+    previous = SimpleNamespace(overall_score=4.0)
     calls: list[str] = []
 
     class FakeRepositoryService:
@@ -293,8 +344,8 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
         }
     ]
     assert analyzed["status"] == "completed"
-    assert analyzed["data"]["previous_score"] == 77.5
-    assert analyzed["data"]["delta"] == 4.0
+    assert analyzed["data"]["previous_score"] == 4.0
+    assert analyzed["data"]["delta"] == 0.5
 
 
 def test_create_and_plan_approval_are_service_backed_and_typed(
@@ -421,6 +472,7 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
             "id": "q1",
             "question": "Which platforms are required?",
             "why": "The answer controls the test matrix.",
+            "hint": None,
         }
     ]
     assert waiting["next_actions"] == [
@@ -429,6 +481,19 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
             "arguments": {"name": "mcp-start", "action": "start"},
         }
     ]
+
+    invalid_answer = _call_tool(
+        "plan",
+        {
+            "name": "mcp-start",
+            "action": "start",
+            "answers": ["   "],
+        },
+    )
+    assert invalid_answer.isError is True
+    assert "Architect question answers must not be empty" in (
+        invalid_answer.content[0].text
+    )
 
     adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     adapter.queue(MockResponse(payload=plan))
@@ -453,7 +518,9 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
         "approve",
     ]
     assert shown["status"] == BorgState.PLAN_APPROVAL_PENDING.value
-    assert shown["data"] == {"borg": "mcp-start", "plan": plan}
+    assert shown["data"]["borg"] == "mcp-start"
+    assert shown["data"]["plan"]["summary"] == "MCP plan is ready."
+    assert shown["data"]["plan"]["phases"][0]["name"] == "01-release-workflow"
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-start")
         assert borg is not None
@@ -513,7 +580,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
     )
 
     assert changed["status"] == BorgState.PLAN_APPROVAL_PENDING.value
-    assert shown["data"]["plan"] == revised
+    assert shown["data"]["plan"]["summary"] == "Revised MCP plan."
+    assert shown["data"]["plan"]["code_pointers"] == revised["code_pointers"]
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-change")
         assert borg is not None
