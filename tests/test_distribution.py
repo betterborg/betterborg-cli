@@ -247,3 +247,25 @@ def test_version_check_rejects_plugin_mismatch(
     assert completed.returncode == 1
     assert manifest in completed.stderr
     assert f"expected {__version__!r}" in completed.stderr
+
+
+def test_version_check_rejects_unreviewed_source_version() -> None:
+    reviewed = "0.0.0" if __version__ != "0.0.0" else "0.0.1"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK_VERSIONS),
+            "--root",
+            str(REPOSITORY_ROOT),
+            "--expected",
+            reviewed,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert f"reviewed version {reviewed!r}" in completed.stderr
+    assert f"source version {__version__!r}" in completed.stderr

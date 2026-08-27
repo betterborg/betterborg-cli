@@ -100,13 +100,25 @@ def main() -> int:
         default=Path(__file__).resolve().parents[1],
         help="repository root to check",
     )
+    parser.add_argument(
+        "--expected",
+        help="also require the reviewed release version to match the source",
+    )
     arguments = parser.parse_args()
-    errors = version_errors(arguments.root.resolve())
+    root = arguments.root.resolve()
+    errors = version_errors(root)
+    if not errors and arguments.expected is not None:
+        source_version = _python_version(root)
+        if arguments.expected != source_version:
+            errors.append(
+                f"reviewed version {arguments.expected!r} does not match "
+                f"source version {source_version!r}"
+            )
     if errors:
         for error in errors:
             print(f"version check failed: {error}", file=sys.stderr)
         return 1
-    print(f"release versions match {_python_version(arguments.root.resolve())}")
+    print(f"release versions match {_python_version(root)}")
     return 0
 
 
