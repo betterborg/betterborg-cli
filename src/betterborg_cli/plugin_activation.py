@@ -12,7 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Generic, TypeVar
 
-PERSISTENT_INSTALL_COMMAND = "uv tool install betterborg-cli"
+PERSISTENT_INSTALL_COMMAND = "uv tool install betterborg"
 
 _SETUP_GUIDANCE = (
     "Install a persistent BetterBorg CLI with "

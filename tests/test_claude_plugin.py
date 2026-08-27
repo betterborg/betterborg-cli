@@ -666,6 +666,6 @@ def test_missing_persistent_borg_does_not_list_or_mutate_claude(
     )
 
     assert result.status is ClaudePluginStatus.SETUP_REQUIRED
-    assert "uv tool install betterborg-cli" in (result.guidance or "")
+    assert "`uv tool install betterborg`" in (result.guidance or "")
     assert fake.calls == [("--version",)]
     assert not tmp_path.joinpath("data").exists()
