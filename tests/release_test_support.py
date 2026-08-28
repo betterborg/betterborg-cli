@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -26,12 +27,16 @@ release_artifacts = load_script("release_artifacts")
 
 
 def write_binary_artifact_set(directory: Path, version: str = "1.2.3") -> None:
-    """Write the four fixture binaries, checksums, and release manifest."""
+    """Write the binaries, checksums, installer, and release manifest."""
     directory.mkdir(parents=True)
     for index, target in enumerate(release_artifacts.TARGETS, start=1):
         binary = directory / target.filename
         binary.write_bytes(f"binary fixture {index}\n".encode())
         release_artifacts.write_checksum(binary)
+    shutil.copyfile(
+        REPOSITORY_ROOT / "scripts/install.sh",
+        directory / release_artifacts.INSTALLER_FILENAME,
+    )
     release_artifacts.write_manifest(
         version, directory, directory / "release-manifest.json"
     )

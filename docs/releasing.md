@@ -65,8 +65,9 @@ different commit under the reviewed tag's version.
    The reusable build workflow then produces and version-smokes
    `borg-darwin-arm64`, `borg-darwin-x86_64`, `borg-linux-arm64`, and
    `borg-linux-x86_64`, writes one `.sha256` sidecar per binary, and generates
-   `release-manifest.json`. Each protected binary/checksum pair and the
-   manifest receives a GitHub artifact attestation.
+   `release-manifest.json`, and packages `install.sh` beside them. Each
+   protected binary/checksum pair, the manifest, and the installer receives a
+   GitHub artifact attestation.
 5. The final job reads the existing `vVERSION` GitHub Release before changing
    it. It compares every existing asset byte-for-byte by SHA-256, uploads only
    missing assets to a matching draft, and publishes the complete draft. It
@@ -130,8 +131,9 @@ python scripts/verify_github_release.py \
   --reviewed-sha REVIEWED_COMMIT_SHA
 ```
 
-The command downloads the nine expected assets through `gh api`: the four
-binaries, their four `.sha256` sidecars, and `release-manifest.json`. It checks
+The command downloads the ten expected assets through `gh api`: the four
+binaries, their four `.sha256` sidecars, `release-manifest.json`, and
+`install.sh`. It checks
 the manifest's recorded version, target metadata, sizes, and binary digests;
 checks every checksum sidecar; rejects the release if the remote tag no longer
 resolves to `REVIEWED_COMMIT_SHA`; and verifies the provenance of every asset
@@ -165,7 +167,7 @@ mismatch is terminal for that version. Do not delete an asset, use `--clobber`,
 move the tag, or rerun publication in an attempt to replace bytes. Preserve the
 run and observed digests for investigation, increment to a new reviewed
 version, and repeat the validation and protected publication path. A published
-release missing any of the nine assets is likewise terminal and requires a new
+release missing any of the ten assets is likewise terminal and requires a new
 version.
 
 If a run is interrupted before the upload step starts, use **Re-run failed
@@ -215,7 +217,8 @@ For an interrupted binary build, use **Re-run failed jobs** only after the PyPI
 digests have been verified again. Builds are replaceable workflow artifacts;
 the GitHub Release assets are not. Before approving a resume, download the
 `binary-release-VERSION` workflow artifact and confirm that it contains exactly
-the four binaries, their four checksum sidecars, and `release-manifest.json`.
+the four binaries, their four checksum sidecars, `release-manifest.json`, and
+`install.sh`.
 The manifest records `schema_version`, `version`, and, for each target, its
 `filename`, `os`, `arch`, `sha256`, and byte `size`.
 
