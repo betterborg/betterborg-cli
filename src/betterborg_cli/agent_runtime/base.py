@@ -161,6 +161,8 @@ class AgentResult:
     duration_seconds: float = 0.0
     usage: AgentUsage | None = None
     billing_mode: BillingMode = BillingMode.API
+    provider: str | None = None
+    model: str | None = None
     artifacts: tuple[AgentArtifact, ...] = ()
     attempts: int = 1
     retryable: bool = False
@@ -177,6 +179,10 @@ class AgentResult:
             raise ValueError("duration must not be negative")
         if self.attempts < 0:
             raise ValueError("attempt count must not be negative")
+        if self.provider == "":
+            raise ValueError("provider must not be empty")
+        if self.model == "":
+            raise ValueError("model must not be empty")
 
     @property
     def resumable(self) -> bool:

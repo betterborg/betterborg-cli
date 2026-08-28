@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import terminate_process
+
 
 class ApiAgentRole(StrEnum):
     """Roles supported by provider API adapters."""
@@ -212,12 +215,18 @@ class ContainedApiTools:
             changed.append(action.relative_path)
         return tuple(changed)
 
-    def run_command(self, argv: Sequence[str]) -> CommandResult:
+    def run_command(
+        self,
+        argv: Sequence[str],
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> CommandResult:
         """Run an argv directly on the host for a trusted execution role.
 
         No shell parses ``argv``.  That prevents shell metacharacters from
         becoming syntax, but it does not contain the selected program: the
-        program remains host-capable.
+        program remains host-capable. Cancellation terminates its complete
+        process group and reports return code ``-1``.
         """
         if self._role not in _COMMAND_ROLES:
             raise ToolGrantError(
@@ -233,19 +242,48 @@ class ContainedApiTools:
             for argument in command
         ):
             raise ValueError("command arguments must be strings without NUL bytes")
-        completed = subprocess.run(
+        if cancel is not None and cancel.is_set():
+            return CommandResult(
+                argv=command,
+                returncode=-1,
+                stdout="",
+                stderr="",
+            )
+        process = subprocess.Popen(
             command,
             cwd=self._cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
+            start_new_session=os.name == "posix",
         )
-        return CommandResult(
-            argv=command,
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-        )
+        while True:
+            if cancel is not None and cancel.is_set():
+                terminate_process(process)
+                stdout, stderr = process.communicate()
+                return CommandResult(
+                    argv=command,
+                    returncode=-1,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                continue
+            if cancel is not None and cancel.is_set():
+                return CommandResult(
+                    argv=command,
+                    returncode=-1,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            return CommandResult(
+                argv=command,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
 
     def _contained_path(self, path: str, *, must_exist: bool) -> Path:
         if not isinstance(path, str) or not path:

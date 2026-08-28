@@ -59,7 +59,7 @@ def run_streamed(
             input_text: str | None = stdin_text
             while True:
                 if cancel is not None and cancel.is_set():
-                    _terminate_process(process)
+                    terminate_process(process)
                     return -1
                 try:
                     process.communicate(input_text, timeout=0.1)
@@ -77,7 +77,8 @@ def run_streamed(
                 process.stdin.close()
 
 
-def _terminate_process(process: subprocess.Popen[str]) -> None:
+def terminate_process(process: subprocess.Popen[str]) -> None:
+    """Terminate and reap a process, including its POSIX process group."""
     if process.poll() is not None:
         return
     try:
