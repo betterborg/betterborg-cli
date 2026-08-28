@@ -115,6 +115,57 @@ def test_complete_fixture_verifies_all_surfaces_and_three_init_paths(
     assert result == verify_final_release.VerificationResult(True, ())
 
 
+def test_complete_fixture_checks_public_surfaces_in_release_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, github, fixture = _write_fixture(tmp_path)
+    events: list[str] = []
+    original_pypi = verify_final_release.verify_pypi_release.publication_action
+    original_github = verify_final_release.verify_github_release.fixture_snapshot
+    original_npm = verify_final_release.reconcile_npm_release.publication_action
+
+    def record_pypi(*args, **kwargs):
+        events.append("pypi")
+        return original_pypi(*args, **kwargs)
+
+    def record_github(*args, **kwargs):
+        events.append("github")
+        return original_github(*args, **kwargs)
+
+    def record_npm(*args, **kwargs):
+        events.append("npm")
+        return original_npm(*args, **kwargs)
+
+    monkeypatch.setattr(
+        verify_final_release.verify_pypi_release,
+        "publication_action",
+        record_pypi,
+    )
+    monkeypatch.setattr(
+        verify_final_release.verify_github_release,
+        "fixture_snapshot",
+        record_github,
+    )
+    monkeypatch.setattr(
+        verify_final_release.reconcile_npm_release,
+        "publication_action",
+        record_npm,
+    )
+    _deny_public_access(monkeypatch)
+
+    result = verify_final_release.verify_final_release(
+        VERSION,
+        registry,
+        github,
+        fixture=fixture,
+        attempts=1,
+        retry_delay=0,
+    )
+
+    assert result.complete is True
+    assert events == ["pypi", "github", "npm"]
+
+
 @pytest.mark.parametrize("partial", ("pypi", "github", "npm"))
 def test_partial_fixture_stops_at_the_first_ordered_publication_gate(
     tmp_path: Path,

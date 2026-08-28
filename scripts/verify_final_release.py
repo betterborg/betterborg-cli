@@ -58,31 +58,37 @@ def _validate_version(version: str) -> None:
         )
 
 
-def _registry_statuses(
+def _pypi_status(
     version: str,
     registry_artifacts: Path,
     fixture: Path | None,
-) -> tuple[str, str]:
+) -> str:
     pypi_fixture = fixture / "pypi.json" if fixture is not None else None
-    npm_fixture = fixture / "npm.json" if fixture is not None else None
-    tarball = registry_artifacts / f"betterborg-cli-{version}.tgz"
     try:
-        pypi = verify_pypi_release.publication_action(
+        return verify_pypi_release.publication_action(
             version,
             registry_artifacts,
             fixture=pypi_fixture,
         )
     except verify_pypi_release.ReleaseVerificationError as error:
         _fail(f"PyPI verification failed: {error}")
+
+
+def _npm_status(
+    version: str,
+    registry_artifacts: Path,
+    fixture: Path | None,
+) -> str:
+    npm_fixture = fixture / "npm.json" if fixture is not None else None
+    tarball = registry_artifacts / f"betterborg-cli-{version}.tgz"
     try:
-        npm = reconcile_npm_release.publication_action(
+        return reconcile_npm_release.publication_action(
             version,
             tarball,
             fixture=npm_fixture,
         )
     except reconcile_npm_release.NpmReconciliationError as error:
         _fail(f"npm verification failed: {error}")
-    return pypi, npm
 
 
 def _github_snapshot(
@@ -117,7 +123,7 @@ def _surface_result(
     fixture: Path | None,
     download_directory: Path,
 ) -> VerificationResult:
-    pypi, npm = _registry_statuses(version, registry_artifacts, fixture)
+    pypi = _pypi_status(version, registry_artifacts, fixture)
     snapshot = _github_snapshot(
         version,
         repository,
@@ -131,6 +137,7 @@ def _surface_result(
     except verify_github_release.GitHubReleaseVerificationError as error:
         _fail(f"GitHub verification failed: {error}")
 
+    npm = _npm_status(version, registry_artifacts, fixture)
     github_started = snapshot is not None
     npm_present = npm == "skip"
     if pypi == "publish":
