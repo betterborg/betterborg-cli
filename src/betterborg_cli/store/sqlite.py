@@ -712,6 +712,20 @@ class SqliteStore:
             ).fetchone()
         return _row_to_prd_session(row) if row is not None else None
 
+    def get_prd_session_for_borg(self, borg_id: UUID) -> PrdSession | None:
+        """Return the latest PRD session belonging to one Borg, if present."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM prd_sessions
+                WHERE borg_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(borg_id),),
+            ).fetchone()
+        return _row_to_prd_session(row) if row is not None else None
+
     def append_prd_turn(
         self, *, session_id: UUID, role: str, content: str
     ) -> PrdTurn:
