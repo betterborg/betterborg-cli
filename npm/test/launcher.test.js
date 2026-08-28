@@ -176,7 +176,7 @@ test("Windows resolution skips its own npm shims and falls back to uvx", async (
   }
 });
 
-test("Windows probes an installed cmd shim through the command shell", async () => {
+test("Windows probes an installed cmd shim through an explicit command shell", async () => {
   const borg = "C:\\tools\\borg.CMD";
   const fileSystem = {
     constants: { X_OK: 1 },
@@ -203,13 +203,13 @@ test("Windows probes an installed cmd shim through the command shell", async () 
   });
 
   assert.deepEqual(invocation, {
-    command: borg,
-    arguments_: ["version"],
+    command: "cmd.exe",
+    arguments_: ["/d", "/s", "/v:off", "/c", '"C:\\tools\\borg.CMD ^"version^""'],
     options: {
       encoding: "utf8",
-      shell: true,
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      windowsVerbatimArguments: true,
     },
   });
   assert.deepEqual(resolved, {
@@ -419,7 +419,7 @@ test("launch forwards a numeric child exit status", async () => {
   assert.equal(processLike.exitCode, 23);
 });
 
-test("launch runs a Windows cmd shim through the command shell", async () => {
+test("launch escapes arguments passed through a Windows command shell", async () => {
   const child = new EventEmitter();
   child.kill = () => {};
   const processLike = new EventEmitter();
@@ -430,8 +430,9 @@ test("launch runs a Windows cmd shim through the command shell", async () => {
       command: "C:\\tools\\uvx.CMD",
       argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
     },
-    ["tasks"],
+    ["two words", "literal&pipe|redirect<>", "100%", "bang!", "(group)"],
     {
+      environment: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
       platform: "win32",
       process: processLike,
       spawn: (command, arguments_, options) => {
@@ -444,9 +445,73 @@ test("launch runs a Windows cmd shim through the command shell", async () => {
   await completed;
 
   assert.deepEqual(invocation, {
-    command: "C:\\tools\\uvx.CMD",
-    arguments_: ["--from", "betterborg==1.2.3", "borg", "tasks"],
-    options: { shell: true, stdio: "inherit" },
+    command: "C:\\Windows\\System32\\cmd.exe",
+    arguments_: [
+      "/d",
+      "/s",
+      "/v:off",
+      "/c",
+      '"C:\\tools\\uvx.CMD ^"--from^" ^"betterborg==1.2.3^" ^"borg^" ^"two^ words^" ^"literal^&pipe^|redirect^<^>^" ^"100^%^" ^"bang^!^" ^"^(group^)^""',
+    ],
+    options: { stdio: "inherit", windowsVerbatimArguments: true },
   });
+  assert.equal(processLike.exitCode, 0);
+});
+
+test("Windows cmd launch rejects command separators it cannot preserve", async () => {
+  const processLike = new EventEmitter();
+  processLike.exitCode = null;
+  await assert.rejects(
+    launch(
+      { command: "C:\\tools\\uvx.cmd", argumentsPrefix: [] },
+      ["tasks\r\necho injected"],
+      {
+        platform: "win32",
+        process: processLike,
+        spawn: () => assert.fail("an unsafe command must not be spawned"),
+      },
+    ),
+    /cannot safely forward.*line breaks/,
+  );
+});
+
+test("Windows cmd launch preserves literal arguments without injection", async (t) => {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const directory = temporaryDirectory(t);
+  const recorder = path.join(directory, "record-arguments.js");
+  const output = path.join(directory, "arguments.json");
+  const sentinel = path.join(directory, "injected.txt");
+  const shim = path.join(directory, "borg.cmd");
+  fs.writeFileSync(
+    recorder,
+    `require("node:fs").writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)));\n`,
+  );
+  fs.writeFileSync(
+    shim,
+    `@echo off\r\n"${process.execPath}" "${recorder}" %*\r\n`,
+  );
+  const arguments_ = [
+    "two words",
+    `literal&echo injected>${sentinel}`,
+    "pipe|value",
+    "redirect<input>output",
+    "100%literal%",
+    "bang!literal",
+    "(group)",
+  ];
+  const processLike = new EventEmitter();
+  processLike.exitCode = null;
+
+  await launch(
+    { command: shim, argumentsPrefix: [] },
+    arguments_,
+    { platform: "win32", process: processLike },
+  );
+
+  assert.deepEqual(JSON.parse(fs.readFileSync(output, "utf8")), arguments_);
+  assert.equal(fs.existsSync(sentinel), false);
   assert.equal(processLike.exitCode, 0);
 });

@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  npm-launcher-windows:
+    name: npm launcher on Windows
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up minimum supported Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Lint npm launcher
+        run: npm --prefix npm run lint
+
+      - name: Test npm launcher
+        run: npm --prefix npm test
+
   validate:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest

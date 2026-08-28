@@ -48,8 +48,47 @@ function samePath(left, right, platform) {
   return left === right;
 }
 
-function requiresShell(command, platform) {
+function isWindowsCommandScript(command, platform) {
   return platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
+const WINDOWS_SHELL_META_CHARACTERS = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeWindowsCommand(command) {
+  return command.replace(WINDOWS_SHELL_META_CHARACTERS, "^$1");
+}
+
+function escapeWindowsArgument(argument) {
+  let escaped = String(argument)
+    .replace(/(\\*)"/g, '$1$1\\"')
+    .replace(/(\\*)$/, "$1$1");
+  escaped = `"${escaped}"`;
+  return escaped.replace(WINDOWS_SHELL_META_CHARACTERS, "^$1");
+}
+
+function commandInvocation(command, arguments_, options, dependencies) {
+  if (!isWindowsCommandScript(command, dependencies.platform)) {
+    return { command, arguments: arguments_, options };
+  }
+  if ([command, ...arguments_].some((value) => /[\r\n]/.test(value))) {
+    throw new Error(
+      "Windows command shims cannot safely forward paths or arguments containing line breaks",
+    );
+  }
+
+  const shell =
+    dependencies.environment.ComSpec ||
+    dependencies.environment.COMSPEC ||
+    "cmd.exe";
+  const shellCommand = [
+    escapeWindowsCommand(command),
+    ...arguments_.map(escapeWindowsArgument),
+  ].join(" ");
+  return {
+    command: shell,
+    arguments: ["/d", "/s", "/v:off", "/c", `"${shellCommand}"`],
+    options: { ...options, windowsVerbatimArguments: true },
+  };
 }
 
 function launcherExecutables(dependencies) {
@@ -126,15 +165,21 @@ function installedCli(version, dependencies) {
   if (!candidate) {
     return null;
   }
-  const options = {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 5000,
-  };
-  if (requiresShell(candidate, dependencies.platform)) {
-    options.shell = true;
-  }
-  const completed = dependencies.spawnSync(candidate, ["version"], options);
+  const invocation = commandInvocation(
+    candidate,
+    ["version"],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    },
+    dependencies,
+  );
+  const completed = dependencies.spawnSync(
+    invocation.command,
+    invocation.arguments,
+    invocation.options,
+  );
   if (
     completed.status === 0 &&
     completed.stdout.trim() === `borg ${version}`
@@ -291,14 +336,16 @@ function launch(resolved, arguments_, overrides = {}) {
     let settled = false;
     let child;
     try {
-      const options = { stdio: "inherit" };
-      if (requiresShell(resolved.command, dependencies.platform)) {
-        options.shell = true;
-      }
-      child = dependencies.spawn(
+      const invocation = commandInvocation(
         resolved.command,
         [...resolved.argumentsPrefix, ...arguments_],
-        options,
+        { stdio: "inherit" },
+        dependencies,
+      );
+      child = dependencies.spawn(
+        invocation.command,
+        invocation.arguments,
+        invocation.options,
       );
     } catch (error) {
       reject(error);
