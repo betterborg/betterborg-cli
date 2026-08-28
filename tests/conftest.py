@@ -38,6 +38,21 @@ def git_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def committed_git_repo(git_repo: Path) -> Path:
+    """Create a temporary Git repository with one tracked commit."""
+    (git_repo / "README.md").write_text(
+        "# Test repository\n\nBuild and test docs.\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    return git_repo
+
+
+@pytest.fixture
 def sqlite_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     """Open a temporary SQLite database and close it after the test."""
     connection = sqlite3.connect(tmp_path / "test.sqlite3")

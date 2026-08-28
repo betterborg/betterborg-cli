@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentRunSpec,
     AgentStatus,
     CancellationToken,
 )
-from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.selection import (
+    AgentSelectionError,
+    SelectedAgent,
+    resolve_agent_model,
+)
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.repo_analysis.discovery import (
     DiscoveryLimits,
@@ -301,12 +306,6 @@ _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
     "or truncated evidence as uncertainty; do not inspect the raw repository."
 )
-_DEFAULT_ANALYSIS_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-5",
-}
-
-
 class AnalyzerError(RuntimeError):
     """Raised when an analyzer run cannot produce a persistent result."""
 
@@ -401,7 +400,7 @@ def _run_in_workspace(
         cwd=workspace_dir.resolve(),
         model=resolve_analysis_model(agent, config.model),
         effort=config.effort,
-        allowed_tools=("list_files", "read_file", "search_text"),
+        allowed_tools=READ_ONLY_API_TOOLS,
         log_path=artifact_dir / f"{run_id}.log",
         result_path=artifact_dir / f"{run_id}.json",
     )
@@ -630,13 +629,9 @@ def resolve_analysis_model(
     agent: AgentAdapter | SelectedAgent, configured_model: str | None
 ) -> str:
     """Resolve an explicit, selected, or provider-default analysis model."""
-    if configured_model is not None:
-        return configured_model
-    if isinstance(agent, SelectedAgent) and agent.model is not None:
-        return agent.model
     try:
-        return _DEFAULT_ANALYSIS_MODELS[agent.name]
-    except KeyError as error:
+        return resolve_agent_model(agent, configured_model)
+    except AgentSelectionError as error:
         raise AnalyzerError(
             f"analysis model must be configured for adapter {agent.name!r}"
         ) from error

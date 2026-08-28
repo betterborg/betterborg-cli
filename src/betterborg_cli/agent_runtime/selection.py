@@ -41,6 +41,12 @@ _API_CREDENTIALS = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
 }
+_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-8",
+    "claude": "claude-opus-4-8",
+    "codex": "gpt-5",
+    "openai": "gpt-5",
+}
 _SETUP_GUIDANCE = (
     "Install and log in to the 'claude' or 'codex' CLI for interactive use, "
     "or set ANTHROPIC_API_KEY or OPENAI_API_KEY for API use."
@@ -262,6 +268,23 @@ def select_agent(
         trust_confirm=trust_confirm,
         trust_requirement=trust_requirement or require_workspace_trust,
     )
+
+
+def resolve_agent_model(
+    agent: AgentAdapter | SelectedAgent,
+    configured_model: str | None,
+) -> str:
+    """Resolve an explicit, selected, or provider-default agent model."""
+    if configured_model is not None:
+        return configured_model
+    if isinstance(agent, SelectedAgent) and agent.model is not None:
+        return agent.model
+    try:
+        return _DEFAULT_MODELS[agent.name]
+    except KeyError as error:
+        raise AgentSelectionError(
+            f"Agent model must be configured for adapter {agent.name!r}"
+        ) from error
 
 
 def _choice_for_role(config: RepositoryConfig, role: ApiAgentRole) -> AgentChoice:

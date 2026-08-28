@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
-from uuid import uuid4
 
 from betterborg_cli.agent_runtime.base import AgentAdapter
 from betterborg_cli.agent_runtime.selection import SelectedAgent
@@ -30,6 +28,10 @@ from betterborg_cli.repository_config import (
     CONFIG_VERSION,
     RepositoryConfig,
     load_repository_config,
+)
+from betterborg_cli.repository_files import (
+    RepositoryPathError,
+    publish_repository_text,
 )
 from betterborg_cli.store import Operation, Repository, RepositoryAnalysis, SqliteStore
 
@@ -249,21 +251,7 @@ def _suggested_borg_names(
 
 
 def _publish_text(path: Path, body: str, *, root: Path) -> None:
-    parent = path.parent
-    if not parent.resolve().is_relative_to(root):
-        raise RepositoryInitializationError(
-            f"output directory escapes repository: {parent}"
-        )
-    parent.mkdir(parents=True, exist_ok=True)
-    resolved_parent = parent.resolve(strict=True)
-    if not resolved_parent.is_relative_to(root):
-        raise RepositoryInitializationError(
-            f"output directory escapes repository: {parent}"
-        )
-    temporary = resolved_parent / f".{path.name}.{uuid4().hex}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as output:
-            output.write(body)
-        os.replace(temporary, resolved_parent / path.name)
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_repository_text(path, body, root=root, overwrite=True)
+    except RepositoryPathError as error:
+        raise RepositoryInitializationError(str(error)) from error

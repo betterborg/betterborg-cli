@@ -80,6 +80,7 @@ class _PatchAction:
 _COMMAND_ROLES = frozenset(
     {ApiAgentRole.CODING, ApiAgentRole.REVIEW, ApiAgentRole.MERGE}
 )
+READ_ONLY_API_TOOLS = ("list_files", "read_file", "search_text")
 
 
 def _object_schema(

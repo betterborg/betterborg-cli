@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentRunSpec,
@@ -184,7 +185,7 @@ def _generate_one_role(
         cwd=repository.root,
         model=model,
         effort=effort,
-        allowed_tools=("list_files", "read_file", "search_text"),
+        allowed_tools=READ_ONLY_API_TOOLS,
         log_path=artifact_dir / f"{analysis.id}.{role}.log",
         result_path=artifact_dir / f"{analysis.id}.{role}.json",
     )

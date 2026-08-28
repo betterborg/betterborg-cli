@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -23,17 +22,14 @@ from betterborg_cli.repo_analysis.text_rendering import (
     markdown_text,
 )
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_files import (
+    RepositoryPathError,
+    is_windows_reserved_filename,
+    publish_repository_text,
+)
 from betterborg_cli.store import RepositoryAnalysis, SqliteStore
 
 _THEME_KEY_PARTS = re.compile(r"[^a-z0-9]+")
-_WINDOWS_RESERVED_BASENAMES = {
-    "aux",
-    "con",
-    "nul",
-    "prn",
-    *(f"com{number}" for number in range(1, 10)),
-    *(f"lpt{number}" for number in range(1, 10)),
-}
 _THEME_FIELDS = (
     "id",
     "title",
@@ -63,7 +59,7 @@ def resolve_theme_key(theme_id: str) -> str:
     key = _THEME_KEY_PARTS.sub("-", ascii_id.casefold()).strip("-")
     if not key:
         raise ValueError(f"theme ID {theme_id!r} does not resolve to a filename key")
-    if key in _WINDOWS_RESERVED_BASENAMES:
+    if is_windows_reserved_filename(key):
         key = f"{key}-theme"
     return key
 
@@ -131,35 +127,20 @@ def generate_improvement_prds(
         )
         for key, ranked in keyed_themes
     )
-    publication_directory = _prepare_publication_directory(paths)
     for document in documents:
-        _publish_prd(
-            publication_directory / document.path.name,
-            document.body_md,
-        )
+        try:
+            publish_repository_text(
+                document.path,
+                document.body_md,
+                root=paths.root,
+                overwrite=True,
+            )
+        except RepositoryPathError as error:
+            raise ValueError(
+                "improvement PRD directory escapes repository: "
+                f"{paths.improvement_prds_dir}"
+            ) from error
     return documents
-
-
-def _prepare_publication_directory(paths: RepoPaths) -> Path:
-    directory = paths.improvement_prds_dir
-    resolved = directory.resolve()
-    if not resolved.is_relative_to(paths.root):
-        raise ValueError(f"improvement PRD directory escapes repository: {directory}")
-    directory.mkdir(parents=True, exist_ok=True)
-    resolved = directory.resolve(strict=True)
-    if not resolved.is_relative_to(paths.root):
-        raise ValueError(f"improvement PRD directory escapes repository: {directory}")
-    return resolved
-
-
-def _publish_prd(path: Path, body_md: str) -> None:
-    temporary = path.with_name(f".{path.name}.{os.urandom(16).hex()}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            handle.write(body_md)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _ranked_themes(payload: Mapping[str, Any]) -> list[RankedRecommendationTheme]:
