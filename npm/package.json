@@ -1,0 +1,31 @@
+{
+  "name": "@betterborg/cli",
+  "version": "0.1.0",
+  "description": "Installer and launcher for the BetterBorg CLI",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/betterborg/betterborg-cli.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/betterborg/betterborg-cli#readme",
+  "bugs": "https://github.com/betterborg/betterborg-cli/issues",
+  "type": "commonjs",
+  "bin": {
+    "borg": "bin/borg.js"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "lint": "node --check bin/borg.js && node --check lib/launcher.js && node --check test/launcher.test.js",
+    "test": "node --test test/launcher.test.js"
+  }
+}

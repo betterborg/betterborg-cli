@@ -29,6 +29,11 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Set up Node for npm launcher checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install locked development environment
         run: make sync
 

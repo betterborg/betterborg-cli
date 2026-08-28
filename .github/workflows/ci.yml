@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Node for npm launcher checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install locked development environment
         run: make sync
 

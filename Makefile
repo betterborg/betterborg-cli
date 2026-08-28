@@ -16,6 +16,8 @@ binary: check-version
 
 lint:
 	.venv/bin/ruff check .
+	npm --prefix npm run lint
 
 test:
 	.venv/bin/pytest
+	npm --prefix npm test

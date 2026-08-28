@@ -8,6 +8,7 @@ foundation; repository and service features will be added incrementally.
 
 - Python 3.11 or newer
 - Python's `venv` module
+- Node.js 18 or newer (for npm launcher checks)
 
 ## Install and run
 
