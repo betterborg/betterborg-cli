@@ -18,11 +18,13 @@ permissions:
 
 jobs:
   validate-release:
-    name: Validate release without publishing
+    name: Validate final tag and build release inputs once
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Check out the complete reviewed history
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,25 +34,32 @@ jobs:
       - name: Set up Node for npm launcher checks
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Install locked development environment
         run: make sync
 
-      - name: Validate reviewed version
+      - name: Validate greater synchronized reviewed tag
         env:
           REVIEWED_VERSION: ${{ inputs.version }}
-        run: .venv/bin/python scripts/check_versions.py --tag "v$REVIEWED_VERSION"
+        run: |
+          .venv/bin/python scripts/check_versions.py \
+            --tag "v$REVIEWED_VERSION" \
+            --greater-than 0.1.0
+          test "$(git rev-list -n 1 "v$REVIEWED_VERSION")" = "$GITHUB_SHA"
 
       - name: Lint and test
         run: |
           make lint
           make test
 
-      - name: Build wheel and source distribution
+      - name: Build reviewed Python distributions once
         run: make build
 
-      - name: Require the exact wheel and source distribution
+      - name: Build reviewed npm package once
+        run: npm pack --pack-destination dist ./npm
+
+      - name: Require exact final-version registry inputs
         env:
           REVIEWED_VERSION: ${{ inputs.version }}
         run: |
@@ -62,27 +71,29 @@ jobs:
           expected = {
               f"betterborg-{version}-py3-none-any.whl",
               f"betterborg-{version}.tar.gz",
+              f"betterborg-cli-{version}.tgz",
           }
           actual = {path.name for path in Path("dist").iterdir() if path.is_file()}
           if actual != expected:
               raise SystemExit(
-                  f"release artifacts differ: expected {sorted(expected)}, "
+                  f"release inputs differ: expected {sorted(expected)}, "
                   f"found {sorted(actual)}"
               )
           PY
 
-      - name: Preserve reviewed distributions
+      - name: Preserve build-once registry inputs
         uses: actions/upload-artifact@v4
         with:
-          name: betterborg-${{ inputs.version }}
+          name: betterborg-registry-inputs-${{ inputs.version }}
           if-no-files-found: error
           retention-days: 7
           path: |
             dist/betterborg-${{ inputs.version }}-py3-none-any.whl
             dist/betterborg-${{ inputs.version }}.tar.gz
+            dist/betterborg-cli-${{ inputs.version }}.tgz
 
   publish-pypi:
-    name: Publish reviewed distributions to PyPI
+    name: Digest-gate and publish reviewed distributions to PyPI
     if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
     needs: [validate-release]
     runs-on: ubuntu-latest
@@ -93,77 +104,55 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Check out verification code
+      - name: Check out reconciliation code
         uses: actions/checkout@v4
 
-      - name: Retrieve reviewed distributions
+      - name: Retrieve reviewed registry inputs
         uses: actions/download-artifact@v4
         with:
-          name: betterborg-${{ inputs.version }}
-          path: dist
+          name: betterborg-registry-inputs-${{ inputs.version }}
+          path: registry-inputs
 
-      - name: Publish with the PyPI trusted publisher
+      - name: Select only Python distributions for PyPI
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          mkdir dist
+          cp "registry-inputs/betterborg-$REVIEWED_VERSION-py3-none-any.whl" dist/
+          cp "registry-inputs/betterborg-$REVIEWED_VERSION.tar.gz" dist/
+
+      - name: Compare an existing immutable PyPI version
+        id: pypi-plan
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          python scripts/verify_pypi_release.py \
+            --version "$REVIEWED_VERSION" \
+            --artifacts dist \
+            --plan-publication \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish only a missing PyPI version with trusted publishing
+        if: ${{ steps.pypi-plan.outputs.action == 'publish' }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           skip-existing: false
 
-      - name: Set up uv for public verification
-        uses: astral-sh/setup-uv@v6
-
-      - name: Verify exact public command and controlled init
+      - name: Require exact public PyPI digests
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REVIEWED_VERSION: ${{ inputs.version }}
-        run: python scripts/verify_pypi_release.py --version "$REVIEWED_VERSION"
-
-  pypi-verification-gate:
-    name: Require verified PyPI release before binaries
-    if: >-
-      ${{ always() && needs.validate-release.result == 'success' &&
-          ((!inputs.publish) || needs.publish-pypi.result == 'success') }}
-    needs: [validate-release, publish-pypi]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out verification fixtures
-        if: ${{ !inputs.publish }}
-        uses: actions/checkout@v4
-
-      - name: Set up fixture test Python
-        if: ${{ !inputs.publish }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Validate PyPI verification without registry access
-        if: ${{ !inputs.publish }}
         run: |
-          make sync
-          .venv/bin/pytest tests/test_release_workflow.py
+          python scripts/verify_pypi_release.py \
+            --version "$REVIEWED_VERSION" \
+            --artifacts dist \
+            --artifacts-only
 
-      - name: Confirm protected PyPI verification
-        if: ${{ inputs.publish }}
-        run: echo "Protected PyPI upload and verification completed."
-
-  build-binaries:
-    name: Build four-platform standalone release
-    needs: [pypi-verification-gate]
-    uses: ./.github/workflows/binary-release.yml
-    with:
-      version: ${{ inputs.version }}
-      attest: ${{ inputs.publish }}
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-
-  validate-github-reconciliation:
-    name: Validate GitHub Release reconciliation without publishing
+  validate-pypi-reconciliation:
+    name: Validate PyPI digest reconciliation without publishing
     if: ${{ !inputs.publish }}
-    needs: [build-binaries]
+    needs: [validate-release]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Check out reconciliation fixtures
         uses: actions/checkout@v4
@@ -173,15 +162,39 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Exercise digest reconciliation fixtures
+      - name: Exercise PyPI digest fixtures
         run: |
           make sync
-          .venv/bin/pytest tests/test_binary_release.py
+          .venv/bin/pytest tests/test_release_workflow.py
+
+  build-binaries-published:
+    name: Build final-tag standalone release after PyPI
+    if: ${{ inputs.publish }}
+    needs: [publish-pypi]
+    uses: ./.github/workflows/binary-release.yml
+    with:
+      version: ${{ inputs.version }}
+      attest: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  build-binaries-dry-run:
+    name: Build final-tag standalone release without publication
+    if: ${{ !inputs.publish }}
+    needs: [validate-pypi-reconciliation]
+    uses: ./.github/workflows/binary-release.yml
+    with:
+      version: ${{ inputs.version }}
+      attest: false
+    permissions:
+      contents: read
 
   reconcile-github-release:
     name: Digest-gate and publish GitHub Release
     if: ${{ inputs.publish }}
-    needs: [build-binaries]
+    needs: [build-binaries-published]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -204,3 +217,145 @@ jobs:
             --version "$REVIEWED_VERSION" \
             --artifacts release-assets \
             --publish
+
+  validate-github-reconciliation:
+    name: Validate GitHub Release reconciliation without publishing
+    if: ${{ !inputs.publish }}
+    needs: [build-binaries-dry-run]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out reconciliation fixtures
+        uses: actions/checkout@v4
+
+      - name: Set up fixture test Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Exercise binary, manifest, and installer fixtures
+        run: |
+          make sync
+          .venv/bin/pytest tests/test_binary_release.py tests/test_install_script.py
+
+  publish-npm:
+    name: Digest-gate and publish reviewed npm package
+    if: ${{ inputs.publish }}
+    needs: [reconcile-github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@betterborg/cli/v/${{ inputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out reconciliation code
+        uses: actions/checkout@v4
+
+      - name: Set up npm trusted publishing
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: Require an OIDC-capable npm CLI
+        run: npm install --global npm@11
+
+      - name: Retrieve reviewed registry inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: betterborg-registry-inputs-${{ inputs.version }}
+          path: dist
+
+      - name: Compare an existing immutable npm version
+        id: npm-plan
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          python scripts/reconcile_npm_release.py \
+            --version "$REVIEWED_VERSION" \
+            --tarball "dist/betterborg-cli-$REVIEWED_VERSION.tgz" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish only a missing npm version with trusted publishing
+        if: ${{ steps.npm-plan.outputs.action == 'publish' }}
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: npm publish "dist/betterborg-cli-$REVIEWED_VERSION.tgz" --access public
+
+      - name: Require exact public npm digest
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          python scripts/reconcile_npm_release.py \
+            --version "$REVIEWED_VERSION" \
+            --tarball "dist/betterborg-cli-$REVIEWED_VERSION.tgz" \
+            --require-present
+
+  validate-npm-reconciliation:
+    name: Validate npm digest reconciliation without publishing
+    if: ${{ !inputs.publish }}
+    needs: [validate-github-reconciliation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out npm reconciliation fixtures
+        uses: actions/checkout@v4
+
+      - name: Set up fixture test Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Exercise npm package and digest fixtures
+        run: |
+          make sync
+          .venv/bin/pytest tests/test_npm_release.py
+          npm --prefix npm test
+
+  smoke-public-release:
+    name: Smoke exact curl, uvx, and npx initialization
+    if: ${{ inputs.publish }}
+    needs: [publish-npm]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      contents: read
+    steps:
+      - name: Check out protected smoke code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Node for npx
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run three isolated trust and provider fixtures
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: python scripts/verify_public_installations.py --version "$REVIEWED_VERSION"
+
+  validate-public-smokes:
+    name: Validate protected public smoke definitions without network access
+    if: ${{ !inputs.publish }}
+    needs: [validate-npm-reconciliation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out protected smoke fixtures
+        uses: actions/checkout@v4
+
+      - name: Set up fixture test Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Exercise exact-version isolated fixtures and credential scans
+        run: |
+          make sync
+          .venv/bin/pytest tests/test_public_installations.py tests/test_public_tree.py

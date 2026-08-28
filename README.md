@@ -29,6 +29,20 @@ WSL1 are unsupported; use a WSL2 shell. For another unsupported target, install
 uv and run `uvx --from betterborg borg version` as a non-persistent fallback;
 plugin activation still requires the persistent installer.
 
+For an ephemeral exact Python package invocation, or the npm launcher, use:
+
+```console
+uvx --from betterborg borg version
+npx --yes @betterborg/cli version
+```
+
+Pin `betterborg==VERSION` or `@betterborg/cli@VERSION` when reproducibility
+matters. The npm launcher uses a compatible installed CLI or a verified
+version-matched GitHub binary and falls back to exact-version `uvx`. See the
+[installation guide](docs/installation.md) for trust, provider, WSL2, and
+recovery guidance. `install.betterborg.ai` remains pending; use the live GitHub
+installer URL above.
+
 To install the CLI from a checkout and print its version instead:
 
 ```console
@@ -85,6 +99,18 @@ borg trust
 For a deliberate noninteractive decision, use `borg trust --yes`. Trust is
 bound to the resolved repository and Git common-directory paths and is stored
 in the user's machine-local state directory, not in the repository.
+
+Noninteractive initialization also requires one provider API credential:
+
+```console
+export OPENAI_API_KEY='your-provider-key'
+borg init --yes
+```
+
+`ANTHROPIC_API_KEY` is supported as an alternative. Keep provider credentials
+in your shell or secret manager, never in `.borg/config.toml` or another
+tracked file. See the [command guide](docs/commands.md) for the bootstrap and
+initialization command shapes.
 
 Provider API agents use contained file tools that reject absolute paths,
 traversal, and symlinks escaping the run directory. Analysis and planning

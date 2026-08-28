@@ -10,6 +10,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -143,7 +144,7 @@ def _local_distribution_digests(
     return digests
 
 
-def _public_distribution_digests(version: str) -> dict[str, str]:
+def _public_distribution_digests(version: str) -> dict[str, str] | None:
     quoted_version = urllib.parse.quote(version, safe="")
     request = urllib.request.Request(
         PYPI_RELEASE_URL.format(version=quoted_version),
@@ -153,6 +154,10 @@ def _public_distribution_digests(version: str) -> dict[str, str]:
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        _fail("could not retrieve public PyPI release metadata")
     except (OSError, ValueError):
         _fail("could not retrieve public PyPI release metadata")
 
@@ -183,9 +188,9 @@ def _public_distribution_digests(version: str) -> dict[str, str]:
     return digests
 
 
-def _verify_public_digests(version: str, artifact_directory: Path) -> None:
-    reviewed = _local_distribution_digests(version, artifact_directory)
-    public = _public_distribution_digests(version)
+def _compare_public_digests(
+    reviewed: dict[str, str], public: dict[str, str]
+) -> None:
     if public.keys() != reviewed.keys():
         _fail("public PyPI artifact names do not match the reviewed distributions")
     for filename, reviewed_digest in reviewed.items():
@@ -194,6 +199,45 @@ def _verify_public_digests(version: str, artifact_directory: Path) -> None:
                 f"public PyPI digest mismatch for {filename}; "
                 "the version is immutable, so prepare a new version"
             )
+
+
+def _verify_public_digests(version: str, artifact_directory: Path) -> None:
+    reviewed = _local_distribution_digests(version, artifact_directory)
+    public = _public_distribution_digests(version)
+    if public is None:
+        _fail("reviewed PyPI version is not public")
+    _compare_public_digests(reviewed, public)
+
+
+def publication_action(version: str, artifact_directory: Path) -> str:
+    """Return ``publish`` or ``skip`` after comparing immutable PyPI bytes."""
+    reviewed = _local_distribution_digests(version, artifact_directory)
+    public = _public_distribution_digests(version)
+    if public is None:
+        return "publish"
+    _compare_public_digests(reviewed, public)
+    return "skip"
+
+
+def verify_public_artifacts(
+    version: str,
+    artifact_directory: Path,
+    *,
+    attempts: int,
+    retry_delay: float,
+) -> None:
+    """Wait for one reviewed wheel and sdist to become publicly visible."""
+    if attempts < 1:
+        _fail("attempts must be at least one")
+    reviewed = _local_distribution_digests(version, artifact_directory)
+    for attempt in range(1, attempts + 1):
+        public = _public_distribution_digests(version)
+        if public is not None:
+            _compare_public_digests(reviewed, public)
+            return
+        if attempt != attempts:
+            time.sleep(retry_delay)
+    _fail("reviewed PyPI version did not become publicly visible")
 
 
 def verify_release(
@@ -326,16 +370,37 @@ def main() -> int:
     )
     parser.add_argument("--attempts", type=int, default=12)
     parser.add_argument("--retry-delay", type=float, default=10.0)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--plan-publication", action="store_true")
+    mode.add_argument("--artifacts-only", action="store_true")
+    parser.add_argument("--github-output", type=Path)
     arguments = parser.parse_args()
     try:
-        with tempfile.TemporaryDirectory(prefix="betterborg-release-") as temporary:
-            verify_release(
+        if arguments.plan_publication:
+            action = publication_action(arguments.version, arguments.artifacts)
+            if arguments.github_output is not None:
+                with arguments.github_output.open("a", encoding="utf-8") as output:
+                    output.write(f"action={action}\n")
+            print(json.dumps({"action": action}, sort_keys=True))
+            return 0
+        if arguments.artifacts_only:
+            verify_public_artifacts(
                 arguments.version,
-                Path(temporary) / "fixture",
                 arguments.artifacts,
                 attempts=arguments.attempts,
                 retry_delay=arguments.retry_delay,
             )
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="betterborg-release-"
+            ) as temporary:
+                verify_release(
+                    arguments.version,
+                    Path(temporary) / "fixture",
+                    arguments.artifacts,
+                    attempts=arguments.attempts,
+                    retry_delay=arguments.retry_delay,
+                )
     except ReleaseVerificationError as error:
         print(f"release verification failed: {error}", file=os.sys.stderr)
         return 1

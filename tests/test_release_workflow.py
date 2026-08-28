@@ -1,4 +1,4 @@
-"""Nonpublishing contracts for the protected PyPI release path."""
+"""Nonpublishing contracts for synchronized protected publication."""
 
 from __future__ import annotations
 
@@ -108,43 +108,54 @@ def test_release_is_manual_and_nonpublishing_by_default() -> None:
     assert re.search(r"publish:\n(?: {8}.*\n)*? {8}default: false", workflow)
     assert "pull_request:" not in workflow
     assert re.search(r"^  push:", workflow, re.MULTILINE) is None
-    assert "Validate release without publishing" in workflow
-    assert 'scripts/check_versions.py --tag "v$REVIEWED_VERSION"' in workflow
+    assert "Validate final tag and build release inputs once" in workflow
+    assert '--tag "v$REVIEWED_VERSION"' in workflow
+    assert "--greater-than 0.1.0" in workflow
+    assert 'git rev-list -n 1 "v$REVIEWED_VERSION"' in workflow
 
 
-def test_protected_job_depends_on_exact_reviewed_artifacts() -> None:
+def test_build_once_artifacts_feed_digest_gated_registry_order() -> None:
     workflow = _workflow_text()
 
     assert "needs: [validate-release]" in workflow
     assert "inputs.publish && github.ref == 'refs/heads/main'" in workflow
     assert "name: pypi" in workflow
-    assert workflow.count("id-token: write") == 2
-    pypi_oidc = workflow.index("id-token: write", workflow.index("publish-pypi:"))
-    binary_oidc = workflow.index("id-token: write", pypi_oidc + 1)
-    assert pypi_oidc < workflow.index("build-binaries:") < binary_oidc
+    assert workflow.count("Build reviewed Python distributions once") == 1
+    assert workflow.count("Build reviewed npm package once") == 1
+    assert "betterborg-registry-inputs-${{ inputs.version }}" in workflow
+    pypi = workflow.index("publish-pypi:")
+    github = workflow.index("reconcile-github-release:")
+    npm = workflow.index("publish-npm:")
+    smokes = workflow.index("smoke-public-release:")
+    assert pypi < github < npm < smokes
+    assert "needs: [publish-pypi]" in workflow
+    assert "needs: [reconcile-github-release]" in workflow
+    assert "needs: [publish-npm]" in workflow
     assert "pypa/gh-action-pypi-publish@release/v1" in workflow
+    assert "--plan-publication" in workflow
+    assert "steps.pypi-plan.outputs.action == 'publish'" in workflow
+    assert "scripts/reconcile_npm_release.py" in workflow
+    assert "steps.npm-plan.outputs.action == 'publish'" in workflow
     assert "packages-dir: dist/" in workflow
     assert "skip-existing: false" in workflow
     assert "password:" not in workflow
     assert "PYPI_API_TOKEN" not in workflow
-    for artifact in (
-        "dist/betterborg-${{ inputs.version }}-py3-none-any.whl",
-        "dist/betterborg-${{ inputs.version }}.tar.gz",
-    ):
-        assert workflow.count(artifact) == 1
+    assert "NPM_TOKEN" not in workflow
 
 
-def test_protected_smoke_has_one_provider_and_explicit_trust() -> None:
+def test_protected_smokes_follow_all_registries_with_one_provider() -> None:
     workflow = _workflow_text()
-    script = (REPOSITORY_ROOT / "scripts/verify_pypi_release.py").read_text(
+    script = (REPOSITORY_ROOT / "scripts/verify_public_installations.py").read_text(
         encoding="utf-8"
     )
 
     assert workflow.count("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}") == 1
     assert "ANTHROPIC_API_KEY: ${{ secrets." not in workflow
     assert "f\"betterborg=={version}\"" in script
-    assert '_uvx_command(version, "version")' in script
-    assert '_uvx_command(version, "init", "--yes", "--json")' in script
+    assert 'f"@betterborg/cli@{version}"' in script
+    assert "releases/download/v{version}/install.sh" in script
+    assert '[*prefix, "init", "--yes", "--json"]' in script
+    assert workflow.index("publish-npm:") < workflow.index("smoke-public-release:")
 
 
 def test_public_smoke_uses_exact_commands_and_isolated_provider(
@@ -256,6 +267,36 @@ def test_release_smoke_rejects_a_public_digest_mismatch_before_commands(
             attempts=1,
             retry_delay=0,
         )
+
+
+def test_pypi_publication_plan_publishes_only_a_missing_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    _release_artifacts(artifacts, "1.2.3")
+    monkeypatch.setattr(
+        verify_pypi_release, "_public_distribution_digests", lambda _version: None
+    )
+
+    assert verify_pypi_release.publication_action("1.2.3", artifacts) == "publish"
+
+
+def test_pypi_publication_plan_skips_only_matching_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    distributions = _release_artifacts(artifacts, "1.2.3")
+    digests = {
+        filename: hashlib.sha256(body).hexdigest()
+        for filename, body in distributions.items()
+    }
+    monkeypatch.setattr(
+        verify_pypi_release,
+        "_public_distribution_digests",
+        lambda _version: digests,
+    )
+
+    assert verify_pypi_release.publication_action("1.2.3", artifacts) == "skip"
 
 
 def test_release_smoke_rejects_wrong_version_output(
