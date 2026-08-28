@@ -44,6 +44,9 @@ class ImprovementPrd:
     """One generated, tracked improvement document."""
 
     theme_key: str
+    title: str
+    predicted_impact: float
+    effort: str
     suggested_borg_name: str
     path: Path
     body_md: str
@@ -121,6 +124,9 @@ def generate_improvement_prds(
     documents = tuple(
         ImprovementPrd(
             theme_key=key,
+            title=ranked.theme.title,
+            predicted_impact=ranked.normalized_impact,
+            effort=ranked.theme.effort,
             suggested_borg_name=resolved_names[key],
             path=paths.improvement_prds_dir / f"{key}.md",
             body_md=_render_prd(ranked, key, resolved_names[key]),
