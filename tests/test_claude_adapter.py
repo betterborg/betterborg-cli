@@ -263,7 +263,7 @@ def test_process_spawn_failure_returns_failed_result(
         raise FileNotFoundError("configured executable disappeared")
 
     monkeypatch.setattr(
-        "betterborg_cli.agent_runtime.claude.shutil.which",
+        "betterborg_cli.agent_runtime.native_cli.shutil.which",
         lambda _binary: "/installed/claude-custom",
     )
     monkeypatch.setattr(

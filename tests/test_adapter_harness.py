@@ -22,7 +22,7 @@ from betterborg_cli.agent_runtime import (
 Response = Mapping[str, Any]
 QueuedResponse = Response | Exception | Callable[[CancellationToken | None], Response]
 Provider = Literal["anthropic", "openai"]
-RunProvider = Literal["anthropic", "openai", "claude"]
+RunProvider = Literal["anthropic", "openai", "claude", "codex"]
 
 
 @dataclass
@@ -96,7 +96,7 @@ def make_run_spec(
     **changes: Any,
 ) -> AgentRunSpec:
     """Build the shared structured-result run contract for one provider."""
-    model = "gpt-test" if provider == "openai" else "claude-test"
+    model = "gpt-test" if provider in {"openai", "codex"} else "claude-test"
     values: dict[str, Any] = {
         "system_prompt": "Inspect the repository and complete the task.",
         "user_prompt": "Read the version, then submit the result.",
@@ -114,7 +114,7 @@ def make_run_spec(
         "log_path": tmp_path / f"{provider}.jsonl",
         "result_path": tmp_path / "result.json",
     }
-    if provider == "claude":
+    if provider in {"claude", "codex"}:
         values["billing_mode"] = "subscription"
     values.update(changes)
     return AgentRunSpec(**values)
@@ -130,6 +130,10 @@ def openai_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
 
 def claude_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
     return make_run_spec(tmp_path, "claude", **changes)
+
+
+def codex_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
+    return make_run_spec(tmp_path, "codex", **changes)
 
 
 def anthropic_message(

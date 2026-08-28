@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import tempfile
-import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,24 +15,23 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.base import (
     AgentArtifact,
     AgentCapabilities,
-    AgentResult,
     AgentRunSpec,
-    AgentStatus,
     AgentUsage,
     BillingMode,
-    CancellationToken,
-    combine_agent_usage,
+)
+from betterborg_cli.agent_runtime.native_cli import (
+    NativeCliAdapter,
+    NativeInvocation,
+    NativePayload,
 )
 from betterborg_cli.agent_runtime.process import ProcessRunner, run_streamed
 from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
-    run_with_transient_retry,
 )
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     extract_json,
-    validate_structured_result,
 )
 
 _PROVIDER = "claude"
@@ -53,7 +51,7 @@ JSON object.
 
 
 @dataclass(slots=True)
-class ClaudeAdapter:
+class ClaudeAdapter(NativeCliAdapter):
     """Run Claude Code in autonomous print mode for a BetterBorg role."""
 
     role: ApiAgentRole | str
@@ -63,6 +61,7 @@ class ClaudeAdapter:
     transient_backoff_seconds: float = DEFAULT_TRANSIENT_BACKOFF_SECONDS
     transient_max_attempts: int = DEFAULT_TRANSIENT_MAX_ATTEMPTS
     name: str = field(default=_PROVIDER, init=False)
+    provider_label: str = field(default="Claude", init=False)
     capabilities: AgentCapabilities = field(
         default_factory=lambda: AgentCapabilities(
             billing_modes=frozenset({BillingMode.SUBSCRIPTION}),
@@ -76,41 +75,12 @@ class ClaudeAdapter:
     )
 
     def __post_init__(self) -> None:
-        self.role = ApiAgentRole(self.role)
-        self.artifacts = tuple(self.artifacts)
-        if not self.binary:
-            raise ValueError("Claude binary must not be empty")
-        if self.transient_backoff_seconds < 0:
-            raise ValueError("transient backoff must not be negative")
-        if self.transient_max_attempts < 1:
-            raise ValueError("transient max attempts must be at least one")
+        self._validate_native_configuration()
 
-    def run(
-        self,
-        spec: AgentRunSpec,
-        *,
-        cancel: CancellationToken | None = None,
-    ) -> AgentResult:
-        start = time.monotonic()
-        if spec.billing_mode != BillingMode.SUBSCRIPTION:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                error="Claude CLI adapter requires subscription billing mode",
-            )
-        if cancel is not None and cancel.is_set():
-            return self._cancelled(spec, start, attempts=0)
-        if self.proc_runner is run_streamed and shutil.which(self.binary) is None:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                error=f"Claude binary not found on PATH: {self.binary!r}",
-            )
-
-        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
-        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+    @contextmanager
+    def _prepare_invocation(
+        self, spec: AgentRunSpec
+    ) -> Iterator[NativeInvocation]:
         system_prompt = (
             spec.system_prompt.rstrip()
             + "\n\n"
@@ -132,213 +102,52 @@ class ClaudeAdapter:
         claude_command.append("--dangerously-skip-permissions")
         if spec.allowed_tools:
             claude_command.extend(("--allowed-tools", ",".join(spec.allowed_tools)))
-        try:
-            system_prompt_path = _write_system_prompt(
-                spec.log_path.parent, system_prompt
-            )
-        except OSError as error:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                error=f"unable to prepare Claude process: {error}",
-            )
+        system_prompt_path = _write_system_prompt(spec.log_path.parent, system_prompt)
         claude_command.extend(("--system-prompt-file", str(system_prompt_path)))
         try:
-            return self._run_native(spec, start, claude_command, cancel)
+            yield NativeInvocation(
+                command=claude_command,
+                stdin_text=spec.user_prompt,
+                load_payload=lambda: self._load_payload(spec.log_path),
+            )
         finally:
             system_prompt_path.unlink(missing_ok=True)
 
-    def _run_native(
-        self,
-        spec: AgentRunSpec,
-        start: float,
-        command: list[str],
-        cancel: CancellationToken | None,
-    ) -> AgentResult:
-        environment = {**os.environ, **spec.env}
-        attempt_usage: list[AgentUsage | None] = []
-        attempts = 0
-
-        def run_once() -> int:
-            nonlocal attempts
-            attempts += 1
-            exit_code = self.proc_runner(
-                command,
-                spec.cwd,
-                spec.user_prompt,
-                spec.log_path,
-                cancel,
-                environment,
-            )
-            attempt_usage.append(_extract_usage(spec.log_path))
-            return exit_code
-
-        try:
-            outcome = run_with_transient_retry(
-                run_once,
-                lambda exit_code: _classify_transient_error(
-                    spec.log_path,
-                    allow_text_fallback=exit_code != 0,
-                ),
-                cancel=cancel,
-                backoff_seconds=self.transient_backoff_seconds,
-                max_attempts=self.transient_max_attempts,
-            )
-        except OSError as error:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                error=f"unable to start Claude process: {error}",
-                attempts=attempts,
-            )
-        usage = combine_agent_usage(attempt_usage)
-        if outcome.cancelled or (cancel is not None and cancel.is_set()):
-            return self._cancelled(
-                spec,
-                start,
-                attempts=outcome.attempts,
-                usage=usage,
-            )
-        if outcome.exhausted:
-            return self._cancelled(
-                spec,
-                start,
-                attempts=outcome.attempts,
-                usage=usage,
-                exit_code=outcome.exit_code,
-                error=f"transient retry exhausted: {outcome.transient_reason}",
-            )
-        if outcome.exit_code != 0:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=outcome.exit_code,
-                error=_terminal_error(spec.log_path, outcome.exit_code),
-                usage=usage,
-                attempts=outcome.attempts,
-            )
-
-        envelope = _result_envelope(spec.log_path)
+    def _load_payload(self, log_path: Path) -> NativePayload:
+        envelope = _result_envelope(log_path)
         if envelope is None:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=0,
-                error="unable to extract Claude result envelope",
-                usage=usage,
-                attempts=outcome.attempts,
-            )
+            return NativePayload(error="unable to extract Claude result envelope")
         if envelope.get("is_error") or str(
             envelope.get("stop_reason") or ""
         ).lower() == "refusal":
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=0,
-                error=_terminal_error(spec.log_path, 0),
-                usage=usage,
-                attempts=outcome.attempts,
-            )
+            return NativePayload(error=_terminal_error(log_path, 0))
 
         result_text = envelope.get("result")
         if not isinstance(result_text, str):
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=0,
-                error="Claude result envelope has no text result",
-                usage=usage,
-                attempts=outcome.attempts,
-            )
+            return NativePayload(error="Claude result envelope has no text result")
         try:
             payload = extract_json(result_text)
             if not isinstance(payload, dict):
                 raise StructuredResultError("result must be a JSON object")
-            validate_structured_result(payload, spec.schema)
         except StructuredResultError as error:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=0,
-                error=f"structured result validation failed: {error}",
-                usage=usage,
-                attempts=outcome.attempts,
+            return NativePayload(
+                error=f"structured result validation failed: {error}"
             )
+        return NativePayload(payload=payload)
 
-        spec.result_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return self._result(
-            spec,
-            start,
-            AgentStatus.COMPLETED,
-            exit_code=0,
-            payload=payload,
-            result_path=spec.result_path,
-            usage=usage,
-            attempts=outcome.attempts,
+    def _extract_usage(self, log_path: Path) -> AgentUsage | None:
+        return _extract_usage(log_path)
+
+    def _classify_transient_error(
+        self, log_path: Path, exit_code: int
+    ) -> str | None:
+        return _classify_transient_error(
+            log_path,
+            allow_text_fallback=exit_code != 0,
         )
 
-    def _cancelled(
-        self,
-        spec: AgentRunSpec,
-        start: float,
-        *,
-        attempts: int,
-        usage: AgentUsage | None = None,
-        exit_code: int = -1,
-        error: str = "agent run cancelled",
-    ) -> AgentResult:
-        return self._result(
-            spec,
-            start,
-            AgentStatus.CANCELLED,
-            exit_code=exit_code,
-            error=error,
-            usage=usage,
-            attempts=attempts,
-            retryable=True,
-        )
-
-    def _result(
-        self,
-        spec: AgentRunSpec,
-        start: float,
-        status: AgentStatus,
-        *,
-        exit_code: int | None = None,
-        payload: dict[str, Any] | None = None,
-        error: str | None = None,
-        result_path: Path | None = None,
-        usage: AgentUsage | None = None,
-        attempts: int = 1,
-        retryable: bool = False,
-    ) -> AgentResult:
-        return AgentResult(
-            status=status,
-            exit_code=exit_code,
-            payload=payload,
-            error=error,
-            log_path=spec.log_path,
-            result_path=result_path,
-            duration_seconds=time.monotonic() - start,
-            usage=usage,
-            billing_mode=spec.billing_mode,
-            provider=_PROVIDER,
-            model=spec.model,
-            artifacts=self.artifacts,
-            attempts=attempts,
-            retryable=retryable,
-            resume_token=spec.resume_token,
-        )
+    def _terminal_error(self, log_path: Path, exit_code: int) -> str:
+        return _terminal_error(log_path, exit_code)
 
 
 def _write_system_prompt(directory: Path, system_prompt: str) -> Path:
