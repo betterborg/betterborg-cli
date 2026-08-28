@@ -30,6 +30,17 @@ make build
 `borg version` and `borg --help` are bootstrap commands. They do not create or
 initialize a repository.
 
+Before a command can load repository configuration or prompts for a
+host-capable agent, trust the current Git workspace interactively:
+
+```console
+borg trust
+```
+
+For a deliberate noninteractive decision, use `borg trust --yes`. Trust is
+bound to the resolved repository and Git common-directory paths and is stored
+in the user's machine-local state directory, not in the repository.
+
 ## Development safety
 
 Follow [AGENTS.md](AGENTS.md) when using the private BetterBorg repository as a
