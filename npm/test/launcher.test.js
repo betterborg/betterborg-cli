@@ -152,6 +152,38 @@ test("Windows resolution skips its own npm shims and falls back to uvx", async (
   }
 });
 
+test("POSIX resolution skips its own regular npm shim and falls back to uvx", async () => {
+  const shim = "/project/node_modules/.bin/borg";
+  const uvx = "/tools/uvx";
+  const available = new Set([shim, uvx]);
+  const fileSystem = {
+    constants: { X_OK: 1 },
+    accessSync(candidate) {
+      if (!available.has(candidate)) {
+        throw new Error("missing");
+      }
+    },
+    realpathSync: (candidate) => candidate,
+  };
+  const resolved = await resolveCli("1.2.3", {
+    architecture: "ia32",
+    environment: { PATH: "/project/node_modules/.bin:/tools" },
+    fileSystem,
+    launcherPath:
+      "/project/node_modules/.pnpm/@betterborg+cli@1.2.3/node_modules/@betterborg/cli/bin/borg.js",
+    pathDelimiter: ":",
+    pathModule: path.posix,
+    platform: "linux",
+    spawnSync: () => assert.fail("the package's own shim must not be probed"),
+  });
+
+  assert.deepEqual(resolved, {
+    command: uvx,
+    argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+    source: "uvx",
+  });
+});
+
 test("resolution downloads and verifies the target into the cache", async (t) => {
   const directory = temporaryDirectory(t);
   const cache = path.join(directory, "cache");

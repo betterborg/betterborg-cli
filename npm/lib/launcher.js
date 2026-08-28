@@ -53,30 +53,29 @@ function launcherExecutables(dependencies) {
     return [];
   }
   const executables = [dependencies.launcherPath];
-  if (dependencies.platform !== "win32") {
-    return executables;
-  }
-
   let directory = dependencies.pathModule.dirname(dependencies.launcherPath);
-  while (
-    dependencies.pathModule.dirname(directory) !== directory &&
-    dependencies.pathModule.basename(directory).toLowerCase() !== "node_modules"
-  ) {
-    directory = dependencies.pathModule.dirname(directory);
-  }
-  if (
-    dependencies.pathModule.basename(directory).toLowerCase() !== "node_modules"
-  ) {
-    return executables;
-  }
-
-  for (const shimDirectory of [
-    dependencies.pathModule.dirname(directory),
-    dependencies.pathModule.join(directory, ".bin"),
-  ]) {
-    for (const name of ["borg", "borg.cmd", "borg.ps1"]) {
-      executables.push(dependencies.pathModule.resolve(shimDirectory, name));
+  while (dependencies.pathModule.dirname(directory) !== directory) {
+    if (
+      dependencies.pathModule.basename(directory).toLowerCase() ===
+      "node_modules"
+    ) {
+      const shimDirectories = [
+        dependencies.pathModule.join(directory, ".bin"),
+      ];
+      if (dependencies.platform === "win32") {
+        shimDirectories.push(dependencies.pathModule.dirname(directory));
+      }
+      const names =
+        dependencies.platform === "win32"
+          ? ["borg", "borg.cmd", "borg.ps1"]
+          : ["borg"];
+      for (const shimDirectory of shimDirectories) {
+        for (const name of names) {
+          executables.push(dependencies.pathModule.resolve(shimDirectory, name));
+        }
+      }
     }
+    directory = dependencies.pathModule.dirname(directory);
   }
   return executables;
 }
