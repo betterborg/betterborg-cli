@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -108,6 +109,17 @@ def test_build_once_artifacts_feed_digest_gated_registry_order() -> None:
     assert "steps.pypi-plan.outputs.action == 'publish'" in workflow
     assert "scripts/reconcile_npm_release.py" in workflow
     assert "steps.npm-plan.outputs.action == 'publish'" in workflow
+    npm_publish = re.search(
+        r"run: (npm publish .*betterborg-cli-\$REVIEWED_VERSION\.tgz.*)", workflow
+    )
+    assert npm_publish is not None
+    assert shlex.split(npm_publish.group(1)) == [
+        "npm",
+        "publish",
+        "./dist/betterborg-cli-$REVIEWED_VERSION.tgz",
+        "--access",
+        "public",
+    ]
     assert "packages-dir: dist/" in workflow
     assert "skip-existing: false" in workflow
     assert "password:" not in workflow

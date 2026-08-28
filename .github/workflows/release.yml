@@ -283,7 +283,7 @@ jobs:
         if: ${{ steps.npm-plan.outputs.action == 'publish' }}
         env:
           REVIEWED_VERSION: ${{ inputs.version }}
-        run: npm publish "dist/betterborg-cli-$REVIEWED_VERSION.tgz" --access public
+        run: npm publish "./dist/betterborg-cli-$REVIEWED_VERSION.tgz" --access public
 
       - name: Require exact public npm digest
         env:
