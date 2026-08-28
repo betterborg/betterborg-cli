@@ -114,10 +114,10 @@ Darwin ARM64 uses `macos-14`, and Darwin x86_64 uses `macos-15-intel`; none of
 the four deliverables is cross-compiled.
 
 The reusable workflow grants `id-token: write` and `attestations: write` only
-to its build and manifest jobs. The PyPI job is the only other OIDC consumer.
-Only the final, publish-enabled reconciliation job receives `contents: write`;
-the fixture validation path remains read-only and cannot create a GitHub
-Release.
+to its build and manifest jobs. The PyPI and npm publishing jobs are the only
+other OIDC consumers. Only the final, publish-enabled GitHub reconciliation
+job receives `contents: write`; the fixture validation path remains read-only
+and cannot create a GitHub Release.
 
 ## Authorize and verify the binary publication
 

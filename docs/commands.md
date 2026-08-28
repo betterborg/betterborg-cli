@@ -43,7 +43,7 @@ the installer requests it.
 
 ## Continue repository work
 
-Once initialization completes, use `borg create`, `borg plan`, `borg tasks`,
+Once initialization completes, use `borg create`, `borg plan`, `borg task`,
 and `borg execute` as shown by `borg COMMAND --help`. Before executing a
 published task generation, `borg task estimate NAME` shows its P50/P80 work and
 billing-mode estimate.
