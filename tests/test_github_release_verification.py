@@ -128,6 +128,25 @@ def test_digest_mismatch_fixture_is_terminal_and_requires_a_new_version(
     assert "new version" in captured.err
 
 
+def test_invalid_utf8_manifest_is_a_terminal_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture, _names = _release_fixture(tmp_path / "invalid-manifest-encoding")
+    (fixture / "assets" / "release-manifest.json").write_bytes(b"\xff")
+
+    result = _run_fixture(monkeypatch, fixture)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert "malformed UTF-8 encoding" in captured.err
+    assert "mismatch" in captured.err
+    assert "immutable" in captured.err
+    assert "prepare a new version" in captured.err
+
+
 def test_published_partial_release_is_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

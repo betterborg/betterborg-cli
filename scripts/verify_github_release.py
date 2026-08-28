@@ -64,6 +64,8 @@ def _mismatch(detail: str) -> NoReturn:
 def _read_manifest(path: Path) -> dict[str, object]:
     try:
         recorded = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        _mismatch("release-manifest.json has malformed UTF-8 encoding")
     except (OSError, json.JSONDecodeError) as error:
         _fail(
             "release-manifest.json is invalid; the release is immutable, "
