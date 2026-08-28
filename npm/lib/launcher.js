@@ -41,7 +41,47 @@ function executableNames(name, platform, environment) {
   return [name, ...extensions.map((extension) => `${name}${extension}`)];
 }
 
-function executableOnPath(name, dependencies, excludedPath) {
+function samePath(left, right, platform) {
+  if (platform === "win32") {
+    return left.toLowerCase() === right.toLowerCase();
+  }
+  return left === right;
+}
+
+function launcherExecutables(dependencies) {
+  if (!dependencies.launcherPath) {
+    return [];
+  }
+  const executables = [dependencies.launcherPath];
+  if (dependencies.platform !== "win32") {
+    return executables;
+  }
+
+  let directory = dependencies.pathModule.dirname(dependencies.launcherPath);
+  while (
+    dependencies.pathModule.dirname(directory) !== directory &&
+    dependencies.pathModule.basename(directory).toLowerCase() !== "node_modules"
+  ) {
+    directory = dependencies.pathModule.dirname(directory);
+  }
+  if (
+    dependencies.pathModule.basename(directory).toLowerCase() !== "node_modules"
+  ) {
+    return executables;
+  }
+
+  for (const shimDirectory of [
+    dependencies.pathModule.dirname(directory),
+    dependencies.pathModule.join(directory, ".bin"),
+  ]) {
+    for (const name of ["borg", "borg.cmd", "borg.ps1"]) {
+      executables.push(dependencies.pathModule.resolve(shimDirectory, name));
+    }
+  }
+  return executables;
+}
+
+function executableOnPath(name, dependencies, excludedPaths = []) {
   const {
     environment,
     fileSystem,
@@ -59,7 +99,11 @@ function executableOnPath(name, dependencies, excludedPath) {
       try {
         fileSystem.accessSync(candidate, fileSystem.constants.X_OK);
         const resolvedCandidate = fileSystem.realpathSync(candidate);
-        if (!excludedPath || resolvedCandidate !== excludedPath) {
+        if (
+          !excludedPaths.some((excludedPath) =>
+            samePath(resolvedCandidate, excludedPath, platform),
+          )
+        ) {
           return candidate;
         }
       } catch {
@@ -74,7 +118,7 @@ function installedCli(version, dependencies) {
   const candidate = executableOnPath(
     "borg",
     dependencies,
-    dependencies.launcherPath,
+    launcherExecutables(dependencies),
   );
   if (!candidate) {
     return null;
@@ -217,7 +261,7 @@ async function resolveCli(version, overrides = {}) {
     }
   }
 
-  const uvx = executableOnPath("uvx", dependencies, null);
+  const uvx = executableOnPath("uvx", dependencies);
   if (uvx) {
     return {
       command: uvx,
@@ -254,9 +298,7 @@ function launch(resolved, arguments_, overrides = {}) {
       FORWARDED_SIGNALS.map((signal) => [
         signal,
         () => {
-          if (!child.killed) {
-            child.kill(signal);
-          }
+          child.kill(signal);
         },
       ]),
     );

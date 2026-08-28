@@ -112,6 +112,46 @@ test("resolution prefers a compatible installed CLI", async (t) => {
   assert.equal(downloads, 0);
 });
 
+test("Windows resolution skips its own npm shims and falls back to uvx", async () => {
+  for (const [launcherPath, shimDirectory] of [
+    ["C:\\npm\\node_modules\\@betterborg\\cli\\bin\\borg.js", "C:\\npm"],
+    [
+      "C:\\project\\node_modules\\@betterborg\\cli\\bin\\borg.js",
+      "C:\\project\\node_modules\\.bin",
+    ],
+  ]) {
+    const available = new Set([
+      `${shimDirectory}\\borg.cmd`.toLowerCase(),
+      "c:\\tools\\uvx.cmd",
+    ]);
+    const fileSystem = {
+      constants: { X_OK: 1 },
+      accessSync(candidate) {
+        if (!available.has(candidate.toLowerCase())) {
+          throw new Error("missing");
+        }
+      },
+      realpathSync: (candidate) => candidate,
+    };
+    const resolved = await resolveCli("1.2.3", {
+      architecture: "x64",
+      environment: { PATH: `${shimDirectory};C:\\tools`, PATHEXT: ".CMD" },
+      fileSystem,
+      launcherPath,
+      pathDelimiter: ";",
+      pathModule: path.win32,
+      platform: "win32",
+      spawnSync: () => assert.fail("the package's own shim must not be probed"),
+    });
+
+    assert.deepEqual(resolved, {
+      command: "C:\\tools\\uvx.CMD",
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+      source: "uvx",
+    });
+  }
+});
+
 test("resolution downloads and verifies the target into the cache", async (t) => {
   const directory = temporaryDirectory(t);
   const cache = path.join(directory, "cache");
@@ -226,6 +266,7 @@ test("launch forwards ordinary arguments, exit status, and signals", async () =>
   const childSignals = [];
   child.kill = (signal) => {
     childSignals.push(signal);
+    child.killed = true;
   };
   const processLike = new EventEmitter();
   processLike.pid = 123;
@@ -246,7 +287,8 @@ test("launch forwards ordinary arguments, exit status, and signals", async () =>
   );
 
   processLike.emit("SIGTERM");
-  assert.deepEqual(childSignals, ["SIGTERM"]);
+  processLike.emit("SIGTERM");
+  assert.deepEqual(childSignals, ["SIGTERM", "SIGTERM"]);
   child.emit("close", null, "SIGTERM");
   await completed;
 
