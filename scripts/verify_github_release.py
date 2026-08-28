@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import subprocess
 import sys
@@ -161,58 +160,6 @@ def _validate_available_assets(
             if expected_digest is not None and checksum_digest != expected_digest:
                 _mismatch(f"checksum sidecar does not match {target.filename}")
     return recorded
-
-
-def _attestation_subject_digests(
-    version: str,
-    assets: dict[str, Path],
-) -> dict[str, str]:
-    """Return every attestation subject digest derivable from partial assets."""
-    recorded = _validate_available_assets(version, assets)
-    digests = {name: sha256(path) for name, path in assets.items()}
-
-    for index, target in enumerate(TARGETS):
-        checksum_name = f"{target.filename}.sha256"
-        binary_digest = digests.get(target.filename)
-        checksum = assets.get(checksum_name)
-        if binary_digest is None and checksum is not None:
-            binary_digest = _read_checksum_digest(checksum, target.filename)
-        if binary_digest is None and recorded is not None:
-            entries = recorded["artifacts"]
-            assert isinstance(entries, list)
-            entry = entries[index]
-            assert isinstance(entry, dict)
-            manifest_digest = entry["sha256"]
-            assert isinstance(manifest_digest, str)
-            binary_digest = manifest_digest
-        if binary_digest is None:
-            continue
-        digests.setdefault(target.filename, binary_digest)
-        checksum_body = f"{binary_digest}  {target.filename}\n".encode()
-        digests.setdefault(checksum_name, hashlib.sha256(checksum_body).hexdigest())
-
-    if "release-manifest.json" not in digests and all(
-        target.filename in assets for target in TARGETS
-    ):
-        manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "version": version,
-            "artifacts": [
-                {
-                    "filename": target.filename,
-                    "os": target.operating_system,
-                    "arch": target.architecture,
-                    "sha256": digests[target.filename],
-                    "size": assets[target.filename].stat().st_size,
-                }
-                for target in TARGETS
-            ],
-        }
-        manifest_body = (
-            json.dumps(manifest, indent=2, sort_keys=False) + "\n"
-        ).encode()
-        digests["release-manifest.json"] = hashlib.sha256(manifest_body).hexdigest()
-    return digests
 
 
 def _validate_complete_assets(version: str, assets: dict[str, Path]) -> None:
@@ -413,13 +360,19 @@ def _verify_attestation(
 def _download_snapshot(
     repository: str,
     version: str,
+    reviewed_sha: str,
     directory: Path,
 ) -> ReleaseSnapshot | None:
     tag = f"v{version}"
+    source_digest = _source_digest(repository, tag)
+    if source_digest != reviewed_sha:
+        _fail(
+            f"reviewed release tag moved: expected {tag} at {reviewed_sha}, "
+            f"found {source_digest}; the release cannot be accepted"
+        )
     payload = _release_metadata(repository, tag)
     if payload is None:
         return None
-    source_digest = _source_digest(repository, tag)
     try:
         remote_tag = payload["tag_name"]
         draft = payload["draft"]
@@ -463,15 +416,12 @@ def _download_snapshot(
 
     verified_attestations: set[str] = set()
     published_attestations: set[str] = set()
-    for name, digest in _attestation_subject_digests(version, assets).items():
+    _validate_available_assets(version, assets)
+    # GitHub CLI needs the subject bytes to verify the signature and provenance.
+    # Do not credit API records inferred for assets that have not been downloaded.
+    for name, path in assets.items():
+        digest = sha256(path)
         if _has_attestation(repository, digest):
-            published_attestations.add(name)
-            path = assets.get(name)
-            if path is None:
-                # API presence alone does not establish signature or signer trust.
-                # Record publication so recovery does not recreate it; verify it
-                # once the reviewed workflow uploads the subject bytes.
-                continue
             try:
                 _verify_attestation(repository, path, source_digest)
             except GitHubReleaseVerificationError as error:
@@ -480,6 +430,7 @@ def _download_snapshot(
                     "the release cannot be accepted: "
                     f"{error}"
                 )
+            published_attestations.add(name)
             verified_attestations.add(name)
 
     return ReleaseSnapshot(
@@ -536,6 +487,7 @@ def verify_release(
     version: str,
     repository: str,
     *,
+    reviewed_sha: str | None = None,
     fixture: Path | None = None,
 ) -> VerificationResult:
     """Verify one public release, or an entirely local fixture snapshot."""
@@ -545,8 +497,19 @@ def verify_release(
         return verify_snapshot(version, _fixture_snapshot(fixture))
     if not repository:
         _fail("--repository is required")
+    if (
+        reviewed_sha is None
+        or len(reviewed_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in reviewed_sha)
+    ):
+        _fail("--reviewed-sha must be the full lowercase reviewed commit SHA")
     with tempfile.TemporaryDirectory(prefix="betterborg-release-") as temporary:
-        snapshot = _download_snapshot(repository, version, Path(temporary))
+        snapshot = _download_snapshot(
+            repository,
+            version,
+            reviewed_sha,
+            Path(temporary),
+        )
         return verify_snapshot(version, snapshot)
 
 
@@ -554,6 +517,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
     parser.add_argument("--repository", default="betterborg/betterborg-cli")
+    parser.add_argument(
+        "--reviewed-sha",
+        help="full commit SHA recorded when vVERSION was reviewed (required live)",
+    )
     parser.add_argument("--fixture", type=Path)
     return parser
 
@@ -564,6 +531,7 @@ def main() -> int:
         result = verify_release(
             arguments.version,
             arguments.repository,
+            reviewed_sha=arguments.reviewed_sha,
             fixture=arguments.fixture,
         )
     except GitHubReleaseVerificationError as error:

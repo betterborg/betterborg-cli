@@ -167,7 +167,7 @@ def test_published_partial_release_is_terminal(
     ("missing", "draft"),
     [(None, False), ("borg-linux-x86_64", True)],
 )
-def test_live_verification_finds_drafts_and_recognizes_published_attestations(
+def test_live_verification_does_not_credit_attestations_without_subject_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     missing: str | None,
@@ -221,7 +221,9 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
     monkeypatch.setattr(verify_github_release.subprocess, "run", fake_run)
 
     result = verify_github_release.verify_release(
-        "1.2.3", "betterborg/betterborg-cli"
+        "1.2.3",
+        "betterborg/betterborg-cli",
+        reviewed_sha="a" * 40,
     )
 
     if missing is None:
@@ -231,6 +233,7 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
         assert result.complete is False
         assert result.remaining == (
             f"upload release asset {missing}",
+            f"publish GitHub artifact attestation for {missing}",
             f"verify GitHub artifact attestation for {missing}",
             "publish the draft GitHub Release",
         )
@@ -240,7 +243,15 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
         if command[1:2] == ["api"]
         and "/attestations/sha256:" in command[2]
     ]
-    assert len(attestation_queries) == 9
+    expected_queries = 8 if missing is not None else 9
+    assert len(attestation_queries) == expected_queries
+    if missing is not None:
+        missing_digest = verify_github_release.sha256(
+            fixture / "assets" / missing
+        )
+        assert all(
+            missing_digest not in command[2] for command in attestation_queries
+        )
     assert [
         command
         for command in commands
@@ -280,6 +291,67 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
         for command in commands
         if command[1:3] == ["attestation", "verify"]
     )
+
+
+def test_live_verification_rejects_a_moved_reviewed_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[1:3] == [
+            "api",
+            "repos/betterborg/betterborg-cli/commits/v1.2.3",
+        ]:
+            return verify_github_release.subprocess.CompletedProcess(
+                command, 0, json.dumps({"sha": "b" * 40}), ""
+            )
+        pytest.fail(f"unexpected command after moved tag: {command}")
+
+    monkeypatch.setattr(verify_github_release.subprocess, "run", fake_run)
+
+    with pytest.raises(
+        verify_github_release.GitHubReleaseVerificationError,
+        match="reviewed release tag moved",
+    ):
+        verify_github_release.verify_release(
+            "1.2.3",
+            "betterborg/betterborg-cli",
+            reviewed_sha="a" * 40,
+        )
+
+    assert commands == [
+        [
+            "gh",
+            "api",
+            "repos/betterborg/betterborg-cli/commits/v1.2.3",
+        ]
+    ]
+
+
+@pytest.mark.parametrize("reviewed_sha", [None, "a" * 39, "A" * 40])
+def test_live_verification_requires_a_full_lowercase_reviewed_sha(
+    monkeypatch: pytest.MonkeyPatch,
+    reviewed_sha: str | None,
+) -> None:
+    monkeypatch.setattr(
+        verify_github_release.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid reviewed SHA must fail before public access"
+        ),
+    )
+
+    with pytest.raises(
+        verify_github_release.GitHubReleaseVerificationError,
+        match="--reviewed-sha must be the full lowercase reviewed commit SHA",
+    ):
+        verify_github_release.verify_release(
+            "1.2.3",
+            "betterborg/betterborg-cli",
+            reviewed_sha=reviewed_sha,
+        )
 
 
 def test_missing_asset_attestation_is_verified_after_upload(
@@ -338,11 +410,14 @@ def test_missing_asset_attestation_is_verified_after_upload(
     monkeypatch.setattr(verify_github_release.subprocess, "run", fake_run)
 
     partial = verify_github_release.verify_release(
-        "1.2.3", "betterborg/betterborg-cli"
+        "1.2.3",
+        "betterborg/betterborg-cli",
+        reviewed_sha="b" * 40,
     )
 
     assert partial.remaining == (
         f"upload release asset {missing}",
+        f"publish GitHub artifact attestation for {missing}",
         f"verify GitHub artifact attestation for {missing}",
         "publish the draft GitHub Release",
     )
@@ -353,5 +428,7 @@ def test_missing_asset_attestation_is_verified_after_upload(
         match=f"attestation digest or provenance mismatch for {missing}",
     ):
         verify_github_release.verify_release(
-            "1.2.3", "betterborg/betterborg-cli"
+            "1.2.3",
+            "betterborg/betterborg-cli",
+            reviewed_sha="b" * 40,
         )
