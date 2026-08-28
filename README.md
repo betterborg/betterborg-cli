@@ -41,6 +41,14 @@ For a deliberate noninteractive decision, use `borg trust --yes`. Trust is
 bound to the resolved repository and Git common-directory paths and is stored
 in the user's machine-local state directory, not in the repository.
 
+Provider API agents use contained file tools that reject absolute paths,
+traversal, and symlinks escaping the run directory. Analysis and planning
+agents receive only those file tools. Coding, review, and merge agents may
+also receive an argv-only command runner after workspace trust. Avoiding a
+shell keeps metacharacters literal, but it is not a sandbox: programs invoked
+by the command runner remain host-capable. Native Claude and Codex tools are
+outside this API file-tool boundary.
+
 ## Development safety
 
 Follow [AGENTS.md](AGENTS.md) when using the private BetterBorg repository as a
