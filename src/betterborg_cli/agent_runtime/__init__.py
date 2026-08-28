@@ -32,6 +32,7 @@ from betterborg_cli.agent_runtime.base import (
     CancellationToken,
     combine_agent_usage,
 )
+from betterborg_cli.agent_runtime.claude import ClaudeAdapter
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.openai import (
     OPENAI_API_URL,
@@ -77,6 +78,7 @@ __all__ = [
     "ApiToolError",
     "BillingMode",
     "CancellationToken",
+    "ClaudeAdapter",
     "CommandResult",
     "ContainedApiTools",
     "MockAdapter",

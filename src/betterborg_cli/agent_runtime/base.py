@@ -53,6 +53,7 @@ class AgentCapabilities:
     streaming: bool = False
     tool_allowlist: bool = False
     resumable: bool = False
+    host_capable: bool = False
 
     def supports_billing(self, mode: BillingMode) -> bool:
         """Return whether the adapter can run under ``mode``."""

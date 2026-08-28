@@ -22,6 +22,7 @@ from betterborg_cli.agent_runtime import (
 Response = Mapping[str, Any]
 QueuedResponse = Response | Exception | Callable[[CancellationToken | None], Response]
 Provider = Literal["anthropic", "openai"]
+RunProvider = Literal["anthropic", "openai", "claude"]
 
 
 @dataclass
@@ -91,11 +92,11 @@ class ChunkedHttpResponse:
 
 def make_run_spec(
     tmp_path: Path,
-    provider: Provider,
+    provider: RunProvider,
     **changes: Any,
 ) -> AgentRunSpec:
     """Build the shared structured-result run contract for one provider."""
-    model = "claude-test" if provider == "anthropic" else "gpt-test"
+    model = "gpt-test" if provider == "openai" else "claude-test"
     values: dict[str, Any] = {
         "system_prompt": "Inspect the repository and complete the task.",
         "user_prompt": "Read the version, then submit the result.",
@@ -113,6 +114,8 @@ def make_run_spec(
         "log_path": tmp_path / f"{provider}.jsonl",
         "result_path": tmp_path / "result.json",
     }
+    if provider == "claude":
+        values["billing_mode"] = "subscription"
     values.update(changes)
     return AgentRunSpec(**values)
 
@@ -123,6 +126,10 @@ def anthropic_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
 
 def openai_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
     return make_run_spec(tmp_path, "openai", **changes)
+
+
+def claude_spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
+    return make_run_spec(tmp_path, "claude", **changes)
 
 
 def anthropic_message(
