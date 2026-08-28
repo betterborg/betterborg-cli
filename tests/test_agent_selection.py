@@ -114,6 +114,22 @@ def test_noninteractive_selection_ignores_installed_native_clis(
     assert selected.name == "anthropic"
 
 
+def test_interactive_analysis_uses_a_path_contained_api_adapter(
+    git_repo: Path,
+) -> None:
+    selected = select_agent(
+        _config(),
+        ApiAgentRole.ANALYSIS,
+        RepoPaths.discover(git_repo),
+        interactive=True,
+        credentials={"ANTHROPIC_API_KEY": "owner-secret"},
+        executable_lookup=lambda binary: f"/bin/{binary}",
+    )
+
+    assert selected.name == "anthropic"
+    assert not selected.capabilities.host_capable
+
+
 def test_configured_native_role_applies_overrides_after_trust_before_spawn(
     git_repo: Path,
 ) -> None:
@@ -213,6 +229,25 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
         selected.run(_spec(git_repo))
 
     assert not spawned
+
+
+def test_contained_run_rejects_a_host_capable_adapter_before_spawn(
+    git_repo: Path,
+) -> None:
+    selected = select_agent(
+        _config(coding=AgentChoice(adapter="codex")),
+        ApiAgentRole.CODING,
+        RepoPaths.discover(git_repo),
+        interactive=True,
+        credentials={},
+        executable_lookup=lambda _binary: "/bin/codex",
+    )
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+
+    with pytest.raises(AgentSelectionError, match="cannot be confined"):
+        selected.run_contained(_spec(git_repo))
 
 
 def test_run_rejects_a_cwd_from_a_different_repository_before_trust_or_spawn(

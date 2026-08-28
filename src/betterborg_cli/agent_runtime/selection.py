@@ -86,16 +86,7 @@ class SelectedAgent:
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
         """Apply overrides, require trust when needed, then invoke the adapter."""
-        resolved_spec = replace(
-            spec,
-            model=self.model or spec.model,
-            effort=self.effort if self.effort is not None else spec.effort,
-            billing_mode=(
-                BillingMode.SUBSCRIPTION
-                if self.name in _NATIVE_ADAPTERS
-                else BillingMode.API
-            ),
-        )
+        resolved_spec = self._resolve_spec(spec)
         if cancel is not None and cancel.is_set():
             return self.adapter.run(resolved_spec, cancel=cancel)
 
@@ -112,6 +103,42 @@ class SelectedAgent:
                 self.adapter.workspace_trusted = True
 
         return self.adapter.run(resolved_spec, cancel=cancel)
+
+    def run_contained(
+        self,
+        spec: AgentRunSpec,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> AgentResult:
+        """Invoke a file-tool adapter in a caller-built contained workspace.
+
+        The caller owns the containment boundary, so this path deliberately
+        does not interpret the sanitized directory as a raw Git checkout or
+        grant repository trust to provider tools.
+        """
+        if self.capabilities.host_capable:
+            raise AgentSelectionError(
+                f"Adapter {self.name!r} is host-capable and cannot be confined "
+                "to a bounded evidence workspace; select the 'anthropic' or "
+                "'openai' API adapter."
+            )
+        if not self.capabilities.tool_allowlist:
+            raise AgentSelectionError(
+                f"Adapter {self.name!r} cannot enforce a bounded tool allowlist"
+            )
+        return self.adapter.run(self._resolve_spec(spec), cancel=cancel)
+
+    def _resolve_spec(self, spec: AgentRunSpec) -> AgentRunSpec:
+        return replace(
+            spec,
+            model=self.model or spec.model,
+            effort=self.effort if self.effort is not None else spec.effort,
+            billing_mode=(
+                BillingMode.SUBSCRIPTION
+                if self.name in _NATIVE_ADAPTERS
+                else BillingMode.API
+            ),
+        )
 
     def _bound_run_paths(self, cwd: Path) -> RepoPaths:
         """Resolve a run cwd that belongs to the selected repository."""
@@ -187,7 +214,11 @@ def select_agent(
                 )
             )
     else:
-        candidates = (*_NATIVE_ADAPTERS, *_API_ADAPTERS) if tty else _API_ADAPTERS
+        candidates = (
+            _API_ADAPTERS
+            if resolved_role is ApiAgentRole.ANALYSIS or not tty
+            else (*_NATIVE_ADAPTERS, *_API_ADAPTERS)
+        )
         adapter_name = next(
             (
                 candidate
