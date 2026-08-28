@@ -163,6 +163,71 @@ def initialize_repository(
             click.echo(shlex.join(command))
 
 
+@cli.command(name="analyze")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit the analysis result as machine-readable JSON.",
+)
+@click.option(
+    "--yes",
+    "explicit_trust",
+    is_flag=True,
+    help="Trust this workspace without prompting before analyzing it.",
+)
+@_trusted_workspace_callback
+def analyze_repository(
+    repository_path: Path,
+    json_output: bool,
+) -> None:
+    """Re-analyze an initialized Git repository and refresh its outputs."""
+    paths = RepoPaths.discover(repository_path)
+    database = paths.state_dir / "borg.sqlite3"
+    interactive = _stdin_is_interactive() and not json_output
+    try:
+        if not database.resolve().is_relative_to(paths.root):
+            raise ValueError(f"repository state path escapes repository: {database}")
+        with SqliteStore.open(database) as store:
+            result = RepositoryService(
+                paths,
+                store,
+                lambda config: select_agent(
+                    config,
+                    ApiAgentRole.ANALYSIS,
+                    paths,
+                    interactive=interactive,
+                ),
+            ).analyze()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    analysis = result.analysis
+    previous_score = result.previous_analysis.overall_score
+    score_delta = analysis.overall_score - previous_score
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "analysis_id": str(analysis.id),
+                    "repository_id": str(result.repository.id),
+                    "score": analysis.overall_score,
+                    "previous_score": previous_score,
+                    "delta": score_delta,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        click.echo(
+            f"Analyzed repository {result.repository.id}: "
+            f"score {analysis.overall_score:.2f}/5 "
+            f"(previous {previous_score:.2f}/5, "
+            f"delta {score_delta:+.2f})."
+        )
+
+
 @cli.command(name="create")
 @click.option(
     "--name",

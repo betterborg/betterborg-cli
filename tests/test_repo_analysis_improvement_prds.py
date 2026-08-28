@@ -149,6 +149,26 @@ def test_generates_one_prd_per_theme_with_exact_canonical_values(
     assert "**S**" not in docs_prd
 
 
+def test_refresh_removes_only_obsolete_generated_markdown(
+    git_repo: Path, analysis: RepositoryAnalysis
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    generate_improvement_prds(
+        analysis,
+        paths,
+        {"ci-safety": "Sentinel", "docs": "Scribe"},
+    )
+    retained_non_prd = paths.improvement_prds_dir / "notes.txt"
+    retained_non_prd.write_text("not a generated PRD\n", encoding="utf-8")
+    analysis.analysis_json["themes"] = [analysis.analysis_json["themes"][1]]
+
+    generate_improvement_prds(analysis, paths, {"docs": "Scribe"})
+
+    assert not paths.improvement_prds_dir.joinpath("ci-safety.md").exists()
+    assert paths.improvement_prds_dir.joinpath("docs.md").is_file()
+    assert retained_non_prd.read_text(encoding="utf-8") == "not a generated PRD\n"
+
+
 def test_dimension_changes_aggregate_same_dimension_and_overlap_effects(
     git_repo: Path, analysis: RepositoryAnalysis
 ) -> None:
