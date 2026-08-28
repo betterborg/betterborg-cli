@@ -21,6 +21,12 @@ from betterborg_cli.repo_analysis.prompts_manager import (
     PromptManagerConfig,
     generate_role_prompts,
 )
+from betterborg_cli.repo_analysis.reporting import (
+    build_machine_report,
+    render_json_report,
+    render_markdown_report,
+    render_terminal_report,
+)
 from betterborg_cli.repo_analysis.scoring import (
     DIMENSIONS,
     EFFORT_COST,
@@ -65,11 +71,15 @@ __all__ = [
     "ScoredRecommendation",
     "WEIGHTS",
     "build_discovery_workspace",
+    "build_machine_report",
     "compute_overall_score",
     "compute_repo_overall_score",
     "discovery_limits_from_mapping",
     "generate_role_prompts",
     "rank_recommendation_themes",
+    "render_json_report",
+    "render_markdown_report",
+    "render_terminal_report",
     "run_analyzer",
     "score_repository",
     "validate_recommendation",

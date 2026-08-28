@@ -56,6 +56,160 @@ _RUBRIC_SCHEMA: dict[str, Any] = {
         dimension: {"$ref": "#/$defs/dimension"} for dimension in DIMENSIONS
     },
 }
+_COMMAND_STEP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["stage", "argv"],
+    "properties": {
+        "stage": {"type": "string", "minLength": 1},
+        "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "cwd": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+        "uses_services": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "required_secrets": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+}
+_COMMAND_CATALOG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "commands": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/command_step"},
+        },
+        "source": {"type": "string", "minLength": 1},
+        "notes": {"type": "string"},
+    },
+}
+_SECRET_REQUIREMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name", "used_by", "scope"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "used_by": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "scope": {"type": "string", "enum": ["all", "build", "agent"]},
+        "source": {"type": "string", "minLength": 1},
+        "description": {"type": "string"},
+    },
+}
+_ENVIRONMENT_VARIABLE_NAME_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
+}
+_SERVICE_PORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["port"],
+    "properties": {
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "protocol": {"type": "string", "enum": ["tcp", "udp"]},
+        "env": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
+        "source": {"type": "string", "minLength": 1},
+    },
+}
+_SERVICE_DEPENDENCY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "image": {"type": "string", "minLength": 1},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "ports": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/service_port"},
+        },
+        "source": {"type": "string", "minLength": 1},
+        "compose_service": {"type": "string", "minLength": 1},
+        "url_env": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
+        "env": {
+            "type": "array",
+            "uniqueItems": True,
+            "items": _ENVIRONMENT_VARIABLE_NAME_SCHEMA,
+        },
+    },
+}
+_ENVIRONMENT_COMMAND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["argv"],
+    "properties": {
+        "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "cwd": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+    },
+}
+_ENVIRONMENT_TOOLCHAIN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {
+            "type": ["string", "null"],
+            "minLength": 1,
+        },
+        "source": {"type": "string", "minLength": 1},
+    },
+}
+_ENVIRONMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "anyOf": [
+        {"required": ["files"]},
+        {"required": ["toolchains"]},
+        {"required": ["package_managers"]},
+        {"required": ["prepare_commands"]},
+        {"required": ["materialize_commands"]},
+    ],
+    "properties": {
+        "version": {"type": "integer", "const": 1},
+        "source": {"type": "string", "minLength": 1},
+        "files": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "toolchains": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/environment_toolchain"},
+        },
+        "package_managers": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "prepare_commands": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/environment_command"},
+        },
+        "materialize_commands": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/environment_command"},
+        },
+    },
+}
 ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "BetterBorg bounded repository analysis",
@@ -86,10 +240,28 @@ ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"$ref": "#/$defs/theme"},
         },
+        "command_catalog": {"$ref": "#/$defs/command_catalog"},
+        "environment": {"$ref": "#/$defs/environment"},
+        "required_secrets": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/secret_requirement"},
+        },
+        "service_dependencies": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/service_dependency"},
+        },
     },
     "$defs": {
         "dimension": _DIMENSION_SCHEMA,
         "rubric": _RUBRIC_SCHEMA,
+        "command_step": _COMMAND_STEP_SCHEMA,
+        "command_catalog": _COMMAND_CATALOG_SCHEMA,
+        "secret_requirement": _SECRET_REQUIREMENT_SCHEMA,
+        "service_port": _SERVICE_PORT_SCHEMA,
+        "service_dependency": _SERVICE_DEPENDENCY_SCHEMA,
+        "environment_command": _ENVIRONMENT_COMMAND_SCHEMA,
+        "environment_toolchain": _ENVIRONMENT_TOOLCHAIN_SCHEMA,
+        "environment": _ENVIRONMENT_SCHEMA,
         "package": {
             "type": "object",
             "additionalProperties": False,
@@ -119,7 +291,11 @@ Open analysis_input.json first and inspect only files listed in its files array.
 Score every package on the eight required dimensions. Every recommendation must
 cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
-rationale. Return only the JSON object required by the supplied schema.
+rationale. Every reported Harness command, environment input, required secret,
+and service must cite a manifest path in its source field or inherit a source
+from its containing catalog/environment/service. Service env contains variable
+names only, never values. Omit an optional category when bounded evidence is
+insufficient. Return only the JSON object required by the supplied schema.
 """
 _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
@@ -273,6 +449,7 @@ def _persist_payload(
         validate_recommendation(recommendation, manifest)
         for recommendation in payload["recommendations"]
     ]
+    _validate_harness_evidence(payload, manifest)
     themes = [validate_recommendation_theme(theme) for theme in payload["themes"]]
     ranked_themes = rank_recommendation_themes(
         package_rubrics, recommendations, themes
@@ -341,6 +518,112 @@ def _persist_payload(
         ]
         store.append_analysis(analysis, packages)
     return analysis
+
+
+def _validate_harness_evidence(
+    payload: Mapping[str, Any], manifest: DiscoveryManifest
+) -> None:
+    """Require every Harness claim to cite bounded discovery evidence."""
+    cited_paths: set[str] = set()
+    uncited_claims: set[str] = set()
+
+    catalog = payload.get("command_catalog")
+    if isinstance(catalog, Mapping):
+        _add_source(cited_paths, catalog)
+        catalog_source = _source(catalog)
+        commands = catalog.get("commands")
+        if isinstance(commands, list):
+            for command in commands:
+                _add_source(cited_paths, command)
+                if _source(command) is None and catalog_source is None:
+                    uncited_claims.add("command")
+
+    environment = payload.get("environment")
+    if isinstance(environment, Mapping):
+        _add_source(cited_paths, environment)
+        files = environment.get("files")
+        environment_sources = {_source(environment)}
+        if isinstance(files, list):
+            file_sources = {path for path in files if isinstance(path, str)}
+            cited_paths.update(file_sources)
+            environment_sources.update(file_sources)
+        environment_sources.discard(None)
+        for key in ("toolchains", "prepare_commands", "materialize_commands"):
+            records = environment.get(key)
+            if isinstance(records, list):
+                for record in records:
+                    _add_source(cited_paths, record)
+                    if _source(record) is None and not environment_sources:
+                        uncited_claims.add(f"environment {key[:-1]}")
+        package_managers = environment.get("package_managers")
+        if (
+            isinstance(package_managers, list)
+            and package_managers
+            and not environment_sources
+        ):
+            uncited_claims.add("environment package manager")
+
+    for key in ("required_secrets", "service_dependencies"):
+        records = payload.get(key)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            _add_source(cited_paths, record)
+            record_source = _source(record)
+            if record_source is None:
+                claim = "required secret" if key == "required_secrets" else "service"
+                uncited_claims.add(claim)
+            if key == "service_dependencies" and isinstance(record, Mapping):
+                ports = record.get("ports")
+                if isinstance(ports, list):
+                    for port in ports:
+                        _add_source(cited_paths, port)
+                        if _source(port) is None and record_source is None:
+                            uncited_claims.add("service port")
+
+    if uncited_claims:
+        names = ", ".join(sorted(uncited_claims))
+        raise AnalyzerError(f"Harness input lacks bounded evidence for: {names}")
+
+    known_paths = {file.path for file in manifest.files}
+    unknown_sources = {
+        source
+        for source in cited_paths
+        if not _source_is_in_manifest(source, known_paths)
+    }
+    if unknown_sources:
+        names = ", ".join(sorted(unknown_sources))
+        raise AnalyzerError(
+            f"Harness input cites evidence absent from manifest: {names}"
+        )
+
+
+def _add_source(paths: set[str], value: object) -> None:
+    if (source := _source(value)) is not None:
+        paths.add(source)
+
+
+def _source(value: object) -> str | None:
+    if isinstance(value, Mapping) and isinstance(value.get("source"), str):
+        return value["source"]
+    return None
+
+
+def _source_is_in_manifest(source: str, known_paths: set[str]) -> bool:
+    """Accept a discovered file or an anchored location within that file."""
+    if source in known_paths:
+        return True
+
+    path, marker, anchor = source.partition("#")
+    if marker and path in known_paths and anchor:
+        return True
+
+    for path in known_paths:
+        prefix = f"{path}/"
+        if source.startswith(prefix):
+            segments = source[len(prefix) :].split("/")
+            return all(segment not in ("", ".", "..") for segment in segments)
+    return False
 
 
 def resolve_analysis_model(
