@@ -55,6 +55,7 @@ def test_every_role_discloses_native_host_capability(role: ApiAgentRole) -> None
     assert adapter.capabilities.supports_billing(BillingMode.SUBSCRIPTION)
     assert not adapter.capabilities.supports_billing(BillingMode.API)
     assert not adapter.capabilities.tool_allowlist
+    assert adapter.capabilities.read_only_sandbox
 
 
 def test_native_command_validates_and_persists_result_metadata(
