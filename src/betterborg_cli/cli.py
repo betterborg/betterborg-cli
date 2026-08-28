@@ -21,12 +21,14 @@ from betterborg_cli.planning import (
     ArchitectLoop,
     TechLeadCancelled,
     TechLeadLoop,
+    render_plan_markdown,
+    validate_plan,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
-from betterborg_cli.store import BorgState, SqliteStore
+from betterborg_cli.store import BorgState, PlanningAttemptStatus, SqliteStore
 from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
     require_workspace_trust,
@@ -371,6 +373,58 @@ def start_plan(repository_path: Path, name: str) -> None:
         raise click.ClickException(
             f"Planning stopped in unexpected state {borg.state.value!r}"
         )
+
+
+@plan.command(name="show")
+@click.argument("name")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit the stored plan as validated machine-readable JSON.",
+)
+def show_plan(name: str, json_output: bool) -> None:
+    """Show the latest complete plan for the named Borg."""
+    try:
+        paths = RepoPaths.discover()
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            repository = store.get_repository(config.repository_id)
+            if repository is None:
+                raise ValueError("repository is not initialized; run 'borg init' first")
+            borg = store.get_borg_by_name(repository.id, name)
+            if borg is None:
+                raise ValueError(
+                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                )
+            attempt = next(
+                (
+                    item
+                    for item in reversed(store.list_planning_attempts(borg.id))
+                    if item.phase == "architect_plan"
+                    and item.status is PlanningAttemptStatus.COMPLETED
+                    and item.result is not None
+                ),
+                None,
+            )
+            if attempt is None:
+                raise ValueError(
+                    f"Borg {name!r} does not have a stored plan; "
+                    f"run 'borg plan start {name}' first"
+                )
+            stored_plan = attempt.result
+            validate_plan(
+                stored_plan,
+                paths.root,
+                check_repository_state=False,
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if json_output:
+        click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
+    else:
+        click.echo(render_plan_markdown(stored_plan), nl=False)
 
 
 def _write_initialized(result) -> None:
