@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import re
 import urllib.error
 import urllib.request
@@ -166,7 +165,7 @@ class OpenAIAdapter:
     """Run a schema-shaped, contained multi-turn OpenAI agent."""
 
     role: ApiAgentRole | str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     workspace_trusted: bool = False
     transport: OpenAITransport = field(default_factory=UrllibOpenAITransport)
     max_output_tokens: int = 8192
@@ -202,9 +201,7 @@ class OpenAIAdapter:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        key = self.api_key or spec.env.get("OPENAI_API_KEY") or os.environ.get(
-            "OPENAI_API_KEY"
-        )
+        key = self.api_key
         runtime = ApiRunContext(
             spec,
             _PROVIDER,

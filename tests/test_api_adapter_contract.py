@@ -334,6 +334,43 @@ def test_credentials_are_redacted_from_errors_and_logs(
     assert "[REDACTED]" in log
 
 
+def test_adapter_requires_an_injected_credential(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variable = (
+        "ANTHROPIC_API_KEY"
+        if harness.provider == "anthropic"
+        else "OPENAI_API_KEY"
+    )
+    monkeypatch.setenv(variable, "ambient-secret")
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "unexpected"},
+                        call_id="submit",
+                    )
+                ]
+            )
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        api_key=None,
+        transport=transport,
+    ).run(harness.spec(tmp_path, env={variable: "spec-secret"}))
+
+    assert result.status == AgentStatus.FAILED
+    provider_name = "Anthropic" if harness.provider == "anthropic" else "OpenAI"
+    assert result.error == f"{provider_name} API credential is not configured"
+    assert transport.payloads == []
+
+
 def test_credentials_are_redacted_from_tools_and_completed_payload(
     tmp_path: Path,
     harness: ApiAdapterHarness,
