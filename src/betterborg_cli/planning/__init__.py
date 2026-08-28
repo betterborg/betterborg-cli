@@ -9,6 +9,12 @@ from betterborg_cli.planning.architect import (
     ArchitectLoop,
     ArchitectResult,
 )
+from betterborg_cli.planning.plan_contracts import (
+    PlanValidationError,
+    render_plan_markdown,
+    validate_plan,
+    validate_plan_json,
+)
 from betterborg_cli.planning.worktree import (
     PlanningWorktreeError,
     materialize_planning_worktree,
@@ -23,5 +29,9 @@ __all__ = [
     "ArchitectLoop",
     "ArchitectResult",
     "PlanningWorktreeError",
+    "PlanValidationError",
     "materialize_planning_worktree",
+    "render_plan_markdown",
+    "validate_plan",
+    "validate_plan_json",
 ]

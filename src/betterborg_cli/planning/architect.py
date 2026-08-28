@@ -24,6 +24,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.planning.plan_contracts import PlanValidationError, validate_plan
 from betterborg_cli.planning.worktree import materialize_planning_worktree
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
@@ -398,6 +399,19 @@ class ArchitectLoop:
                 self._answer_question_round(borg, question)
                 continue
 
+            try:
+                self._validate_plan_in_snapshot(payload)
+            except PlanValidationError as error:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=payload,
+                    summary=f"invalid plan contract: {error}",
+                )
+                raise ArchitectError(
+                    f"Architect plan failed deterministic validation: {error}"
+                ) from error
+
             with self.store.transaction():
                 completed = self.store.complete_planning_attempt(
                     attempt.id,
@@ -615,7 +629,7 @@ class ArchitectLoop:
         )
 
     def _completed_plan(self) -> PlanningAttempt | None:
-        return next(
+        completed = next(
             (
                 item
                 for item in reversed(self._phase_attempts(_PLAN_PHASE))
@@ -624,6 +638,27 @@ class ArchitectLoop:
             ),
             None,
         )
+        if completed is None:
+            return None
+        try:
+            self._validate_plan_in_snapshot(completed.result or {})
+        except PlanValidationError as error:
+            raise ArchitectError(
+                "Stored Architect plan failed deterministic validation: "
+                f"{error}"
+            ) from error
+        return completed
+
+    def _validate_plan_in_snapshot(self, plan: dict[str, Any]) -> None:
+        """Validate against the same committed-only view exposed to Architect."""
+        with materialize_planning_worktree(
+            self.repository,
+            self._current_borg(),
+            self.store,
+            dirty_borg_documents=self.dirty_borg_documents,
+            worktrees_root=self.worktrees_root,
+        ) as worktree:
+            validate_plan(plan, worktree)
 
     def _latest_ambiguous_plan(self) -> PlanningAttempt | None:
         return next(

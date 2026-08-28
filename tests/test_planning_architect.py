@@ -583,6 +583,161 @@ def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
         assert len(adapter.calls) == 3
 
 
+def test_invalid_plan_contract_fails_before_tech_review(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=invalid_plan))
+    database = committed_git_repo.parent / "architect-invalid-plan.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "invalid-plan"
+        )
+
+        with pytest.raises(ArchitectError, match="deterministic validation"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert store.get_borg(borg.id).state is BorgState.ARCHITECT_WORKING
+        plan_attempt = store.list_planning_attempts(borg.id)[-1]
+        assert plan_attempt.status is PlanningAttemptStatus.FAILED
+        assert plan_attempt.result == invalid_plan
+        assert "expected number 01" in plan_attempt.summary
+
+
+def test_plan_validation_rejects_untracked_source_the_architect_did_not_see(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["code_pointers"] = [
+        {"path": "untracked.py", "why": "This file is not in the planning snapshot."}
+    ]
+
+    def create_untracked_source(_spec):
+        (committed_git_repo / "untracked.py").write_text(
+            "print('dirty source')\n", encoding="utf-8"
+        )
+        return invalid_plan
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(dynamic=create_untracked_source))
+    database = committed_git_repo.parent / "architect-untracked-source.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "untracked-source"
+        )
+
+        with pytest.raises(ArchitectError, match="not grounded in the repository"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        plan_attempt = store.list_planning_attempts(borg.id)[-1]
+        assert plan_attempt.status is PlanningAttemptStatus.FAILED
+        assert plan_attempt.result == invalid_plan
+
+
+def test_plan_validation_ignores_dirty_source_drift_after_architect_turn(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    def remove_tracked_source_after_inspection(spec):
+        assert (spec.cwd / "README.md").is_file()
+        (committed_git_repo / "README.md").unlink()
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(dynamic=remove_tracked_source_after_inspection))
+    database = committed_git_repo.parent / "architect-dirty-drift.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "dirty-drift"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+
+
+def test_revalidates_a_durable_completed_plan_before_resuming(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    adapter = MockAdapter(name="openai")
+    database = committed_git_repo.parent / "architect-invalid-completed-plan.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, draft = persist_planning_context(
+            committed_git_repo, store, "invalid-completed-plan"
+        )
+        working = store.compare_and_set_borg_state(
+            draft.id,
+            expected_state=BorgState.DRAFT,
+            expected_version=0,
+            new_state=BorgState.ARCHITECT_WORKING,
+        )
+        attempt = PlanningAttempt(
+            borg_id=working.id,
+            phase="architect_plan",
+            round=1,
+            adapter="openai",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=invalid_plan,
+            summary=str(invalid_plan["title"]),
+        )
+
+        with pytest.raises(
+            ArchitectError,
+            match="Stored Architect plan failed deterministic validation",
+        ):
+            ArchitectLoop(
+                repository,
+                working,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert store.get_borg(working.id).state is BorgState.ARCHITECT_WORKING
+        assert len(adapter.calls) == 0
+
+
 def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:
     return InteractiveIO(
         prompt=lambda _message: next(answers, None),
@@ -610,9 +765,9 @@ def _plan() -> dict[str, object]:
                 ),
                 "files_touched": [
                     {
-                        "path": ".github/workflows/release.yml",
+                        "path": "CHANGELOG.md",
                         "role": "new",
-                        "description": "Builds release artifacts.",
+                        "description": "Documents the release workflow.",
                     }
                 ],
                 "test_strategy": (
