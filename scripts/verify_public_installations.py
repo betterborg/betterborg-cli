@@ -3,43 +3,24 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import json
-import os
 import subprocess
 import sys
 import tempfile
-import time
-import urllib.parse
-from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
 
-PROVIDER_VARIABLE = "OPENAI_API_KEY"
-OTHER_PROVIDER_VARIABLE = "ANTHROPIC_API_KEY"
+try:
+    from scripts import protected_smoke
+except ModuleNotFoundError:  # Direct execution adds scripts/, not the repository root.
+    import protected_smoke
+
 INSTALL_URL = (
     "https://github.com/betterborg/betterborg-cli/"
     "releases/download/v{version}/install.sh"
 )
 
 
-class PublicInstallationError(RuntimeError):
-    """A public installation path failed its protected smoke contract."""
-
-
-@dataclass(frozen=True)
-class CommandCapture:
-    label: str
-    stdout: bytes
-    stderr: bytes
-
-
-Runner = Callable[..., subprocess.CompletedProcess[bytes]]
-
-
-def _fail(message: str) -> NoReturn:
-    raise PublicInstallationError(message)
+PublicInstallationError = protected_smoke.ProtectedSmokeError
+Runner = protected_smoke.Runner
 
 
 def command_shapes(version: str) -> dict[str, tuple[str, ...]]:
@@ -67,108 +48,13 @@ def command_shapes(version: str) -> dict[str, tuple[str, ...]]:
     }
 
 
-def _credential_markers(credential: str) -> tuple[bytes, ...]:
-    raw = credential.encode()
-    standard = base64.b64encode(raw)
-    urlsafe = base64.urlsafe_b64encode(raw)
-    return tuple(
-        marker
-        for marker in {
-            raw,
-            standard,
-            standard.rstrip(b"="),
-            urlsafe,
-            urlsafe.rstrip(b"="),
-            urllib.parse.quote(credential, safe="").encode(),
-        }
-        if marker
-    )
-
-
-def _assert_no_credential_leak(
-    credential: str, captures: list[CommandCapture], root: Path
-) -> None:
-    markers = _credential_markers(credential)
-    for capture in captures:
-        for stream_name, body in (
-            ("stdout", capture.stdout),
-            ("stderr", capture.stderr),
-        ):
-            if any(marker in body for marker in markers):
-                _fail(f"provider credential leaked in {capture.label} {stream_name}")
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(marker in os.fsencode(relative) for marker in markers):
-            _fail("provider credential leaked in fixture path")
-        if path.is_symlink():
-            if any(marker in os.fsencode(os.readlink(path)) for marker in markers):
-                _fail("provider credential leaked in fixture symlink")
-        elif path.is_file():
-            try:
-                body = path.read_bytes()
-            except OSError:
-                _fail(f"could not inspect public smoke fixture file {relative}")
-            if any(marker in body for marker in markers):
-                _fail(f"provider credential leaked in fixture file {relative}")
-
-
-def _run(
-    runner: Runner,
-    command: list[str],
-    *,
-    label: str,
-    captures: list[CommandCapture],
-    cwd: Path,
-    env: dict[str, str],
-) -> subprocess.CompletedProcess[bytes]:
-    try:
-        completed = runner(
-            command,
-            cwd=cwd,
-            env=env,
-            check=False,
-            capture_output=True,
-        )
-    except OSError as error:
-        _fail(f"{label} could not start: {type(error).__name__}")
-    captures.append(CommandCapture(label, completed.stdout, completed.stderr))
-    return completed
-
-
-def _initialize_git(
-    fixture: Path,
-    environment: dict[str, str],
-    captures: list[CommandCapture],
-    runner: Runner,
-) -> None:
-    fixture.mkdir()
-    (fixture / "README.md").write_text("# BetterBorg public smoke\n", encoding="utf-8")
-    commands = (
-        ["git", "init", "--initial-branch=main", "."],
-        ["git", "config", "user.name", "Release Smoke"],
-        ["git", "config", "user.email", "release-smoke@betterborg.com"],
-        ["git", "add", "README.md"],
-        ["git", "commit", "-m", "Initialize fixture"],
-    )
-    for command in commands:
-        completed = _run(
-            runner,
-            command,
-            label=" ".join(command[:2]),
-            captures=captures,
-            cwd=fixture,
-            env=environment,
-        )
-        if completed.returncode != 0:
-            _fail(f"fixture setup failed: {' '.join(command[:2])}")
-
-
 def _commands_for_installation(
     method: str,
     version: str,
     fixture: Path,
     environment: dict[str, str],
-    captures: list[CommandCapture],
+    captures: list[protected_smoke.CommandCapture],
+    credential: str,
     runner: Runner,
 ) -> tuple[list[str], dict[str, str]]:
     shapes = command_shapes(version)
@@ -179,28 +65,32 @@ def _commands_for_installation(
 
     installer = fixture / "install.sh"
     download = [*shapes["curl"], "--output", str(installer)]
-    completed = _run(
+    completed = protected_smoke.run_command(
         runner,
         download,
         label="exact-version curl installer download",
         captures=captures,
+        credential=credential,
+        roots=(fixture,),
         cwd=fixture,
         env=environment,
     )
     if completed.returncode != 0:
-        _fail("exact-version curl installer download failed")
+        protected_smoke.fail("exact-version curl installer download failed")
     install_environment = dict(environment)
     install_environment["BETTERBORG_VERSION"] = version
-    completed = _run(
+    completed = protected_smoke.run_command(
         runner,
         ["sh", str(installer)],
         label="checksum-verifying curl installation",
         captures=captures,
+        credential=credential,
+        roots=(fixture,),
         cwd=fixture,
         env=install_environment,
     )
     if completed.returncode != 0:
-        _fail("checksum-verifying curl installation failed")
+        protected_smoke.fail("checksum-verifying curl installation failed")
     return [str(fixture / "home/.local/bin/borg")], environment
 
 
@@ -214,18 +104,13 @@ def verify_installations(
 ) -> None:
     """Run each public source in a fresh repository with isolated machine state."""
     if attempts < 1:
-        _fail("attempts must be at least one")
-    credential = os.environ.get(PROVIDER_VARIABLE, "")
-    if len(credential) < 12:
-        _fail(f"{PROVIDER_VARIABLE} is missing or too short for the protected smoke")
+        protected_smoke.fail("attempts must be at least one")
+    credential, base_environment = protected_smoke.protected_environment()
     root.mkdir(parents=True, exist_ok=False)
-    base_environment = dict(os.environ)
-    base_environment.pop(PROVIDER_VARIABLE, None)
-    base_environment.pop(OTHER_PROVIDER_VARIABLE, None)
 
     for method in ("curl", "uvx", "npx"):
         fixture = root / method
-        captures: list[CommandCapture] = []
+        captures: list[protected_smoke.CommandCapture] = []
         environment = dict(base_environment)
         environment.update(
             {
@@ -236,47 +121,24 @@ def verify_installations(
                 "XDG_STATE_HOME": str(fixture / "state"),
             }
         )
-        _initialize_git(fixture, environment, captures, runner)
+        protected_smoke.initialize_git_fixture(
+            fixture, environment, captures, credential, runner
+        )
         prefix, command_environment = _commands_for_installation(
-            method, version, fixture, environment, captures, runner
+            method, version, fixture, environment, captures, credential, runner
         )
-        expected = f"borg {version}".encode()
-        for attempt in range(1, attempts + 1):
-            completed = _run(
-                runner,
-                [*prefix, "version"],
-                label=f"{method} exact-version check attempt {attempt}",
-                captures=captures,
-                cwd=fixture,
-                env=command_environment,
-            )
-            _assert_no_credential_leak(credential, captures, fixture)
-            if completed.returncode == 0 and completed.stdout.strip() == expected:
-                break
-            if attempt != attempts:
-                time.sleep(retry_delay)
-        else:
-            _fail(f"{method} did not run exact BetterBorg {version}")
-
-        init_environment = dict(command_environment)
-        init_environment[PROVIDER_VARIABLE] = credential
-        initialized = _run(
-            runner,
-            [*prefix, "init", "--yes", "--json"],
-            label=f"{method} trusted provider initialization",
+        protected_smoke.verify_cli_initialization(
+            prefix,
+            method=method,
+            version=version,
+            fixture=fixture,
+            environment=command_environment,
             captures=captures,
-            cwd=fixture,
-            env=init_environment,
+            credential=credential,
+            runner=runner,
+            attempts=attempts,
+            retry_delay=retry_delay,
         )
-        _assert_no_credential_leak(credential, captures, fixture)
-        if initialized.returncode != 0:
-            _fail(f"{method} provider initialization failed")
-        try:
-            payload = json.loads(initialized.stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            _fail(f"{method} provider initialization did not emit valid JSON")
-        if not isinstance(payload, dict) or payload.get("initialized") is not True:
-            _fail(f"{method} provider initialization was not fresh")
 
 
 def main() -> int:

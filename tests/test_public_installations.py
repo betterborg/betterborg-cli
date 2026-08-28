@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from release_test_support import load_script
+from scripts import protected_smoke
 
 verify_public_installations = load_script("verify_public_installations")
 
@@ -88,25 +89,54 @@ def test_three_fresh_fixtures_isolate_trust_provider_and_machine_state(
 @pytest.mark.parametrize(
     "encoded",
     (
-        CREDENTIAL.encode(),
-        urllib.parse.quote(CREDENTIAL, safe="").encode(),
-        base64.b64encode(CREDENTIAL.encode()),
-        base64.b64encode(CREDENTIAL.encode()).rstrip(b"="),
-        base64.urlsafe_b64encode(CREDENTIAL.encode()),
-        base64.urlsafe_b64encode(CREDENTIAL.encode()).rstrip(b"="),
+        pytest.param(CREDENTIAL.encode(), id="raw"),
+        pytest.param(
+            urllib.parse.quote(CREDENTIAL, safe="").encode(), id="percent-encoded"
+        ),
+        pytest.param(
+            base64.b64encode(CREDENTIAL.encode()), id="standard-base64-padded"
+        ),
+        pytest.param(
+            base64.b64encode(CREDENTIAL.encode()).rstrip(b"="),
+            id="standard-base64-unpadded",
+        ),
+        pytest.param(
+            base64.urlsafe_b64encode(CREDENTIAL.encode()),
+            id="urlsafe-base64-padded",
+        ),
+        pytest.param(
+            base64.urlsafe_b64encode(CREDENTIAL.encode()).rstrip(b"="),
+            id="urlsafe-base64-unpadded",
+        ),
     ),
 )
-def test_public_smoke_rejects_every_credential_representation(
-    tmp_path: Path, encoded: bytes
+@pytest.mark.parametrize("location", ("stdout", "stderr", "fixture"))
+def test_shared_smoke_rejects_credential_from_every_capture_location(
+    tmp_path: Path,
+    encoded: bytes,
+    location: str,
 ) -> None:
     fixture = tmp_path / "fixture"
     fixture.mkdir()
-    (fixture / "state").write_bytes(encoded)
+    stdout = encoded if location == "stdout" else b""
+    stderr = encoded if location == "stderr" else b""
+    if location == "fixture":
+        (fixture / "state").write_bytes(encoded)
 
-    with pytest.raises(
-        verify_public_installations.PublicInstallationError,
-        match="provider credential leaked",
-    ):
-        verify_public_installations._assert_no_credential_leak(
-            CREDENTIAL, [], fixture
+    def leaking_run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout, stderr)
+
+    with pytest.raises(protected_smoke.ProtectedSmokeError) as raised:
+        protected_smoke.run_command(
+            leaking_run,
+            ["borg", "version"],
+            label="test command",
+            captures=[],
+            credential=CREDENTIAL,
+            roots=(fixture,),
+            cwd=fixture,
+            env={},
         )
+
+    assert location in str(raised.value)
+    assert CREDENTIAL not in str(raised.value)
