@@ -288,9 +288,7 @@ def verify_snapshot(
     unverified_attestations = tuple(
         name
         for name in expected
-        if name in snapshot.assets
-        and name in snapshot.published_attestations
-        and name not in snapshot.verified_attestations
+        if name not in snapshot.verified_attestations
     )
 
     remaining = [f"upload release asset {name}" for name in missing]

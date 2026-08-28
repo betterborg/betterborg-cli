@@ -342,6 +342,7 @@ def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:
         "maintainer with push access",
         "token only read access",
         "the peeled `vVERSION` commit, and `refs/heads/main`",
+        "do not publish the draft while any listed attestation-verification",
         "PyPI project: `betterborg`",
         "GitHub owner: `betterborg`",
         "GitHub repository: `betterborg-cli`",

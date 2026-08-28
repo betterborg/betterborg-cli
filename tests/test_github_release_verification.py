@@ -2,29 +2,15 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import pytest
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
+from release_test_support import load_script, write_binary_artifact_set
 
-
-def _load_script(name: str):
-    specification = importlib.util.spec_from_file_location(
-        name, REPOSITORY_ROOT / "scripts" / f"{name}.py"
-    )
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    sys.modules[name] = module
-    specification.loader.exec_module(module)
-    return module
-
-
-release_artifacts = _load_script("release_artifacts")
-verify_github_release = _load_script("verify_github_release")
+verify_github_release = load_script("verify_github_release")
 
 
 def _release_fixture(
@@ -34,14 +20,7 @@ def _release_fixture(
     attested: set[str] | None = None,
 ) -> tuple[Path, tuple[str, ...]]:
     assets = directory / "assets"
-    assets.mkdir(parents=True)
-    for index, target in enumerate(release_artifacts.TARGETS, start=1):
-        binary = assets / target.filename
-        binary.write_bytes(f"binary fixture {index}\n".encode())
-        release_artifacts.write_checksum(binary)
-    release_artifacts.write_manifest(
-        "1.2.3", assets, assets / "release-manifest.json"
-    )
+    write_binary_artifact_set(assets)
     names = verify_github_release._expected_names()
     metadata = {
         "tag_name": "v1.2.3",
@@ -114,6 +93,7 @@ def test_partial_draft_fixture_reports_each_remaining_publication_step(
     assert captured.err == ""
     assert f"upload release asset {missing}" in captured.out
     assert f"publish GitHub artifact attestation for {missing}" in captured.out
+    assert f"verify GitHub artifact attestation for {missing}" in captured.out
     assert "publish the draft GitHub Release" in captured.out
 
 
@@ -232,6 +212,7 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
         assert result.complete is False
         assert result.remaining == (
             f"upload release asset {missing}",
+            f"verify GitHub artifact attestation for {missing}",
             "publish the draft GitHub Release",
         )
     attestation_queries = [
@@ -282,13 +263,13 @@ def test_live_verification_finds_drafts_and_recognizes_published_attestations(
     )
 
 
-def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
+def test_missing_asset_attestation_is_verified_after_upload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture, names = _release_fixture(tmp_path / "source")
     missing = "borg-linux-x86_64"
-    rejected = "borg-darwin-arm64"
+    uploaded = False
     bodies = {
         name: (fixture / "assets" / name).read_bytes()
         for name in names
@@ -303,7 +284,7 @@ def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
                 "assets": [
                     {"name": name, "url": f"asset-api/{name}"}
                     for name in names
-                    if name != missing
+                    if uploaded or name != missing
                 ],
             }
             return verify_github_release.subprocess.CompletedProcess(
@@ -329,17 +310,28 @@ def test_partial_live_release_rejects_wrong_attestation_signer_workflow(
             path = Path(command[3])
             return verify_github_release.subprocess.CompletedProcess(
                 command,
-                1 if path.name == rejected else 0,
-                "" if path.name == rejected else "verified",
-                "signer workflow mismatch" if path.name == rejected else "",
+                1 if path.name == missing else 0,
+                "" if path.name == missing else "verified",
+                "signer workflow mismatch" if path.name == missing else "",
             )
         pytest.fail(f"unexpected command: {command}")
 
     monkeypatch.setattr(verify_github_release.subprocess, "run", fake_run)
 
+    partial = verify_github_release.verify_release(
+        "1.2.3", "betterborg/betterborg-cli"
+    )
+
+    assert partial.remaining == (
+        f"upload release asset {missing}",
+        f"verify GitHub artifact attestation for {missing}",
+        "publish the draft GitHub Release",
+    )
+
+    uploaded = True
     with pytest.raises(
         verify_github_release.GitHubReleaseVerificationError,
-        match=f"attestation digest or provenance mismatch for {rejected}",
+        match=f"attestation digest or provenance mismatch for {missing}",
     ):
         verify_github_release.verify_release(
             "1.2.3", "betterborg/betterborg-cli"

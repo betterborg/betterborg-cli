@@ -138,15 +138,16 @@ the published release is complete, `2` means a draft or its attestations are
 partial and the output lists the publication steps that remain, and `1` means
 verification is terminal or could not establish trust.
 
-For exit status `2`, perform only the listed steps through the same reviewed
-workflow run, then rerun verification. A matching draft may upload missing
-assets and then publish. An attestation that already exists for a missing
-asset's reviewed digest is not republished; after upload, rerun the verifier so
-it can cryptographically verify the attestation against the asset bytes and
-reviewed source. If the release is already public but an attestation is
-missing, stop promotion and have a release maintainer complete the attestation
-for the unchanged digest through the protected release process. Never replace
-an asset to repair an attestation.
+For exit status `2`, perform only the listed steps, in order, through the same
+reviewed workflow run. Rerun verification after satisfying an upload or
+attestation-publication prerequisite; do not publish the draft while any
+listed attestation-verification step remains. An attestation that already
+exists for a missing asset's reviewed digest is not republished; after upload,
+the verifier must cryptographically verify the attestation against the asset
+bytes and reviewed source before draft publication. If the release is already
+public but an attestation is missing, stop promotion and have a release
+maintainer complete the attestation for the unchanged digest through the
+protected release process. Never replace an asset to repair an attestation.
 
 Release assets are immutable. Matching names and SHA-256 digests are verified
 and retained; a digest, checksum, manifest, tag, or attestation-provenance

@@ -2,45 +2,29 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
-import sys
 from pathlib import Path
 
 import pytest
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
+from release_test_support import (
+    REPOSITORY_ROOT,
+    load_script,
+    release_artifacts,
+    write_binary_artifact_set,
+)
+
 BINARY_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/binary-release.yml"
 RELEASE_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/release.yml"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github/workflows/ci.yml"
 BINARY_LOCK = REPOSITORY_ROOT / "requirements-binary.lock"
 
-
-def _load_script(name: str):
-    specification = importlib.util.spec_from_file_location(
-        name, REPOSITORY_ROOT / "scripts" / f"{name}.py"
-    )
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    sys.modules[name] = module
-    specification.loader.exec_module(module)
-    return module
-
-
-release_artifacts = _load_script("release_artifacts")
-reconcile_github_release = _load_script("reconcile_github_release")
+reconcile_github_release = load_script("reconcile_github_release")
 
 
 def _artifact_set(directory: Path, version: str = "1.2.3") -> dict[str, str]:
-    directory.mkdir()
-    for index, target in enumerate(release_artifacts.TARGETS, start=1):
-        path = directory / target.filename
-        path.write_bytes(f"binary fixture {index}\n".encode())
-        release_artifacts.write_checksum(path)
-    release_artifacts.write_manifest(
-        version, directory, directory / "release-manifest.json"
-    )
+    write_binary_artifact_set(directory, version)
     return reconcile_github_release.expected_assets(version, directory)
 
 
