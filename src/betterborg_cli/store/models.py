@@ -37,6 +37,22 @@ class PlanningAttemptStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TaskComplexity(str, Enum):
+    """Coarse implementation estimate attached to an immutable task record."""
+
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+
+
+class TaskGenerationStatus(str, Enum):
+    """Publication lifecycle for one immutable task-generation snapshot."""
+
+    PREPARING = "preparing"
+    CURRENT = "current"
+    SUPERSEDED = "superseded"
+
+
 def utcnow() -> datetime:
     """Return a timezone-aware timestamp in UTC."""
     return datetime.now(UTC)
@@ -357,4 +373,188 @@ class PlanChangeRequest:
             raise ValueError("plan change request round must be positive")
         if not self.note.strip():
             raise ValueError("plan change request note must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanApproval:
+    """One immutable approval of a digest-bound plan manifest."""
+
+    borg_id: UUID
+    plan_digest: str
+    manifest: dict[str, Any]
+    attempt_id: UUID | None = None
+    approved_by: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    approved_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"plan approval {name} must be a UUID")
+        if self.attempt_id is not None and not isinstance(self.attempt_id, UUID):
+            raise TypeError("plan approval attempt ID must be a UUID")
+        if not self.plan_digest.strip():
+            raise ValueError("plan approval digest must not be empty")
+        if not isinstance(self.manifest, dict):
+            raise TypeError("plan approval manifest must be a dictionary")
+        _validate_utc(self.approved_at)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskBatch:
+    """One immutable PM-produced task batch bound to an approved plan."""
+
+    borg_id: UUID
+    plan_approval_id: UUID
+    round: int
+    digest: str
+    manifest: dict[str, Any]
+    summary: str = ""
+    attempt_id: UUID | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "plan_approval_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task batch {name} must be a UUID")
+        if self.attempt_id is not None and not isinstance(self.attempt_id, UUID):
+            raise TypeError("task batch attempt ID must be a UUID")
+        if self.round < 1:
+            raise ValueError("task batch round must be positive")
+        if not self.digest.strip():
+            raise ValueError("task batch digest must not be empty")
+        if not isinstance(self.manifest, dict):
+            raise TypeError("task batch manifest must be a dictionary")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskFinding:
+    """One immutable supervisor finding against a task batch."""
+
+    borg_id: UUID
+    batch_id: UUID
+    round: int
+    severity: str
+    message: str
+    attempt_id: UUID | None = None
+    suggestion: str | None = None
+    task_ref: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "batch_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task finding {name} must be a UUID")
+        if self.attempt_id is not None and not isinstance(self.attempt_id, UUID):
+            raise TypeError("task finding attempt ID must be a UUID")
+        if self.round < 1:
+            raise ValueError("task finding round must be positive")
+        if not self.severity.strip() or not self.message.strip():
+            raise ValueError("task finding severity and message must not be empty")
+        if self.task_ref is not None and not self.task_ref.strip():
+            raise ValueError("task finding task ref must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskGeneration:
+    """One digest-bound task set whose metadata never changes after creation."""
+
+    borg_id: UUID
+    plan_approval_id: UUID
+    batch_id: UUID
+    digest: str
+    manifest: dict[str, Any]
+    status: TaskGenerationStatus = TaskGenerationStatus.PREPARING
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+    current_at: datetime | None = None
+    superseded_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "plan_approval_id", "batch_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task generation {name} must be a UUID")
+        if not isinstance(self.status, TaskGenerationStatus):
+            raise TypeError("task generation status must be a TaskGenerationStatus")
+        if not self.digest.strip():
+            raise ValueError("task generation digest must not be empty")
+        if not isinstance(self.manifest, dict):
+            raise TypeError("task generation manifest must be a dictionary")
+        _validate_utc(self.created_at)
+        if self.current_at is not None:
+            _validate_utc(self.current_at)
+        if self.superseded_at is not None:
+            _validate_utc(self.superseded_at)
+        timestamps_are_valid = (
+            self.status is TaskGenerationStatus.PREPARING
+            and self.current_at is None
+            and self.superseded_at is None
+        ) or (
+            self.status is TaskGenerationStatus.CURRENT
+            and self.current_at is not None
+            and self.superseded_at is None
+        ) or (
+            self.status is TaskGenerationStatus.SUPERSEDED
+            and self.current_at is not None
+            and self.superseded_at is not None
+        )
+        if not timestamps_are_valid:
+            raise ValueError("task generation timestamps do not match its status")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRecord:
+    """Immutable structured metadata for one task in a generation."""
+
+    generation_id: UUID
+    borg_id: UUID
+    task_ref: str
+    stage: str
+    stem: str
+    position: int
+    title: str
+    complexity: TaskComplexity
+    digest: str
+    task: dict[str, Any]
+    manifest: dict[str, Any]
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "generation_id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task record {name} must be a UUID")
+        for name in ("task_ref", "stage", "stem", "title", "digest"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"task record {name} must not be empty")
+        if self.position < 1:
+            raise ValueError("task record position must be positive")
+        if not isinstance(self.complexity, TaskComplexity):
+            raise TypeError("task record complexity must be a TaskComplexity")
+        if not isinstance(self.task, dict) or not isinstance(self.manifest, dict):
+            raise TypeError("task record task and manifest must be dictionaries")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDependency:
+    """One immutable directed edge between tasks in the same generation."""
+
+    generation_id: UUID
+    task_id: UUID
+    depends_on_task_id: UUID
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "generation_id", "task_id", "depends_on_task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task dependency {name} must be a UUID")
+        if self.task_id == self.depends_on_task_id:
+            raise ValueError("a task cannot depend on itself")
         _validate_utc(self.created_at)

@@ -5,6 +5,7 @@ from betterborg_cli.store.models import (
     BorgState,
     GeneratedPrompt,
     Operation,
+    PlanApproval,
     PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
@@ -15,6 +16,13 @@ from betterborg_cli.store.models import (
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
+    TaskBatch,
+    TaskComplexity,
+    TaskDependency,
+    TaskFinding,
+    TaskGeneration,
+    TaskGenerationStatus,
+    TaskRecord,
 )
 from betterborg_cli.store.sqlite import SqliteStore, StaleBorgStateError
 
@@ -23,6 +31,7 @@ __all__ = [
     "BorgState",
     "GeneratedPrompt",
     "Operation",
+    "PlanApproval",
     "PlanChangeRequest",
     "PlanningAttempt",
     "PlanningAttemptStatus",
@@ -35,4 +44,11 @@ __all__ = [
     "RepositoryPackage",
     "SqliteStore",
     "StaleBorgStateError",
+    "TaskBatch",
+    "TaskComplexity",
+    "TaskDependency",
+    "TaskFinding",
+    "TaskGeneration",
+    "TaskGenerationStatus",
+    "TaskRecord",
 ]
