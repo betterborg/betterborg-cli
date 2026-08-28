@@ -14,6 +14,13 @@ from betterborg_cli.repo_analysis.discovery import (
     build_discovery_workspace,
     discovery_limits_from_mapping,
 )
+from betterborg_cli.repo_analysis.prompts_manager import (
+    PROMPT_MANAGER_OUTPUT_SCHEMA,
+    PROMPT_ROLES,
+    PromptGeneration,
+    PromptManagerConfig,
+    generate_role_prompts,
+)
 from betterborg_cli.repo_analysis.scoring import (
     DIMENSIONS,
     EFFORT_COST,
@@ -45,6 +52,10 @@ __all__ = [
     "DIMENSIONS",
     "EFFORT_COST",
     "PackageScore",
+    "PROMPT_MANAGER_OUTPUT_SCHEMA",
+    "PROMPT_ROLES",
+    "PromptGeneration",
+    "PromptManagerConfig",
     "RECOMMENDATION_SCHEMA",
     "RECOMMENDATION_THEME_SCHEMA",
     "RankedRecommendationTheme",
@@ -57,6 +68,7 @@ __all__ = [
     "compute_overall_score",
     "compute_repo_overall_score",
     "discovery_limits_from_mapping",
+    "generate_role_prompts",
     "rank_recommendation_themes",
     "run_analyzer",
     "score_repository",

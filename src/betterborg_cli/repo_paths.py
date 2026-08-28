@@ -26,6 +26,11 @@ class RepoPaths:
         """Return the repository's managed ignore file."""
         return self.root / ".gitignore"
 
+    @property
+    def prompts_dir(self) -> Path:
+        """Return the tracked directory containing stable generated prompts."""
+        return self.tracked_dir / "prompts"
+
     @classmethod
     def discover(cls, start: Path | None = None) -> RepoPaths:
         """Discover the nearest containing Git repository from ``start``."""

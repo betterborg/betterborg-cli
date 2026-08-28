@@ -223,7 +223,7 @@ def _run_in_workspace(
         user_prompt=_USER_PROMPT,
         schema=ANALYZER_OUTPUT_SCHEMA,
         cwd=workspace_dir.resolve(),
-        model=_analysis_model(agent, config.model),
+        model=resolve_analysis_model(agent, config.model),
         effort=config.effort,
         allowed_tools=("list_files", "read_file", "search_text"),
         log_path=artifact_dir / f"{run_id}.log",
@@ -343,9 +343,10 @@ def _persist_payload(
     return analysis
 
 
-def _analysis_model(
+def resolve_analysis_model(
     agent: AgentAdapter | SelectedAgent, configured_model: str | None
 ) -> str:
+    """Resolve an explicit, selected, or provider-default analysis model."""
     if configured_model is not None:
         return configured_model
     if isinstance(agent, SelectedAgent) and agent.model is not None:
