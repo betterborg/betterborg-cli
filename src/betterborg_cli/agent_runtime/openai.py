@@ -1,4 +1,4 @@
-"""Anthropic Messages API adapter over the contained API tool registry."""
+"""OpenAI Responses API adapter over the contained API tool registry."""
 
 from __future__ import annotations
 
@@ -36,25 +36,25 @@ from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
 )
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_API_VERSION = "2023-06-01"
-_PROVIDER = "anthropic"
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
+_PROVIDER = "openai"
 _SUBMIT_TOOL = "submit_result"
 _HTTP_TIMEOUT_SECONDS = 60.0
-_TRANSIENT_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+_TRANSIENT_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 _TRANSIENT_ERROR_TYPES = frozenset(
-    {"api_error", "overloaded_error", "rate_limit_error"}
+    {"api_error", "rate_limit_error", "server_error"}
 )
 _CREDENTIAL_PATTERN = re.compile(
-    r"(?i)(?:sk-ant-[a-z0-9_-]+|"
-    r"(?:anthropic_api_key|x-api-key)\s*[:=]\s*['\"]?[^\s,'\"}]+)"
+    r"(?i)(?:sk-(?:proj-|svcacct-)?[a-z0-9_-]+|"
+    r"(?:openai_api_key|authorization)\s*[:=]\s*['\"]?"
+    r"(?:bearer\s+)?[^\s,'\"}]+)"
 )
 
 
-class AnthropicTransport(Protocol):
+class OpenAITransport(Protocol):
     """Transport boundary used by the adapter and hermetic test doubles."""
 
-    def create_message(
+    def create_response(
         self,
         payload: Mapping[str, Any],
         *,
@@ -63,8 +63,8 @@ class AnthropicTransport(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
-class AnthropicApiError(RuntimeError):
-    """A failed Messages API request with retry classification metadata."""
+class OpenAIApiError(RuntimeError):
+    """A failed Responses API request with retry classification metadata."""
 
     def __init__(
         self,
@@ -87,12 +87,12 @@ class AnthropicApiError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class UrllibAnthropicTransport:
-    """Small standard-library transport for Anthropic's Messages endpoint."""
+class UrllibOpenAITransport:
+    """Small standard-library transport for OpenAI's Responses endpoint."""
 
-    url: str = ANTHROPIC_API_URL
+    url: str = OPENAI_API_URL
 
-    def create_message(
+    def create_response(
         self,
         payload: Mapping[str, Any],
         *,
@@ -100,14 +100,13 @@ class UrllibAnthropicTransport:
         cancel: CancellationToken | None = None,
     ) -> Mapping[str, Any]:
         if cancel is not None and cancel.is_set():
-            raise AnthropicApiError("agent run cancelled")
+            raise OpenAIApiError("agent run cancelled")
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
-                "anthropic-version": ANTHROPIC_API_VERSION,
+                "authorization": f"Bearer {api_key}",
                 "content-type": "application/json",
-                "x-api-key": api_key,
             },
             method="POST",
         )
@@ -120,57 +119,57 @@ class UrllibAnthropicTransport:
                 while chunk := response.read(64 * 1024):
                     chunks.append(chunk)
                     if cancel is not None and cancel.is_set():
-                        raise AnthropicApiError("agent run cancelled")
+                        raise OpenAIApiError("agent run cancelled")
             body = b"".join(chunks).decode("utf-8", errors="replace")
         except urllib.error.HTTPError as error:
             try:
                 body = error.read().decode("utf-8", errors="replace")
             except (OSError, http.client.HTTPException) as body_error:
-                raise AnthropicApiError(
-                    f"Anthropic HTTP {error.code} response body failed: {body_error}",
+                raise OpenAIApiError(
+                    f"OpenAI HTTP {error.code} response body failed: {body_error}",
                     status_code=error.code,
                 ) from body_error
             error_type, message = _api_error_details(body, str(error.reason))
-            raise AnthropicApiError(
+            raise OpenAIApiError(
                 message,
                 status_code=error.code,
                 error_type=error_type,
             ) from error
         except urllib.error.URLError as error:
-            raise AnthropicApiError(
-                f"Anthropic network error: {error.reason}",
+            raise OpenAIApiError(
+                f"OpenAI network error: {error.reason}",
                 error_type="api_error",
             ) from error
         except TimeoutError as error:
-            raise AnthropicApiError(
-                "Anthropic network request timed out",
+            raise OpenAIApiError(
+                "OpenAI network request timed out",
                 error_type="api_error",
             ) from error
         except (OSError, http.client.HTTPException) as error:
-            raise AnthropicApiError(
-                f"Anthropic network response failed: {error}",
+            raise OpenAIApiError(
+                f"OpenAI network response failed: {error}",
                 error_type="api_error",
             ) from error
         if cancel is not None and cancel.is_set():
-            raise AnthropicApiError("agent run cancelled")
+            raise OpenAIApiError("agent run cancelled")
         try:
             decoded = json.loads(body)
         except json.JSONDecodeError as error:
-            raise AnthropicApiError("Anthropic returned malformed JSON") from error
+            raise OpenAIApiError("OpenAI returned malformed JSON") from error
         if not isinstance(decoded, Mapping):
-            raise AnthropicApiError("Anthropic returned a non-object response")
+            raise OpenAIApiError("OpenAI returned a non-object response")
         return decoded
 
 
 @dataclass(slots=True)
-class AnthropicAdapter:
-    """Run a schema-shaped, contained multi-turn Anthropic agent."""
+class OpenAIAdapter:
+    """Run a schema-shaped, contained multi-turn OpenAI agent."""
 
     role: ApiAgentRole | str
     api_key: str | None = None
     workspace_trusted: bool = False
-    transport: AnthropicTransport = field(default_factory=UrllibAnthropicTransport)
-    max_tokens: int = 8192
+    transport: OpenAITransport = field(default_factory=UrllibOpenAITransport)
+    max_output_tokens: int = 8192
     max_turns: int = 64
     transient_backoff_seconds: float = DEFAULT_TRANSIENT_BACKOFF_SECONDS
     transient_max_attempts: int = DEFAULT_TRANSIENT_MAX_ATTEMPTS
@@ -188,10 +187,10 @@ class AnthropicAdapter:
 
     def __post_init__(self) -> None:
         self.role = ApiAgentRole(self.role)
-        if self.max_tokens < 1:
-            raise ValueError("max_tokens must be at least one")
+        if self.max_output_tokens < 1:
+            raise ValueError("max output tokens must be at least one")
         if self.max_turns < 1:
-            raise ValueError("max_turns must be at least one")
+            raise ValueError("max turns must be at least one")
         if self.transient_backoff_seconds < 0:
             raise ValueError("transient backoff must not be negative")
         if self.transient_max_attempts < 1:
@@ -203,8 +202,8 @@ class AnthropicAdapter:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        key = self.api_key or spec.env.get("ANTHROPIC_API_KEY") or os.environ.get(
-            "ANTHROPIC_API_KEY"
+        key = self.api_key or spec.env.get("OPENAI_API_KEY") or os.environ.get(
+            "OPENAI_API_KEY"
         )
         runtime = ApiRunContext(
             spec,
@@ -215,14 +214,14 @@ class AnthropicAdapter:
         if spec.billing_mode != BillingMode.API:
             return runtime.result(
                 AgentStatus.FAILED,
-                error="Anthropic API adapter requires API billing mode",
+                error="OpenAI API adapter requires API billing mode",
             )
         if cancel is not None and cancel.is_set():
             return runtime.cancelled()
         if not key:
             return runtime.result(
                 AgentStatus.FAILED,
-                error="Anthropic API credential is not configured",
+                error="OpenAI API credential is not configured",
             )
 
         try:
@@ -237,31 +236,36 @@ class AnthropicAdapter:
         tool_definitions = [
             _tool_definition(name) for name in sorted(allowed)
         ] + [_submit_definition(spec.schema)]
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": spec.user_prompt}
-        ]
+        input_items: str | list[dict[str, Any]] = spec.user_prompt
+        previous_response_id: str | None = None
 
         for _turn in range(self.max_turns):
             if cancel is not None and cancel.is_set():
                 return runtime.cancelled()
-            request_payload = {
+            request_payload: dict[str, Any] = {
                 "model": spec.model,
-                "max_tokens": self.max_tokens,
-                "system": spec.system_prompt,
-                "messages": messages,
+                "instructions": spec.system_prompt,
+                "input": input_items,
                 "tools": tool_definitions,
+                "parallel_tool_calls": False,
+                "max_output_tokens": self.max_output_tokens,
             }
+            if previous_response_id is not None:
+                request_payload["previous_response_id"] = previous_response_id
+            if spec.effort is not None:
+                request_payload["reasoning"] = {"effort": spec.effort}
             response = runtime.request(
                 lambda request_cancel, payload=request_payload: (
-                    self.transport.create_message(
+                    _create_response(
+                        self.transport,
                         payload,
                         api_key=key,
                         cancel=request_cancel,
                     )
                 ),
-                api_error_type=AnthropicApiError,
+                api_error_type=OpenAIApiError,
                 cancel=cancel,
-                thread_name="betterborg-anthropic-request",
+                thread_name="betterborg-openai-request",
                 backoff_seconds=self.transient_backoff_seconds,
                 max_attempts=self.transient_max_attempts,
             )
@@ -269,152 +273,212 @@ class AnthropicAdapter:
                 return response
 
             runtime.append_log(response)
-            try:
-                content = _response_content(response)
-                response_usage = _response_usage(response)
-            except AnthropicApiError as error:
-                return runtime.result(AgentStatus.FAILED, error=str(error))
-            runtime.record_response(response, response_usage)
-
-            tool_uses = [block for block in content if block.get("type") == "tool_use"]
-            stop_reason = response.get("stop_reason")
-            if tool_uses and stop_reason != "tool_use":
+            response_status = response.get("status")
+            if response_status == "failed":
                 return runtime.result(
                     AgentStatus.FAILED,
-                    error=(
-                        "Anthropic returned tool calls without a tool_use "
-                        f"stop reason ({stop_reason or 'missing'})"
-                    ),
+                    error=_incomplete_response_error(response, response_status),
                 )
+            try:
+                output = _response_output(response)
+                response_usage = _response_usage(response)
+            except OpenAIApiError as error:
+                return runtime.result(AgentStatus.FAILED, error=str(error))
+            runtime.record_response(response, response_usage)
+            response_id = response.get("id")
+            if not isinstance(response_id, str) or not response_id:
+                return runtime.result(
+                    AgentStatus.FAILED,
+                    error="OpenAI response is missing an id",
+                )
+            if response_status != "completed":
+                return runtime.result(
+                    AgentStatus.FAILED,
+                    error=_incomplete_response_error(response, response_status),
+                )
+
+            calls = [item for item in output if item.get("type") == "function_call"]
             submissions = [
-                block for block in tool_uses if block.get("name") == _SUBMIT_TOOL
+                item for item in calls if item.get("name") == _SUBMIT_TOOL
             ]
             if submissions:
-                if len(tool_uses) != 1 or len(submissions) != 1:
+                if len(calls) != 1 or len(submissions) != 1:
                     return runtime.result(
                         AgentStatus.FAILED,
                         error="submit_result must be the only tool call in its turn",
                     )
-                candidate = submissions[0].get("input")
-                if not isinstance(candidate, Mapping):
-                    return runtime.result(
-                        AgentStatus.FAILED,
-                        error="submit_result input must be an object",
-                    )
-                return runtime.complete(candidate)
+                try:
+                    payload = _tool_arguments(submissions[0])
+                except OpenAIApiError as error:
+                    return runtime.result(AgentStatus.FAILED, error=str(error))
+                return runtime.complete(payload)
 
-            if not tool_uses:
+            if not calls:
                 return runtime.result(
                     AgentStatus.FAILED,
-                    error=(
-                        "Anthropic ended without submit_result "
-                        f"({stop_reason or 'unknown'})"
-                    ),
+                    error="OpenAI ended without submit_result",
                 )
-            messages.append({"role": "assistant", "content": content})
-            tool_results: list[dict[str, Any]] = []
-            for block in tool_uses:
+            function_outputs: list[dict[str, Any]] = []
+            for call in calls:
                 if cancel is not None and cancel.is_set():
                     return runtime.cancelled()
                 try:
-                    tool_result = _execute_tool_use(
-                        block,
+                    function_output = _execute_tool_call(
+                        call,
                         tools,
                         allowed,
                         redactor=runtime.redactor,
                         cancel=cancel,
                     )
-                except AnthropicApiError as error:
+                except OpenAIApiError as error:
                     return runtime.result(AgentStatus.FAILED, error=str(error))
                 if cancel is not None and cancel.is_set():
                     return runtime.cancelled()
-                tool_results.append(tool_result)
-            messages.append({"role": "user", "content": tool_results})
+                function_outputs.append(function_output)
+            input_items = function_outputs
+            previous_response_id = response_id
 
         return runtime.result(
             AgentStatus.FAILED,
-            error=f"Anthropic exceeded the {self.max_turns}-turn limit",
+            error=f"OpenAI exceeded the {self.max_turns}-turn limit",
         )
+
+
+def _create_response(
+    transport: OpenAITransport,
+    payload: Mapping[str, Any],
+    *,
+    api_key: str,
+    cancel: CancellationToken | None,
+) -> Mapping[str, Any]:
+    response = transport.create_response(
+        payload,
+        api_key=api_key,
+        cancel=cancel,
+    )
+    if response.get("status") != "failed":
+        return response
+    detail = response.get("error")
+    if not isinstance(detail, Mapping):
+        return response
+    error_type = detail.get("type") or detail.get("code")
+    error = OpenAIApiError(
+        _incomplete_response_error(response, "failed"),
+        error_type=error_type if isinstance(error_type, str) else None,
+    )
+    if error.transient:
+        raise error
+    return response
 
 
 def _tool_definition(name: str) -> dict[str, Any]:
     definition = api_tool_definition(name)
     return {
+        "type": "function",
         "name": definition.name,
         "description": definition.description,
-        "input_schema": definition.parameters,
+        "parameters": definition.parameters,
+        "strict": False,
     }
 
 
 def _submit_definition(schema: Mapping[str, Any]) -> dict[str, Any]:
     return {
+        "type": "function",
         "name": _SUBMIT_TOOL,
         "description": "Submit the final result after all work is complete.",
-        "input_schema": dict(schema),
+        "parameters": dict(schema),
+        "strict": False,
     }
 
 
-def _execute_tool_use(
-    block: Mapping[str, Any],
+def _tool_arguments(call: Mapping[str, Any]) -> dict[str, Any]:
+    arguments = call.get("arguments")
+    if not isinstance(arguments, str):
+        raise OpenAIApiError("OpenAI tool call arguments must be JSON text")
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError as error:
+        raise OpenAIApiError("OpenAI tool call arguments are malformed JSON") from error
+    if not isinstance(decoded, dict):
+        raise OpenAIApiError("OpenAI tool call arguments must be an object")
+    return decoded
+
+
+def _execute_tool_call(
+    call: Mapping[str, Any],
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
     redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
-    tool_id = block.get("id")
-    name = block.get("name")
-    arguments = block.get("input")
-    if not isinstance(tool_id, str) or not tool_id:
-        raise AnthropicApiError("Anthropic tool call is missing an id")
-    result: dict[str, Any] = {"type": "tool_result", "tool_use_id": tool_id}
-
-    def redacted_result() -> dict[str, Any]:
-        return cast(dict[str, Any], redactor.value(result))
-
+    call_id = call.get("call_id")
+    name = call.get("name")
+    if not isinstance(call_id, str) or not call_id:
+        raise OpenAIApiError("OpenAI tool call is missing a call_id")
+    result: dict[str, Any] = {
+        "type": "function_call_output",
+        "call_id": call_id,
+    }
     if not isinstance(name, str) or name not in allowed:
-        result.update(content=f"tool is not allowed: {name}", is_error=True)
-        return redacted_result()
-    if not isinstance(arguments, Mapping):
-        result.update(content="tool input must be an object", is_error=True)
-        return redacted_result()
-    try:
-        value = tools.execute(name, arguments, cancel=cancel)
-        result["content"] = json.dumps(value, sort_keys=True)
-    except Exception as error:
-        result.update(content=str(error), is_error=True)
-    return redacted_result()
+        value: Any = {"error": f"tool is not allowed: {name}"}
+    else:
+        try:
+            arguments = _tool_arguments(call)
+            value = tools.execute(name, arguments, cancel=cancel)
+        except Exception as error:
+            value = {"error": str(error)}
+    result["output"] = json.dumps(
+        redactor.value(value),
+        sort_keys=True,
+    )
+    return result
 
 
-def _response_content(response: Mapping[str, Any]) -> list[dict[str, Any]]:
-    content = response.get("content")
-    if not isinstance(content, list) or not all(
-        isinstance(block, Mapping) for block in content
+def _response_output(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+    output = response.get("output")
+    if not isinstance(output, list) or not all(
+        isinstance(item, Mapping) for item in output
     ):
-        raise AnthropicApiError("Anthropic response has malformed content")
-    return [dict(block) for block in content]
+        raise OpenAIApiError("OpenAI response has malformed output")
+    return [dict(item) for item in output]
 
 
 def _response_usage(response: Mapping[str, Any]) -> AgentUsage:
     raw = response.get("usage")
     if not isinstance(raw, Mapping):
-        raise AnthropicApiError("Anthropic response has malformed usage")
+        raise OpenAIApiError("OpenAI response has malformed usage")
 
-    def token(name: str) -> int | None:
-        value = raw.get(name)
+    def token(container: Mapping[str, Any], name: str) -> int | None:
+        value = container.get(name)
         if value is None:
             return None
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise AnthropicApiError(f"Anthropic usage {name} is invalid")
+            raise OpenAIApiError(f"OpenAI usage {name} is invalid")
         return value
 
+    details = raw.get("input_tokens_details", {})
+    if not isinstance(details, Mapping):
+        raise OpenAIApiError("OpenAI input token details are malformed")
     return AgentUsage(
-        tokens_input=token("input_tokens"),
-        tokens_output=token("output_tokens"),
-        tokens_cache_read=token("cache_read_input_tokens"),
-        tokens_cache_write=token("cache_creation_input_tokens"),
+        tokens_input=token(raw, "input_tokens"),
+        tokens_output=token(raw, "output_tokens"),
+        tokens_cache_read=token(details, "cached_tokens"),
+        tokens_cache_write=token(details, "cache_write_tokens"),
         num_turns=1,
     )
+
+
+def _incomplete_response_error(
+    response: Mapping[str, Any], status: Any
+) -> str:
+    detail = response.get("incomplete_details") or response.get("error")
+    if isinstance(detail, Mapping):
+        reason = detail.get("reason") or detail.get("message") or detail.get("code")
+        if isinstance(reason, str) and reason:
+            return f"OpenAI response is {status or 'not completed'}: {reason}"
+    return f"OpenAI response is {status or 'not completed'}"
 
 
 def _api_error_details(body: str, fallback: str) -> tuple[str | None, str]:
@@ -425,7 +489,7 @@ def _api_error_details(body: str, fallback: str) -> tuple[str | None, str]:
         return None, fallback
     if not isinstance(error, Mapping):
         return None, fallback
-    error_type = error.get("type")
+    error_type = error.get("type") or error.get("code")
     message = error.get("message")
     return (
         error_type if isinstance(error_type, str) else None,

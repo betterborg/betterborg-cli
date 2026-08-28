@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.process import terminate_process
@@ -61,18 +62,104 @@ class CommandResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiToolDefinition:
+    """Provider-neutral description and argument schema for one API tool."""
+
+    name: str
+    description: str
+    parameters: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class _PatchAction:
     operation: str
     relative_path: str
     body: tuple[str, ...]
 
 
-_FILE_TOOL_NAMES = frozenset(
-    {"list_files", "search_text", "read_file", "apply_patch"}
-)
 _COMMAND_ROLES = frozenset(
     {ApiAgentRole.CODING, ApiAgentRole.REVIEW, ApiAgentRole.MERGE}
 )
+
+
+def _object_schema(
+    properties: Mapping[str, Any], *, required: Sequence[str] = ()
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": dict(properties),
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = list(required)
+    return schema
+
+
+_TOOL_DEFINITIONS = {
+    "list_files": ApiToolDefinition(
+        name="list_files",
+        description=(
+            "List files recursively beneath a relative path in the run directory."
+        ),
+        parameters=_object_schema({"path": {"type": "string"}}),
+    ),
+    "search_text": ApiToolDefinition(
+        name="search_text",
+        description="Search UTF-8 files for literal text beneath a relative path.",
+        parameters=_object_schema(
+            {"query": {"type": "string"}, "path": {"type": "string"}},
+            required=("query",),
+        ),
+    ),
+    "read_file": ApiToolDefinition(
+        name="read_file",
+        description="Read one UTF-8 file at a relative path in the run directory.",
+        parameters=_object_schema(
+            {"path": {"type": "string"}}, required=("path",)
+        ),
+    ),
+    "apply_patch": ApiToolDefinition(
+        name="apply_patch",
+        description="Apply a BetterBorg patch to files inside the run directory.",
+        parameters=_object_schema(
+            {"patch": {"type": "string"}}, required=("patch",)
+        ),
+    ),
+    "run_command": ApiToolDefinition(
+        name="run_command",
+        description=(
+            "Run a shell-free argv on the host from the trusted run directory."
+        ),
+        parameters=_object_schema(
+            {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                }
+            },
+            required=("argv",),
+        ),
+    ),
+}
+_FILE_TOOL_NAMES = frozenset(_TOOL_DEFINITIONS) - {"run_command"}
+
+
+def api_tool_definition(name: str) -> ApiToolDefinition:
+    """Return the shared provider-neutral definition for a contained tool."""
+    try:
+        return _TOOL_DEFINITIONS[name]
+    except KeyError as error:
+        raise ValueError(f"unknown API tool: {name}") from error
+
+
+def select_api_tool_names(
+    tools: ContainedApiTools, requested: Sequence[str]
+) -> frozenset[str]:
+    """Apply a run allowlist to the tools granted by role and trust."""
+    if not requested:
+        return tools.available_tools
+    return tools.available_tools.intersection(requested)
 
 
 class ContainedApiTools:
@@ -284,6 +371,28 @@ class ContainedApiTools:
                 stdout=stdout,
                 stderr=stderr,
             )
+
+    def execute(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> dict[str, Any]:
+        """Execute a granted tool and return a JSON-serializable value."""
+        if name not in self.available_tools:
+            raise ToolGrantError(f"tool is not granted: {name}")
+        if name == "list_files":
+            return {"files": list(self.list_files(**arguments))}
+        if name == "search_text":
+            return {
+                "matches": [asdict(match) for match in self.search_text(**arguments)]
+            }
+        if name == "read_file":
+            return {"content": self.read_file(**arguments)}
+        if name == "apply_patch":
+            return {"changed_files": list(self.apply_patch(**arguments))}
+        return asdict(self.run_command(**arguments, cancel=cancel))
 
     def _contained_path(self, path: str, *, must_exist: bool) -> Path:
         if not isinstance(path, str) or not path:
