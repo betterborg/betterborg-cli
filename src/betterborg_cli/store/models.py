@@ -4,11 +4,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 _PROMPT_ROLES = frozenset({"coding", "review", "merge"})
+
+
+class BorgState(str, Enum):
+    """Durable lifecycle states used by the Borg planning pipeline."""
+
+    DRAFT = "draft"
+    ARCHITECT_WORKING = "architect_working"
+    ARCHITECT_AWAITING_ANSWERS = "architect_awaiting_answers"
+    TECH_REVIEW_WORKING = "tech_review_working"
+    PLAN_APPROVAL_PENDING = "plan_approval_pending"
+    PM_WORKING = "pm_working"
+    SUPERVISOR_WORKING = "supervisor_working"
+    TASKS_APPROVAL_PENDING = "tasks_approval_pending"
+    EXECUTING = "executing"
+    DONE = "done"
+    BLOCKED = "blocked"
+
+
+class PlanningAttemptStatus(str, Enum):
+    """Completion state for one planning-agent invocation."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 def utcnow() -> datetime:
@@ -153,6 +179,8 @@ class Borg:
 
     repository_id: UUID
     name: str
+    state: BorgState = BorgState.DRAFT
+    state_version: int = 0
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=utcnow)
 
@@ -162,6 +190,10 @@ class Borg:
                 raise TypeError(f"Borg {name} must be a UUID")
         if not self.name.strip():
             raise ValueError("Borg name must not be empty")
+        if not isinstance(self.state, BorgState):
+            raise TypeError("Borg state must be a BorgState")
+        if self.state_version < 0:
+            raise ValueError("Borg state version must not be negative")
         _validate_utc(self.created_at)
 
 
@@ -209,4 +241,120 @@ class PrdTurn:
             raise ValueError("PRD turn role must not be empty")
         if not self.content:
             raise ValueError("PRD turn content must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningAttempt:
+    """One durable invocation in a Borg's planning pipeline."""
+
+    borg_id: UUID
+    phase: str
+    round: int
+    adapter: str
+    model: str
+    request: dict[str, Any] = field(default_factory=dict)
+    status: PlanningAttemptStatus = PlanningAttemptStatus.RUNNING
+    result: dict[str, Any] | None = None
+    summary: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    started_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"planning attempt {name} must be a UUID")
+        if not self.phase.strip():
+            raise ValueError("planning attempt phase must not be empty")
+        if self.round < 1:
+            raise ValueError("planning attempt round must be positive")
+        if not self.adapter.strip() or not self.model.strip():
+            raise ValueError("planning attempt adapter and model must not be empty")
+        if not isinstance(self.status, PlanningAttemptStatus):
+            raise TypeError("planning attempt status must be a PlanningAttemptStatus")
+        if (self.status is PlanningAttemptStatus.RUNNING) != (
+            self.finished_at is None
+        ):
+            raise ValueError("only running planning attempts may be unfinished")
+        _validate_utc(self.started_at)
+        if self.finished_at is not None:
+            _validate_utc(self.finished_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningQuestion:
+    """One durable architect Q&A round, optionally awaiting answers."""
+
+    borg_id: UUID
+    round: int
+    questions: list[dict[str, Any]]
+    attempt_id: UUID | None = None
+    answers: list[dict[str, Any]] | None = None
+    id: UUID = field(default_factory=uuid4)
+    asked_at: datetime = field(default_factory=utcnow)
+    answered_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"planning question {name} must be a UUID")
+        if self.attempt_id is not None and not isinstance(self.attempt_id, UUID):
+            raise TypeError("planning question attempt ID must be a UUID")
+        if self.round < 1:
+            raise ValueError("planning question round must be positive")
+        if not self.questions:
+            raise ValueError("planning question round must contain questions")
+        if (self.answers is None) != (self.answered_at is None):
+            raise ValueError(
+                "planning answers and answered timestamp must be set together"
+            )
+        _validate_utc(self.asked_at)
+        if self.answered_at is not None:
+            _validate_utc(self.answered_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningFinding:
+    """One immutable tech-lead finding from a planning attempt."""
+
+    borg_id: UUID
+    attempt_id: UUID
+    round: int
+    severity: str
+    message: str
+    suggestion: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "attempt_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"planning finding {name} must be a UUID")
+        if self.round < 1:
+            raise ValueError("planning finding round must be positive")
+        if not self.severity.strip() or not self.message.strip():
+            raise ValueError("planning finding severity and message must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanChangeRequest:
+    """One immutable human request in a Borg's plan-revision thread."""
+
+    borg_id: UUID
+    round: int
+    note: str
+    decided_by: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"plan change request {name} must be a UUID")
+        if self.round < 1:
+            raise ValueError("plan change request round must be positive")
+        if not self.note.strip():
+            raise ValueError("plan change request note must not be empty")
         _validate_utc(self.created_at)
