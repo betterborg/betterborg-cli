@@ -127,7 +127,10 @@ def _compare_public_digests(
     reviewed: dict[str, str], public: dict[str, str]
 ) -> None:
     if public.keys() != reviewed.keys():
-        _fail("public PyPI artifact names do not match the reviewed distributions")
+        _fail(
+            "public PyPI artifact names do not match the reviewed distributions; "
+            "the version is immutable, so prepare a new version"
+        )
     for filename, reviewed_digest in reviewed.items():
         if public[filename] != reviewed_digest:
             _fail(

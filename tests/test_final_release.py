@@ -272,6 +272,31 @@ def test_public_digest_mismatch_is_terminal_for_every_surface(
     assert surface in str(raised.value).casefold()
 
 
+@pytest.mark.parametrize("filename_state", ("missing", "unexpected"))
+def test_public_pypi_filename_mismatch_is_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename_state: str,
+) -> None:
+    registry, github, fixture = _write_fixture(tmp_path)
+    pypi_fixture = fixture / "pypi.json"
+    payload = json.loads(pypi_fixture.read_text(encoding="utf-8"))
+    if filename_state == "missing":
+        payload["urls"].pop()
+    else:
+        payload["urls"][0]["filename"] = "unexpected-public-file.whl"
+    pypi_fixture.write_text(json.dumps(payload), encoding="utf-8")
+    _deny_public_access(monkeypatch)
+
+    with pytest.raises(
+        verify_final_release.FinalReleaseVerificationError,
+        match="artifact names.*immutable.*prepare a new version",
+    ):
+        verify_final_release.verify_final_release(
+            VERSION, registry, github, fixture=fixture
+        )
+
+
 def test_out_of_order_publication_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -368,7 +393,7 @@ def test_cli_exit_status_one_names_an_immutable_terminal_mismatch(
 ) -> None:
     registry, github, fixture = _write_fixture(tmp_path)
     payload = json.loads((fixture / "pypi.json").read_text(encoding="utf-8"))
-    payload["urls"][0]["digests"]["sha256"] = "0" * 64
+    payload["urls"].pop()
     (fixture / "pypi.json").write_text(json.dumps(payload), encoding="utf-8")
     _deny_public_access(monkeypatch)
 
