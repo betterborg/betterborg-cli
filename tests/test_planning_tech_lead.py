@@ -27,9 +27,14 @@ from betterborg_cli.store import (
 def test_findings_drive_bounded_revision_then_exact_approval_transition(
     committed_git_repo: Path,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
 ) -> None:
-    initial_plan = _plan()
-    revised_plan = _plan(summary="Clarify the tested release failure behavior.")
+    initial_plan = planning_plan_response()
+    revised_plan = planning_plan_response(
+        summary="Clarify the tested release failure behavior."
+    )
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
@@ -38,7 +43,7 @@ def test_findings_drive_bounded_revision_then_exact_approval_transition(
     def request_revision(spec):
         assert _current_plan(spec) == initial_plan
         assert _findings(spec) == []
-        return _request_changes("Define rollback behavior.")
+        return tech_lead_change_request_response("Define rollback behavior.")
 
     def revise_with_persisted_finding(spec):
         findings = _findings(spec)
@@ -53,7 +58,7 @@ def test_findings_drive_bounded_revision_then_exact_approval_transition(
         assert [item["message"] for item in _findings(spec)] == [
             "Define rollback behavior."
         ]
-        return _approve()
+        return tech_lead_approval_response()
 
     reviewer = MockAdapter(name="openai")
     reviewer.queue(MockResponse(dynamic=request_revision))
@@ -105,13 +110,17 @@ def test_recovers_completed_provider_review_without_duplicate_turn(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
 ) -> None:
     database = committed_git_repo.parent / "tech-lead-interruption.sqlite3"
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
-    architect.queue(MockResponse(payload=_plan()))
-    reviewer = MockAdapter(name="openai").queue(MockResponse(payload=_approve()))
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
 
     with SqliteStore.open(database) as store:
         repository, borg = persist_planning_context(
@@ -168,19 +177,30 @@ def test_resumes_committed_change_request_through_architect_pause(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
 ) -> None:
-    initial_plan = _plan()
-    ambiguous_plan = _plan(summary="Choose a concrete rollback strategy.")
+    initial_plan = planning_plan_response()
+    ambiguous_plan = planning_plan_response(
+        summary="Choose a concrete rollback strategy."
+    )
     ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
-    revised_plan = _plan(summary="Use retries before rolling back the release.")
+    revised_plan = planning_plan_response(
+        summary="Use retries before rolling back the release."
+    )
     database = committed_git_repo.parent / "tech-lead-architect-resume.sqlite3"
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
     architect.queue(MockResponse(payload=initial_plan))
     reviewer = MockAdapter(name="openai")
-    reviewer.queue(MockResponse(payload=_request_changes("Define rollback behavior.")))
-    reviewer.queue(MockResponse(payload=_approve()))
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
 
     with SqliteStore.open(database) as store:
         repository, borg = persist_planning_context(
@@ -239,12 +259,14 @@ def test_resumes_committed_change_request_through_architect_pause(
 def test_third_change_request_blocks_with_durable_resumable_history(
     committed_git_repo: Path,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
 ) -> None:
     database = committed_git_repo.parent / "tech-lead-cap.sqlite3"
     plans = [
-        _plan(),
-        _plan(summary="Revision one."),
-        _plan(summary="Revision two."),
+        planning_plan_response(),
+        planning_plan_response(summary="Revision one."),
+        planning_plan_response(summary="Revision two."),
     ]
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
@@ -266,7 +288,9 @@ def test_third_change_request_blocks_with_durable_resumable_history(
             MockResponse(
                 dynamic=lambda spec, round_number=round_number: (
                     _assert_prior_finding_count(spec, round_number - 1)
-                    or _request_changes(f"Finding round {round_number}.")
+                    or tech_lead_change_request_response(
+                        f"Finding round {round_number}."
+                    )
                 )
             )
         )
@@ -305,10 +329,14 @@ def test_third_change_request_blocks_with_durable_resumable_history(
 def test_revalidates_architect_handoff_before_invoking_tech_lead(
     committed_git_repo: Path,
     persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
 ) -> None:
-    invalid = _plan()
+    invalid = planning_plan_response()
     invalid["phases"][0]["name"] = "02-release-workflow"
-    reviewer = MockAdapter(name="openai").queue(MockResponse(payload=_approve()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
     database = committed_git_repo.parent / "tech-lead-invalid.sqlite3"
 
     with SqliteStore.open(database) as store:
@@ -373,28 +401,6 @@ def _assert_prior_finding_count(spec, expected: int) -> None:
     assert len(_findings(spec)) == expected
 
 
-def _approve() -> dict:
-    return {
-        "decision": "approve",
-        "summary": "The plan is ready for human approval.",
-        "findings": [],
-    }
-
-
-def _request_changes(message: str) -> dict:
-    return {
-        "decision": "request_changes",
-        "summary": message,
-        "findings": [
-            {
-                "severity": "major",
-                "message": message,
-                "suggestion": "Clarify the plan and its verification.",
-            }
-        ],
-    }
-
-
 def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
     supplied_answers = answers or iter(())
     return InteractiveIO(
@@ -402,37 +408,3 @@ def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
         confirm=lambda _message, _default: False,
         write=lambda _message: None,
     )
-
-
-def _plan(*, summary: str = "Add a small, tested release workflow.") -> dict:
-    return {
-        "title": "Release workflow",
-        "summary": summary,
-        "overall_approach": (
-            "Extend the existing repository conventions and verify public behavior."
-        ),
-        "phases": [
-            {
-                "name": "01-release-workflow",
-                "title": "Add release workflow",
-                "goal": "Document and test the release path.",
-                "technical_approach": "Update the tracked README convention.",
-                "files_touched": [
-                    {
-                        "path": "README.md",
-                        "role": "modified",
-                        "description": "Document the release workflow.",
-                    }
-                ],
-                "test_strategy": "Assert the documented public workflow.",
-                "acceptance_criteria": ["The release path is documented."],
-                "deliverables": ["Release workflow documentation."],
-                "dependencies_on": [],
-            }
-        ],
-        "code_pointers": [
-            {"path": "README.md", "why": "It owns repository guidance."}
-        ],
-        "risks": [],
-        "open_questions": [],
-    }

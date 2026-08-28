@@ -16,11 +16,17 @@ from betterborg_cli.onboarding import (
     OnboardingDispatcher,
     create_commands,
 )
+from betterborg_cli.planning import (
+    ArchitectCancelled,
+    ArchitectLoop,
+    TechLeadCancelled,
+    TechLeadLoop,
+)
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
-from betterborg_cli.store import SqliteStore
+from betterborg_cli.store import BorgState, SqliteStore
 from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
     require_workspace_trust,
@@ -286,6 +292,85 @@ def create_borg(
         click.echo("Borg PRD needs more input before it can be created.")
     else:
         click.echo("Borg draft saved without a confirmed PRD.")
+
+
+@cli.group()
+def plan() -> None:
+    """Create and review implementation plans for a Borg."""
+
+
+@plan.command(name="start")
+@click.argument("name")
+@click.option(
+    "--yes",
+    "explicit_trust",
+    is_flag=True,
+    help="Trust this workspace without prompting before planning.",
+)
+@_trusted_workspace_callback
+def start_plan(repository_path: Path, name: str) -> None:
+    """Start or resume planning for the named Borg."""
+    paths = RepoPaths.discover(repository_path)
+    try:
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            repository = store.get_repository(config.repository_id)
+            if repository is None:
+                raise ValueError("repository is not initialized; run 'borg init' first")
+            borg = store.get_borg_by_name(repository.id, name)
+            if borg is None:
+                raise ValueError(
+                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                )
+
+            if borg.state not in {
+                BorgState.PLAN_APPROVAL_PENDING,
+                BorgState.BLOCKED,
+            }:
+                interactive = _stdin_is_interactive()
+                agent = select_agent(
+                    config,
+                    ApiAgentRole.PLANNING,
+                    paths,
+                    interactive=interactive,
+                )
+                io = _interactive_io()
+                if borg.state is BorgState.DRAFT:
+                    borg = ArchitectLoop(
+                        repository,
+                        borg,
+                        store,
+                        agent,
+                        io=io,
+                    ).run().borg
+                borg = TechLeadLoop(
+                    repository,
+                    borg,
+                    store,
+                    agent,
+                    architect_agent=agent,
+                    io=io,
+                ).run().borg
+    except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
+        message = str(error).strip()
+        detail = f" ({message})" if message else ""
+        raise click.ClickException(
+            f"Planning for Borg {name!r} was interrupted{detail}. "
+            f"Run 'borg plan start {name}' to resume."
+        ) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if borg.state is BorgState.PLAN_APPROVAL_PENDING:
+        click.echo(f"Plan approval pending for Borg {name!r}.")
+        click.echo(f"Review it with: borg plan show {name}")
+    elif borg.state is BorgState.BLOCKED:
+        click.echo(f"Planning blocked for Borg {name!r}.")
+        click.echo(f"Review the saved Tech Lead findings with: borg plan show {name}")
+    else:
+        raise click.ClickException(
+            f"Planning stopped in unexpected state {borg.state.value!r}"
+        )
 
 
 def _write_initialized(result) -> None:

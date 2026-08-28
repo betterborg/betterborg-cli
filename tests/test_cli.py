@@ -1,6 +1,6 @@
 """Tests for the public CLI bootstrap."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -45,19 +45,19 @@ def initialized_cli_repository(
 def _invoke_create(
     cli_runner: CliRunner,
     monkeypatch: MonkeyPatch,
+    configure_interactive_cli: Callable,
     repository: Repository,
     adapter: MockAdapter,
     io: InteractiveIO,
     *arguments: str,
     editor=None,
 ):
-    monkeypatch.chdir(repository.root)
-    monkeypatch.setenv(
-        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        io,
+        state_home=repository.root.parent / "machine-state",
     )
-    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
-    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
-    monkeypatch.setattr(cli_module, "_interactive_io", lambda: io)
     monkeypatch.setattr(cli_module, "_edit_markdown", editor)
     return cli_runner.invoke(cli, ["create", *arguments, "--yes"])
 
@@ -113,6 +113,7 @@ def test_create_without_prd_runs_brainstorm_and_prints_plan_handoff(
     cli_runner: CliRunner,
     initialized_cli_repository: tuple[Repository, RepoPaths],
     monkeypatch: MonkeyPatch,
+    configure_interactive_cli: Callable,
 ) -> None:
     repository, paths = initialized_cli_repository
     adapter = MockAdapter(name="openai").queue(
@@ -134,6 +135,7 @@ def test_create_without_prd_runs_brainstorm_and_prints_plan_handoff(
     result = _invoke_create(
         cli_runner,
         monkeypatch,
+        configure_interactive_cli,
         repository,
         adapter,
         io,
@@ -158,6 +160,7 @@ def test_create_with_prd_propagates_and_preserves_exact_input(
     cli_runner: CliRunner,
     initialized_cli_repository: tuple[Repository, RepoPaths],
     monkeypatch: MonkeyPatch,
+    configure_interactive_cli: Callable,
 ) -> None:
     repository, paths = initialized_cli_repository
     source = repository.root / "incoming.md"
@@ -186,6 +189,7 @@ def test_create_with_prd_propagates_and_preserves_exact_input(
     result = _invoke_create(
         cli_runner,
         monkeypatch,
+        configure_interactive_cli,
         repository,
         adapter,
         io,
@@ -220,6 +224,7 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
     cli_runner: CliRunner,
     initialized_cli_repository: tuple[Repository, RepoPaths],
     monkeypatch: MonkeyPatch,
+    configure_interactive_cli: Callable,
 ) -> None:
     repository, paths = initialized_cli_repository
     adapter = MockAdapter(name="openai").queue(
@@ -240,6 +245,7 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
     result = _invoke_create(
         cli_runner,
         monkeypatch,
+        configure_interactive_cli,
         repository,
         adapter,
         io,

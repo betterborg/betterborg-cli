@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from pytest import MonkeyPatch
 
+from betterborg_cli import cli as cli_module
+from betterborg_cli.agent_runtime.mock import MockAdapter
+from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.store import (
     Borg,
@@ -90,6 +94,46 @@ def persist_planning_context():
     return _persist_planning_context
 
 
+@pytest.fixture
+def planning_plan_response():
+    """Build a valid plan response shared by planning lifecycle tests."""
+    return _planning_plan_response
+
+
+@pytest.fixture
+def tech_lead_approval_response():
+    """Build an approving Tech Lead response."""
+    return _tech_lead_approval_response
+
+
+@pytest.fixture
+def tech_lead_change_request_response():
+    """Build a Tech Lead response that requests a plan revision."""
+    return _tech_lead_change_request_response
+
+
+@pytest.fixture
+def configure_interactive_cli(monkeypatch: MonkeyPatch):
+    """Return the shared interactive CLI dependency configurator."""
+
+    def configure(
+        root: Path,
+        adapter: MockAdapter,
+        io: InteractiveIO,
+        *,
+        state_home: Path,
+    ) -> None:
+        monkeypatch.chdir(root)
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+        monkeypatch.setattr(
+            cli_module, "select_agent", lambda *_args, **_kwargs: adapter
+        )
+        monkeypatch.setattr(cli_module, "_interactive_io", lambda: io)
+
+    return configure
+
+
 def _write_repository_config(root: Path, repository: Repository) -> None:
     (root / ".borg").mkdir()
     (root / ".borg/config.toml").write_text(
@@ -160,3 +204,61 @@ def _persist_planning_context(
     )
     _persist_repository_analysis(store, repository)
     return repository, borg
+
+
+def _planning_plan_response(
+    *, summary: str = "Add a small, tested release workflow."
+) -> dict:
+    return {
+        "title": "Release workflow",
+        "summary": summary,
+        "overall_approach": (
+            "Extend the existing repository conventions and verify public behavior."
+        ),
+        "phases": [
+            {
+                "name": "01-release-workflow",
+                "title": "Add release workflow",
+                "goal": "Document and test the release path.",
+                "technical_approach": "Update the tracked README convention.",
+                "files_touched": [
+                    {
+                        "path": "README.md",
+                        "role": "modified",
+                        "description": "Document the release workflow.",
+                    }
+                ],
+                "test_strategy": "Assert the documented public workflow.",
+                "acceptance_criteria": ["The release path is documented."],
+                "deliverables": ["Release workflow documentation."],
+                "dependencies_on": [],
+            }
+        ],
+        "code_pointers": [
+            {"path": "README.md", "why": "It owns repository guidance."}
+        ],
+        "risks": [],
+        "open_questions": [],
+    }
+
+
+def _tech_lead_approval_response() -> dict:
+    return {
+        "decision": "approve",
+        "summary": "The plan is ready for human approval.",
+        "findings": [],
+    }
+
+
+def _tech_lead_change_request_response(message: str) -> dict:
+    return {
+        "decision": "request_changes",
+        "summary": message,
+        "findings": [
+            {
+                "severity": "major",
+                "message": message,
+                "suggestion": "Clarify the plan and its verification.",
+            }
+        ],
+    }
