@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
@@ -40,6 +41,29 @@ test("package metadata exposes the public scoped borg command", () => {
     directory: "npm",
   });
   assert.match(metadata.version, /^\d+\.\d+\.\d+$/);
+});
+
+test("packed package includes the license and attribution notice", () => {
+  const packageRoot = path.resolve(__dirname, "..");
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const output = childProcess.execFileSync(
+    npmCommand,
+    ["pack", "--dry-run", "--json", "."],
+    { cwd: packageRoot, encoding: "utf8" },
+  );
+  const [{ files }] = JSON.parse(output);
+  const packedPaths = new Set(files.map((file) => file.path));
+
+  assert.equal(packedPaths.has("LICENSE"), true);
+  assert.equal(packedPaths.has("NOTICE"), true);
+  assert.equal(
+    fs.readFileSync(path.join(packageRoot, "LICENSE"), "utf8"),
+    fs.readFileSync(path.join(packageRoot, "..", "LICENSE"), "utf8"),
+  );
+  assert.equal(
+    fs.readFileSync(path.join(packageRoot, "NOTICE"), "utf8"),
+    fs.readFileSync(path.join(packageRoot, "..", "NOTICE"), "utf8"),
+  );
 });
 
 test("target mapping accepts only released platforms and architectures", () => {

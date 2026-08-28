@@ -15,6 +15,8 @@
     "borg": "bin/borg.js"
   },
   "files": [
+    "LICENSE",
+    "NOTICE",
     "bin",
     "lib"
   ],
