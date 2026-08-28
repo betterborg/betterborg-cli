@@ -18,6 +18,19 @@ binary, verifies its SHA-256 digest and exact version, atomically installs it at
 and plugin hosts. The vanity URL `install.betterborg.ai` is not active yet; do
 not substitute it for the GitHub URL.
 
+To verify or install one immutable release instead of following `latest`, pin
+both the release URL and installer version:
+
+```console
+curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  https://github.com/betterborg/betterborg-cli/releases/download/vVERSION/install.sh \
+  --output install.sh
+BETTERBORG_VERSION=VERSION sh ./install.sh
+~/.local/bin/borg version
+```
+
+The final command must print exactly `borg VERSION`.
+
 Native Windows and WSL1 are unsupported. On Windows, open a WSL2 shell and run
 the Linux installer there. The CLI, machine state, and plugin hosts must all be
 used from that WSL2 environment.

@@ -101,11 +101,16 @@ def verify_installations(
     attempts: int = 6,
     retry_delay: float = 10.0,
     runner: Runner = subprocess.run,
+    protected_context: tuple[str, dict[str, str]] | None = None,
 ) -> None:
     """Run each public source in a fresh repository with isolated machine state."""
     if attempts < 1:
         protected_smoke.fail("attempts must be at least one")
-    credential, base_environment = protected_smoke.protected_environment()
+    credential, base_environment = (
+        protected_smoke.protected_environment()
+        if protected_context is None
+        else protected_context
+    )
     root.mkdir(parents=True, exist_ok=False)
 
     for method in ("curl", "uvx", "npx"):

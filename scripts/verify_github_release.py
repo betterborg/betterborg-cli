@@ -262,6 +262,33 @@ def verify_snapshot(
     return VerificationResult(not remaining, tuple(remaining))
 
 
+def compare_reviewed_assets(
+    snapshot: ReleaseSnapshot | None,
+    reviewed_directory: Path,
+) -> None:
+    """Compare every available public asset with the reviewed build-once bytes."""
+    expected = _expected_names()
+    try:
+        reviewed = {name: sha256(reviewed_directory / name) for name in expected}
+    except ReleaseArtifactError as error:
+        _fail(f"reviewed GitHub artifact set is incomplete: {error}")
+    unexpected = {
+        path.name
+        for path in reviewed_directory.iterdir()
+        if path.is_file() and path.name not in expected
+    }
+    if unexpected:
+        _fail(
+            "reviewed GitHub artifact set has unexpected files: "
+            f"{sorted(unexpected)}"
+        )
+    if snapshot is None:
+        return
+    for name, public_path in snapshot.assets.items():
+        if name not in reviewed or sha256(public_path) != reviewed[name]:
+            _mismatch(f"public {name} does not match the reviewed build-once asset")
+
+
 def _run(command: list[str], *, binary: bool = False) -> bytes | str:
     completed = subprocess.run(
         command,
@@ -519,6 +546,26 @@ def verify_release(
             Path(temporary),
         )
         return verify_snapshot(version, snapshot)
+
+
+def fixture_snapshot(path: Path) -> ReleaseSnapshot | None:
+    """Load a local release fixture for cross-surface verification."""
+    return _fixture_snapshot(path)
+
+
+def download_snapshot(
+    repository: str,
+    version: str,
+    reviewed_sha: str,
+    directory: Path,
+) -> ReleaseSnapshot | None:
+    """Download a read-only public snapshot into an operator-owned temporary path."""
+    if (
+        len(reviewed_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in reviewed_sha)
+    ):
+        _fail("--reviewed-sha must be the full lowercase reviewed commit SHA")
+    return _download_snapshot(repository, version, reviewed_sha, directory)
 
 
 def _parser() -> argparse.ArgumentParser:
