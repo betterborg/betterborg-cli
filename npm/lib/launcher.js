@@ -48,6 +48,10 @@ function samePath(left, right, platform) {
   return left === right;
 }
 
+function requiresShell(command, platform) {
+  return platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
 function launcherExecutables(dependencies) {
   if (!dependencies.launcherPath) {
     return [];
@@ -122,11 +126,15 @@ function installedCli(version, dependencies) {
   if (!candidate) {
     return null;
   }
-  const completed = dependencies.spawnSync(candidate, ["version"], {
+  const options = {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
     timeout: 5000,
-  });
+  };
+  if (requiresShell(candidate, dependencies.platform)) {
+    options.shell = true;
+  }
+  const completed = dependencies.spawnSync(candidate, ["version"], options);
   if (
     completed.status === 0 &&
     completed.stdout.trim() === `borg ${version}`
@@ -283,10 +291,14 @@ function launch(resolved, arguments_, overrides = {}) {
     let settled = false;
     let child;
     try {
+      const options = { stdio: "inherit" };
+      if (requiresShell(resolved.command, dependencies.platform)) {
+        options.shell = true;
+      }
       child = dependencies.spawn(
         resolved.command,
         [...resolved.argumentsPrefix, ...arguments_],
-        { stdio: "inherit" },
+        options,
       );
     } catch (error) {
       reject(error);

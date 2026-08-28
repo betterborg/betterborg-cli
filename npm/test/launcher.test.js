@@ -176,6 +176,49 @@ test("Windows resolution skips its own npm shims and falls back to uvx", async (
   }
 });
 
+test("Windows probes an installed cmd shim through the command shell", async () => {
+  const borg = "C:\\tools\\borg.CMD";
+  const fileSystem = {
+    constants: { X_OK: 1 },
+    accessSync(candidate) {
+      if (candidate.toLowerCase() !== borg.toLowerCase()) {
+        throw new Error("missing");
+      }
+    },
+    realpathSync: (candidate) => candidate,
+  };
+  let invocation;
+  const resolved = await resolveCli("1.2.3", {
+    architecture: "x64",
+    environment: { PATH: "C:\\tools", PATHEXT: ".CMD" },
+    fileSystem,
+    launcherPath: "C:\\npm\\node_modules\\@betterborg\\cli\\bin\\borg.js",
+    pathDelimiter: ";",
+    pathModule: path.win32,
+    platform: "win32",
+    spawnSync: (command, arguments_, options) => {
+      invocation = { command, arguments_, options };
+      return { status: 0, stdout: "borg 1.2.3\n" };
+    },
+  });
+
+  assert.deepEqual(invocation, {
+    command: borg,
+    arguments_: ["version"],
+    options: {
+      encoding: "utf8",
+      shell: true,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    },
+  });
+  assert.deepEqual(resolved, {
+    command: borg,
+    argumentsPrefix: [],
+    source: "installed",
+  });
+});
+
 test("POSIX resolution skips its own regular npm shim and falls back to uvx", async () => {
   const shim = "/project/node_modules/.bin/borg";
   const uvx = "/tools/uvx";
@@ -374,4 +417,36 @@ test("launch forwards a numeric child exit status", async () => {
   child.emit("close", 23, null);
   await completed;
   assert.equal(processLike.exitCode, 23);
+});
+
+test("launch runs a Windows cmd shim through the command shell", async () => {
+  const child = new EventEmitter();
+  child.kill = () => {};
+  const processLike = new EventEmitter();
+  processLike.exitCode = null;
+  let invocation;
+  const completed = launch(
+    {
+      command: "C:\\tools\\uvx.CMD",
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+    },
+    ["tasks"],
+    {
+      platform: "win32",
+      process: processLike,
+      spawn: (command, arguments_, options) => {
+        invocation = { command, arguments_, options };
+        return child;
+      },
+    },
+  );
+  child.emit("close", 0, null);
+  await completed;
+
+  assert.deepEqual(invocation, {
+    command: "C:\\tools\\uvx.CMD",
+    arguments_: ["--from", "betterborg==1.2.3", "borg", "tasks"],
+    options: { shell: true, stdio: "inherit" },
+  });
+  assert.equal(processLike.exitCode, 0);
 });
