@@ -83,6 +83,16 @@ _COMMAND_ROLES = frozenset(
 READ_ONLY_API_TOOLS = ("list_files", "read_file", "search_text")
 
 
+def is_read_only_tool_set(allowed_tools: Sequence[str]) -> bool:
+    """Return whether a run is confined to an explicit read-only tool set.
+
+    Native CLI adapters translate this into a provider read-only sandbox, so
+    an empty tool set is not read-only: it grants the adapter's default, which
+    is unrestricted host access.
+    """
+    return bool(allowed_tools) and set(allowed_tools) <= set(READ_ONLY_API_TOOLS)
+
+
 def _object_schema(
     properties: Mapping[str, Any], *, required: Sequence[str] = ()
 ) -> dict[str, Any]:

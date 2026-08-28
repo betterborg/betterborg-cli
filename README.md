@@ -100,7 +100,9 @@ For a deliberate noninteractive decision, use `borg trust --yes`. Trust is
 bound to the resolved repository and Git common-directory paths and is stored
 in the user's machine-local state directory, not in the repository.
 
-Noninteractive initialization also requires one provider API credential:
+Noninteractive initialization also needs one agent transport. A `claude` or
+`codex` CLI on `PATH` is preferred; with neither installed, supply a provider
+API credential:
 
 ```console
 export OPENAI_API_KEY='your-provider-key'

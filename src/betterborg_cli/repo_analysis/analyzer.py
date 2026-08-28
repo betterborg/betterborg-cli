@@ -20,6 +20,7 @@ from betterborg_cli.agent_runtime.base import (
 from betterborg_cli.agent_runtime.selection import (
     AgentSelectionError,
     SelectedAgent,
+    require_read_only_agent,
     resolve_agent_model,
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
@@ -419,17 +420,7 @@ def _run_in_workspace(
         workspace_dir,
         limits=config.limits,
     )
-    if agent.capabilities.host_capable:
-        raise AnalyzerError(
-            f"adapter {agent.name!r} is host-capable and cannot be confined to "
-            "the bounded discovery workspace; select the 'anthropic' or "
-            "'openai' API adapter"
-        )
-    if not agent.capabilities.tool_allowlist:
-        raise AnalyzerError(
-            f"adapter {agent.name!r} cannot enforce the bounded analyzer "
-            "tool allowlist"
-        )
+    require_read_only_agent(agent, role="analyzer", error_factory=AnalyzerError)
     run_id = uuid4()
     spec = AgentRunSpec(
         system_prompt=_SYSTEM_PROMPT,

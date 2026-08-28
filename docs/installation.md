@@ -67,15 +67,24 @@ borg trust
 ```
 
 Use `borg trust --yes` only for a deliberate noninteractive decision. A fresh
-noninteractive initialization can combine explicit trust with one provider:
+initialization needs one agent transport. Every command prefers the `claude`
+or `codex` CLI whenever one is on `PATH`:
+
+```console
+borg init --yes
+```
+
+Selection tests only for the executable, so a CLI on `PATH` must already be
+logged in. An installed but unauthenticated CLI is still chosen, and the run
+fails rather than falling back to a provider key. With neither CLI on `PATH`,
+supply a key instead:
 
 ```console
 export OPENAI_API_KEY='your-provider-key'
 borg init --yes
 ```
 
-Set `ANTHROPIC_API_KEY` instead to use Anthropic. Interactive users may also
-install and log in to the Claude Code or Codex CLI. Never write a provider key
+`ANTHROPIC_API_KEY` is the supported alternative. Never write a provider key
 to `.borg/config.toml`, a PRD, shell output, or any tracked file; use the shell
 environment or a secret manager.
 

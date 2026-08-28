@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from collections.abc import Sequence
 from copy import deepcopy
 from pathlib import Path
 
@@ -272,6 +273,7 @@ def test_analyzer_rejects_effort_for_default_selected_anthropic(
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"},
+        executable_lookup=lambda _binary: None,
     )
     adapter = MockAdapter(name="anthropic").queue(MockResponse(payload=_payload()))
     selected.adapter = adapter
@@ -294,9 +296,64 @@ def test_analyzer_rejects_effort_for_default_selected_anthropic(
         assert store.list_analyses(repository.id) == []
 
 
-def test_native_analyzer_fails_closed_before_spawning(
+def test_native_analyzer_runs_read_only_in_the_bounded_workspace(
     git_repo: Path,
 ) -> None:
+    _commit_repository(git_repo)
+    repository = Repository(root=git_repo)
+    observed: dict[str, object] = {}
+
+    def runner(
+        command: Sequence[str],
+        cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: object,
+        _env: object,
+    ) -> int:
+        observed.update(
+            command=list(command),
+            cwd=cwd,
+            visible=sorted(
+                path.relative_to(cwd).as_posix()
+                for path in cwd.rglob("*")
+                if path.is_file()
+            ),
+        )
+        log_path.write_text("", encoding="utf-8")
+        Path(command[command.index("-o") + 1]).write_text(
+            json.dumps(_payload()), encoding="utf-8"
+        )
+        return 0
+
+    trusted: list[Path] = []
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner),
+        paths=RepoPaths.discover(git_repo),
+        trust_requirement=lambda paths, **_kwargs: trusted.append(paths.root),
+    )
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = run_analyzer(
+            repository,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+        )
+
+        assert store.list_analyses(repository.id) == [analysis]
+
+    assert trusted == [git_repo.resolve()]
+
+    command = observed["command"]
+    assert command[command.index("-s") + 1] == "read-only"
+    assert command[command.index("-C") + 1] == str(observed["cwd"])
+    assert observed["cwd"] != git_repo
+    assert observed["visible"] == ["analysis_input.json", "files/README.md"]
+
+
+def test_analyzer_rejects_an_unwrapped_native_adapter(git_repo: Path) -> None:
     _commit_repository(git_repo)
     repository = Repository(root=git_repo)
     spawned = False
@@ -306,19 +363,15 @@ def test_native_analyzer_fails_closed_before_spawning(
         spawned = True
         return 0
 
-    selected = SelectedAgent(
-        role=ApiAgentRole.ANALYSIS,
-        adapter=CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner),
-        paths=RepoPaths.discover(git_repo),
-    )
+    adapter = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner)
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
 
-        with pytest.raises(AnalyzerError, match="cannot be confined"):
+        with pytest.raises(AnalyzerError, match="must be wrapped by SelectedAgent"):
             run_analyzer(
                 repository,
                 store,
-                selected,
+                adapter,
                 artifact_dir=git_repo / "artifacts",
             )
 
@@ -326,7 +379,7 @@ def test_native_analyzer_fails_closed_before_spawning(
     assert not spawned
 
 
-def test_analyzer_rejects_an_adapter_without_a_tool_allowlist(
+def test_analyzer_rejects_an_adapter_without_a_read_only_boundary(
     git_repo: Path,
 ) -> None:
     _commit_repository(git_repo)
@@ -336,7 +389,7 @@ def test_analyzer_rejects_an_adapter_without_a_tool_allowlist(
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
 
-        with pytest.raises(AnalyzerError, match="tool allowlist"):
+        with pytest.raises(AnalyzerError, match="read-only execution boundary"):
             run_analyzer(
                 repository,
                 store,

@@ -1,4 +1,4 @@
-"""TTY-aware adapter selection and trust-gated execution policy."""
+"""Native-first adapter selection and trust-gated execution policy."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from betterborg_cli.agent_runtime.anthropic import AnthropicAdapter
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
+from betterborg_cli.agent_runtime.api_tools import ApiAgentRole, is_read_only_tool_set
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
     AgentCapabilities,
@@ -48,13 +48,39 @@ _DEFAULT_MODELS = {
     "openai": "gpt-5",
 }
 _SETUP_GUIDANCE = (
-    "Install and log in to the 'claude' or 'codex' CLI for interactive use, "
-    "or set ANTHROPIC_API_KEY or OPENAI_API_KEY for API use."
+    "Install and log in to the 'claude' or 'codex' CLI, or set "
+    "ANTHROPIC_API_KEY or OPENAI_API_KEY for API use."
 )
 
 
 class AgentSelectionError(RuntimeError):
     """Raised with operator-facing guidance when no adapter can be selected."""
+
+
+def require_read_only_agent(
+    agent: AgentAdapter | SelectedAgent,
+    *,
+    role: str,
+    error_factory: Callable[[str], Exception],
+) -> None:
+    """Reject an adapter that cannot enforce a read-only execution boundary.
+
+    An adapter qualifies by confining tool access to an allowlist, or by
+    running its provider CLI in a read-only sandbox. A host-capable adapter
+    additionally has to arrive wrapped, because ``SelectedAgent`` is what
+    holds it to a read-only tool set and to workspace trust.
+    """
+    if not (
+        agent.capabilities.tool_allowlist or agent.capabilities.read_only_sandbox
+    ):
+        raise error_factory(
+            f"adapter {agent.name!r} cannot enforce the {role} read-only "
+            "execution boundary"
+        )
+    if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
+        raise error_factory(
+            f"host-capable adapter {agent.name!r} must be wrapped by SelectedAgent"
+        )
 
 
 @dataclass(slots=True)
@@ -116,21 +142,47 @@ class SelectedAgent:
         *,
         cancel: CancellationToken | None = None,
     ) -> AgentResult:
-        """Invoke a file-tool adapter in a caller-built contained workspace.
+        """Invoke a read-only adapter in a caller-built contained workspace.
 
-        The caller owns the containment boundary, so this path deliberately
-        does not interpret the sanitized directory as a raw Git checkout or
-        grant repository trust to provider tools.
+        The caller owns the workspace, so this path deliberately does not
+        interpret the sanitized directory as a raw Git checkout. How tightly
+        the run is held to that directory depends on the transport:
+
+        A provider API adapter is path-contained, because its file tools
+        resolve every path beneath the run directory. It reaches nothing else
+        on the host and therefore needs no repository trust.
+
+        A native CLI is only held to reading. Its read-only tool set stops it
+        writing or editing, but neither provider confines reads to the working
+        directory, so it can still reach the repository the workspace was
+        sampled from. For a native CLI the workspace is therefore a bound on
+        cost and on the evidence the prompt cites, not a containment boundary.
+
+        Trust is required for that host access, but every current caller
+        already trusts the workspace before selecting an agent, so this is
+        defence in depth for future callers rather than a gate an operator
+        will meet here.
         """
+        if cancel is not None and cancel.is_set():
+            return self.adapter.run(self._resolve_spec(spec), cancel=cancel)
+
+        require_read_only_agent(
+            self,
+            role=self.role.value,
+            error_factory=AgentSelectionError,
+        )
         if self.capabilities.host_capable:
-            raise AgentSelectionError(
-                f"Adapter {self.name!r} is host-capable and cannot be confined "
-                "to a bounded evidence workspace; select the 'anthropic' or "
-                "'openai' API adapter."
-            )
-        if not self.capabilities.tool_allowlist:
-            raise AgentSelectionError(
-                f"Adapter {self.name!r} cannot enforce a bounded tool allowlist"
+            if not is_read_only_tool_set(spec.allowed_tools):
+                raise AgentSelectionError(
+                    f"Host-capable adapter {self.name!r} may only run in a "
+                    "bounded workspace under a read-only tool set"
+                )
+            self.trust_requirement(
+                self.paths,
+                store=self.trust_store,
+                explicit=self.trust_explicit,
+                interactive=self.interactive,
+                confirm=self.trust_confirm,
             )
         return self.adapter.run(self._resolve_spec(spec), cancel=cancel)
 
@@ -185,9 +237,12 @@ def select_agent(
 ) -> SelectedAgent:
     """Resolve one configured role across native and provider API transports.
 
-    Native transports are eligible only for an interactive invocation. Provider
-    credentials are read here, by the selection-policy owner, and only the
-    credential for the selected API adapter is retained.
+    Every role prefers a logged-in native CLI and falls back to a provider API
+    credential, so subscription billing is chosen ahead of metered billing.
+    ``interactive`` governs only whether a trust prompt may be shown, never
+    which transports are eligible. Provider credentials are read here, by the
+    selection-policy owner, and only the credential for the selected API
+    adapter is retained.
     """
     resolved_role = ApiAgentRole(role)
     tty = sys.stdin.isatty() if interactive is None else interactive
@@ -207,7 +262,6 @@ def select_agent(
             )
         unusable = _unusable_reason(
             adapter_name,
-            tty=tty,
             effort=choice.effort,
             credentials=environment,
             executable_lookup=find_executable,
@@ -220,18 +274,12 @@ def select_agent(
                 )
             )
     else:
-        candidates = (
-            _API_ADAPTERS
-            if resolved_role is ApiAgentRole.ANALYSIS or not tty
-            else (*_NATIVE_ADAPTERS, *_API_ADAPTERS)
-        )
         adapter_name = next(
             (
                 candidate
-                for candidate in candidates
+                for candidate in (*_NATIVE_ADAPTERS, *_API_ADAPTERS)
                 if _unusable_reason(
                     candidate,
-                    tty=tty,
                     effort=choice.effort,
                     credentials=environment,
                     executable_lookup=find_executable,
@@ -241,12 +289,9 @@ def select_agent(
             None,
         )
         if adapter_name is None:
-            context = (
-                "No usable agent adapter is configured."
-                if tty
-                else "No provider API credential is configured for non-interactive use."
+            raise AgentSelectionError(
+                _with_setup("No usable agent adapter is configured.")
             )
-            raise AgentSelectionError(_with_setup(context))
 
     adapter = _build_adapter(
         adapter_name,
@@ -303,14 +348,11 @@ def _choice_for_role(config: RepositoryConfig, role: ApiAgentRole) -> AgentChoic
 def _unusable_reason(
     name: str,
     *,
-    tty: bool,
     effort: str | None,
     credentials: Mapping[str, str],
     executable_lookup: Callable[[str], str | None],
 ) -> str | None:
     if name in _NATIVE_ADAPTERS:
-        if not tty:
-            return "native CLI adapters require an interactive TTY"
         if executable_lookup(name) is None:
             return f"the {name!r} executable was not found on PATH"
         return None

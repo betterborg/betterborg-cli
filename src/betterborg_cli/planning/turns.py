@@ -35,26 +35,6 @@ from betterborg_cli.store import (
 ErrorFactory = Callable[[str], Exception]
 
 
-def require_read_only_agent(
-    agent: AgentAdapter | SelectedAgent,
-    *,
-    role: str,
-    error_factory: ErrorFactory,
-) -> None:
-    """Reject an adapter that cannot enforce a read-only planning boundary."""
-    if not (
-        agent.capabilities.tool_allowlist or agent.capabilities.read_only_sandbox
-    ):
-        raise error_factory(
-            f"adapter {agent.name!r} cannot enforce the {role} read-only "
-            "execution boundary"
-        )
-    if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
-        raise error_factory(
-            f"host-capable adapter {agent.name!r} must be wrapped by SelectedAgent"
-        )
-
-
 class DurablePlanningTurns:
     """Create, recover, execute, and validate durable planning turns."""
 
@@ -315,4 +295,4 @@ class DurablePlanningTurns:
         return payload
 
 
-__all__ = ["DurablePlanningTurns", "require_read_only_agent"]
+__all__ = ["DurablePlanningTurns"]
