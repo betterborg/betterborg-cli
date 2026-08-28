@@ -17,6 +17,7 @@ def test_help_lists_bootstrap_commands(cli_runner: CliRunner) -> None:
 
     assert result.exit_code == 0
     assert "Work with BetterBorg" in result.output
+    assert "init" in result.output
     assert "trust" in result.output
     assert "version" in result.output
 

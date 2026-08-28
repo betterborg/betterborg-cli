@@ -36,6 +36,11 @@ class RepoPaths:
         """Return the tracked directory containing generated improvement PRDs."""
         return self.tracked_dir / "prds" / "improvements"
 
+    @property
+    def score_report(self) -> Path:
+        """Return the tracked repository score report path."""
+        return self.tracked_dir / "score.md"
+
     @classmethod
     def discover(cls, start: Path | None = None) -> RepoPaths:
         """Discover the nearest containing Git repository from ``start``."""
