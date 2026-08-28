@@ -135,11 +135,22 @@ class ScoredRecommendation:
 
 
 @dataclass(frozen=True, slots=True)
+class ThemeDimensionChange:
+    """One theme's aggregate change to a package dimension."""
+
+    package_path: str
+    dimension: str
+    proposed_delta: float
+    effective_delta: float
+
+
+@dataclass(frozen=True, slots=True)
 class RankedRecommendationTheme:
     """A theme's normalized impact and effort-aware ordering value."""
 
     theme: RecommendationTheme
     recommendations: tuple[ScoredRecommendation, ...]
+    dimension_changes: tuple[ThemeDimensionChange, ...]
     normalized_impact: float
     ranking_score: float
 
@@ -269,7 +280,11 @@ def rank_recommendation_themes(
             )
             for recommendation_id in theme.recommendation_ids
         )
-        dimension_points = _theme_dimension_points(scored, package_rubrics)
+        dimension_changes = _theme_dimension_changes(scored, package_rubrics)
+        dimension_points = sum(
+            change.effective_delta * WEIGHTS[change.dimension]
+            for change in dimension_changes
+        )
         normalized_impact = dimension_points / (
             sum(WEIGHTS.values()) * len(package_rubrics)
         )
@@ -277,6 +292,7 @@ def rank_recommendation_themes(
             RankedRecommendationTheme(
                 theme=theme,
                 recommendations=scored,
+                dimension_changes=dimension_changes,
                 normalized_impact=normalized_impact,
                 ranking_score=normalized_impact / EFFORT_COST[theme.effort],
             )
@@ -329,10 +345,10 @@ def _score_recommendation(
     )
 
 
-def _theme_dimension_points(
+def _theme_dimension_changes(
     scored: Sequence[ScoredRecommendation],
     package_rubrics: Mapping[str, Mapping[str, Mapping[str, object]]],
-) -> float:
+) -> tuple[ThemeDimensionChange, ...]:
     grouped: dict[tuple[str, str], dict[tuple[str, str], float]] = {}
     for result in scored:
         recommendation = result.recommendation
@@ -345,12 +361,20 @@ def _theme_dimension_points(
             else ("recommendation", recommendation.id)
         )
         grouped.setdefault(target, {})[group] = max(
-            result.effective_delta,
+            recommendation.estimated_delta,
             grouped.get(target, {}).get(group, 0.0),
         )
 
-    total = 0.0
+    changes = []
     for (package_path, dimension), groups in grouped.items():
         current = _dimension_score(package_rubrics[package_path], dimension)
-        total += min(sum(groups.values()), 5.0 - current) * WEIGHTS[dimension]
-    return total
+        proposed = sum(groups.values())
+        changes.append(
+            ThemeDimensionChange(
+                package_path=package_path,
+                dimension=dimension,
+                proposed_delta=proposed,
+                effective_delta=min(proposed, 5.0 - current),
+            )
+        )
+    return tuple(changes)

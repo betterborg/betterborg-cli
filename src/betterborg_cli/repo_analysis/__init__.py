@@ -14,6 +14,11 @@ from betterborg_cli.repo_analysis.discovery import (
     build_discovery_workspace,
     discovery_limits_from_mapping,
 )
+from betterborg_cli.repo_analysis.improvement_prds import (
+    ImprovementPrd,
+    generate_improvement_prds,
+    resolve_theme_key,
+)
 from betterborg_cli.repo_analysis.prompts_manager import (
     PROMPT_MANAGER_OUTPUT_SCHEMA,
     PROMPT_ROLES,
@@ -39,6 +44,7 @@ from betterborg_cli.repo_analysis.scoring import (
     RecommendationTheme,
     RepositoryScore,
     ScoredRecommendation,
+    ThemeDimensionChange,
     compute_overall_score,
     compute_repo_overall_score,
     rank_recommendation_themes,
@@ -57,6 +63,7 @@ __all__ = [
     "DiscoveryOmission",
     "DIMENSIONS",
     "EFFORT_COST",
+    "ImprovementPrd",
     "PackageScore",
     "PROMPT_MANAGER_OUTPUT_SCHEMA",
     "PROMPT_ROLES",
@@ -69,6 +76,7 @@ __all__ = [
     "RecommendationTheme",
     "RepositoryScore",
     "ScoredRecommendation",
+    "ThemeDimensionChange",
     "WEIGHTS",
     "build_discovery_workspace",
     "build_machine_report",
@@ -76,10 +84,12 @@ __all__ = [
     "compute_repo_overall_score",
     "discovery_limits_from_mapping",
     "generate_role_prompts",
+    "generate_improvement_prds",
     "rank_recommendation_themes",
     "render_json_report",
     "render_markdown_report",
     "render_terminal_report",
+    "resolve_theme_key",
     "run_analyzer",
     "score_repository",
     "validate_recommendation",

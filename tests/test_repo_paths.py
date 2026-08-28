@@ -23,6 +23,9 @@ def test_discover_uses_nearest_git_root(git_repo: Path) -> None:
     assert paths.tracked_dir == nested_repo / ".borg"
     assert paths.state_dir == nested_repo / ".borg" / "state"
     assert paths.artifacts_dir == nested_repo / ".borg" / "state" / "artifacts"
+    assert paths.improvement_prds_dir == (
+        nested_repo / ".borg" / "prds" / "improvements"
+    )
 
 
 def test_managed_ignore_keeps_documents_trackable_and_ignores_state(

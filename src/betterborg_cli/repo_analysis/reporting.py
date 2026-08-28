@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from betterborg_cli.repo_analysis.scoring import DIMENSIONS
+from betterborg_cli.repo_analysis.text_rendering import (
+    markdown_text as _markdown_text,
+)
+from betterborg_cli.repo_analysis.text_rendering import (
+    terminal_text as _terminal_text,
+)
 from betterborg_cli.store import RepositoryAnalysis, RepositoryPackage
 
 _MAX_SCORE = 5.0
@@ -28,7 +33,6 @@ _EFFORT_LABEL = "S/M/L are estimated effort labels."
 _NON_DETERMINISM_LABEL = (
     "Analyzer output is non-deterministic and may vary between runs."
 )
-_MARKDOWN_SPECIALS = frozenset(r"\`*_{}[]<>#+!|")
 _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -612,22 +616,3 @@ def _score_bar(score: float) -> str:
 
 def _number(value: object) -> float:
     return float(value) if isinstance(value, int | float) else 0.0
-
-
-def _terminal_text(value: object) -> str:
-    """Flatten text and remove characters that can control a terminal."""
-    cleaned: list[str] = []
-    for character in str(value):
-        if character.isspace():
-            cleaned.append(" ")
-        elif not unicodedata.category(character).startswith("C"):
-            cleaned.append(character)
-    return " ".join("".join(cleaned).split())
-
-
-def _markdown_text(value: object) -> str:
-    """Render analyzer-controlled text as one escaped Markdown fragment."""
-    return "".join(
-        f"\\{character}" if character in _MARKDOWN_SPECIALS else character
-        for character in _terminal_text(value)
-    )
