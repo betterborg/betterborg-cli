@@ -168,6 +168,7 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
             "plugins/borg/.codex-plugin/plugin.json"
         ).read_text()
     )
+    assert marketplace["plugins"][0]["version"] == manifest["version"] == "0.2.0"
     assert manifest["mcpServers"] == "./.mcp.json"
     assert manifest["skills"] == "./skills/"
     mcp = json.loads(expected.joinpath("plugins/borg/.mcp.json").read_text())
@@ -184,6 +185,25 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
     assert fake.installed_version == "0.2.0"
     assert spawns == [Path(result.preflight.executable)]
     assert "new Codex thread" in (result.new_thread_guidance or "")
+
+
+def test_mismatched_marketplace_and_manifest_versions_are_rejected(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeCodex()
+    source = _upgraded_bundle(tmp_path, "mismatch", "0.2.0+codex.next")
+    marketplace_path = source / ".agents/plugins/marketplace.json"
+    marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    marketplace["plugins"][0]["version"] = "0.2.0+codex.other"
+    marketplace_path.write_text(json.dumps(marketplace), encoding="utf-8")
+
+    result, spawns = _install(tmp_path, fake, bundle_source=source)
+
+    assert result.status is CodexPluginStatus.FAILED
+    assert "marketplace Borg entry does not match" in (result.reason or "")
+    assert fake.calls == []
+    assert not tmp_path.joinpath("data").exists()
+    assert spawns == []
 
 
 def test_reinstall_is_a_verified_no_op(tmp_path: Path) -> None:
@@ -433,4 +453,8 @@ def _upgraded_bundle(tmp_path: Path, name: str, version: str) -> Path:
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = version
     manifest.write_text(json.dumps(value), encoding="utf-8")
+    marketplace = destination / ".agents/plugins/marketplace.json"
+    value = json.loads(marketplace.read_text(encoding="utf-8"))
+    value["plugins"][0]["version"] = version
+    marketplace.write_text(json.dumps(value), encoding="utf-8")
     return destination

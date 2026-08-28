@@ -409,9 +409,15 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     entries = marketplace.get("plugins")
     if not isinstance(entries, list) or len(entries) != 1:
         raise ValueError("marketplace must expose exactly the Borg plugin")
+    if manifest.get("name") != PLUGIN_NAME:
+        raise ValueError("plugin name is not stable")
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("plugin version must be a non-empty string")
     entry = entries[0]
     expected_entry = {
         "name": PLUGIN_NAME,
+        "version": version,
         "source": {"source": "local", "path": "./plugins/borg"},
         "policy": {
             "installation": "AVAILABLE",
@@ -421,11 +427,6 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     }
     if entry != expected_entry:
         raise ValueError("marketplace Borg entry does not match the Codex contract")
-    if manifest.get("name") != PLUGIN_NAME:
-        raise ValueError("plugin name is not stable")
-    version = manifest.get("version")
-    if not isinstance(version, str) or not version.strip():
-        raise ValueError("plugin version must be a non-empty string")
     if manifest.get("skills") != "./skills/":
         raise ValueError("plugin manifest must register bundled skills")
     if manifest.get("mcpServers") != "./.mcp.json":
