@@ -33,7 +33,7 @@ jobs:
           REVIEWED_VERSION: ${{ inputs.version }}
         run: |
           if [ -n "$REVIEWED_VERSION" ]; then
-            output=$(python3 scripts/check_versions.py --expected "$REVIEWED_VERSION")
+            output=$(python3 scripts/check_versions.py --tag "v$REVIEWED_VERSION")
           else
             output=$(python3 scripts/check_versions.py)
           fi

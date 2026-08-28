@@ -113,7 +113,7 @@ class _FakeCodex:
 
 def _host(tmp_path: Path):
     bin_dir = tmp_path / "host-bin"
-    borg = executable(bin_dir / "borg", "printf 'borg 0.1.0\\n'")
+    borg = executable(bin_dir / "borg", "printf 'borg 0.2.0\\n'")
     codex = executable(bin_dir / "codex", "exit 0")
 
     def lookup(name: str, *, path: str):
@@ -181,7 +181,7 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
     ) in fake.calls
     assert ("plugin", "add", PLUGIN_ID, "--json") in fake.calls
     assert fake.installed is True
-    assert fake.installed_version == "0.1.0"
+    assert fake.installed_version == "0.2.0"
     assert spawns == [Path(result.preflight.executable)]
     assert "new Codex thread" in (result.new_thread_guidance or "")
 
@@ -210,7 +210,7 @@ def test_cachebuster_upgrade_remove_adds_and_retains_previous_bundle(
     fake = _FakeCodex()
     first, _ = _install(tmp_path, fake)
     assert first.bundle_path is not None
-    upgraded = _upgraded_bundle(tmp_path, "upgrade", "0.1.0+codex.next")
+    upgraded = _upgraded_bundle(tmp_path, "upgrade", "0.2.0+codex.next")
     unrelated_marketplace = {
         "name": "team-tools",
         "root": str(tmp_path / "team-tools"),
@@ -235,8 +235,8 @@ def test_cachebuster_upgrade_remove_adds_and_retains_previous_bundle(
     previous_manifest = result.previous_bundle / (
         "plugins/borg/.codex-plugin/plugin.json"
     )
-    assert json.loads(previous_manifest.read_text())["version"] == "0.1.0"
-    assert fake.installed_version == "0.1.0+codex.next"
+    assert json.loads(previous_manifest.read_text())["version"] == "0.2.0"
+    assert fake.installed_version == "0.2.0+codex.next"
     assert ("plugin", "remove", PLUGIN_ID, "--json") in fake.calls
     assert (
         "plugin",
@@ -261,7 +261,7 @@ def test_owned_stale_install_is_recovered_with_remove_add(tmp_path: Path) -> Non
     result, _ = _install(tmp_path, fake)
 
     assert result.status is CodexPluginStatus.INSTALLED
-    assert fake.installed_version == "0.1.0"
+    assert fake.installed_version == "0.2.0"
     assert ("plugin", "remove", PLUGIN_ID, "--json") in fake.calls
     assert (
         "plugin",
@@ -305,7 +305,7 @@ def test_failed_upgrade_restores_prior_bundle_and_host_state(
     fake = _FakeCodex()
     first, _ = _install(tmp_path, fake)
     assert first.bundle_path is not None
-    upgraded = _upgraded_bundle(tmp_path, "broken", "0.1.0+codex.broken")
+    upgraded = _upgraded_bundle(tmp_path, "broken", "0.2.0+codex.broken")
 
     def fail_verification(*_args) -> None:
         raise ValueError("injected MCP failure")
@@ -322,10 +322,10 @@ def test_failed_upgrade_restores_prior_bundle_and_host_state(
     restored_manifest = first.bundle_path / (
         "plugins/borg/.codex-plugin/plugin.json"
     )
-    assert json.loads(restored_manifest.read_text())["version"] == "0.1.0"
+    assert json.loads(restored_manifest.read_text())["version"] == "0.2.0"
     assert fake.marketplace_source == str(first.bundle_path)
     assert fake.installed is True
-    assert fake.installed_version == "0.1.0"
+    assert fake.installed_version == "0.2.0"
     assert list(first.bundle_path.parent.joinpath("backups").glob("failed-*"))
     assert spawns == []
 

@@ -21,7 +21,8 @@ borg version
 
 The Python distribution is named `betterborg`; it installs the `borg` console
 command. Release versions are sourced from `betterborg_cli.__version__` and
-checked against the bundled Claude and Codex plugin manifests.
+checked against npm metadata plus the bundled Claude and Codex plugin and
+marketplace manifests.
 
 For development, create the locked environment and run the standard checks:
 
