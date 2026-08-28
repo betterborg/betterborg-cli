@@ -38,7 +38,7 @@ def _documents(root: Path) -> tuple[ImprovementPrd, ...]:
             title="Reliable checks",
             predicted_impact=0.25,
             effort="S",
-            suggested_borg_name="Sentinel",
+            suggested_borg_name="sentinel",
             path=directory / "checks.md",
             body_md="# Reliable checks\n",
         ),
@@ -47,7 +47,7 @@ def _documents(root: Path) -> tuple[ImprovementPrd, ...]:
             title="Approachable docs",
             predicted_impact=0.125,
             effort="M",
-            suggested_borg_name="Scribe",
+            suggested_borg_name="scribe",
             path=directory / "docs.md",
             body_md="# Approachable docs\n",
         ),
@@ -67,8 +67,8 @@ def onboarding_context(committed_git_repo: Path):
 @pytest.mark.parametrize(
     ("theme_answer", "expected_name", "expected_filename"),
     [
-        ("", "Sentinel", "checks.md"),
-        ("2", "Scribe", "docs.md"),
+        ("", "sentinel", "checks.md"),
+        ("2", "scribe", "docs.md"),
     ],
     ids=["top-theme-default", "second-ranked-theme"],
 )
@@ -108,7 +108,7 @@ def test_fix_door_lists_every_ranked_theme_and_dispatches_exact_source(
 
 def test_fix_door_edits_a_colliding_suggested_name(onboarding_context) -> None:
     repository, store = onboarding_context
-    store.add_borg(Borg(repository_id=repository.id, name="Sentinel"))
+    store.add_borg(Borg(repository_id=repository.id, name="sentinel"))
     output: list[str] = []
     creator = RecordingCreator()
     dispatcher = OnboardingDispatcher(
@@ -196,16 +196,14 @@ def test_machine_handoff_commands_are_exact_and_mutation_free(
         (
             "borg",
             "create",
-            "--name",
-            "Sentinel",
+            "sentinel",
             "--prd",
             ".borg/prds/improvements/checks.md",
         ),
         (
             "borg",
             "create",
-            "--name",
-            "Scribe",
+            "scribe",
             "--prd",
             ".borg/prds/improvements/docs.md",
         ),

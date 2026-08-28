@@ -329,7 +329,7 @@ def _suggested_borg_names(
                 "persisted analysis contains an invalid recommendation theme"
             )
         key = resolve_theme_key(theme["id"])
-        suggestions[key] = key.replace("-", " ").title()
+        suggestions[key] = key
     return suggestions
 
 
