@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -103,6 +103,7 @@ class DurablePlanningTurns:
         user_prompt: str,
         current_plan: str | None = None,
         turn_name: str | None = None,
+        request_context: Mapping[str, Any] | None = None,
     ) -> tuple[PlanningAttempt, dict[str, Any]]:
         """Resume or invoke one provider turn while preserving its durable record."""
         label = turn_name or phase
@@ -116,8 +117,24 @@ class DurablePlanningTurns:
                 None,
             )
             if running is None:
-                attempt = self._start_attempt(phase, round_number)
+                attempt = self._start_attempt(
+                    phase, round_number, request_context=request_context
+                )
                 break
+
+            stale_context = {
+                key: value
+                for key, value in (request_context or {}).items()
+                if running.request.get(key) != value
+            }
+            if stale_context:
+                self.store.complete_planning_attempt(
+                    running.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    summary="interrupted attempt belongs to stale request context",
+                )
+                round_number = max(round_number, running.round + 1)
+                continue
 
             recovered = self._recover_payload(running, schema)
             if recovered is not None:
@@ -243,17 +260,30 @@ class DurablePlanningTurns:
         with self.materialized_worktree() as worktree:
             validate_plan(plan, worktree)
 
-    def _start_attempt(self, phase: str, round_number: int) -> PlanningAttempt:
+    def _start_attempt(
+        self,
+        phase: str,
+        round_number: int,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> PlanningAttempt:
+        request = dict(request_context or {})
+        if "result_path" in request:
+            raise ValueError("planning request context cannot override result_path")
         attempt = PlanningAttempt(
             borg_id=self.borg_id,
             phase=phase,
             round=round_number,
             adapter=self.agent.name,
             model=self.model,
-            request={"result_path": "pending"},
+            request={**request, "result_path": "pending"},
         )
         attempt = replace(
-            attempt, request={"result_path": str(self.result_path(attempt))}
+            attempt,
+            request={
+                **request,
+                "result_path": str(self.result_path(attempt)),
+            },
         )
         self.store.append_planning_attempt(attempt)
         return attempt

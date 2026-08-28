@@ -15,6 +15,15 @@ from betterborg_cli.planning.plan_contracts import (
     validate_plan,
     validate_plan_json,
 )
+from betterborg_cli.planning.pm import (
+    PM_OUTPUT_RETRY_CAP,
+    PROJECT_MANAGER_TASKS_SCHEMA,
+    ProjectManagerCancelled,
+    ProjectManagerError,
+    ProjectManagerLoop,
+    ProjectManagerResult,
+    approved_plan_digest,
+)
 from betterborg_cli.planning.task_validation import (
     NonProgressingTaskRepairError,
     PlanElement,
@@ -48,6 +57,12 @@ __all__ = [
     "ArchitectResult",
     "NonProgressingTaskRepairError",
     "PlanElement",
+    "PM_OUTPUT_RETRY_CAP",
+    "PROJECT_MANAGER_TASKS_SCHEMA",
+    "ProjectManagerCancelled",
+    "ProjectManagerError",
+    "ProjectManagerLoop",
+    "ProjectManagerResult",
     "TECH_LEAD_REVIEW_SCHEMA",
     "TECH_REVIEW_ROUND_CAP",
     "TechLeadCancelled",
@@ -59,6 +74,7 @@ __all__ = [
     "PlanningWorktreeError",
     "PlanValidationError",
     "build_plan_element_catalog",
+    "approved_plan_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
     "task_graph_findings",

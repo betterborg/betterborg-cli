@@ -1,21 +1,37 @@
-"""Deterministic contracts for decomposed task graphs."""
+"""Deterministic and agent lifecycle contracts for task decomposition."""
 
+import json
 from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
+from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     NonProgressingTaskRepairError,
+    ProjectManagerError,
+    ProjectManagerLoop,
     TaskGraphFinding,
     TaskGraphValidationError,
+    approved_plan_digest,
     build_plan_element_catalog,
     task_graph_findings,
     validate_task_graph,
     validate_task_repair_progress,
 )
-from betterborg_cli.store import TaskComplexity, TaskDependency, TaskRecord
+from betterborg_cli.store import (
+    Borg,
+    BorgState,
+    PlanApproval,
+    PlanningAttempt,
+    PlanningAttemptStatus,
+    SqliteStore,
+    TaskComplexity,
+    TaskDependency,
+    TaskRecord,
+)
 
 
 def _plan() -> dict:
@@ -117,8 +133,303 @@ def _valid_graph() -> tuple[dict, list[TaskRecord], list[TaskDependency]]:
     return plan, [foundation, consumer], [dependency]
 
 
+def _pm_payload(plan: dict) -> dict:
+    def task(
+        stage: str,
+        stem: str,
+        refs: list[str],
+        *,
+        dependencies: list[str],
+        complexity: str,
+    ) -> dict:
+        return {
+            "stage": stage,
+            "stem": stem,
+            "repository": "repo",
+            "title": f"Build {stage}",
+            "why": "This task owns one independently testable plan slice.",
+            "scope": [f"Implement the concrete {stage} deliverable."],
+            "implementation_notes": [],
+            "acceptance_criteria": [f"The {stage} behavior works."],
+            "tests": [f"Cover the {stage} behavior with a focused test."],
+            "dependencies": dependencies,
+            "out_of_scope": [],
+            "plan_refs": refs,
+            "estimate_complexity": complexity,
+        }
+
+    return {
+        "summary": "Two dependency-ordered tasks cover the approved plan.",
+        "tasks": [
+            task(
+                "01-foundation",
+                "01-build",
+                _required_refs(plan, "01-foundation"),
+                dependencies=[],
+                complexity="small",
+            ),
+            task(
+                "02-consumer",
+                "01-build",
+                _required_refs(plan, "02-consumer"),
+                dependencies=["01-foundation/01-build"],
+                complexity="medium",
+            ),
+        ],
+    }
+
+
+def _approve_plan(
+    store: SqliteStore, borg: Borg, plan: dict
+) -> tuple[PlanApproval, Borg]:
+    approval = PlanApproval(
+        borg_id=borg.id,
+        plan_digest=approved_plan_digest(plan),
+        manifest={"plan.json": approved_plan_digest(plan)},
+        approved_by="test operator",
+    )
+    store.append_plan_approval(approval)
+    approved_borg = store.compare_and_set_borg_state(
+        borg.id,
+        expected_state=borg.state,
+        expected_version=borg.state_version,
+        new_state=BorgState.PLAN_APPROVAL_PENDING,
+    )
+    return approval, approved_borg
+
+
 def _rules(findings: Iterable[TaskGraphFinding]) -> set[str]:
     return {finding.rule for finding in findings}
+
+
+def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    payload = _pm_payload(plan)
+
+    def complete_batch(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".borg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        annotated_plan = json.loads(
+            (spec.cwd / manifest["current_plan"]).read_text(encoding="utf-8")
+        )
+        required_refs = {
+            item["ref"]
+            for item in annotated_plan["_betterborg_plan_refs"]
+            if item["required"]
+        }
+        assert required_refs == {
+            *payload["tasks"][0]["plan_refs"],
+            *payload["tasks"][1]["plan_refs"],
+        }
+        return payload
+
+    adapter = MockAdapter(name="openai").queue(MockResponse(dynamic=complete_batch))
+    database = committed_git_repo.parent / "pm-complete.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-complete"
+        )
+        plan_attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_plan",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(plan_attempt)
+        store.complete_planning_attempt(
+            plan_attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=plan,
+            summary="Approved plan candidate.",
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+
+        result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+        ).run()
+
+        assert result.borg.state is BorgState.SUPERVISOR_WORKING
+        assert result.batch.plan_approval_id == approval.id
+        assert result.batch.manifest["approved_plan_digest"] == approval.plan_digest
+        assert (
+            result.generation.manifest["approved_plan_digest"]
+            == approval.plan_digest
+        )
+        assert [task.task for task in result.tasks] == payload["tasks"]
+        assert [task.complexity for task in result.tasks] == [
+            TaskComplexity.SMALL,
+            TaskComplexity.MEDIUM,
+        ]
+        assert len(result.dependencies) == 1
+        validate_task_graph(plan, result.tasks, result.dependencies)
+        attempts = [
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "pm_tasks"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].status is PlanningAttemptStatus.COMPLETED
+        assert attempts[0].result == payload
+        assert attempts[0].request["plan_approval_id"] == str(approval.id)
+        assert (
+            attempts[0].request["approved_plan_digest"] == approval.plan_digest
+        )
+
+    with SqliteStore.open(database) as reopened:
+        persisted = [
+            item
+            for item in reopened.list_planning_attempts(borg.id)
+            if item.phase == "pm_tasks"
+        ]
+        assert persisted[0].status is PlanningAttemptStatus.COMPLETED
+        assert persisted[0].result == payload
+        assert len(reopened.list_task_batches(borg.id)) == 1
+
+
+def test_pm_retries_malformed_output_with_persisted_feedback(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    malformed = _pm_payload(plan)
+    malformed["tasks"][0].pop("tests")
+
+    def repaired_batch(spec):
+        assert "Repair the previous rejected output" in spec.user_prompt
+        assert "structured result validation failed" in spec.user_prompt
+        return _pm_payload(plan)
+
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=malformed))
+    adapter.queue(MockResponse(dynamic=repaired_batch))
+    database = committed_git_repo.parent / "pm-retry.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-retry"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+
+        result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            approved_plan=plan,
+        ).run()
+
+        assert result.borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(adapter.calls) == 2
+        attempts = store.list_planning_attempts(borg.id)
+        assert [item.status for item in attempts] == [
+            PlanningAttemptStatus.FAILED,
+            PlanningAttemptStatus.COMPLETED,
+        ]
+        assert attempts[0].result is None
+        assert "structured result validation failed" in (attempts[0].summary or "")
+        assert attempts[1].result == _pm_payload(plan)
+
+
+def test_pm_resumes_completed_provider_turn_without_replay(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_payload(plan))
+    )
+    database = committed_git_repo.parent / "pm-resume.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-resume"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        loop = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            approved_plan=plan,
+        )
+        original_complete = store.complete_planning_attempt
+        interrupted = False
+
+        def interrupt_after_result(attempt_id, **kwargs):
+            nonlocal interrupted
+            attempt = next(
+                item
+                for item in store.list_planning_attempts(borg.id)
+                if item.id == attempt_id
+            )
+            if (
+                attempt.phase == "pm_tasks"
+                and kwargs["status"] is PlanningAttemptStatus.COMPLETED
+                and not interrupted
+            ):
+                interrupted = True
+                raise RuntimeError("simulated terminal interruption")
+            return original_complete(attempt_id, **kwargs)
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(
+                store, "complete_planning_attempt", interrupt_after_result
+            )
+            with pytest.raises(RuntimeError, match="terminal interruption"):
+                loop.run()
+
+        running = store.list_planning_attempts(borg.id)[-1]
+        assert running.status is PlanningAttemptStatus.RUNNING
+        assert Path(running.request["result_path"]).is_file()
+        assert store.list_task_batches(borg.id) == []
+        assert len(adapter.calls) == 1
+
+        resumed = loop.run()
+
+        assert resumed.borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(adapter.calls) == 1
+        assert loop.run() == resumed
+        assert len(adapter.calls) == 1
+
+
+def test_pm_rejects_plan_content_that_does_not_match_approval_digest(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_payload(plan))
+    )
+    database = committed_git_repo.parent / "pm-plan-binding.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-plan-binding"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        changed_plan = _plan()
+        changed_plan["phases"][0]["deliverables"] = ["Changed foundation"]
+
+        with pytest.raises(ProjectManagerError, match="digest mismatch"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                approved_plan=changed_plan,
+            ).run()
+
+        assert adapter.calls == []
+        assert store.list_planning_attempts(borg.id) == []
+        assert store.list_task_batches(borg.id) == []
 
 
 def test_complete_graph_has_one_owner_per_required_element() -> None:
