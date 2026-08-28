@@ -145,3 +145,68 @@ class GeneratedPrompt:
         if not self.body_md:
             raise ValueError("generated prompt body must not be empty")
         _validate_utc(self.generated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class Borg:
+    """One named Borg identity belonging to a repository."""
+
+    repository_id: UUID
+    name: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "repository_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"Borg {name} must be a UUID")
+        if not self.name.strip():
+            raise ValueError("Borg name must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PrdSession:
+    """A durable conversation whose confirmed PRD remains tracked Markdown."""
+
+    repository_id: UUID
+    borg_id: UUID
+    prd_path: Path
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "repository_id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"PRD session {name} must be a UUID")
+        path = Path(self.prd_path)
+        if path.is_absolute() or path == Path(".") or ".." in path.parts:
+            raise ValueError("PRD path must be repository-relative")
+        if path.suffix.casefold() != ".md":
+            raise ValueError("PRD path must identify a Markdown file")
+        object.__setattr__(self, "prd_path", path)
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class PrdTurn:
+    """One immutable turn in a PRD onboarding session."""
+
+    session_id: UUID
+    position: int
+    role: str
+    content: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "session_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"PRD turn {name} must be a UUID")
+        if self.position < 1:
+            raise ValueError("PRD turn position must be positive")
+        if not self.role.strip():
+            raise ValueError("PRD turn role must not be empty")
+        if not self.content:
+            raise ValueError("PRD turn content must not be empty")
+        _validate_utc(self.created_at)

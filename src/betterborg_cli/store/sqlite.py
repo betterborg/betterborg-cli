@@ -14,8 +14,11 @@ from pathlib import Path
 from uuid import UUID
 
 from betterborg_cli.store.models import (
+    Borg,
     GeneratedPrompt,
     Operation,
+    PrdSession,
+    PrdTurn,
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
@@ -369,6 +372,117 @@ class SqliteStore:
             ).fetchall()
         return {row["role"]: _row_to_generated_prompt(row) for row in rows}
 
+    def add_borg(self, borg: Borg) -> None:
+        """Persist one repository-scoped named Borg identity."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO borgs(id, repository_id, name, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    str(borg.id),
+                    str(borg.repository_id),
+                    borg.name,
+                    borg.created_at.isoformat(),
+                ),
+            )
+
+    def get_borg(self, borg_id: UUID) -> Borg | None:
+        """Return one Borg identity by ID, if it exists."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM borgs WHERE id = ?", (str(borg_id),)
+            ).fetchone()
+        return _row_to_borg(row) if row is not None else None
+
+    def get_borg_by_name(self, repository_id: UUID, name: str) -> Borg | None:
+        """Return one repository's Borg identity by its unique name."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM borgs
+                WHERE repository_id = ? AND name = ?
+                """,
+                (str(repository_id), name),
+            ).fetchone()
+        return _row_to_borg(row) if row is not None else None
+
+    def add_prd_session(self, session: PrdSession) -> None:
+        """Persist a PRD session that points to tracked Markdown."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO prd_sessions(
+                    id, repository_id, borg_id, prd_path, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(session.id),
+                    str(session.repository_id),
+                    str(session.borg_id),
+                    session.prd_path.as_posix(),
+                    session.created_at.isoformat(),
+                ),
+            )
+
+    def get_prd_session(self, session_id: UUID) -> PrdSession | None:
+        """Return one PRD session by ID, if it exists."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM prd_sessions WHERE id = ?", (str(session_id),)
+            ).fetchone()
+        return _row_to_prd_session(row) if row is not None else None
+
+    def append_prd_turn(
+        self, *, session_id: UUID, role: str, content: str
+    ) -> PrdTurn:
+        """Append and return the next ordered turn for a PRD session."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(position), 0) AS position
+                FROM prd_turns
+                WHERE session_id = ?
+                """,
+                (str(session_id),),
+            ).fetchone()
+            turn = PrdTurn(
+                session_id=session_id,
+                position=row["position"] + 1,
+                role=role,
+                content=content,
+            )
+            connection.execute(
+                """
+                INSERT INTO prd_turns(
+                    id, session_id, position, role, content, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(turn.id),
+                    str(turn.session_id),
+                    turn.position,
+                    turn.role,
+                    turn.content,
+                    turn.created_at.isoformat(),
+                ),
+            )
+        return turn
+
+    def list_prd_turns(self, session_id: UUID) -> list[PrdTurn]:
+        """Return a PRD session's immutable turns in conversation order."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM prd_turns
+                WHERE session_id = ?
+                ORDER BY position
+                """,
+                (str(session_id),),
+            ).fetchall()
+        return [_row_to_prd_turn(row) for row in rows]
+
     def applied_migrations(self) -> tuple[int, ...]:
         """Return applied migration versions in ascending order."""
         with self.locked_connection() as connection:
@@ -482,4 +596,34 @@ def _row_to_generated_prompt(row: sqlite3.Row) -> GeneratedPrompt:
         version=row["version"],
         body_md=row["body_md"],
         generated_at=datetime.fromisoformat(row["generated_at"]),
+    )
+
+
+def _row_to_borg(row: sqlite3.Row) -> Borg:
+    return Borg(
+        id=UUID(row["id"]),
+        repository_id=UUID(row["repository_id"]),
+        name=row["name"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_prd_session(row: sqlite3.Row) -> PrdSession:
+    return PrdSession(
+        id=UUID(row["id"]),
+        repository_id=UUID(row["repository_id"]),
+        borg_id=UUID(row["borg_id"]),
+        prd_path=Path(row["prd_path"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_prd_turn(row: sqlite3.Row) -> PrdTurn:
+    return PrdTurn(
+        id=UUID(row["id"]),
+        session_id=UUID(row["session_id"]),
+        position=row["position"],
+        role=row["role"],
+        content=row["content"],
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
