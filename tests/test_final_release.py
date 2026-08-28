@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,41 @@ def test_partial_fixture_stops_at_the_first_ordered_publication_gate(
     assert partial in joined.casefold()
 
 
+def test_pypi_partial_does_not_require_unbuilt_github_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _github, fixture = _write_fixture(tmp_path)
+    (fixture / "pypi.json").write_text("null\n", encoding="utf-8")
+    shutil.rmtree(fixture / "github" / "assets")
+    (fixture / "github" / "release.json").write_text("null\n", encoding="utf-8")
+    (fixture / "npm.json").write_text("null\n", encoding="utf-8")
+    _deny_public_access(monkeypatch)
+
+    result = verify_final_release.verify_final_release(
+        VERSION, registry, fixture=fixture
+    )
+
+    assert result.complete is False
+    assert "PyPI" in " ".join(result.remaining)
+
+
+def test_github_not_started_does_not_require_unbuilt_github_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, _github, fixture = _write_fixture(tmp_path)
+    shutil.rmtree(fixture / "github" / "assets")
+    (fixture / "github" / "release.json").write_text("null\n", encoding="utf-8")
+    (fixture / "npm.json").write_text("null\n", encoding="utf-8")
+    _deny_public_access(monkeypatch)
+
+    result = verify_final_release.verify_final_release(
+        VERSION, registry, fixture=fixture
+    )
+
+    assert result.complete is False
+    assert result.remaining[0] == "create the draft GitHub Release"
+
+
 @pytest.mark.parametrize("surface", ("pypi", "github", "npm"))
 def test_public_digest_mismatch_is_terminal_for_every_surface(
     tmp_path: Path,
@@ -270,6 +306,90 @@ def test_integrated_fixture_rejects_a_provider_credential_leak(
         )
 
     assert CREDENTIAL not in str(raised.value)
+
+
+def _run_main(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: Path,
+    fixture: Path,
+    github: Path | None = None,
+) -> int:
+    arguments = [
+        "verify_final_release.py",
+        "--version",
+        VERSION,
+        "--registry-artifacts",
+        str(registry),
+        "--fixture",
+        str(fixture),
+        "--attempts",
+        "1",
+        "--retry-delay",
+        "0",
+    ]
+    if github is not None:
+        arguments.extend(("--github-artifacts", str(github)))
+    monkeypatch.setattr(sys, "argv", arguments)
+    return verify_final_release.main()
+
+
+def test_cli_exit_status_zero_means_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry, github, fixture = _write_fixture(tmp_path)
+    _deny_public_access(monkeypatch)
+
+    assert _run_main(monkeypatch, registry, fixture, github) == 0
+    assert "verified synchronized BetterBorg" in capsys.readouterr().out
+
+
+def test_cli_exit_status_two_needs_only_available_pypi_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry, _github, fixture = _write_fixture(tmp_path)
+    (fixture / "pypi.json").write_text("null\n", encoding="utf-8")
+    shutil.rmtree(fixture / "github" / "assets")
+    (fixture / "github" / "release.json").write_text("null\n", encoding="utf-8")
+    (fixture / "npm.json").write_text("null\n", encoding="utf-8")
+    _deny_public_access(monkeypatch)
+
+    assert _run_main(monkeypatch, registry, fixture) == 2
+    assert "publication is partial" in capsys.readouterr().out
+
+
+def test_cli_exit_status_one_names_an_immutable_terminal_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry, github, fixture = _write_fixture(tmp_path)
+    payload = json.loads((fixture / "pypi.json").read_text(encoding="utf-8"))
+    payload["urls"][0]["digests"]["sha256"] = "0" * 64
+    (fixture / "pypi.json").write_text(json.dumps(payload), encoding="utf-8")
+    _deny_public_access(monkeypatch)
+
+    assert _run_main(monkeypatch, registry, fixture, github) == 1
+    error = capsys.readouterr().err
+    assert "immutable" in error
+    assert "prepare a new version" in error
+
+
+def test_cli_exit_status_one_reports_a_retryable_local_input_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    registry, _github, fixture = _write_fixture(tmp_path)
+    _deny_public_access(monkeypatch)
+
+    assert _run_main(monkeypatch, registry, fixture) == 1
+    error = capsys.readouterr().err
+    assert "--github-artifacts is required" in error
+    assert "prepare a new version" not in error
 
 
 def test_public_install_and_command_docs_match_release_artifacts() -> None:

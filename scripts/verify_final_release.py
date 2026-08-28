@@ -91,6 +91,14 @@ def _npm_status(
         _fail(f"npm verification failed: {error}")
 
 
+def _npm_present(version: str, fixture: Path | None) -> bool:
+    npm_fixture = fixture / "npm.json" if fixture is not None else None
+    try:
+        return reconcile_npm_release.version_exists(version, fixture=npm_fixture)
+    except reconcile_npm_release.NpmReconciliationError as error:
+        _fail(f"npm verification failed: {error}")
+
+
 def _github_snapshot(
     version: str,
     repository: str,
@@ -117,7 +125,7 @@ def _github_snapshot(
 def _surface_result(
     version: str,
     registry_artifacts: Path,
-    github_artifacts: Path,
+    github_artifacts: Path | None,
     repository: str,
     reviewed_sha: str | None,
     fixture: Path | None,
@@ -131,16 +139,9 @@ def _surface_result(
         fixture,
         download_directory,
     )
-    try:
-        verify_github_release.compare_reviewed_assets(snapshot, github_artifacts)
-        github = verify_github_release.verify_snapshot(version, snapshot)
-    except verify_github_release.GitHubReleaseVerificationError as error:
-        _fail(f"GitHub verification failed: {error}")
-
-    npm = _npm_status(version, registry_artifacts, fixture)
     github_started = snapshot is not None
-    npm_present = npm == "skip"
     if pypi == "publish":
+        npm_present = _npm_present(version, fixture)
         if github_started or npm_present:
             _fail(
                 "publication order violation: GitHub or npm exists before the "
@@ -154,7 +155,20 @@ def _surface_result(
             ),
         )
 
+    if snapshot is not None and github_artifacts is None:
+        _fail(
+            "--github-artifacts is required once GitHub publication has started; "
+            f"download binary-release-{version} from the reviewed workflow run"
+        )
+    try:
+        if github_artifacts is not None:
+            verify_github_release.compare_reviewed_assets(snapshot, github_artifacts)
+        github = verify_github_release.verify_snapshot(version, snapshot)
+    except verify_github_release.GitHubReleaseVerificationError as error:
+        _fail(f"GitHub verification failed: {error}")
+
     if not github.complete:
+        npm_present = _npm_present(version, fixture)
         if npm_present:
             _fail(
                 "publication order violation: npm exists before the GitHub "
@@ -162,6 +176,7 @@ def _surface_result(
             )
         return VerificationResult(False, github.remaining)
 
+    npm = _npm_status(version, registry_artifacts, fixture)
     if npm == "publish":
         return VerificationResult(
             False,
@@ -285,7 +300,7 @@ def _fixture_smoke(path: Path) -> tuple[str, str | None]:
 def verify_final_release(
     version: str,
     registry_artifacts: Path,
-    github_artifacts: Path,
+    github_artifacts: Path | None = None,
     *,
     repository: str = REPOSITORY,
     reviewed_sha: str | None = None,
@@ -337,7 +352,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
     parser.add_argument("--registry-artifacts", required=True, type=Path)
-    parser.add_argument("--github-artifacts", required=True, type=Path)
+    parser.add_argument(
+        "--github-artifacts",
+        type=Path,
+        help=(
+            "reviewed binary-release artifact directory; required after GitHub "
+            "publication starts"
+        ),
+    )
     parser.add_argument("--repository", default=REPOSITORY)
     parser.add_argument("--reviewed-sha")
     parser.add_argument(

@@ -109,18 +109,15 @@ different commit under the reviewed tag's version.
 
 ## Verify the synchronized public release
 
-After the publish-enabled workflow completes, retain its run ID and download
-the two build-once artifact sets from that same reviewed run. Do not rebuild
-either input for verification:
+Retain the publish-enabled workflow run ID. The registry inputs exist as soon
+as validation completes, so download them even when the protected run stops at
+PyPI. Do not rebuild an input for verification:
 
 ```console
-mkdir -p verified-registry-inputs verified-github-assets
+mkdir -p verified-registry-inputs
 gh run download RUN_ID \
   --name betterborg-registry-inputs-VERSION \
   --dir verified-registry-inputs
-gh run download RUN_ID \
-  --name binary-release-VERSION \
-  --dir verified-github-assets
 git rev-parse HEAD
 ```
 
@@ -130,6 +127,22 @@ recorded full SHA from the final command above:
 
 ```console
 export OPENAI_API_KEY='value supplied by the protected secret manager'
+python scripts/verify_final_release.py \
+  --version VERSION \
+  --reviewed-sha REVIEWED_COMMIT_SHA \
+  --registry-artifacts verified-registry-inputs
+```
+
+This first check can report a missing PyPI version or a not-yet-started GitHub
+Release without the downstream binary artifact. Once the workflow has produced
+`binary-release-VERSION`, download that artifact from the same run and include
+it in every subsequent check:
+
+```console
+mkdir -p verified-github-assets
+gh run download RUN_ID \
+  --name binary-release-VERSION \
+  --dir verified-github-assets
 python scripts/verify_final_release.py \
   --version VERSION \
   --reviewed-sha REVIEWED_COMMIT_SHA \
@@ -164,9 +177,12 @@ The version output from curl, uvx, and npx must be exactly `borg VERSION`.
 Exit status `0` means every public digest and smoke matches. Exit status `2`
 means publication is safely partial and lists only the next digest-gated step;
 resume the same reviewed workflow run with **Re-run failed jobs**, then rerun
-the verifier. Exit status `1` is terminal for that version: preserve the
-evidence and prepare a new greater version. The verifier has no registry or
-GitHub publication command and must never be given write-scoped credentials.
+the verifier. Exit status `1` means verification could not safely determine a
+resumable state. Inspect its error: only an error that explicitly identifies
+immutable public state and says to prepare a new version is terminal. Retry
+transient registry, GitHub, credential, tooling, and local-input failures after
+correcting the reported cause. The verifier has no registry or GitHub
+publication command and must never be given write-scoped credentials.
 
 Linux binaries are built natively on `ubuntu-24.04` and
 `ubuntu-24.04-arm` inside the architecture-matched PyPA `manylinux2014`
