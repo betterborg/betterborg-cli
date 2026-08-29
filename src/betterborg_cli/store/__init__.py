@@ -6,8 +6,10 @@ from betterborg_cli.store.models import (
     BorgState,
     ComposeResource,
     EnvironmentAttempt,
+    ExecutionAttemptStatus,
     ExecutionEvent,
     ExecutionRun,
+    ExecutionRunAcquisition,
     ExecutionRunStatus,
     GeneratedPrompt,
     Operation,
@@ -33,7 +35,12 @@ from betterborg_cli.store.models import (
     TaskRuntime,
     TaskRuntimeStatus,
 )
-from betterborg_cli.store.sqlite import SqliteStore, StaleBorgStateError
+from betterborg_cli.store.sqlite import (
+    ExecutionOwnershipError,
+    SqliteStore,
+    StaleBorgStateError,
+    StaleTaskRuntimeError,
+)
 
 __all__ = [
     "AgentAttempt",
@@ -41,8 +48,11 @@ __all__ = [
     "BorgState",
     "ComposeResource",
     "EnvironmentAttempt",
+    "ExecutionAttemptStatus",
     "ExecutionEvent",
+    "ExecutionOwnershipError",
     "ExecutionRun",
+    "ExecutionRunAcquisition",
     "ExecutionRunStatus",
     "GeneratedPrompt",
     "Operation",
@@ -59,6 +69,7 @@ __all__ = [
     "RepositoryPackage",
     "SqliteStore",
     "StaleBorgStateError",
+    "StaleTaskRuntimeError",
     "TaskBatch",
     "TaskClaim",
     "TaskComplexity",

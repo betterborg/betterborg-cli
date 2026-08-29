@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from uuid import UUID
@@ -22,8 +22,10 @@ from betterborg_cli.store.models import (
     BorgState,
     ComposeResource,
     EnvironmentAttempt,
+    ExecutionAttemptStatus,
     ExecutionEvent,
     ExecutionRun,
+    ExecutionRunAcquisition,
     ExecutionRunStatus,
     GeneratedPrompt,
     Operation,
@@ -52,10 +54,69 @@ from betterborg_cli.store.models import (
 )
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
+_TERMINAL_ATTEMPT_EVENT_KINDS = frozenset(
+    {
+        "environment.attempt_finished",
+        "environment.attempt_interrupted",
+        "agent.attempt_finished",
+        "agent.attempt_interrupted",
+    }
+)
 
 
 class StaleBorgStateError(RuntimeError):
     """Raised when a Borg state compare-and-set loses a concurrent race."""
+
+
+class ExecutionOwnershipError(RuntimeError):
+    """Raised when a caller no longer owns a live execution lease."""
+
+
+class StaleTaskRuntimeError(RuntimeError):
+    """Raised when a guarded task phase transition loses its race."""
+
+
+_ACTIVE_TASK_STATUSES = frozenset(
+    {
+        TaskRuntimeStatus.CLAIMED,
+        TaskRuntimeStatus.ENVIRONMENT,
+        TaskRuntimeStatus.CODING,
+        TaskRuntimeStatus.REVIEW,
+        TaskRuntimeStatus.FIX,
+        TaskRuntimeStatus.MERGING,
+    }
+)
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskRuntimeStatus.DONE,
+        TaskRuntimeStatus.BLOCKED,
+        TaskRuntimeStatus.FAILED,
+    }
+)
+_TASK_TRANSITIONS = {
+    TaskRuntimeStatus.CLAIMED: (
+        _ACTIVE_TASK_STATUSES | _TERMINAL_TASK_STATUSES
+    )
+    - {TaskRuntimeStatus.CLAIMED},
+    TaskRuntimeStatus.ENVIRONMENT: {
+        TaskRuntimeStatus.CODING,
+        *_TERMINAL_TASK_STATUSES,
+    },
+    TaskRuntimeStatus.CODING: {
+        TaskRuntimeStatus.REVIEW,
+        *_TERMINAL_TASK_STATUSES,
+    },
+    TaskRuntimeStatus.REVIEW: {
+        TaskRuntimeStatus.FIX,
+        TaskRuntimeStatus.MERGING,
+        *_TERMINAL_TASK_STATUSES,
+    },
+    TaskRuntimeStatus.FIX: {
+        TaskRuntimeStatus.REVIEW,
+        *_TERMINAL_TASK_STATUSES,
+    },
+    TaskRuntimeStatus.MERGING: _TERMINAL_TASK_STATUSES,
+}
 
 
 class SqliteStore:
@@ -1054,28 +1115,930 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_task_dependency(row) for row in rows]
 
+    def acquire_execution_run(
+        self,
+        borg_id: UUID,
+        generation_id: UUID,
+        *,
+        lease_duration: timedelta,
+        now: datetime | None = None,
+    ) -> ExecutionRunAcquisition:
+        """Atomically acquire a run or return the live operation already owning it."""
+        acquired_at = _execution_time(now)
+        lease_expires_at = _lease_expiry(acquired_at, lease_duration)
+        with self.transaction() as connection:
+            generation = connection.execute(
+                """
+                SELECT 1 FROM task_generations
+                WHERE id = ? AND borg_id = ? AND status = 'current'
+                """,
+                (str(generation_id), str(borg_id)),
+            ).fetchone()
+            if generation is None:
+                raise ValueError(
+                    "execution runs require the Borg's current task generation"
+                )
+
+            live = connection.execute(
+                "SELECT * FROM execution_runs WHERE borg_id = ? AND status = 'running'",
+                (str(borg_id),),
+            ).fetchone()
+            if live is not None and datetime.fromisoformat(
+                live["lease_expires_at"]
+            ) <= acquired_at:
+                self._interrupt_run(
+                    connection,
+                    live,
+                    now=acquired_at,
+                    reason="execution lease expired",
+                    event_kind="run.expired",
+                )
+                live = None
+            if live is not None:
+                return ExecutionRunAcquisition(
+                    operation_id=UUID(live["id"]),
+                    owner_token=None,
+                    acquired=False,
+                )
+
+            run = ExecutionRun(
+                borg_id=borg_id,
+                generation_id=generation_id,
+                started_at=acquired_at,
+                heartbeat_at=acquired_at,
+                lease_expires_at=lease_expires_at,
+            )
+            self._insert_execution_run(connection, run)
+            task_rows = connection.execute(
+                "SELECT id FROM task_records WHERE generation_id = ?",
+                (str(generation_id),),
+            ).fetchall()
+            for task_row in task_rows:
+                runtime = TaskRuntime(
+                    generation_id=generation_id,
+                    task_id=UUID(task_row["id"]),
+                    created_at=acquired_at,
+                    updated_at=acquired_at,
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO task_runtimes(
+                        id, generation_id, task_id, status, resume_phase,
+                        review_round, state_reason, branch, worktree_path,
+                        last_run_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(runtime.id),
+                        str(runtime.generation_id),
+                        str(runtime.task_id),
+                        runtime.status.value,
+                        runtime.resume_phase,
+                        runtime.review_round,
+                        runtime.state_reason,
+                        runtime.branch,
+                        runtime.worktree_path,
+                        None,
+                        acquired_at.isoformat(),
+                        acquired_at.isoformat(),
+                    ),
+                )
+            self._insert_execution_event(
+                connection,
+                run_id=run.id,
+                kind="run.acquired",
+                payload={"generation_id": str(generation_id)},
+                created_at=acquired_at,
+            )
+        return ExecutionRunAcquisition(
+            operation_id=run.id,
+            owner_token=run.owner_token,
+            acquired=True,
+        )
+
+    def renew_execution_run(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        *,
+        lease_duration: timedelta,
+        now: datetime | None = None,
+    ) -> ExecutionRun:
+        """Renew a live run and all of its open task claims under one write lock."""
+        heartbeat_at = _execution_time(now)
+        lease_expires_at = _lease_expiry(heartbeat_at, lease_duration)
+        expired = False
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"execution run {run_id} not found")
+            if row["owner_token"] != owner_token:
+                raise ExecutionOwnershipError("execution run ownership changed")
+            if row["status"] != ExecutionRunStatus.RUNNING.value:
+                raise ExecutionOwnershipError("execution run is no longer running")
+            if datetime.fromisoformat(row["lease_expires_at"]) <= heartbeat_at:
+                self._interrupt_run(
+                    connection,
+                    row,
+                    now=heartbeat_at,
+                    reason="execution lease expired",
+                    event_kind="run.expired",
+                )
+                expired = True
+            else:
+                self._reconcile_expired_claims(
+                    connection, run_id, now=heartbeat_at
+                )
+                connection.execute(
+                    """
+                    UPDATE execution_runs
+                    SET heartbeat_at = ?, lease_expires_at = ?
+                    WHERE id = ? AND owner_token = ? AND status = 'running'
+                    """,
+                    (
+                        heartbeat_at.isoformat(),
+                        lease_expires_at.isoformat(),
+                        str(run_id),
+                        owner_token,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE task_claims
+                    SET lease_expires_at = ?
+                    WHERE run_id = ? AND released_at IS NULL
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        lease_expires_at.isoformat(),
+                        str(run_id),
+                        heartbeat_at.isoformat(),
+                    ),
+                )
+                self._insert_execution_event(
+                    connection,
+                    run_id=run_id,
+                    kind="run.lease_renewed",
+                    payload={"lease_expires_at": lease_expires_at.isoformat()},
+                    created_at=heartbeat_at,
+                )
+            updated = connection.execute(
+                "SELECT * FROM execution_runs WHERE id = ?", (str(run_id),)
+            ).fetchone()
+        if expired:
+            raise ExecutionOwnershipError("execution run lease expired")
+        return _row_to_execution_run(updated)
+
+    def claim_dependency_ready_task(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        *,
+        lease_duration: timedelta,
+        now: datetime | None = None,
+    ) -> TaskClaim | None:
+        """Claim the first unowned task whose dependencies are all complete."""
+        claimed_at = _execution_time(now)
+        requested_expiry = _lease_expiry(claimed_at, lease_duration)
+        with self.transaction() as connection:
+            run = self._require_live_run(
+                connection, run_id, owner_token, now=claimed_at
+            )
+            self._reconcile_expired_claims(connection, run_id, now=claimed_at)
+            run_expiry = datetime.fromisoformat(run["lease_expires_at"])
+            lease_expires_at = min(requested_expiry, run_expiry)
+            task = connection.execute(
+                """
+                SELECT task.id, runtime.resume_phase
+                FROM task_records AS task
+                JOIN task_runtimes AS runtime ON runtime.task_id = task.id
+                WHERE task.generation_id = ?
+                  AND runtime.status = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_claims AS claim
+                      WHERE claim.task_id = task.id AND claim.released_at IS NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM task_dependencies AS dependency
+                      LEFT JOIN task_runtimes AS prerequisite
+                        ON prerequisite.task_id = dependency.depends_on_task_id
+                      WHERE dependency.task_id = task.id
+                        AND (
+                            prerequisite.id IS NULL
+                            OR prerequisite.status != 'done'
+                        )
+                  )
+                ORDER BY task.position, task.id
+                LIMIT 1
+                """,
+                (run["generation_id"],),
+            ).fetchone()
+            if task is None:
+                return None
+
+            claim = TaskClaim(
+                run_id=run_id,
+                task_id=UUID(task["id"]),
+                resume_phase=task["resume_phase"],
+                claimed_at=claimed_at,
+                lease_expires_at=lease_expires_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_claims(
+                    id, run_id, generation_id, task_id, claim_token,
+                    resume_phase, claimed_at, lease_expires_at, released_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    str(claim.id),
+                    str(run_id),
+                    run["generation_id"],
+                    str(claim.task_id),
+                    claim.claim_token,
+                    claim.resume_phase,
+                    claimed_at.isoformat(),
+                    lease_expires_at.isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE task_runtimes
+                SET status = 'claimed', last_run_id = ?, state_reason = NULL,
+                    updated_at = ?
+                WHERE task_id = ? AND status = 'pending'
+                """,
+                (str(run_id), claimed_at.isoformat(), str(claim.task_id)),
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                task_id=claim.task_id,
+                kind="task.claimed",
+                payload={
+                    "claim_id": str(claim.id),
+                    "resume_phase": claim.resume_phase,
+                },
+                created_at=claimed_at,
+            )
+        return claim
+
+    def transition_task_runtime(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        claim_id: UUID,
+        claim_token: str,
+        *,
+        expected_status: TaskRuntimeStatus,
+        new_status: TaskRuntimeStatus,
+        resume_phase: str | None = None,
+        review_round: int | None = None,
+        state_reason: str | None = None,
+        branch: str | None = None,
+        worktree_path: str | None = None,
+        now: datetime | None = None,
+    ) -> TaskRuntime:
+        """Compare-and-set one task phase while both run leases are still owned."""
+        transitioned_at = _execution_time(now)
+        if not isinstance(expected_status, TaskRuntimeStatus) or not isinstance(
+            new_status, TaskRuntimeStatus
+        ):
+            raise TypeError("task runtime states must be TaskRuntimeStatus values")
+        next_phase = resume_phase or new_status.value
+        if not next_phase.strip():
+            raise ValueError("task resume phase must not be empty")
+        if review_round is not None and review_round < 0:
+            raise ValueError("task review round must not be negative")
+        if new_status not in _TASK_TRANSITIONS.get(expected_status, frozenset()):
+            raise ValueError(
+                f"illegal task phase transition: {expected_status.value} -> "
+                f"{new_status.value}"
+            )
+
+        with self.transaction() as connection:
+            self._require_live_run(connection, run_id, owner_token, now=transitioned_at)
+            claim = connection.execute(
+                """
+                SELECT * FROM task_claims
+                WHERE id = ? AND run_id = ? AND claim_token = ?
+                  AND released_at IS NULL AND lease_expires_at > ?
+                """,
+                (
+                    str(claim_id),
+                    str(run_id),
+                    claim_token,
+                    transitioned_at.isoformat(),
+                ),
+            ).fetchone()
+            if claim is None:
+                raise ExecutionOwnershipError("task claim is no longer owned")
+            assignments = [
+                "status = ?",
+                "resume_phase = ?",
+                "state_reason = ?",
+                "updated_at = ?",
+            ]
+            parameters: list[object] = [
+                new_status.value,
+                next_phase,
+                state_reason,
+                transitioned_at.isoformat(),
+            ]
+            if review_round is not None:
+                assignments.append("review_round = ?")
+                parameters.append(review_round)
+            if branch is not None:
+                assignments.append("branch = ?")
+                parameters.append(branch)
+            if worktree_path is not None:
+                assignments.append("worktree_path = ?")
+                parameters.append(worktree_path)
+            parameters.extend((claim["task_id"], expected_status.value))
+            cursor = connection.execute(
+                f"""
+                UPDATE task_runtimes SET {", ".join(assignments)}
+                WHERE task_id = ? AND status = ?
+                """,
+                parameters,
+            )
+            if cursor.rowcount != 1:
+                raise StaleTaskRuntimeError(
+                    "task phase changed before compare-and-set transition"
+                )
+            task_id = UUID(claim["task_id"])
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                task_id=task_id,
+                kind="task.phase_transitioned",
+                payload={
+                    "claim_id": str(claim_id),
+                    "from": expected_status.value,
+                    "to": new_status.value,
+                    "resume_phase": next_phase,
+                },
+                created_at=transitioned_at,
+            )
+            terminal_without_cleanup = (
+                new_status in _TERMINAL_TASK_STATUSES
+                and not self._claim_has_pending_compose(connection, claim_id)
+            )
+            if terminal_without_cleanup:
+                connection.execute(
+                    "UPDATE task_claims SET released_at = ? WHERE id = ?",
+                    (transitioned_at.isoformat(), str(claim_id)),
+                )
+            updated = connection.execute(
+                "SELECT * FROM task_runtimes WHERE task_id = ?", (str(task_id),)
+            ).fetchone()
+        return _row_to_task_runtime(updated)
+
+    def interrupt_execution_run(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        *,
+        reason: str = "execution interrupted",
+        now: datetime | None = None,
+    ) -> list[ComposeResource]:
+        """Cooperatively stop an owned run and return cleanup still required."""
+        interrupted_at = _execution_time(now)
+        if not reason.strip():
+            raise ValueError("execution interruption reason must not be empty")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_runs WHERE id = ?", (str(run_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"execution run {run_id} not found")
+            if row["owner_token"] != owner_token:
+                raise ExecutionOwnershipError("execution run ownership changed")
+            if row["status"] == ExecutionRunStatus.RUNNING.value:
+                self._interrupt_run(
+                    connection,
+                    row,
+                    now=interrupted_at,
+                    reason=reason,
+                    event_kind="run.interrupted",
+                )
+            rows = self._stale_compose_rows(connection, run_id=run_id)
+        return [_row_to_compose_resource(row) for row in rows]
+
+    def reconcile_expired_execution_runs(
+        self, *, now: datetime | None = None
+    ) -> list[ComposeResource]:
+        """Interrupt every expired run and identify exact pending Compose resources."""
+        reconciled_at = _execution_time(now)
+        with self.transaction() as connection:
+            expired = connection.execute(
+                """
+                SELECT * FROM execution_runs
+                WHERE status = 'running' AND lease_expires_at <= ?
+                ORDER BY lease_expires_at, id
+                """,
+                (reconciled_at.isoformat(),),
+            ).fetchall()
+            for row in expired:
+                self._interrupt_run(
+                    connection,
+                    row,
+                    now=reconciled_at,
+                    reason="execution lease expired",
+                    event_kind="run.expired",
+                )
+            rows = self._stale_compose_rows(connection)
+        return [_row_to_compose_resource(row) for row in rows]
+
+    def list_stale_compose_resources(
+        self, run_id: UUID | None = None
+    ) -> list[ComposeResource]:
+        """Return stale resources whose exact project awaits teardown."""
+        with self.locked_connection() as connection:
+            rows = self._stale_compose_rows(connection, run_id=run_id)
+        return [_row_to_compose_resource(row) for row in rows]
+
+    def confirm_compose_project_cleanup(
+        self,
+        run_id: UUID,
+        task_id: UUID,
+        project_name: str,
+        *,
+        now: datetime | None = None,
+    ) -> list[ComposeResource]:
+        """Record successful external teardown and release its blocked claim."""
+        cleaned_at = _execution_time(now)
+        if not project_name.strip():
+            raise ValueError("Compose project name must not be empty")
+        with self.transaction() as connection:
+            resources = connection.execute(
+                """
+                SELECT * FROM compose_resources
+                WHERE run_id = ? AND task_id = ? AND project_name = ?
+                ORDER BY created_at, id
+                """,
+                (str(run_id), str(task_id), project_name),
+            ).fetchall()
+            if not resources:
+                raise KeyError("Compose project identity not found")
+            self._reconcile_expired_claims(connection, run_id, now=cleaned_at)
+            pending = [
+                row
+                for row in resources
+                if not self._compose_resource_cleanup_confirmed(
+                    connection,
+                    run_id=run_id,
+                    task_id=task_id,
+                    resource_id=UUID(row["id"]),
+                )
+            ]
+            if pending:
+                self._insert_execution_event(
+                    connection,
+                    run_id=run_id,
+                    task_id=task_id,
+                    kind="compose.cleanup_completed",
+                    payload={
+                        "project_name": project_name,
+                        "resource_ids": [row["id"] for row in pending],
+                    },
+                    created_at=cleaned_at,
+                )
+            claim_ids = {UUID(row["claim_id"]) for row in resources}
+            for claim_id in claim_ids:
+                if not self._claim_has_pending_compose(connection, claim_id):
+                    claim = connection.execute(
+                        "SELECT lease_expires_at FROM task_claims WHERE id = ?",
+                        (str(claim_id),),
+                    ).fetchone()
+                    self._release_reconciled_claim(
+                        connection,
+                        claim_id,
+                        now=cleaned_at,
+                        reason="Compose cleanup completed",
+                        force=(
+                            datetime.fromisoformat(claim["lease_expires_at"])
+                            <= cleaned_at
+                        ),
+                    )
+        return [_row_to_compose_resource(row) for row in resources]
+
+    @staticmethod
+    def _insert_execution_run(
+        connection: sqlite3.Connection, run: ExecutionRun
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO execution_runs(
+                id, borg_id, generation_id, owner_token, status, started_at,
+                heartbeat_at, lease_expires_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(run.id),
+                str(run.borg_id),
+                str(run.generation_id),
+                run.owner_token,
+                run.status.value,
+                run.started_at.isoformat(),
+                run.heartbeat_at.isoformat() if run.heartbeat_at else None,
+                run.lease_expires_at.isoformat(),
+                run.finished_at.isoformat() if run.finished_at else None,
+            ),
+        )
+
+    @staticmethod
+    def _insert_execution_event(
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        kind: str,
+        payload: dict[str, object],
+        created_at: datetime,
+        task_id: UUID | None = None,
+        attempt_id: UUID | None = None,
+    ) -> None:
+        event = ExecutionEvent(
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            kind=kind,
+            payload=payload,
+            created_at=created_at,
+        )
+        connection.execute(
+            """
+            INSERT INTO execution_events(
+                id, run_id, task_id, attempt_id, kind, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(event.id),
+                str(run_id),
+                str(task_id) if task_id else None,
+                str(attempt_id) if attempt_id else None,
+                kind,
+                _encode_json(payload),
+                created_at.isoformat(),
+            ),
+        )
+
+    def _require_live_run(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        owner_token: str,
+        *,
+        now: datetime,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM execution_runs WHERE id = ?", (str(run_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"execution run {run_id} not found")
+        if row["owner_token"] != owner_token:
+            raise ExecutionOwnershipError("execution run ownership changed")
+        if row["status"] != ExecutionRunStatus.RUNNING.value:
+            raise ExecutionOwnershipError("execution run is no longer running")
+        if datetime.fromisoformat(row["lease_expires_at"]) <= now:
+            raise ExecutionOwnershipError("execution run lease expired")
+        return row
+
+    def _require_live_claim(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        owner_token: str,
+        claim_id: UUID,
+        claim_token: str,
+        task_id: UUID,
+        now: datetime,
+    ) -> sqlite3.Row:
+        self._require_live_run(connection, run_id, owner_token, now=now)
+        claim = connection.execute(
+            """
+            SELECT * FROM task_claims
+            WHERE id = ? AND run_id = ? AND task_id = ? AND claim_token = ?
+              AND released_at IS NULL AND lease_expires_at > ?
+            """,
+            (
+                str(claim_id),
+                str(run_id),
+                str(task_id),
+                claim_token,
+                now.isoformat(),
+            ),
+        ).fetchone()
+        if claim is None:
+            raise ExecutionOwnershipError("task claim is no longer owned")
+        return claim
+
+    def _interrupt_run(
+        self,
+        connection: sqlite3.Connection,
+        run: sqlite3.Row,
+        *,
+        now: datetime,
+        reason: str,
+        event_kind: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            UPDATE execution_runs
+            SET status = 'cancelled', finished_at = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (now.isoformat(), run["id"]),
+        )
+        if cursor.rowcount != 1:
+            return
+        self._interrupt_open_attempts(
+            connection,
+            run_id=UUID(run["id"]),
+            now=now,
+            reason=reason,
+        )
+        claims = connection.execute(
+            """
+            SELECT id, task_id FROM task_claims
+            WHERE run_id = ? AND released_at IS NULL
+            """,
+            (run["id"],),
+        ).fetchall()
+        for claim in claims:
+            claim_id = UUID(claim["id"])
+            task_id = UUID(claim["task_id"])
+            self._insert_execution_event(
+                connection,
+                run_id=UUID(run["id"]),
+                task_id=task_id,
+                kind="task.interrupted",
+                payload={"claim_id": claim["id"], "reason": reason},
+                created_at=now,
+            )
+            if self._claim_has_pending_compose(connection, claim_id):
+                connection.execute(
+                    """
+                    UPDATE task_runtimes SET state_reason = ?, updated_at = ?
+                    WHERE task_id = ? AND status NOT IN ('done', 'blocked', 'failed')
+                    """,
+                    (
+                        f"{reason}; awaiting Compose cleanup",
+                        now.isoformat(),
+                        claim["task_id"],
+                    ),
+                )
+            else:
+                self._release_reconciled_claim(
+                    connection, claim_id, now=now, reason=reason
+                )
+        self._insert_execution_event(
+            connection,
+            run_id=UUID(run["id"]),
+            kind=event_kind,
+            payload={"reason": reason},
+            created_at=now,
+        )
+
+    def _interrupt_open_attempts(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        now: datetime,
+        reason: str,
+        claim_id: UUID | None = None,
+    ) -> None:
+        for table, event_kind in (
+            ("environment_attempts", "environment.attempt_interrupted"),
+            ("agent_attempts", "agent.attempt_interrupted"),
+        ):
+            claim_parameter = str(claim_id) if claim_id is not None else None
+            attempts = connection.execute(
+                f"""
+                SELECT id, task_id FROM {table} AS attempt
+                WHERE run_id = ? AND status = 'running'
+                  AND (? IS NULL OR claim_id = ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM execution_events AS event
+                      WHERE event.attempt_id = attempt.id
+                        AND event.kind IN (
+                            'environment.attempt_finished',
+                            'environment.attempt_interrupted',
+                            'agent.attempt_finished',
+                            'agent.attempt_interrupted'
+                        )
+                  )
+                ORDER BY started_at, id
+                """,
+                (str(run_id), claim_parameter, claim_parameter),
+            ).fetchall()
+            for attempt in attempts:
+                self._insert_execution_event(
+                    connection,
+                    run_id=run_id,
+                    task_id=UUID(attempt["task_id"]),
+                    attempt_id=UUID(attempt["id"]),
+                    kind=event_kind,
+                    payload={"reason": reason},
+                    created_at=now,
+                )
+
+    def _release_reconciled_claim(
+        self,
+        connection: sqlite3.Connection,
+        claim_id: UUID,
+        *,
+        now: datetime,
+        reason: str,
+        force: bool = False,
+    ) -> None:
+        claim = connection.execute(
+            "SELECT * FROM task_claims WHERE id = ?", (str(claim_id),)
+        ).fetchone()
+        if claim is None or claim["released_at"] is not None:
+            return
+        runtime = connection.execute(
+            "SELECT status FROM task_runtimes WHERE task_id = ?",
+            (claim["task_id"],),
+        ).fetchone()
+        run = connection.execute(
+            "SELECT status FROM execution_runs WHERE id = ?", (claim["run_id"],)
+        ).fetchone()
+        runtime_status = TaskRuntimeStatus(runtime["status"])
+        may_release = force or (
+            run["status"] != ExecutionRunStatus.RUNNING.value
+            or runtime_status in _TERMINAL_TASK_STATUSES
+        )
+        if not may_release:
+            return
+        connection.execute(
+            "UPDATE task_claims SET released_at = ? WHERE id = ?",
+            (now.isoformat(), str(claim_id)),
+        )
+        if runtime_status in _ACTIVE_TASK_STATUSES:
+            connection.execute(
+                """
+                UPDATE task_runtimes
+                SET status = 'pending', state_reason = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (reason, now.isoformat(), claim["task_id"]),
+            )
+
+    def _reconcile_expired_claims(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        *,
+        now: datetime,
+    ) -> None:
+        expired = connection.execute(
+            """
+            SELECT id, task_id FROM task_claims
+            WHERE run_id = ? AND released_at IS NULL AND lease_expires_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM execution_events AS event
+                  WHERE event.run_id = task_claims.run_id
+                    AND event.task_id = task_claims.task_id
+                    AND event.kind = 'task.claim_expired'
+                    AND json_extract(event.payload_json, '$.claim_id') =
+                        task_claims.id
+              )
+            """,
+            (str(run_id), now.isoformat()),
+        ).fetchall()
+        for claim in expired:
+            claim_id = UUID(claim["id"])
+            self._interrupt_open_attempts(
+                connection,
+                run_id=run_id,
+                claim_id=claim_id,
+                now=now,
+                reason="task claim expired",
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                task_id=UUID(claim["task_id"]),
+                kind="task.claim_expired",
+                payload={"claim_id": claim["id"]},
+                created_at=now,
+            )
+            if self._claim_has_pending_compose(connection, claim_id):
+                connection.execute(
+                    """
+                    UPDATE task_runtimes
+                    SET state_reason = ?, updated_at = ?
+                    WHERE task_id = ? AND status NOT IN ('done', 'blocked', 'failed')
+                    """,
+                    (
+                        "task claim expired; awaiting Compose cleanup",
+                        now.isoformat(),
+                        claim["task_id"],
+                    ),
+                )
+            else:
+                self._release_reconciled_claim(
+                    connection,
+                    claim_id,
+                    now=now,
+                    reason="task claim expired",
+                    force=True,
+                )
+
+    @staticmethod
+    def _claim_has_pending_compose(
+        connection: sqlite3.Connection, claim_id: UUID
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM compose_resources AS resource
+            WHERE resource.claim_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM execution_events AS event,
+                       json_each(event.payload_json, '$.resource_ids') AS cleaned
+                  WHERE event.run_id = resource.run_id
+                    AND event.task_id = resource.task_id
+                    AND event.kind = 'compose.cleanup_completed'
+                    AND cleaned.value = resource.id
+              )
+            LIMIT 1
+            """,
+            (str(claim_id),),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _compose_resource_cleanup_confirmed(
+        connection: sqlite3.Connection,
+        *,
+        run_id: UUID,
+        task_id: UUID,
+        resource_id: UUID,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM execution_events AS event,
+                 json_each(event.payload_json, '$.resource_ids') AS cleaned
+            WHERE event.run_id = ? AND event.task_id = ?
+              AND event.kind = 'compose.cleanup_completed'
+              AND cleaned.value = ?
+            LIMIT 1
+            """,
+            (str(run_id), str(task_id), str(resource_id)),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _stale_compose_rows(
+        connection: sqlite3.Connection, *, run_id: UUID | None = None
+    ) -> list[sqlite3.Row]:
+        filters = "AND resource.run_id = ?" if run_id is not None else ""
+        parameters = (str(run_id),) if run_id is not None else ()
+        return connection.execute(
+            f"""
+            SELECT resource.*
+            FROM compose_resources AS resource
+            JOIN execution_runs AS run ON run.id = resource.run_id
+            WHERE (
+                run.status != 'running'
+                OR EXISTS (
+                    SELECT 1 FROM execution_events AS expired
+                    WHERE expired.run_id = resource.run_id
+                      AND expired.task_id = resource.task_id
+                      AND expired.kind = 'task.claim_expired'
+                      AND json_extract(expired.payload_json, '$.claim_id') =
+                          resource.claim_id
+                )
+              )
+              {filters}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM execution_events AS event,
+                       json_each(event.payload_json, '$.resource_ids') AS cleaned
+                  WHERE event.run_id = resource.run_id
+                    AND event.task_id = resource.task_id
+                    AND event.kind = 'compose.cleanup_completed'
+                    AND cleaned.value = resource.id
+              )
+            ORDER BY resource.project_name, resource.created_at, resource.id
+            """,
+            parameters,
+        ).fetchall()
+
     def add_execution_run(self, run: ExecutionRun) -> None:
         """Persist a newly leased execution run."""
         with self.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO execution_runs(
-                    id, borg_id, generation_id, owner_token, status, started_at,
-                    heartbeat_at, lease_expires_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(run.id),
-                    str(run.borg_id),
-                    str(run.generation_id),
-                    run.owner_token,
-                    run.status.value,
-                    run.started_at.isoformat(),
-                    run.heartbeat_at.isoformat() if run.heartbeat_at else None,
-                    run.lease_expires_at.isoformat(),
-                    run.finished_at.isoformat() if run.finished_at else None,
-                ),
-            )
+            self._insert_execution_run(connection, run)
 
     def get_execution_run(self, run_id: UUID) -> ExecutionRun | None:
         """Return an execution run by ID."""
@@ -1214,9 +2177,24 @@ class SqliteStore:
             ).fetchone()
         return row is not None
 
-    def append_environment_attempt(self, attempt: EnvironmentAttempt) -> None:
-        """Append one immutable environment preparation/materialization result."""
+    def append_environment_attempt(
+        self,
+        attempt: EnvironmentAttempt,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Append an environment attempt while its execution lease is owned."""
+        persisted_at = _execution_time(now)
         with self.transaction() as connection:
+            self._require_attempt_ownership(
+                connection,
+                attempt,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO environment_attempts(
@@ -1243,7 +2221,11 @@ class SqliteStore:
                     attempt.error,
                     attempt.duration_seconds,
                     attempt.started_at.isoformat(),
-                    attempt.finished_at.isoformat(),
+                    (
+                        attempt.finished_at.isoformat()
+                        if attempt.finished_at is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -1252,17 +2234,88 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM environment_attempts
-                WHERE task_id = ?
-                ORDER BY started_at, id
+                SELECT environment_attempts.*,
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
+                FROM environment_attempts
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = environment_attempts.id
+                 AND terminal.kind IN (
+                    'environment.attempt_finished',
+                    'environment.attempt_interrupted'
+                 )
+                WHERE environment_attempts.task_id = ?
+                ORDER BY environment_attempts.started_at, environment_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_environment_attempt(row) for row in rows]
 
-    def append_agent_attempt(self, attempt: AgentAttempt) -> None:
-        """Append one immutable, billing-aware agent result."""
+    def complete_environment_attempt(
+        self,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        *,
+        status: ExecutionAttemptStatus | AgentStatus,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+        duration_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> EnvironmentAttempt:
+        """Durably finish one owned environment attempt exactly once."""
+        finished_at = _execution_time(now)
+        terminal_status = _terminal_attempt_status(status)
+        if duration_seconds is not None and duration_seconds < 0:
+            raise ValueError("environment attempt duration must not be negative")
         with self.transaction() as connection:
+            attempt = self._require_owned_open_attempt(
+                connection,
+                table="environment_attempts",
+                attempt_id=attempt_id,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=finished_at,
+            )
+            duration = _completed_attempt_duration(
+                attempt, finished_at=finished_at, duration_seconds=duration_seconds
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=UUID(attempt["run_id"]),
+                task_id=UUID(attempt["task_id"]),
+                attempt_id=attempt_id,
+                kind="environment.attempt_finished",
+                payload={
+                    "status": terminal_status.value,
+                    "result": result,
+                    "error": error,
+                    "duration_seconds": duration,
+                },
+                created_at=finished_at,
+            )
+            row = self._environment_attempt_projection(connection, attempt_id)
+        return _row_to_environment_attempt(row)
+
+    def append_agent_attempt(
+        self,
+        attempt: AgentAttempt,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Append a billing-aware agent attempt while its lease is owned."""
+        persisted_at = _execution_time(now)
+        with self.transaction() as connection:
+            self._require_attempt_ownership(
+                connection,
+                attempt,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO agent_attempts(
@@ -1305,7 +2358,11 @@ class SqliteStore:
                     attempt.usage.tokens_cache_write if attempt.usage else None,
                     attempt.usage.num_turns if attempt.usage else None,
                     attempt.started_at.isoformat(),
-                    attempt.finished_at.isoformat(),
+                    (
+                        attempt.finished_at.isoformat()
+                        if attempt.finished_at is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -1314,16 +2371,189 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM agent_attempts
-                WHERE task_id = ?
-                ORDER BY started_at, id
+                SELECT agent_attempts.*,
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
+                FROM agent_attempts
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = agent_attempts.id
+                 AND terminal.kind IN (
+                    'agent.attempt_finished',
+                    'agent.attempt_interrupted'
+                 )
+                WHERE agent_attempts.task_id = ?
+                ORDER BY agent_attempts.started_at, agent_attempts.id
                 """,
                 (str(task_id),),
             ).fetchall()
         return [_row_to_agent_attempt(row) for row in rows]
 
+    def complete_agent_attempt(
+        self,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        *,
+        status: ExecutionAttemptStatus | AgentStatus,
+        result_path: str | None = None,
+        result: dict[str, object] | None = None,
+        summary: str | None = None,
+        duration_seconds: float | None = None,
+        usage: AgentUsage | None = None,
+        now: datetime | None = None,
+    ) -> AgentAttempt:
+        """Durably finish one owned billing-aware agent attempt exactly once."""
+        finished_at = _execution_time(now)
+        terminal_status = _terminal_attempt_status(status)
+        if duration_seconds is not None and duration_seconds < 0:
+            raise ValueError("agent attempt duration must not be negative")
+        if usage is not None and not isinstance(usage, AgentUsage):
+            raise TypeError("agent attempt usage must be an AgentUsage")
+        with self.transaction() as connection:
+            attempt = self._require_owned_open_attempt(
+                connection,
+                table="agent_attempts",
+                attempt_id=attempt_id,
+                owner_token=owner_token,
+                claim_token=claim_token,
+                now=finished_at,
+            )
+            duration = _completed_attempt_duration(
+                attempt, finished_at=finished_at, duration_seconds=duration_seconds
+            )
+            self._insert_execution_event(
+                connection,
+                run_id=UUID(attempt["run_id"]),
+                task_id=UUID(attempt["task_id"]),
+                attempt_id=attempt_id,
+                kind="agent.attempt_finished",
+                payload={
+                    "status": terminal_status.value,
+                    "result_path": result_path,
+                    "result": result,
+                    "summary": summary,
+                    "duration_seconds": duration,
+                    "usage": _agent_usage_payload(usage),
+                },
+                created_at=finished_at,
+            )
+            row = self._agent_attempt_projection(connection, attempt_id)
+        return _row_to_agent_attempt(row)
+
+    def _require_owned_open_attempt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        attempt_id: UUID,
+        owner_token: str,
+        claim_token: str,
+        now: datetime,
+    ) -> sqlite3.Row:
+        if table not in {"environment_attempts", "agent_attempts"}:
+            raise ValueError("unsupported execution attempt table")
+        attempt = connection.execute(
+            f"SELECT * FROM {table} WHERE id = ?", (str(attempt_id),)
+        ).fetchone()
+        if attempt is None:
+            raise KeyError(f"execution attempt {attempt_id} not found")
+        if attempt["status"] != ExecutionAttemptStatus.RUNNING.value:
+            raise ValueError("execution attempt has already finished")
+        terminal = connection.execute(
+            """
+            SELECT 1 FROM execution_events
+            WHERE attempt_id = ? AND kind IN (
+                'environment.attempt_finished',
+                'environment.attempt_interrupted',
+                'agent.attempt_finished',
+                'agent.attempt_interrupted'
+            )
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+        if terminal is not None:
+            raise ValueError("execution attempt has already finished")
+        self._require_live_claim(
+            connection,
+            run_id=UUID(attempt["run_id"]),
+            owner_token=owner_token,
+            claim_id=UUID(attempt["claim_id"]),
+            claim_token=claim_token,
+            task_id=UUID(attempt["task_id"]),
+            now=now,
+        )
+        return attempt
+
+    @staticmethod
+    def _environment_attempt_projection(
+        connection: sqlite3.Connection, attempt_id: UUID
+    ) -> sqlite3.Row:
+        return connection.execute(
+            """
+            SELECT environment_attempts.*,
+                   terminal.kind AS terminal_kind,
+                   terminal.payload_json AS terminal_payload_json,
+                   terminal.created_at AS terminal_at
+            FROM environment_attempts
+            LEFT JOIN execution_events AS terminal
+              ON terminal.attempt_id = environment_attempts.id
+             AND terminal.kind IN (
+                'environment.attempt_finished',
+                'environment.attempt_interrupted'
+             )
+            WHERE environment_attempts.id = ?
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+
+    @staticmethod
+    def _agent_attempt_projection(
+        connection: sqlite3.Connection, attempt_id: UUID
+    ) -> sqlite3.Row:
+        return connection.execute(
+            """
+            SELECT agent_attempts.*,
+                   terminal.kind AS terminal_kind,
+                   terminal.payload_json AS terminal_payload_json,
+                   terminal.created_at AS terminal_at
+            FROM agent_attempts
+            LEFT JOIN execution_events AS terminal
+              ON terminal.attempt_id = agent_attempts.id
+             AND terminal.kind IN (
+                'agent.attempt_finished',
+                'agent.attempt_interrupted'
+             )
+            WHERE agent_attempts.id = ?
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+
+    def _require_attempt_ownership(
+        self,
+        connection: sqlite3.Connection,
+        attempt: EnvironmentAttempt | AgentAttempt,
+        *,
+        owner_token: str,
+        claim_token: str,
+        now: datetime,
+    ) -> None:
+        self._require_live_claim(
+            connection,
+            run_id=attempt.run_id,
+            owner_token=owner_token,
+            claim_id=attempt.claim_id,
+            claim_token=claim_token,
+            task_id=attempt.task_id,
+            now=now,
+        )
+
     def append_execution_event(self, event: ExecutionEvent) -> None:
         """Append one durable execution event."""
+        if event.kind in _TERMINAL_ATTEMPT_EVENT_KINDS:
+            raise ValueError(
+                "terminal attempt lifecycle events require guarded completion"
+            )
         with self.transaction() as connection:
             connection.execute(
                 """
@@ -1355,9 +2585,26 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_execution_event(row) for row in rows]
 
-    def add_compose_resource(self, resource: ComposeResource) -> None:
-        """Persist one task-owned Compose resource identity."""
+    def add_compose_resource(
+        self,
+        resource: ComposeResource,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist Compose identity while its run and task claim are owned."""
+        persisted_at = _execution_time(now)
         with self.transaction() as connection:
+            self._require_live_claim(
+                connection,
+                run_id=resource.run_id,
+                owner_token=owner_token,
+                claim_id=resource.claim_id,
+                claim_token=claim_token,
+                task_id=resource.task_id,
+                now=persisted_at,
+            )
             connection.execute(
                 """
                 INSERT INTO compose_resources(
@@ -1549,6 +2796,21 @@ class SqliteStore:
 
 def _encode_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _execution_time(value: datetime | None) -> datetime:
+    timestamp = value or utcnow()
+    if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
+        raise ValueError("execution timestamps must be timezone-aware UTC values")
+    return timestamp
+
+
+def _lease_expiry(started_at: datetime, duration: timedelta) -> datetime:
+    if not isinstance(duration, timedelta):
+        raise TypeError("execution lease duration must be a timedelta")
+    if duration <= timedelta(0):
+        raise ValueError("execution lease duration must be positive")
+    return started_at + duration
 
 
 def _row_to_analysis(row: sqlite3.Row) -> RepositoryAnalysis:
@@ -1923,6 +3185,7 @@ def _row_to_task_claim(row: sqlite3.Row) -> TaskClaim:
 
 
 def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
+    status, finished_at, duration_seconds, terminal = _project_attempt_lifecycle(row)
     return EnvironmentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -1931,21 +3194,26 @@ def _row_to_environment_attempt(row: sqlite3.Row) -> EnvironmentAttempt:
         kind=row["kind"],
         attempt_number=row["attempt_number"],
         fingerprint=row["fingerprint"],
-        status=AgentStatus(row["status"]),
+        status=status,
         commands=json.loads(row["commands_json"]),
         result=(
-            json.loads(row["result_json"])
-            if row["result_json"] is not None
-            else None
+            terminal["result"]
+            if terminal is not None
+            else (
+                json.loads(row["result_json"])
+                if row["result_json"] is not None
+                else None
+            )
         ),
-        error=row["error"],
-        duration_seconds=row["duration_seconds"],
+        error=terminal["error"] if terminal is not None else row["error"],
+        duration_seconds=duration_seconds,
         started_at=datetime.fromisoformat(row["started_at"]),
-        finished_at=datetime.fromisoformat(row["finished_at"]),
+        finished_at=finished_at,
     )
 
 
 def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
+    status, finished_at, duration_seconds, terminal = _project_attempt_lifecycle(row)
     return AgentAttempt(
         id=UUID(row["id"]),
         run_id=UUID(row["run_id"]),
@@ -1957,20 +3225,107 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         adapter=row["adapter"],
         model=row["model"],
         billing_mode=BillingMode(row["billing_mode"]),
-        status=AgentStatus(row["status"]),
+        status=status,
         log_path=row["log_path"],
-        result_path=row["result_path"],
-        result=(
-            json.loads(row["result_json"])
-            if row["result_json"] is not None
-            else None
+        result_path=(
+            terminal["result_path"] if terminal is not None else row["result_path"]
         ),
-        summary=row["summary"],
-        duration_seconds=row["duration_seconds"],
-        usage=_row_to_agent_usage(row),
+        result=(
+            terminal["result"]
+            if terminal is not None
+            else (
+                json.loads(row["result_json"])
+                if row["result_json"] is not None
+                else None
+            )
+        ),
+        summary=terminal["summary"] if terminal is not None else row["summary"],
+        duration_seconds=duration_seconds,
+        usage=(
+            _agent_usage_from_payload(terminal["usage"])
+            if terminal is not None
+            else _row_to_agent_usage(row)
+        ),
         started_at=datetime.fromisoformat(row["started_at"]),
-        finished_at=datetime.fromisoformat(row["finished_at"]),
+        finished_at=finished_at,
     )
+
+
+def _project_attempt_lifecycle(
+    row: sqlite3.Row,
+) -> tuple[
+    ExecutionAttemptStatus,
+    datetime | None,
+    float | None,
+    dict[str, object] | None,
+]:
+    status = ExecutionAttemptStatus(row["status"])
+    finished_at = (
+        datetime.fromisoformat(row["finished_at"])
+        if row["finished_at"] is not None
+        else None
+    )
+    duration_seconds = row["duration_seconds"]
+    terminal_kind = row["terminal_kind"] if "terminal_kind" in row.keys() else None
+    terminal = None
+    if status is ExecutionAttemptStatus.RUNNING and terminal_kind is not None:
+        finished_at = datetime.fromisoformat(row["terminal_at"])
+        if terminal_kind.endswith("attempt_finished"):
+            terminal = json.loads(row["terminal_payload_json"])
+            status = ExecutionAttemptStatus(terminal["status"])
+            duration_seconds = terminal["duration_seconds"]
+        else:
+            status = ExecutionAttemptStatus.CANCELLED
+            duration_seconds = (
+                finished_at - datetime.fromisoformat(row["started_at"])
+            ).total_seconds()
+    return status, finished_at, duration_seconds, terminal
+
+
+def _terminal_attempt_status(
+    status: ExecutionAttemptStatus | AgentStatus,
+) -> ExecutionAttemptStatus:
+    if not isinstance(status, ExecutionAttemptStatus | AgentStatus):
+        raise TypeError("attempt status must be an ExecutionAttemptStatus")
+    terminal_status = ExecutionAttemptStatus(status.value)
+    if terminal_status is ExecutionAttemptStatus.RUNNING:
+        raise ValueError("a completed execution attempt cannot remain running")
+    return terminal_status
+
+
+def _completed_attempt_duration(
+    row: sqlite3.Row,
+    *,
+    finished_at: datetime,
+    duration_seconds: float | None,
+) -> float:
+    started_at = datetime.fromisoformat(row["started_at"])
+    if finished_at < started_at:
+        raise ValueError("execution attempt cannot finish before it starts")
+    if duration_seconds is not None:
+        return duration_seconds
+    return (finished_at - started_at).total_seconds()
+
+
+def _agent_usage_payload(usage: AgentUsage | None) -> dict[str, object] | None:
+    if usage is None:
+        return None
+    return {
+        "cost_usd": usage.cost_usd,
+        "tokens_input": usage.tokens_input,
+        "tokens_output": usage.tokens_output,
+        "tokens_cache_read": usage.tokens_cache_read,
+        "tokens_cache_write": usage.tokens_cache_write,
+        "num_turns": usage.num_turns,
+    }
+
+
+def _agent_usage_from_payload(payload: object) -> AgentUsage | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise TypeError("agent attempt usage payload must be a dictionary")
+    return AgentUsage(**payload)
 
 
 def _row_to_agent_usage(row: sqlite3.Row) -> AgentUsage | None:
