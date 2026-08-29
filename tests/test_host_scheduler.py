@@ -1,0 +1,394 @@
+"""Behavior contracts for the lease-backed host task scheduler."""
+
+from __future__ import annotations
+
+import hashlib
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.host_execution import (
+    HostSchedulerConfig,
+    HostTaskScheduler,
+    ScheduledTaskContext,
+)
+from betterborg_cli.store import (
+    Borg,
+    ExecutionOwnershipError,
+    ExecutionRunStatus,
+    PlanApproval,
+    Repository,
+    SqliteStore,
+    TaskBatch,
+    TaskComplexity,
+    TaskDependency,
+    TaskGeneration,
+    TaskRecord,
+    TaskRuntimeStatus,
+)
+
+
+class FakeClock:
+    """Small thread-safe controllable UTC clock."""
+
+    def __init__(self) -> None:
+        self._now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+        self._lock = threading.Lock()
+
+    def __call__(self) -> datetime:
+        with self._lock:
+            return self._now
+
+    def advance(self, delta: timedelta) -> None:
+        with self._lock:
+            self._now += delta
+
+
+def _scheduler_fixture(
+    tmp_path: Path,
+    *,
+    task_refs: tuple[str, ...],
+    dependencies: tuple[tuple[str, str], ...],
+) -> tuple[Path, Borg, TaskGeneration, dict[str, TaskRecord]]:
+    database = tmp_path / "scheduler.sqlite3"
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="Scheduler")
+    approval = PlanApproval(
+        borg_id=borg.id,
+        plan_digest="sha256:plan",
+        manifest={"plan.md": "sha256:plan"},
+    )
+    batch = TaskBatch(
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        round=1,
+        digest="sha256:batch",
+        manifest={"tasks": list(task_refs)},
+    )
+    generation = TaskGeneration(
+        borg_id=borg.id,
+        plan_approval_id=approval.id,
+        batch_id=batch.id,
+        digest="sha256:generation",
+        manifest={"tasks": list(task_refs)},
+    )
+    records: dict[str, TaskRecord] = {}
+    for position, task_ref in enumerate(task_refs, start=1):
+        digest = f"sha256:{hashlib.sha256(task_ref.encode()).hexdigest()}"
+        records[task_ref] = TaskRecord(
+            generation_id=generation.id,
+            borg_id=borg.id,
+            task_ref=task_ref,
+            stage="07-host-execution",
+            stem=f"{position:02d}-{task_ref}",
+            position=position,
+            title=f"Implement {task_ref}",
+            complexity=TaskComplexity.SMALL,
+            digest=digest,
+            task={"acceptance_criteria": [f"{task_ref} works"]},
+            manifest={"task.md": digest},
+        )
+    edges = [
+        TaskDependency(
+            generation_id=generation.id,
+            task_id=records[task_ref].id,
+            depends_on_task_id=records[dependency_ref].id,
+        )
+        for task_ref, dependency_ref in dependencies
+    ]
+    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_plan_approval(approval)
+        store.append_task_batch(batch)
+        store.add_task_generation(generation, list(records.values()), edges)
+        for record in records.values():
+            path = durable_root / record.stage / f"{record.stem}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(record.task_ref, encoding="utf-8")
+        store._promote_published_task_generation(
+            generation.id, durable_root=durable_root
+        )
+    return database, borg, generation, records
+
+
+def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition was not reached before timeout")
+
+
+def test_scheduler_limits_jobs_renews_claims_and_reports_active_operation(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("foundation-a", "foundation-b", "consumer-a", "consumer-b"),
+        dependencies=(
+            ("consumer-a", "foundation-a"),
+            ("consumer-b", "foundation-b"),
+        ),
+    )
+    clock = FakeClock()
+    release_foundations = threading.Event()
+    foundations_started = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    started: list[str] = []
+
+    with SqliteStore.open(database) as owner_store, SqliteStore.open(
+        database
+    ) as observer_store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            nonlocal active, maximum_active
+            task_ref = next(
+                ref
+                for ref, record in records.items()
+                if record.id == context.claim.task_id
+            )
+            if task_ref.startswith("consumer"):
+                dependency_ref = task_ref.replace("consumer", "foundation")
+                dependency = owner_store.get_task_runtime(records[dependency_ref].id)
+                assert dependency is not None
+                assert dependency.status is TaskRuntimeStatus.DONE
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                started.append(task_ref)
+                if sum(ref.startswith("foundation") for ref in started) == 2:
+                    foundations_started.set()
+            if task_ref.startswith("foundation"):
+                assert release_foundations.wait(timeout=2)
+            with lock:
+                active -= 1
+            return TaskRuntimeStatus.DONE
+
+        config = HostSchedulerConfig(
+            jobs=2,
+            lease_duration=timedelta(seconds=30),
+            heartbeat_interval=timedelta(seconds=10),
+            poll_interval_seconds=0.005,
+        )
+        scheduler = HostTaskScheduler(
+            owner_store, behavior, config=config, clock=clock
+        )
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("duplicate caller must not run tasks")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert foundations_started.wait(timeout=2)
+            run = observer_store.list_execution_runs(borg.id)[0]
+            first_claims = observer_store.list_task_claims(run.id)
+            assert {claim.task_id for claim in first_claims} == {
+                records["foundation-a"].id,
+                records["foundation-b"].id,
+            }
+
+            clock.advance(timedelta(seconds=11))
+            _wait_until(
+                lambda: any(
+                    event.kind == "run.lease_renewed"
+                    for event in observer_store.list_execution_events(run.id)
+                )
+            )
+            renewed_claims = observer_store.list_task_claims(run.id)
+            assert all(
+                claim.lease_expires_at == clock() + timedelta(seconds=30)
+                for claim in renewed_claims
+            )
+
+            duplicate = HostTaskScheduler(
+                observer_store,
+                unexpected_behavior,
+                config=config,
+                clock=clock,
+            ).run(borg.id, generation.id)
+            assert duplicate.acquired is False
+            assert duplicate.active_operation_id == run.id
+            assert duplicate.status is ExecutionRunStatus.RUNNING
+
+            release_foundations.set()
+            result = running.result(timeout=2)
+
+        assert result.operation_id == run.id
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert result.done == result.total == 4
+        assert maximum_active == 2
+        assert set(started[:2]) == {"foundation-a", "foundation-b"}
+        claims = owner_store.list_task_claims(run.id)
+        assert len(claims) == 4
+        assert {claim.run_id for claim in claims} == {run.id}
+
+
+def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("foundation", "consumer"),
+        dependencies=(("consumer", "foundation"),),
+    )
+    clock = FakeClock()
+    cancel = CancellationToken()
+    consumer_started = threading.Event()
+    first_invocations: list[str] = []
+
+    with SqliteStore.open(database) as store:
+
+        def cancelling_behavior(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            task_ref = next(
+                ref
+                for ref, record in records.items()
+                if record.id == context.claim.task_id
+            )
+            first_invocations.append(task_ref)
+            if task_ref == "consumer":
+                consumer_started.set()
+                assert context.cancel.wait(timeout=2)
+            return TaskRuntimeStatus.DONE
+
+        scheduler = HostTaskScheduler(
+            store,
+            cancelling_behavior,
+            config=HostSchedulerConfig(jobs=1, poll_interval_seconds=0.005),
+            clock=clock,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                scheduler.run, borg.id, generation.id, cancel=cancel
+            )
+            assert consumer_started.wait(timeout=2)
+            cancel.cancel()
+            cancelled = running.result(timeout=2)
+
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert first_invocations == ["foundation", "consumer"]
+        assert store.get_task_runtime(records["foundation"].id).status is (
+            TaskRuntimeStatus.DONE
+        )
+        assert store.get_task_runtime(records["consumer"].id).status is (
+            TaskRuntimeStatus.PENDING
+        )
+
+        resumed_invocations: list[str] = []
+
+        def resumed_behavior(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus | None:
+            task_ref = next(
+                ref
+                for ref, record in records.items()
+                if record.id == context.claim.task_id
+            )
+            resumed_invocations.append(task_ref)
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return None
+
+        resumed = HostTaskScheduler(
+            store,
+            resumed_behavior,
+            config=HostSchedulerConfig(jobs=1, poll_interval_seconds=0.005),
+            clock=clock,
+        ).run(borg.id, generation.id)
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+        assert resumed_invocations == ["consumer"]
+        assert resumed.operation_id != cancelled.operation_id
+        runs_by_id = {run.id: run for run in store.list_execution_runs(borg.id)}
+        assert runs_by_id[cancelled.operation_id].status is (
+            ExecutionRunStatus.CANCELLED
+        )
+        assert runs_by_id[resumed.operation_id].status is (
+            ExecutionRunStatus.COMPLETED
+        )
+
+
+def test_scheduler_cancels_inflight_behavior_when_run_lease_expires(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    clock = FakeClock()
+    started = threading.Event()
+    cancellation_observed = threading.Event()
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            if context.cancel.wait(timeout=2):
+                cancellation_observed.set()
+            return TaskRuntimeStatus.DONE
+
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(
+                lease_duration=timedelta(seconds=10),
+                heartbeat_interval=timedelta(seconds=2),
+                poll_interval_seconds=0.005,
+            ),
+            clock=clock,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            clock.advance(timedelta(seconds=11))
+
+            with pytest.raises(ExecutionOwnershipError, match="lease expired"):
+                running.result(timeout=2)
+
+        assert cancellation_observed.is_set()
+        run = store.list_execution_runs(borg.id)[0]
+        assert run.status is ExecutionRunStatus.CANCELLED
+        runtime = store.get_task_runtime(records["task"].id)
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
+
+
+def test_scheduler_isolates_task_failure_and_finishes_run(tmp_path: Path) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("foundation", "consumer"),
+        dependencies=(("consumer", "foundation"),),
+    )
+
+    def failing_behavior(_context: ScheduledTaskContext) -> TaskRuntimeStatus:
+        raise RuntimeError("injected task crash")
+
+    with SqliteStore.open(database) as store:
+        result = HostTaskScheduler(store, failing_behavior).run(
+            borg.id, generation.id
+        )
+
+        assert result.status is ExecutionRunStatus.FAILED
+        assert result.failed == 1
+        assert result.pending == 1
+        failed = store.get_task_runtime(records["foundation"].id)
+        assert failed is not None
+        assert failed.status is TaskRuntimeStatus.FAILED
+        assert failed.state_reason == "task behavior failed: injected task crash"
+        consumer = store.get_task_runtime(records["consumer"].id)
+        assert consumer is not None
+        assert consumer.status is TaskRuntimeStatus.PENDING
