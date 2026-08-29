@@ -1416,6 +1416,10 @@ class SqliteStore:
             raise ValueError("task resume phase must not be empty")
         if review_round is not None and review_round < 0:
             raise ValueError("task review round must not be negative")
+        if (branch is None) != (worktree_path is None):
+            raise ValueError(
+                "task branch and worktree path must be transitioned together"
+            )
         if new_status not in _TASK_TRANSITIONS.get(expected_status, frozenset()):
             raise ValueError(
                 f"illegal task phase transition: {expected_status.value} -> "
@@ -1439,6 +1443,19 @@ class SqliteStore:
             ).fetchone()
             if claim is None:
                 raise ExecutionOwnershipError("task claim is no longer owned")
+            runtime_identity = connection.execute(
+                """
+                SELECT branch, worktree_path FROM task_runtimes
+                WHERE task_id = ?
+                """,
+                (claim["task_id"],),
+            ).fetchone()
+            if branch is not None and (
+                runtime_identity["branch"], runtime_identity["worktree_path"]
+            ) not in {(None, None), (branch, worktree_path)}:
+                raise StaleTaskRuntimeError(
+                    "task worktree identity cannot be replaced"
+                )
             assignments = [
                 "status = ?",
                 "resume_phase = ?",
@@ -2109,6 +2126,71 @@ class SqliteStore:
                 "SELECT * FROM task_runtimes WHERE task_id = ?", (str(task_id),)
             ).fetchone()
         return _row_to_task_runtime(row) if row is not None else None
+
+    def assign_task_worktree(
+        self,
+        run_id: UUID,
+        owner_token: str,
+        task_id: UUID,
+        *,
+        branch: str,
+        worktree_path: str,
+        now: datetime | None = None,
+    ) -> TaskRuntime:
+        """Persist one immutable task Git identity under the live run lease."""
+        assigned_at = _execution_time(now)
+        if not branch.strip() or not worktree_path.strip():
+            raise ValueError("task branch and worktree path must not be empty")
+        with self.transaction() as connection:
+            run = self._require_live_run(
+                connection, run_id, owner_token, now=assigned_at
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM task_runtimes
+                WHERE task_id = ? AND generation_id = ?
+                """,
+                (str(task_id), run["generation_id"]),
+            ).fetchone()
+            if row is None:
+                raise ValueError("task does not belong to the execution run")
+            existing = (row["branch"], row["worktree_path"])
+            requested = (branch, worktree_path)
+            if existing == requested:
+                return _row_to_task_runtime(row)
+            if existing != (None, None):
+                raise StaleTaskRuntimeError(
+                    "task worktree identity is already assigned"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE task_runtimes
+                SET branch = ?, worktree_path = ?, updated_at = ?
+                WHERE task_id = ? AND branch IS NULL AND worktree_path IS NULL
+                """,
+                (
+                    branch,
+                    worktree_path,
+                    assigned_at.isoformat(),
+                    str(task_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleTaskRuntimeError(
+                    "task worktree identity changed before assignment"
+                )
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                task_id=task_id,
+                kind="task.worktree_assigned",
+                payload={"branch": branch, "worktree_path": worktree_path},
+                created_at=assigned_at,
+            )
+            updated = connection.execute(
+                "SELECT * FROM task_runtimes WHERE task_id = ?", (str(task_id),)
+            ).fetchone()
+        return _row_to_task_runtime(updated)
 
     def list_task_runtimes(self, generation_id: UUID) -> list[TaskRuntime]:
         """Return runtime projections in generated-task order."""

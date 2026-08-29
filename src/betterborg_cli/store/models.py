@@ -696,6 +696,10 @@ class TaskRuntime:
             raise ValueError("task runtime resume phase must not be empty")
         if self.review_round < 0:
             raise ValueError("task runtime review round must not be negative")
+        if (self.branch is None) != (self.worktree_path is None):
+            raise ValueError(
+                "task runtime branch and worktree path must be assigned together"
+            )
         _validate_utc(self.created_at)
         _validate_utc(self.updated_at)
         if self.updated_at < self.created_at:
