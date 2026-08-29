@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 
 from betterborg_cli.planning import (
     TaskDigestDriftError,
     TaskPublisher,
-    approved_plan_digest,
     render_task_markdown,
     task_markdown_digest,
 )
@@ -19,15 +17,9 @@ from betterborg_cli.store import (
     Borg,
     BorgState,
     PlanApproval,
-    PlanningAttempt,
-    PlanningAttemptStatus,
     Repository,
     SqliteStore,
-    TaskBatch,
-    TaskComplexity,
-    TaskGeneration,
     TaskGenerationStatus,
-    TaskRecord,
 )
 
 
@@ -50,94 +42,6 @@ def _task_body(stem: str) -> dict:
         "plan_refs": ["P1.deliverable.1"],
         "estimate_complexity": "small",
     }
-
-
-def _add_approved_generation(
-    store: SqliteStore,
-    borg: Borg,
-    approval: PlanApproval,
-    *,
-    stem: str,
-    round_number: int,
-) -> TaskGeneration:
-    attempt = PlanningAttempt(
-        borg_id=borg.id,
-        phase="supervisor_review",
-        round=round_number,
-        adapter="mock",
-        model="test-model",
-    )
-    batch = TaskBatch(
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        attempt_id=attempt.id,
-        round=round_number,
-        digest=f"sha256:batch-{round_number}",
-        manifest={},
-    )
-    generation_id = uuid4()
-    body = _task_body(stem)
-    digest = task_markdown_digest(render_task_markdown(body))
-    task = TaskRecord(
-        generation_id=generation_id,
-        borg_id=borg.id,
-        task_ref=f"T-{generation_id.hex}",
-        stage=body["stage"],
-        stem=stem,
-        position=1,
-        title=body["title"],
-        complexity=TaskComplexity.SMALL,
-        digest=digest,
-        task=body,
-        manifest={"approved_plan_digest": approval.plan_digest, "task.md": digest},
-    )
-    relative_path = (
-        f".borg/tasks/{borg.name}/{generation_id}/{task.stage}/{task.stem}.md"
-    )
-    manifest = {
-        "approved_plan_digest": approval.plan_digest,
-        "batch_digest": batch.digest,
-        "dependencies": [],
-        "plan_approval_id": str(approval.id),
-        "tasks": [
-            {
-                "digest": digest,
-                "path": relative_path,
-                "position": 1,
-                "task_ref": task.task_ref,
-            }
-        ],
-    }
-    generation = TaskGeneration(
-        id=generation_id,
-        borg_id=borg.id,
-        plan_approval_id=approval.id,
-        batch_id=batch.id,
-        digest=approved_plan_digest(manifest),
-        manifest=manifest,
-    )
-    attempt = PlanningAttempt(
-        id=attempt.id,
-        borg_id=borg.id,
-        phase=attempt.phase,
-        round=attempt.round,
-        adapter=attempt.adapter,
-        model=attempt.model,
-        request={
-            "batch_id": str(batch.id),
-            "generation_id": str(generation.id),
-        },
-    )
-    store.append_planning_attempt(attempt)
-    store.append_task_batch(batch)
-    store.add_task_generation(generation, [task])
-    store.complete_planning_attempt(
-        attempt.id,
-        status=PlanningAttemptStatus.COMPLETED,
-        result={"decision": "approve", "summary": "Ready.", "findings": []},
-        summary="Ready.",
-    )
-    return generation
 
 
 def _publication_context(
@@ -193,13 +97,18 @@ The approved plan needs a durable foundation.
 
 def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
     committed_git_repo: Path,
+    approved_task_generation,
 ) -> None:
     database = committed_git_repo.parent / "task-publication.sqlite3"
     repository, borg, approval = _publication_context(committed_git_repo, database)
     with SqliteStore.open(database) as store:
-        generation = _add_approved_generation(
-            store, borg, approval, stem="01-publish", round_number=1
-        )
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-publish"),
+            round_number=1,
+        ).generation
         publication = TaskPublisher(repository, store).publish(generation.id)
 
         expected = (
@@ -253,17 +162,26 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
 def test_reopens_and_resumes_every_publication_boundary(
     committed_git_repo: Path,
     failure_point: str,
+    approved_task_generation,
 ) -> None:
     database = committed_git_repo.parent / f"failure-{failure_point}.sqlite3"
     repository, borg, approval = _publication_context(committed_git_repo, database)
     with SqliteStore.open(database) as store:
-        prior = _add_approved_generation(
-            store, borg, approval, stem="01-prior", round_number=1
-        )
+        prior = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-prior"),
+            round_number=1,
+        ).generation
         prior_current = TaskPublisher(repository, store).publish(prior.id).generation
-        replacement = _add_approved_generation(
-            store, borg, approval, stem="02-replacement", round_number=2
-        )
+        replacement = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("02-replacement"),
+            round_number=2,
+        ).generation
 
         def fail_at(point: str) -> None:
             if point == failure_point:
@@ -301,13 +219,18 @@ def test_reopens_and_resumes_every_publication_boundary(
 
 def test_reconcile_resumes_interrupted_first_publication(
     committed_git_repo: Path,
+    approved_task_generation,
 ) -> None:
     database = committed_git_repo.parent / "reconcile-first.sqlite3"
     repository, borg, approval = _publication_context(committed_git_repo, database)
     with SqliteStore.open(database) as store:
-        generation = _add_approved_generation(
-            store, borg, approval, stem="01-first", round_number=1
-        )
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-first"),
+            round_number=1,
+        ).generation
 
         def fail_after_rename(point: str) -> None:
             if point == "after_rename":
