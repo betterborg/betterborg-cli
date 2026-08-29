@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import anyio
+import pytest
+from mcp import types as mcp_types
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from betterborg_cli import cli as cli_module
@@ -37,13 +39,35 @@ from betterborg_cli.store import (
     TaskRuntimeStatus,
 )
 from betterborg_cli.store.models import utcnow
+from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
 
 
-def _call_tool(name: str, arguments: dict | None = None):
+def _call_tool(
+    name: str,
+    arguments: dict | None = None,
+    *,
+    answers: tuple[str, ...] = (),
+    approve: bool = True,
+    elicitation: bool = True,
+    requests: list | None = None,
+):
     async def call():
+        supplied = iter(answers)
+
+        async def elicit(_context, params):
+            if requests is not None:
+                requests.append(params)
+            properties = params.requestedSchema["properties"]
+            if "approved" in properties:
+                content = {"approved": approve}
+            else:
+                content = {"answer": next(supplied)}
+            return mcp_types.ElicitResult(action="accept", content=content)
+
         async with create_connected_server_and_client_session(
             mcp_server.server,
             raise_exceptions=True,
+            elicitation_callback=elicit if elicitation else None,
         ) as session:
             return await session.call_tool(name, arguments or {})
 
@@ -65,6 +89,36 @@ def _structured(result) -> dict:
     assert result.isError is False
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_empty_elicitation_capability_supports_legacy_form_mode() -> None:
+    params = mcp_types.InitializeRequestParams.model_validate(
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"elicitation": {}},
+            "clientInfo": {"name": "legacy-form-client", "version": "1.0"},
+        }
+    )
+    context = SimpleNamespace(
+        session=SimpleNamespace(client_params=params),
+    )
+
+    assert mcp_server.McpInteractiveIO.supported(context) is True
+
+
+def test_url_only_elicitation_capability_does_not_support_forms() -> None:
+    params = mcp_types.InitializeRequestParams.model_validate(
+        {
+            "protocolVersion": mcp_types.LATEST_PROTOCOL_VERSION,
+            "capabilities": {"elicitation": {"url": {}}},
+            "clientInfo": {"name": "url-only-client", "version": "1.0"},
+        }
+    )
+    context = SimpleNamespace(
+        session=SimpleNamespace(client_params=params),
+    )
+
+    assert mcp_server.McpInteractiveIO.supported(context) is False
 
 
 def _task_body() -> dict:
@@ -252,6 +306,11 @@ def test_tool_inventory_has_typed_results_and_no_removed_gates() -> None:
         "change",
         "approve",
     ]
+    assert "answers" not in plan_schema["properties"]
+    create_schema = next(tool.inputSchema for tool in tools if tool.name == "create")
+    assert "confirmed" not in create_schema["properties"]
+    execute_schema = next(tool.inputSchema for tool in tools if tool.name == "execute")
+    assert "auto_execute" not in execute_schema["properties"]
 
 
 def _additional_properties(value) -> list[object]:
@@ -292,7 +351,7 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
         def initialize(self):
             calls.append("init")
             return SimpleNamespace(
-                initialized=True,
+                initialized=False,
                 repository=repository,
                 analysis=analysis,
                 score_path=score,
@@ -321,14 +380,14 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
                 ),
             )
 
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted, io=None: paths)
     monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
 
     initialized = _structured(_call_tool("init"))
     analyzed = _structured(_call_tool("analyze"))
 
     assert calls == ["init", "analyze"]
-    assert initialized["status"] == "initialized"
+    assert initialized["status"] == "already_initialized"
     assert initialized["artifacts"] == [
         {"kind": "score", "path": ".borg/score.md"},
         {"kind": "coding_prompt", "path": ".borg/prompts/coding.md"},
@@ -354,15 +413,14 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     approved_task_generation,
     monkeypatch,
 ) -> None:
-    paths, borg, _current, publication = _published_runtime(
+    paths, borg, _current, _publication = _published_runtime(
         committed_git_repo,
         planning_cli_repository,
         approved_task_generation,
     )
     prd_path = paths.tracked_dir / "prds" / "new-borg.md"
-    approved_plan = paths.tracked_dir / "plans" / f"{borg.name}.md"
     created_borg = Borg(repository_id=borg.repository_id, name="new-borg")
-    create_calls: list[tuple[str, Path | None, bool]] = []
+    create_calls: list[tuple[str, Path | None]] = []
 
     class FakeCreateService:
         def __init__(
@@ -371,13 +429,15 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
             _store,
             _agent,
             *,
+            io,
             interactive: bool,
         ) -> None:
             assert repository.id == borg.repository_id
-            assert interactive is False
+            assert io is not None
+            assert interactive is True
 
-        def create(self, name, source, *, confirmed):
-            create_calls.append((name, source, confirmed))
+        def create(self, name, source):
+            create_calls.append((name, source))
             return SimpleNamespace(
                 borg=created_borg,
                 confirmed=True,
@@ -386,48 +446,27 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
                 prd_path=prd_path,
             )
 
-    approval = SimpleNamespace(plan_digest="sha256:mcp-approved-plan")
-    approve_calls: list[str] = []
-
-    def approve(service_paths, name):
-        approve_calls.append(name)
-        assert service_paths == paths
-        return borg, approval, approved_plan, publication
-
     monkeypatch.chdir(committed_git_repo)
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
     monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
-    monkeypatch.setattr(mcp_server, "_approve_plan", approve)
 
     created = _structured(
         _call_tool(
             "create",
-            {"name": "new-borg", "source": "source.md", "confirmed": True},
+            {"name": "new-borg", "source": "source.md"},
         )
     )
-    planned = _structured(
-        _call_tool("plan", {"name": borg.name, "action": "approve"})
-    )
 
-    assert create_calls == [("new-borg", paths.root / "source.md", True)]
+    assert create_calls == [("new-borg", paths.root / "source.md")]
     assert created["status"] == "confirmed"
     assert created["artifacts"] == [
         {"kind": "prd", "path": ".borg/prds/new-borg.md"}
     ]
     assert created["next_actions"] == [
         {"tool": "plan", "arguments": {"name": "new-borg", "action": "start"}}
-    ]
-    assert approve_calls == [borg.name]
-    assert planned["status"] == BorgState.READY_TO_EXECUTE.value
-    assert planned["data"]["plan_digest"] == approval.plan_digest
-    assert planned["artifacts"][0] == {
-        "kind": "approved_plan",
-        "path": f".borg/plans/{borg.name}.md",
-    }
-    assert [action["tool"] for action in planned["next_actions"]] == [
-        "task_list",
-        "execute",
     ]
 
 
@@ -453,59 +492,24 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
                 ],
             }
         )
-    )
+    ).queue(MockResponse(payload={"decision": "ready_to_plan"})).queue(
+        MockResponse(payload=plan)
+    ).queue(MockResponse(payload=tech_lead_approval_response()))
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
         mcp_server,
         "_paths",
-        lambda *, trusted: paths,
+        lambda *, trusted, io=None: paths,
     )
     monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
 
-    waiting = _structured(
-        _call_tool("plan", {"name": "mcp-start", "action": "start"})
-    )
-
-    assert waiting["status"] == BorgState.ARCHITECT_AWAITING_ANSWERS.value
-    assert waiting["data"]["questions"] == [
-        {
-            "id": "q1",
-            "question": "Which platforms are required?",
-            "why": "The answer controls the test matrix.",
-            "hint": None,
-        }
-    ]
-    assert waiting["next_actions"] == [
-        {
-            "tool": "plan",
-            "arguments": {"name": "mcp-start", "action": "start"},
-        }
-    ]
-
-    invalid_answer = _call_tool(
-        "plan",
-        {
-            "name": "mcp-start",
-            "action": "start",
-            "answers": ["   "],
-        },
-    )
-    assert invalid_answer.isError is True
-    assert "Architect question answers must not be empty" in (
-        invalid_answer.content[0].text
-    )
-
-    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    adapter.queue(MockResponse(payload=plan))
-    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    requests: list = []
     started = _structured(
         _call_tool(
             "plan",
-            {
-                "name": "mcp-start",
-                "action": "start",
-                "answers": ["Linux, macOS, and Windows."],
-            },
+            {"name": "mcp-start", "action": "start"},
+            answers=("Linux, macOS, and Windows.",),
+            requests=requests,
         )
     )
     shown = _structured(
@@ -521,6 +525,8 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     assert shown["data"]["borg"] == "mcp-start"
     assert shown["data"]["plan"]["summary"] == "MCP plan is ready."
     assert shown["data"]["plan"]["phases"][0]["name"] == "01-release-workflow"
+    assert len(requests) == 1
+    assert "Which platforms are required?" in requests[0].message
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-start")
         assert borg is not None
@@ -548,7 +554,9 @@ def test_plan_change_validates_note_and_preserves_service_history(
     ):
         adapter.queue(MockResponse(payload=payload))
     monkeypatch.chdir(committed_git_repo)
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
     monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
 
     started = _structured(
@@ -639,15 +647,22 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
         )
     )
     monkeypatch.chdir(committed_git_repo)
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
     monkeypatch.setattr(
         mcp_server,
         "select_agent",
         lambda *_args, **_kwargs: adapter,
     )
 
+    requests: list = []
     result = _structured(
-        _call_tool("plan", {"name": "mcp-plan", "action": "approve"})
+        _call_tool(
+            "plan",
+            {"name": "mcp-plan", "action": "approve"},
+            requests=requests,
+        )
     )
 
     assert result["status"] == BorgState.READY_TO_EXECUTE.value
@@ -665,6 +680,8 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
         generations = store.list_task_generations(stored.id)
     assert stored.state is BorgState.READY_TO_EXECUTE
     assert len(generations) == 1
+    assert len(requests) == 1
+    assert "Approve the current plan" in requests[0].message
     assert not hasattr(mcp_server, "approve_task")
     assert not hasattr(mcp_server, "decompose")
 
@@ -710,13 +727,15 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         )
 
     monkeypatch.chdir(committed_git_repo)
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted: paths)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
     monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
 
     listed = _structured(_call_tool("task_list", {"name": borg.name}))
-    estimate = _structured(_call_tool("execute", {"name": borg.name}))
+    requests: list = []
     executed = _structured(
-        _call_tool("execute", {"name": borg.name, "auto_execute": True})
+        _call_tool("execute", {"name": borg.name}, requests=requests)
     )
 
     assert listed["generation_id"] == str(current.generation.id)
@@ -744,14 +763,9 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
             },
         }
     ]
-    assert estimate["status"] == "estimate_approval_required"
-    assert estimate["next_actions"] == [
-        {
-            "tool": "execute",
-            "arguments": {"name": borg.name, "auto_execute": True},
-        }
-    ]
     assert len(invoked) == 1
+    assert len(requests) == 1
+    assert "Approve this estimate" in requests[0].message
     (
         invoked_paths,
         invoked_store,
@@ -773,8 +787,241 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         decision = store.get_current_execution_decision(borg.id)
     assert decision is not None
-    assert decision.source == "mcp_auto_execute"
-    assert decision.decision == "bypassed"
+    assert decision.source == "mcp_elicitation"
+    assert decision.decision == "approved"
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "command"),
+    [
+        ("init", {}, "borg init"),
+        ("analyze", {}, "borg analyze"),
+        (
+            "create",
+            {"name": "new-borg", "source": "docs/my prd.md"},
+            "borg create new-borg --prd 'docs/my prd.md'",
+        ),
+        (
+            "plan",
+            {"name": "new-borg", "action": "start"},
+            "borg plan start new-borg",
+        ),
+        (
+            "plan",
+            {
+                "name": "new-borg",
+                "action": "change",
+                "note": "ship safely",
+            },
+            "borg plan change new-borg --note 'ship safely'",
+        ),
+        (
+            "plan",
+            {"name": "new-borg", "action": "approve"},
+            "borg plan approve new-borg",
+        ),
+        (
+            "execute",
+            {"name": "new-borg"},
+            "borg execute new-borg",
+        ),
+    ],
+)
+def test_interactive_tools_require_elicitation_before_workflow_mutation(
+    tool: str,
+    arguments: dict,
+    command: str,
+    monkeypatch,
+) -> None:
+    touched: list[str] = []
+
+    def unexpected_paths(**_kwargs):
+        touched.append("paths")
+        raise AssertionError("workflow reached before capability gate")
+
+    def unexpected_io(*_args, **_kwargs):
+        touched.append("prompt")
+        raise AssertionError("interactive IO constructed without elicitation")
+
+    monkeypatch.setattr(mcp_server, "_paths", unexpected_paths)
+    monkeypatch.setattr(mcp_server.McpInteractiveIO, "__init__", unexpected_io)
+
+    result = _structured(
+        _call_tool(tool, arguments, elicitation=False)
+    )
+
+    assert result == {
+        "status": "setup_required",
+        "artifacts": [],
+        "next_actions": [],
+        "data": {"cli_command": command},
+    }
+    assert touched == []
+    serialized = json.dumps(result)
+    assert "continuation" not in serialized
+    assert "resume" not in serialized
+
+
+def test_workspace_trust_confirmation_uses_elicitation(
+    committed_git_repo: Path,
+    monkeypatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    paths.state_dir.mkdir(parents=True)
+    repository = SimpleNamespace(id=uuid4())
+    analysis = SimpleNamespace(id=uuid4(), overall_score=4.0)
+
+    class FakeRepositoryService:
+        def __init__(self, service_paths, _store, _factory) -> None:
+            assert service_paths == paths
+
+        def initialize(self):
+            return SimpleNamespace(
+                initialized=False,
+                repository=repository,
+                analysis=analysis,
+                score_path=paths.score_report,
+                prompts=(),
+                improvement_prds=(),
+            )
+
+    state_home = committed_git_repo.parent / "mcp-machine-state"
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
+    requests: list = []
+
+    result = _structured(_call_tool("init", requests=requests))
+
+    identity = WorkspaceIdentity.discover(paths)
+    assert result["status"] == "already_initialized"
+    assert TrustStore().is_trusted(identity)
+    assert len(requests) == 1
+    assert "host-capable agents may read and modify files" in requests[0].message
+    assert requests[0].requestedSchema["properties"]["approved"]["default"] is False
+
+
+def test_init_elicits_onboarding_door_theme_and_name(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    monkeypatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "existing")
+    score = paths.score_report
+    theme = SimpleNamespace(
+        title="Repair CI",
+        predicted_impact=1.5,
+        effort="small",
+        suggested_borg_name="repair-ci",
+        path=paths.improvement_prds_dir / "repair-ci.md",
+    )
+    analysis = SimpleNamespace(id=uuid4(), overall_score=3.5)
+    created = Borg(repository_id=repository.id, name="repair-ci")
+
+    class FakeRepositoryService:
+        def __init__(self, service_paths, _store, _factory) -> None:
+            assert service_paths == paths
+
+        def initialize(self):
+            return SimpleNamespace(
+                initialized=True,
+                repository=repository,
+                analysis=analysis,
+                score_path=score,
+                prompts=(),
+                improvement_prds=(theme,),
+            )
+
+    class FakeCreateService:
+        def __init__(self, _repository, _store, _agent, *, io, interactive):
+            assert io is not None
+            assert interactive is True
+
+        def create(self, name, source):
+            assert (name, source) == ("repair-ci", theme.path)
+            return SimpleNamespace(
+                borg=created,
+                confirmed=True,
+                questions=(),
+                body_md="# Repair CI\n",
+                prd_path=paths.tracked_dir / "prds" / "repair-ci.md",
+            )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
+    monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
+    monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
+    monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: object())
+    requests: list = []
+
+    result = _structured(
+        _call_tool(
+            "init",
+            answers=("1", "1", ""),
+            requests=requests,
+        )
+    )
+
+    assert result["status"] == "initialized"
+    assert result["artifacts"][-1] == {
+        "kind": "prd",
+        "path": ".borg/prds/repair-ci.md",
+    }
+    assert result["next_actions"] == [
+        {"tool": "plan", "arguments": {"name": "repair-ci", "action": "start"}}
+    ]
+    assert len(requests) == 3
+    assert "Choose a door" in requests[0].message
+    assert "Choose a theme" in requests[1].message
+    assert "Borg name [repair-ci]" in requests[2].message
+
+
+def test_create_elicits_prd_question_and_final_confirmation(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    monkeypatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "existing")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": ["Which operating systems must be supported?"],
+                "prd_markdown": None,
+            }
+        )
+    ).queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# Portable CLI\n\nSupport all required systems.\n",
+            }
+        )
+    )
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None: paths
+    )
+    monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: adapter)
+    requests: list = []
+
+    result = _structured(
+        _call_tool(
+            "create",
+            {"name": "portable-cli"},
+            answers=("Linux, macOS, and Windows.",),
+            requests=requests,
+        )
+    )
+
+    assert result["status"] == "confirmed"
+    assert paths.tracked_dir.joinpath("prds", "portable-cli.md").is_file()
+    assert len(requests) == 2
+    assert "Which operating systems" in requests[0].message
+    assert "# Portable CLI" in requests[1].message
+    assert "Create Borg 'portable-cli'" in requests[1].message
+    assert requests[1].requestedSchema["properties"]["approved"]["default"] is False
 
 
 def test_stdio_stdout_contains_only_protocol_json() -> None:

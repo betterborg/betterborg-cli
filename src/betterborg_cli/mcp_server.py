@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
+import anyio
 import click
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.host_execution import HostPreflightBlock
-from betterborg_cli.onboarding import CreateService
+from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
@@ -93,7 +96,6 @@ class TaskListActionArguments(ProtocolModel):
 
 class ExecuteActionArguments(ProtocolModel):
     name: str
-    auto_execute: bool = False
 
 
 class CreateNextAction(ProtocolModel):
@@ -314,32 +316,35 @@ class ExecuteData(ProtocolModel):
     estimate: ExecutionEstimateData
 
 
+class SetupRequiredData(ProtocolModel):
+    cli_command: str
+
+
 class InitializeResult(ProtocolModel):
-    status: Literal["initialized", "already_initialized"]
-    artifacts: tuple[AnalysisArtifact, ...] = ()
-    next_actions: tuple[CreateNextAction, ...] = ()
-    data: InitializeData
+    status: Literal["initialized", "already_initialized", "setup_required"]
+    artifacts: tuple[AnalysisArtifact | PrdArtifact, ...] = ()
+    next_actions: tuple[CreateNextAction | PlanNextAction, ...] = ()
+    data: InitializeData | SetupRequiredData
 
 
 class AnalyzeResult(ProtocolModel):
-    status: Literal["completed"]
-    artifacts: tuple[AnalysisArtifact, ...]
-    next_actions: tuple[CreateNextAction, ...]
-    data: AnalyzeData
+    status: Literal["completed", "setup_required"]
+    artifacts: tuple[AnalysisArtifact, ...] = ()
+    next_actions: tuple[CreateNextAction, ...] = ()
+    data: AnalyzeData | SetupRequiredData
 
 
 class CreateResult(ProtocolModel):
-    status: Literal["confirmed", "needs_input", "draft"]
+    status: Literal["confirmed", "draft", "setup_required"]
     artifacts: tuple[PrdArtifact, ...] = ()
     next_actions: tuple[PlanNextAction, ...] = ()
-    data: CreateData
+    data: CreateData | SetupRequiredData
 
 
 class PlanResult(ProtocolModel):
     status: Literal[
         "draft",
         "architect_working",
-        "architect_awaiting_answers",
         "tech_review_working",
         "plan_approval_pending",
         "pm_working",
@@ -348,25 +353,27 @@ class PlanResult(ProtocolModel):
         "executing",
         "done",
         "blocked",
+        "cancelled",
+        "setup_required",
     ]
     artifacts: tuple[PlanArtifact, ...] = ()
     next_actions: tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]
-    data: PlanData
+    data: PlanData | SetupRequiredData
 
 
 class ExecuteResult(ProtocolModel):
     status: Literal[
-        "estimate_approval_required",
         "blocked",
         "active",
         "running",
         "completed",
         "failed",
         "cancelled",
+        "setup_required",
     ]
-    artifacts: tuple[TaskArtifact, ...]
-    next_actions: tuple[ExecuteNextAction, ...]
-    data: ExecuteData
+    artifacts: tuple[TaskArtifact, ...] = ()
+    next_actions: tuple[ExecuteNextAction, ...] = ()
+    data: ExecuteData | SetupRequiredData
 
 
 class RuntimeCost(ProtocolModel):
@@ -418,11 +425,95 @@ server = FastMCP(
 )
 
 
-def _paths(*, trusted: bool) -> RepoPaths:
+class ElicitedAnswer(BaseModel):
+    """Primitive form returned for one free-text InteractiveIO prompt."""
+
+    answer: str = Field(description="Your answer")
+
+
+class ElicitedConfirmation(BaseModel):
+    """Primitive form returned for one InteractiveIO confirmation."""
+
+    approved: bool = Field(description="Approve this operation")
+
+
+class McpInteractiveIO(InteractiveIO):
+    """Bridge synchronous workflow prompts to same-request MCP elicitation."""
+
+    def __init__(self, context: Context) -> None:
+        self._context = context
+        self._rendered: list[str] = []
+        super().__init__(
+            prompt=self._prompt,
+            confirm=self._confirm,
+            write=self._write,
+        )
+
+    @staticmethod
+    def supported(context: Context) -> bool:
+        """Return whether the connected client supports form elicitation."""
+        params = context.session.client_params
+        if params is None or params.capabilities.elicitation is None:
+            return False
+        capability = params.capabilities.elicitation
+        # MCP 2025-06-18 only defined form elicitation and advertised support
+        # with an empty object. Newer clients can identify form and URL modes
+        # separately, so URL-only support must still be rejected here.
+        return capability.form is not None or (
+            capability.form is None and capability.url is None
+        )
+
+    def _message(self, message: str) -> str:
+        if not self._rendered:
+            return message
+        rendered = "\n".join(self._rendered)
+        self._rendered.clear()
+        return f"{rendered}\n\n{message}"
+
+    async def _elicit_answer(self, message: str) -> str | None:
+        result = await self._context.elicit(self._message(message), ElicitedAnswer)
+        if result.action != "accept":
+            return None
+        return result.data.answer
+
+    async def _elicit_confirmation(self, message: str, default: bool) -> bool:
+        class Confirmation(ElicitedConfirmation):
+            approved: bool = Field(
+                default=default,
+                description="Approve this operation",
+            )
+
+        result = await self._context.elicit(self._message(message), Confirmation)
+        return result.action == "accept" and result.data.approved
+
+    def _prompt(self, message: str) -> str | None:
+        return anyio.from_thread.run(self._elicit_answer, message)
+
+    def _confirm(self, message: str, default: bool) -> bool:
+        return anyio.from_thread.run(self._elicit_confirmation, message, default)
+
+    def _write(self, message: str) -> None:
+        self._rendered.append(message)
+
+
+def _paths(*, trusted: bool, io: InteractiveIO | None = None) -> RepoPaths:
     paths = RepoPaths.discover()
     if trusted:
-        require_workspace_trust(paths, explicit=False, interactive=False)
+        require_workspace_trust(
+            paths,
+            explicit=False,
+            interactive=io is not None,
+            confirm=(
+                (lambda prompt: io.confirm(prompt, default=False))
+                if io is not None
+                else None
+            ),
+        )
     return paths
+
+
+def _cli_command(*arguments: str) -> str:
+    return shlex.join(("borg", *arguments))
 
 
 def _relative(paths: RepoPaths, path: Path) -> str:
@@ -465,10 +556,8 @@ def _theme_actions(paths: RepoPaths, result: Any) -> tuple[CreateNextAction, ...
     )
 
 
-@server.tool(name="init")
-def initialize() -> InitializeResult:
-    """Initialize and analyze the server's current Git repository."""
-    paths = _paths(trusted=True)
+def _initialize(io: McpInteractiveIO) -> InitializeResult:
+    paths = _paths(trusted=True, io=io)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         result = RepositoryService(
             paths,
@@ -477,10 +566,49 @@ def initialize() -> InitializeResult:
                 config, ApiAgentRole.ANALYSIS, paths, interactive=False
             ),
         ).initialize()
+        onboarding = None
+        if result.initialized:
+            config = load_repository_config(paths)
+            creator = CreateService(
+                result.repository,
+                store,
+                select_agent(
+                    config, ApiAgentRole.PLANNING, paths, interactive=False
+                ),
+                io=io,
+                interactive=True,
+            )
+            onboarding = OnboardingDispatcher(
+                result.repository,
+                store,
+                io,
+                creator,
+                result.improvement_prds,
+            ).run()
+
+    artifacts: list[AnalysisArtifact | PrdArtifact] = list(
+        _analysis_artifacts(paths, result)
+    )
+    actions: list[CreateNextAction | PlanNextAction] = list(
+        _theme_actions(paths, result)
+    )
+    if onboarding is not None and onboarding.confirmed:
+        artifacts.append(
+            PrdArtifact(kind="prd", path=_relative(paths, onboarding.prd_path))
+        )
+        actions = [
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(
+                    name=onboarding.borg.name,
+                    action="start",
+                ),
+            )
+        ]
     return InitializeResult(
         status="initialized" if result.initialized else "already_initialized",
-        artifacts=_analysis_artifacts(paths, result),
-        next_actions=_theme_actions(paths, result),
+        artifacts=tuple(artifacts),
+        next_actions=tuple(actions),
         data=InitializeData(
             repository_id=result.repository.id,
             analysis_id=result.analysis.id,
@@ -489,10 +617,19 @@ def initialize() -> InitializeResult:
     )
 
 
-@server.tool(name="analyze")
-def analyze() -> AnalyzeResult:
-    """Re-analyze the initialized current Git repository."""
-    paths = _paths(trusted=True)
+@server.tool(name="init")
+async def initialize(ctx: Context) -> InitializeResult:
+    """Initialize, analyze, and interactively onboard the current repository."""
+    if not McpInteractiveIO.supported(ctx):
+        return InitializeResult(
+            status="setup_required",
+            data=SetupRequiredData(cli_command=_cli_command("init")),
+        )
+    return await anyio.to_thread.run_sync(_initialize, McpInteractiveIO(ctx))
+
+
+def _analyze(io: McpInteractiveIO) -> AnalyzeResult:
+    paths = _paths(trusted=True, io=io)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         result = RepositoryService(
             paths,
@@ -515,14 +652,19 @@ def analyze() -> AnalyzeResult:
     )
 
 
-@server.tool(name="create")
-def create(
-    name: str,
-    source: str | None = None,
-    confirmed: bool = False,
-) -> CreateResult:
-    """Create a Borg PRD, optionally confirming the returned draft."""
-    paths = _paths(trusted=True)
+@server.tool(name="analyze")
+async def analyze(ctx: Context) -> AnalyzeResult:
+    """Re-analyze the initialized current Git repository."""
+    if not McpInteractiveIO.supported(ctx):
+        return AnalyzeResult(
+            status="setup_required",
+            data=SetupRequiredData(cli_command=_cli_command("analyze")),
+        )
+    return await anyio.to_thread.run_sync(_analyze, McpInteractiveIO(ctx))
+
+
+def _create(name: str, source: str | None, io: McpInteractiveIO) -> CreateResult:
+    paths = _paths(trusted=True, io=io)
     config = load_repository_config(paths)
     source_path = Path(source) if source is not None else None
     if source_path is not None and not source_path.is_absolute():
@@ -537,8 +679,9 @@ def create(
             select_agent(
                 config, ApiAgentRole.PLANNING, paths, interactive=False
             ),
-            interactive=False,
-        ).create(name, source_path, confirmed=confirmed)
+            io=io,
+            interactive=True,
+        ).create(name, source_path)
 
     if result.confirmed:
         status = "confirmed"
@@ -551,10 +694,6 @@ def create(
                 arguments=PlanActionArguments(name=name, action="start")
             ),
         )
-    elif result.questions:
-        status = "needs_input"
-        artifacts = ()
-        actions = ()
     else:
         status = "draft"
         artifacts = ()
@@ -572,16 +711,26 @@ def create(
     )
 
 
-def _planning_io(answers: list[str] | None) -> InteractiveIO:
-    supplied = iter(answers or ())
-
-    def prompt(_message: str) -> str | None:
-        return next(supplied, None)
-
-    return InteractiveIO(
-        prompt=prompt,
-        confirm=lambda _message, _default: False,
-        write=lambda _message: None,
+@server.tool(name="create")
+async def create(
+    name: str,
+    ctx: Context,
+    source: str | None = None,
+) -> CreateResult:
+    """Interactively interview, review, and confirm a Borg PRD."""
+    arguments = ["create", name]
+    if source is not None:
+        arguments.extend(("--prd", source))
+    if not McpInteractiveIO.supported(ctx):
+        return CreateResult(
+            status="setup_required",
+            data=SetupRequiredData(cli_command=_cli_command(*arguments)),
+        )
+    return await anyio.to_thread.run_sync(
+        _create,
+        name,
+        source,
+        McpInteractiveIO(ctx),
     )
 
 
@@ -609,13 +758,6 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
 def _plan_actions(
     name: str, state: BorgState
 ) -> tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]:
-    if state is BorgState.ARCHITECT_AWAITING_ANSWERS:
-        return (
-            PlanNextAction(
-                tool="plan",
-                arguments=PlanActionArguments(name=name, action="start")
-            ),
-        )
     if state is BorgState.PLAN_APPROVAL_PENDING:
         return (
             PlanNextAction(
@@ -654,18 +796,31 @@ def _approve_plan(paths: RepoPaths, name: str) -> tuple[Any, Any, Path, Any]:
     return result.borg, result.approval, result.plan_path, result.publication
 
 
-@server.tool(name="plan")
-def plan(
+def _plan(
     name: str,
-    action: Literal["start", "show", "change", "approve"] = "start",
-    note: str | None = None,
-    answers: list[str] | None = None,
+    action: Literal["start", "show", "change", "approve"],
+    note: str | None,
+    io: McpInteractiveIO | None,
 ) -> PlanResult:
-    """Start, inspect, change, or approve a plan; approval decomposes tasks."""
     from betterborg_cli import cli as cli_module
 
-    paths = _paths(trusted=action != "show")
+    paths = _paths(trusted=action != "show", io=io)
     if action == "approve":
+        assert io is not None
+        borg, _questions = _planning_state(paths, name)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            attempt = validated_current_plan_attempt(paths, store, borg)
+        plan_document = PlanDocument.model_validate(attempt.result)
+        io.write(json.dumps(attempt.result, indent=2, sort_keys=True))
+        if not io.confirm(
+            f"Approve the current plan for Borg {name!r} and decompose its tasks?",
+            default=False,
+        ):
+            return PlanResult(
+                status=borg.state,
+                next_actions=_plan_actions(name, borg.state),
+                data=PlanShowData(borg=name, plan=plan_document),
+            )
         borg, approval, plan_path, publication = _approve_plan(paths, name)
         artifacts = [
             ApprovedPlanArtifact(
@@ -711,7 +866,7 @@ def plan(
             paths.root,
             name,
             change_note=note.strip() if action == "change" and note else None,
-            io=_planning_io(answers),
+            io=io,
         )
         questions: list[dict[str, Any]] = []
     except click.ClickException as error:
@@ -720,9 +875,14 @@ def plan(
             "Architect questions are awaiting answers"
         ):
             raise
-        borg, questions = _planning_state(paths, name)
+        borg, _questions = _planning_state(paths, name)
         if borg.state is not BorgState.ARCHITECT_AWAITING_ANSWERS:
             raise
+        return PlanResult(
+            status="cancelled",
+            next_actions=(),
+            data=PlanProgressData(borg=name, questions=()),
+        )
     return PlanResult(
         status=borg.state,
         next_actions=_plan_actions(name, borg.state),
@@ -733,6 +893,35 @@ def plan(
                 for question in questions
             ),
         ),
+    )
+
+
+@server.tool(name="plan")
+async def plan(
+    name: str,
+    ctx: Context,
+    action: Literal["start", "show", "change", "approve"] = "start",
+    note: str | None = None,
+) -> PlanResult:
+    """Start, inspect, change, or approve a plan; approval decomposes tasks."""
+    if action == "show":
+        return await anyio.to_thread.run_sync(_plan, name, action, note, None)
+
+    arguments = ["plan", action, name]
+    if action == "change" and note is not None:
+        arguments.extend(("--note", note))
+    if not McpInteractiveIO.supported(ctx):
+        return PlanResult(
+            status="setup_required",
+            next_actions=(),
+            data=SetupRequiredData(cli_command=_cli_command(*arguments)),
+        )
+    return await anyio.to_thread.run_sync(
+        _plan,
+        name,
+        action,
+        note,
+        McpInteractiveIO(ctx),
     )
 
 
@@ -792,20 +981,26 @@ def task_list(name: str) -> TaskListResult:
     )
 
 
-def _execute(name: str, auto_execute: bool) -> ExecuteResult:
+def _execute(name: str, io: McpInteractiveIO) -> ExecuteResult:
     from betterborg_cli import cli as cli_module
 
-    paths = _paths(trusted=True)
+    paths = _paths(trusted=True, io=io)
     config = load_repository_config(paths)
+
+    def decide(estimate: dict[str, Any]) -> ExecutionDecisionRequest | None:
+        io.write(json.dumps(estimate, indent=2, sort_keys=True))
+        if not io.confirm(
+            f"Approve this estimate for Borg {name!r} and begin host execution?",
+            default=False,
+        ):
+            return None
+        return ExecutionDecisionRequest("mcp_elicitation", "approved")
+
     workflow = execute_workflow(
         paths,
         config,
         name,
-        decide=lambda _estimate: (
-            ExecutionDecisionRequest("mcp_auto_execute", "bypassed")
-            if auto_execute
-            else None
-        ),
+        decide=decide,
         invoke_host=cli_module._invoke_host_execution,
     )
     publication = workflow.publication
@@ -814,18 +1009,10 @@ def _execute(name: str, auto_execute: bool) -> ExecuteResult:
     result = workflow.host_result
     if result is None:
         return ExecuteResult(
-            status="estimate_approval_required",
+            status="cancelled",
             artifacts=tuple(
                 TaskArtifact(kind="task", path=_relative(paths, item.path))
                 for item in publication.files
-            ),
-            next_actions=(
-                ExecuteNextAction(
-                    tool="execute",
-                    arguments=ExecuteActionArguments(
-                        name=name, auto_execute=True
-                    )
-                ),
             ),
             data=ExecuteData(
                 borg=name,
@@ -878,9 +1065,14 @@ def _execute(name: str, auto_execute: bool) -> ExecuteResult:
 
 
 @server.tool(name="execute")
-def execute(name: str, auto_execute: bool = False) -> ExecuteResult:
-    """Estimate or run the assembled host execution service."""
-    return _execute(name, auto_execute)
+async def execute(name: str, ctx: Context) -> ExecuteResult:
+    """Elicit estimate approval and run the assembled host execution service."""
+    if not McpInteractiveIO.supported(ctx):
+        return ExecuteResult(
+            status="setup_required",
+            data=SetupRequiredData(cli_command=_cli_command("execute", name)),
+        )
+    return await anyio.to_thread.run_sync(_execute, name, McpInteractiveIO(ctx))
 
 
 def run_stdio_server() -> None:
