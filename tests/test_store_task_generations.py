@@ -1,5 +1,6 @@
 """Contracts for immutable, SQLite-current task generations."""
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def _task(
     position: int,
     complexity: TaskComplexity,
 ) -> TaskRecord:
+    digest = f"sha256:{hashlib.sha256(task_ref.encode()).hexdigest()}"
     return TaskRecord(
         generation_id=generation.id,
         borg_id=generation.borg_id,
@@ -36,10 +38,24 @@ def _task(
         position=position,
         title=f"Implement {task_ref}",
         complexity=complexity,
-        digest=f"sha256:task-{task_ref}",
+        digest=digest,
         task={"acceptance_criteria": [f"{task_ref} works"]},
-        manifest={"task.md": f"sha256:markdown-{task_ref}"},
+        manifest={"task.md": digest},
     )
+
+
+def _write_durable_tree(
+    repository: Repository,
+    borg: Borg,
+    generation: TaskGeneration,
+    tasks: list[TaskRecord],
+) -> Path:
+    root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+    for task in tasks:
+        path = root / task.stage / f"{task.stem}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(task.task_ref.encode())
+    return root
 
 
 def test_generation_transitions_preserve_immutable_history_after_reopen(
@@ -106,7 +122,12 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         )
 
         assert store.get_current_task_generation(borg.id) is None
-        first_current = store.promote_task_generation(first_generation.id)
+        first_root = _write_durable_tree(
+            repository, borg, first_generation, [foundation, consumer]
+        )
+        first_current = store._promote_published_task_generation(
+            first_generation.id, durable_root=first_root
+        )
         assert first_current.status is TaskGenerationStatus.CURRENT
         assert first_current.current_at is not None
 
@@ -134,7 +155,12 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         store.add_task_generation(second_generation, [replacement])
         assert store.get_current_task_generation(borg.id) == first_current
 
-        second_current = store.promote_task_generation(second_generation.id)
+        second_root = _write_durable_tree(
+            repository, borg, second_generation, [replacement]
+        )
+        second_current = store._promote_published_task_generation(
+            second_generation.id, durable_root=second_root
+        )
         generations = store.list_task_generations(borg.id)
         first_superseded = generations[0]
         assert first_superseded.status is TaskGenerationStatus.SUPERSEDED
@@ -204,7 +230,20 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
         store.append_plan_approval(approval)
         store.append_task_batch(batch)
         store.add_task_generation(generation, [first, second], [dependency])
-        current = store.promote_task_generation(generation.id)
+        assert not hasattr(store, "promote_task_generation")
+        missing_root = (
+            repository.root / ".borg/tasks" / borg.name / str(generation.id)
+        )
+        with pytest.raises(ValueError, match="tree is missing"):
+            store._promote_published_task_generation(
+                generation.id, durable_root=missing_root
+            )
+        durable_root = _write_durable_tree(
+            repository, borg, generation, [first, second]
+        )
+        current = store._promote_published_task_generation(
+            generation.id, durable_root=durable_root
+        )
 
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             with store.transaction() as connection:
@@ -245,7 +284,9 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
                     ),
                 )
         with pytest.raises(ValueError, match="only a preparing"):
-            store.promote_task_generation(generation.id)
+            store._promote_published_task_generation(
+                generation.id, durable_root=durable_root
+            )
 
         next_batch = TaskBatch(
             borg_id=borg.id,

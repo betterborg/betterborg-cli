@@ -33,6 +33,17 @@ from betterborg_cli.planning.supervisor import (
     SupervisorLoop,
     SupervisorResult,
 )
+from betterborg_cli.planning.task_publication import (
+    PublishedTaskFile,
+    TaskDigestDriftError,
+    TaskPublication,
+    TaskPublicationError,
+    TaskPublisher,
+)
+from betterborg_cli.planning.task_render import (
+    render_task_markdown,
+    task_markdown_digest,
+)
 from betterborg_cli.planning.task_validation import (
     NonProgressingTaskRepairError,
     PlanElement,
@@ -72,6 +83,7 @@ __all__ = [
     "ProjectManagerError",
     "ProjectManagerLoop",
     "ProjectManagerResult",
+    "PublishedTaskFile",
     "SUPERVISOR_REVIEW_SCHEMA",
     "SUPERVISOR_ROUND_CAP",
     "SupervisorCancelled",
@@ -86,6 +98,10 @@ __all__ = [
     "TechLeadResult",
     "TaskGraphFinding",
     "TaskGraphValidationError",
+    "TaskDigestDriftError",
+    "TaskPublication",
+    "TaskPublicationError",
+    "TaskPublisher",
     "PlanningWorktreeError",
     "PlanValidationError",
     "build_plan_element_catalog",
@@ -93,7 +109,9 @@ __all__ = [
     "task_batch_semantic_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
+    "render_task_markdown",
     "task_graph_findings",
+    "task_markdown_digest",
     "validate_plan",
     "validate_plan_json",
     "validate_task_graph",
