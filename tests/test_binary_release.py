@@ -208,13 +208,18 @@ def test_protected_ordering_and_nonpublishing_ci_path() -> None:
     release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     ci = CI_WORKFLOW.read_text(encoding="utf-8")
 
-    assert release.index("publish-pypi:") < release.index("pypi-verification-gate:")
-    assert release.index("pypi-verification-gate:") < release.index("build-binaries:")
-    assert release.index("build-binaries:") < release.index(
+    assert release.index("publish-pypi:") < release.index(
+        "build-binaries-published:"
+    )
+    assert release.index("build-binaries-published:") < release.index(
         "reconcile-github-release:"
     )
-    assert "needs: [pypi-verification-gate]" in release
-    assert "needs: [build-binaries]" in release
+    assert release.index("reconcile-github-release:") < release.index(
+        "publish-npm:"
+    )
+    assert "needs: [publish-pypi]" in release
+    assert "needs: [build-binaries-published]" in release
+    assert "needs: [reconcile-github-release]" in release
     assert "contents: write" in release
     assert re.search(
         r"reconcile-github-release:\n(?:.*\n)*?    if: \$\{\{ inputs.publish \}\}",

@@ -165,6 +165,20 @@ def test_supported_target_mapping_uses_manifest_and_exact_versioned_asset(
     ]
 
 
+def test_selected_version_uses_only_versioned_manifest_and_assets(
+    tmp_path: Path,
+) -> None:
+    result, _home, curl_log, _install_log = _run_installer(
+        tmp_path, extra_environment={"BETTERBORG_VERSION": "1.2.3"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert curl_log.read_text(encoding="utf-8").splitlines() == [
+        "https://releases.example.test/download/v1.2.3/release-manifest.json",
+        "https://releases.example.test/download/v1.2.3/borg-linux-x86_64",
+    ]
+
+
 def test_install_is_atomic_verified_and_activates_plugins_last(
     tmp_path: Path,
 ) -> None:

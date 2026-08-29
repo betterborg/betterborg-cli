@@ -286,6 +286,8 @@ def test_version_check_accepts_all_sources_and_prospective_tag(tmp_path: Path) -
             str(root),
             "--tag",
             f"v{__version__}",
+            "--greater-than",
+            "0.1.0",
         ],
         check=False,
         capture_output=True,
@@ -294,6 +296,44 @@ def test_version_check_accepts_all_sources_and_prospective_tag(tmp_path: Path) -
 
     assert completed.returncode == 0
     assert completed.stdout.strip() == f"release versions match {__version__}"
+
+
+def test_version_check_rejects_phase_10_version_as_final(tmp_path: Path) -> None:
+    root = _minimal_version_tree(tmp_path)
+    for source, version_location in VERSION_SOURCES:
+        path = root / source
+        content = path.read_text(encoding="utf-8")
+        if version_location == "python":
+            content = content.replace(
+                f'__version__ = "{__version__}"', '__version__ = "0.1.0"'
+            )
+        else:
+            value = json.loads(content)
+            if version_location == "marketplace-entry":
+                value["plugins"][0]["version"] = "0.1.0"
+            else:
+                value["version"] = "0.1.0"
+            content = json.dumps(value)
+        path.write_text(content, encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK_VERSIONS),
+            "--root",
+            str(root),
+            "--tag",
+            "v0.1.0",
+            "--greater-than",
+            "0.1.0",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert "must be greater than '0.1.0'" in completed.stderr
 
 
 def test_version_check_rejects_mismatched_prospective_tag() -> None:

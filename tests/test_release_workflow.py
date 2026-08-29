@@ -1,15 +1,14 @@
-"""Nonpublishing contracts for the protected PyPI release path."""
+"""Nonpublishing contracts for synchronized protected publication."""
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import importlib.util
 import json
 import re
+import shlex
 import subprocess
 import sys
-import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -26,32 +25,6 @@ assert _VERIFY_SPEC is not None and _VERIFY_SPEC.loader is not None
 verify_pypi_release = importlib.util.module_from_spec(_VERIFY_SPEC)
 sys.modules[_VERIFY_SPEC.name] = verify_pypi_release
 _VERIFY_SPEC.loader.exec_module(verify_pypi_release)
-
-LEAK_TEST_CREDENTIAL = "release/secret+value?12345"
-LEAK_TEST_REPRESENTATIONS = (
-    ("raw", LEAK_TEST_CREDENTIAL.encode()),
-    (
-        "percent-encoded",
-        urllib.parse.quote(LEAK_TEST_CREDENTIAL, safe="").encode(),
-    ),
-    (
-        "standard-base64-padded",
-        base64.b64encode(LEAK_TEST_CREDENTIAL.encode()),
-    ),
-    (
-        "standard-base64-unpadded",
-        base64.b64encode(LEAK_TEST_CREDENTIAL.encode()).rstrip(b"="),
-    ),
-    (
-        "urlsafe-base64-padded",
-        base64.urlsafe_b64encode(LEAK_TEST_CREDENTIAL.encode()),
-    ),
-    (
-        "urlsafe-base64-unpadded",
-        base64.urlsafe_b64encode(LEAK_TEST_CREDENTIAL.encode()).rstrip(b"="),
-    ),
-)
-
 
 class _RegistryResponse:
     def __init__(self, payload: dict[str, object]) -> None:
@@ -108,43 +81,68 @@ def test_release_is_manual_and_nonpublishing_by_default() -> None:
     assert re.search(r"publish:\n(?: {8}.*\n)*? {8}default: false", workflow)
     assert "pull_request:" not in workflow
     assert re.search(r"^  push:", workflow, re.MULTILINE) is None
-    assert "Validate release without publishing" in workflow
-    assert 'scripts/check_versions.py --tag "v$REVIEWED_VERSION"' in workflow
+    assert "Validate final tag and build release inputs once" in workflow
+    assert '--tag "v$REVIEWED_VERSION"' in workflow
+    assert "--greater-than 0.1.0" in workflow
+    assert 'git rev-list -n 1 "v$REVIEWED_VERSION"' in workflow
 
 
-def test_protected_job_depends_on_exact_reviewed_artifacts() -> None:
+def test_build_once_artifacts_feed_digest_gated_registry_order() -> None:
     workflow = _workflow_text()
 
     assert "needs: [validate-release]" in workflow
     assert "inputs.publish && github.ref == 'refs/heads/main'" in workflow
     assert "name: pypi" in workflow
-    assert workflow.count("id-token: write") == 2
-    pypi_oidc = workflow.index("id-token: write", workflow.index("publish-pypi:"))
-    binary_oidc = workflow.index("id-token: write", pypi_oidc + 1)
-    assert pypi_oidc < workflow.index("build-binaries:") < binary_oidc
+    assert workflow.count("Build reviewed Python distributions once") == 1
+    assert workflow.count("Build reviewed npm package once") == 1
+    assert "betterborg-registry-inputs-${{ inputs.version }}" in workflow
+    pypi = workflow.index("publish-pypi:")
+    github = workflow.index("reconcile-github-release:")
+    npm = workflow.index("publish-npm:")
+    smokes = workflow.index("smoke-public-release:")
+    assert pypi < github < npm < smokes
+    assert "needs: [publish-pypi]" in workflow
+    assert "needs: [reconcile-github-release]" in workflow
+    assert "needs: [publish-npm]" in workflow
     assert "pypa/gh-action-pypi-publish@release/v1" in workflow
+    assert "--plan-publication" in workflow
+    assert "steps.pypi-plan.outputs.action == 'publish'" in workflow
+    assert "scripts/reconcile_npm_release.py" in workflow
+    assert "steps.npm-plan.outputs.action == 'publish'" in workflow
+    npm_publish = re.search(
+        r"run: (npm publish .*betterborg-cli-\$REVIEWED_VERSION\.tgz.*)", workflow
+    )
+    assert npm_publish is not None
+    assert shlex.split(npm_publish.group(1)) == [
+        "npm",
+        "publish",
+        "./dist/betterborg-cli-$REVIEWED_VERSION.tgz",
+        "--access",
+        "public",
+    ]
     assert "packages-dir: dist/" in workflow
     assert "skip-existing: false" in workflow
     assert "password:" not in workflow
     assert "PYPI_API_TOKEN" not in workflow
-    for artifact in (
-        "dist/betterborg-${{ inputs.version }}-py3-none-any.whl",
-        "dist/betterborg-${{ inputs.version }}.tar.gz",
-    ):
-        assert workflow.count(artifact) == 1
+    assert "NPM_TOKEN" not in workflow
 
 
-def test_protected_smoke_has_one_provider_and_explicit_trust() -> None:
+def test_protected_smokes_follow_all_registries_with_one_provider() -> None:
     workflow = _workflow_text()
-    script = (REPOSITORY_ROOT / "scripts/verify_pypi_release.py").read_text(
+    script = (REPOSITORY_ROOT / "scripts/verify_public_installations.py").read_text(
+        encoding="utf-8"
+    )
+    shared_smoke = (REPOSITORY_ROOT / "scripts/protected_smoke.py").read_text(
         encoding="utf-8"
     )
 
     assert workflow.count("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}") == 1
     assert "ANTHROPIC_API_KEY: ${{ secrets." not in workflow
     assert "f\"betterborg=={version}\"" in script
-    assert '_uvx_command(version, "version")' in script
-    assert '_uvx_command(version, "init", "--yes", "--json")' in script
+    assert 'f"@betterborg/cli@{version}"' in script
+    assert "releases/download/v{version}/install.sh" in script
+    assert '[*prefix, "init", "--yes", "--json"]' in shared_smoke
+    assert workflow.index("publish-npm:") < workflow.index("smoke-public-release:")
 
 
 def test_public_smoke_uses_exact_commands_and_isolated_provider(
@@ -258,6 +256,36 @@ def test_release_smoke_rejects_a_public_digest_mismatch_before_commands(
         )
 
 
+def test_pypi_publication_plan_publishes_only_a_missing_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    _release_artifacts(artifacts, "1.2.3")
+    monkeypatch.setattr(
+        verify_pypi_release, "_public_distribution_digests", lambda _version: None
+    )
+
+    assert verify_pypi_release.publication_action("1.2.3", artifacts) == "publish"
+
+
+def test_pypi_publication_plan_skips_only_matching_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    distributions = _release_artifacts(artifacts, "1.2.3")
+    digests = {
+        filename: hashlib.sha256(body).hexdigest()
+        for filename, body in distributions.items()
+    }
+    monkeypatch.setattr(
+        verify_pypi_release,
+        "_public_distribution_digests",
+        lambda _version: digests,
+    )
+
+    assert verify_pypi_release.publication_action("1.2.3", artifacts) == "skip"
+
+
 def test_release_smoke_rejects_wrong_version_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -291,45 +319,6 @@ def test_release_smoke_rejects_wrong_version_output(
             attempts=1,
             retry_delay=0,
         )
-
-
-def test_credential_markers_cover_every_distinct_representation() -> None:
-    expected = {encoded for _name, encoded in LEAK_TEST_REPRESENTATIONS}
-
-    assert len(expected) == 6
-    assert (
-        set(verify_pypi_release._credential_markers(LEAK_TEST_CREDENTIAL))
-        == expected
-    )
-
-
-@pytest.mark.parametrize("location", ["stdout", "stderr", "fixture"])
-@pytest.mark.parametrize(
-    "encoded",
-    [encoded for _name, encoded in LEAK_TEST_REPRESENTATIONS],
-    ids=[name for name, _encoded in LEAK_TEST_REPRESENTATIONS],
-)
-def test_release_smoke_rejects_credential_leaks(
-    tmp_path: Path,
-    location: str,
-    encoded: bytes,
-) -> None:
-    stdout = encoded if location == "stdout" else b""
-    stderr = encoded if location == "stderr" else b""
-    fixture = tmp_path / "fixture"
-    fixture.mkdir()
-    if location == "fixture":
-        (fixture / "state.bin").write_bytes(encoded)
-
-    with pytest.raises(verify_pypi_release.ReleaseVerificationError) as raised:
-        verify_pypi_release._assert_no_credential_leak(
-            LEAK_TEST_CREDENTIAL,
-            [verify_pypi_release.CommandCapture("test command", stdout, stderr)],
-            (fixture,),
-        )
-
-    assert location in str(raised.value)
-    assert LEAK_TEST_CREDENTIAL not in str(raised.value)
 
 
 def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:

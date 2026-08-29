@@ -16,6 +16,7 @@ VERSION_PATTERN = re.compile(
     r"(?:\.dev[0-9]+)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$",
     re.IGNORECASE,
 )
+STABLE_VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 JSON_VERSION_SOURCES = (
     Path("npm/package.json"),
     Path(
@@ -139,6 +140,22 @@ def version_errors(root: Path, tag: str | None = None) -> list[str]:
     return errors
 
 
+def _stable_version_parts(version: str) -> tuple[int, ...]:
+    if not STABLE_VERSION_PATTERN.fullmatch(version):
+        raise ValueError(
+            "greater-version validation requires stable numeric versions"
+        )
+    return tuple(int(part) for part in version.split("."))
+
+
+def is_greater_version(version: str, previous: str) -> bool:
+    """Return whether one stable numeric version is strictly greater."""
+    left = _stable_version_parts(version)
+    right = _stable_version_parts(previous)
+    width = max(len(left), len(right))
+    return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -155,6 +172,10 @@ def main() -> int:
         "--tag",
         help="also require the prospective release tag (in vVERSION form) to match",
     )
+    parser.add_argument(
+        "--greater-than",
+        help="also require a stable source version greater than this prior release",
+    )
     arguments = parser.parse_args()
     root = arguments.root.resolve()
     errors = version_errors(root, arguments.tag)
@@ -165,6 +186,18 @@ def main() -> int:
                 f"reviewed version {arguments.expected!r} does not match "
                 f"source version {source_version!r}"
             )
+    if not errors and arguments.greater_than is not None:
+        source_version = _python_version(root)
+        try:
+            greater = is_greater_version(source_version, arguments.greater_than)
+        except ValueError as error:
+            errors.append(str(error))
+        else:
+            if not greater:
+                errors.append(
+                    f"release version {source_version!r} must be greater than "
+                    f"{arguments.greater_than!r}"
+                )
     if errors:
         for error in errors:
             print(f"version check failed: {error}", file=sys.stderr)

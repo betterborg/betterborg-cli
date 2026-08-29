@@ -1,8 +1,9 @@
-# PyPI and standalone binary release runbook
+# Synchronized PyPI, GitHub, and npm release runbook
 
 The `.github/workflows/release.yml` workflow is manual and defaults to a
 nonpublishing validation run. Public upload requires the `publish` input, a
-run from `main`, and approval of the protected `pypi` GitHub environment.
+run from `main`, and approval of the protected `pypi` and `npm` GitHub
+environments at their registry gates.
 Ordinary pushes and pull requests never invoke this workflow; CI calls the
 same reusable four-platform binary workflow with publication and attestations
 disabled.
@@ -31,12 +32,29 @@ this exact identity:
 The reviewer approving the first run must confirm those five fields on PyPI
 and confirm that the workflow run's commit is the reviewed `main` commit.
 
+Configure a second GitHub environment named `npm` with required reviewers,
+prevent self-review and administrator bypass, and restrict deployment branches
+to `main`. It has no secrets. An npm owner configures trusted publishing for
+the public `@betterborg/cli` package with organization `betterborg`, repository
+`betterborg-cli`, workflow filename `release.yml`, environment `npm`, and the
+`npm publish` action allowed. npm trusted publishing requires Node 22.14 or
+newer and npm 11.5.1 or newer; the workflow uses Node 24 and npm 11. Do not add
+an `NPM_TOKEN`.
+
+If `@betterborg/cli` does not exist yet, an npm owner must complete a separate,
+reviewed lower-version package-claim checkpoint before configuring its trusted
+publisher. Do not claim it with the phase-10 version or the synchronized final
+version, and do not dispatch this workflow until the trusted publisher is
+active. Restrict token-based publishing after OIDC succeeds.
+
 ## Select the reviewed release
 
 Update `betterborg_cli.__version__`, `npm/package.json`, both bundled plugin
 manifests, and both marketplace entries in one reviewed change. Run
-`python scripts/check_versions.py --tag vVERSION`, `make lint`, `make test`, and
-`make build`, then create the reviewed `vVERSION` tag on that exact commit.
+`python scripts/check_versions.py --tag vVERSION --greater-than 0.1.0`,
+`make lint`, `make test`, and `make build`, then create the reviewed `vVERSION`
+tag on that exact commit. The final version must remain greater than the
+phase-10 version; the phase-10 tag is never a publication target.
 Verify that the tag is annotated or signed according to the project's release
 policy, that its version matches the source and artifact names, and that the
 tagged commit is the current tip of `main`.
@@ -50,17 +68,18 @@ different commit under the reviewed tag's version.
 
 1. After `.github/workflows/release.yml` is merged, open **Release BetterBorg** in
    GitHub Actions, choose **Run workflow**, select `main`, enter the exact
-   reviewed version, leave `publish` disabled, and require **Validate release
-   without publishing** to pass.
+   reviewed version, leave `publish` disabled, and require every dry-run job to
+   pass. The run builds the wheel, sdist, npm tarball, four binaries, manifest,
+   and installer once, then exercises PyPI, GitHub, npm, curl, uvx, npx, and
+   credential fixtures without contacting a write API or mutating a registry.
 2. Dispatch the same tagged `main` commit and version with `publish` enabled.
    An authorized reviewer checks the run SHA, version, artifact names, and the
    five trusted-publisher identity fields before approving the protected
    `pypi` environment deployment.
-3. Require the protected job to finish. It publishes only the reviewed wheel
-   and sdist, compares their SHA-256 digests with the public PyPI metadata, then
-   runs `uvx --refresh --from 'betterborg==VERSION' borg version` and `borg
-   init --yes --json` from that exact distribution in a disposable, committed
-   Git fixture.
+3. Require the PyPI gate to finish. Before uploading, it reads the exact public
+   version metadata. A missing version is published from the preserved wheel
+   and sdist; a complete matching version is skipped only after both SHA-256
+   digests match. It compares their SHA-256 digests again after any upload.
 4. The PyPI verification gate must succeed before any standalone build starts.
    The reusable build workflow then produces and version-smokes
    `borg-darwin-arm64`, `borg-darwin-x86_64`, `borg-linux-arm64`, and
@@ -68,11 +87,21 @@ different commit under the reviewed tag's version.
    `release-manifest.json`, and packages `install.sh` beside them. Each
    protected binary/checksum pair, the manifest, and the installer receives a
    GitHub artifact attestation.
-5. The final job reads the existing `vVERSION` GitHub Release before changing
+5. The GitHub reconciliation job reads the existing `vVERSION` GitHub Release before changing
    it. It compares every existing asset byte-for-byte by SHA-256, uploads only
    missing assets to a matching draft, and publishes the complete draft. It
    never overwrites an asset. A complete matching published release is a
    successful resume and needs no mutation.
+6. After GitHub is complete, approve the protected `npm` environment. The job
+   compares the preserved npm tarball's SHA-512 integrity with
+   `@betterborg/cli@VERSION`. It publishes only a missing version with npm OIDC,
+   skips an exact match, and rejects a mismatch as immutable.
+7. Only after all three public sources match, approve the protected `pypi`
+   environment for the final smoke. One provider credential runs fresh,
+   isolated trusted initialization fixtures through the versioned GitHub curl
+   installer, `uvx --from betterborg==VERSION`, and
+   `npx @betterborg/cli@VERSION`. Each fixture scans stdout, stderr, paths,
+   symlinks, and files for raw and encoded credential forms.
 
 Linux binaries are built natively on `ubuntu-24.04` and
 `ubuntu-24.04-arm` inside the architecture-matched PyPA `manylinux2014`
@@ -85,10 +114,10 @@ Darwin ARM64 uses `macos-14`, and Darwin x86_64 uses `macos-15-intel`; none of
 the four deliverables is cross-compiled.
 
 The reusable workflow grants `id-token: write` and `attestations: write` only
-to its build and manifest jobs. The PyPI job is the only other OIDC consumer.
-Only the final, publish-enabled reconciliation job receives `contents: write`;
-the fixture validation path remains read-only and cannot create a GitHub
-Release.
+to its build and manifest jobs. The PyPI and npm publishing jobs are the only
+other OIDC consumers. Only the final, publish-enabled GitHub reconciliation
+job receives `contents: write`; the fixture validation path remains read-only
+and cannot create a GitHub Release.
 
 ## Authorize and verify the binary publication
 
@@ -119,7 +148,7 @@ newer `main` commit for the old version. The PyPI gate must remain successful
 before the four-platform build and the final GitHub Release reconciliation
 run.
 
-After the final job succeeds, run the read-only public verification from the
+After the protected workflow succeeds, run the read-only GitHub verification from the
 reviewed checkout. First record that checkout's full commit SHA; this trusted
 value lets the verifier reject a tag that has moved since review:
 
@@ -170,32 +199,36 @@ version, and repeat the validation and protected publication path. A published
 release missing any of the ten assets is likewise terminal and requires a new
 version.
 
-If a run is interrupted before the upload step starts, use **Re-run failed
-jobs** on the same workflow run after confirming its SHA and inputs. If any
-file may have reached PyPI, do not rerun the publish job. Download the preserved
-`betterborg-VERSION` workflow artifact, place its wheel and sdist together in a
-directory, and run the read-only verification from the reviewed checkout:
+If a run is interrupted, use **Re-run failed jobs** on the same workflow run
+after confirming its SHA and inputs. Each registry job reads public metadata
+before its mutation step: missing bytes may be published, exact matching bytes
+are skipped, and mismatches stop the release. Download the preserved
+`betterborg-registry-inputs-VERSION` workflow artifact and run the read-only
+PyPI verification from the reviewed checkout:
 
 ```console
-python scripts/verify_pypi_release.py --version VERSION --artifacts PATH
+python scripts/verify_pypi_release.py \
+  --version VERSION \
+  --artifacts PATH \
+  --artifacts-only
 ```
 
-Supply only `OPENAI_API_KEY` from the protected `pypi` environment. GitHub must
-mask that secret, and the operator must confirm no unmasked value occurs in any
-step output before accepting the run. Do not supply `ANTHROPIC_API_KEY`, a PyPI
-password, or a PyPI token. The verification script only performs a GET of the
-exact-version PyPI metadata and runs the public CLI; it has no upload path.
+This verification needs no credential and has no upload path. For the final
+three-source smoke, supply only `OPENAI_API_KEY` from the protected `pypi`
+environment. GitHub must mask that secret, and the operator must confirm no
+unmasked value occurs in any step output before accepting the run. Do not
+supply `ANTHROPIC_API_KEY`, a PyPI password, a PyPI token, or an npm token.
 
-The smoke child process receives exactly one provider variable,
-`OPENAI_API_KEY`, and puts machine state inside the disposable fixture. The
-verification captures stdout and stderr and recursively scans the fixture,
-including Git and BetterBorg state, for raw, URL-encoded, standard-base64, and
-URL-safe-base64 forms of the credential. GitHub log masking is defense in
-depth; it is not the redaction assertion.
+Each curl, uvx, and npx init child receives exactly one provider variable,
+`OPENAI_API_KEY`, and puts HOME, cache, data, and state inside its own
+disposable fixture. The verification captures stdout and stderr and recursively
+scans each fixture, including Git and BetterBorg state, for raw, URL-encoded,
+standard-base64, and URL-safe-base64 forms of the credential. GitHub log
+masking is defense in depth; it is not the redaction assertion.
 
 ## Immutable-version decision
 
-PyPI versions and their artifact bytes are immutable. If the version already
+PyPI and npm versions and their artifact bytes are immutable. If the PyPI version already
 exists, compare both public SHA-256 digests with the preserved reviewed wheel
 and sdist by running the verification command above. Exact filename and digest
 matches mean the existing publication is the reviewed release: finish the
@@ -211,6 +244,12 @@ new version. A transient version or init check may be rerun only as read-only
 verification after the artifact digests have matched; it never authorizes
 another upload for the existing version.
 
+Apply the same decision to `@betterborg/cli@VERSION`: compare the preserved
+tarball's SHA-512 integrity with the exact public npm metadata. A match is a
+successful skip. A missing version may be published only after GitHub assets
+are complete. A different integrity value, partial npm state, or package defect
+requires a new synchronized version; never unpublish and reuse the version.
+
 ## Binary recovery and rollback
 
 For an interrupted binary build, use **Re-run failed jobs** only after the PyPI
@@ -223,7 +262,7 @@ The manifest records `schema_version`, `version`, and, for each target, its
 `filename`, `os`, `arch`, `sha256`, and byte `size`.
 
 If reconciliation stopped after creating or partially filling a draft, rerun
-the final job. Matching remote digests are retained and only absent assets are
+the GitHub reconciliation job. Matching remote digests are retained and only absent assets are
 uploaded. If any draft digest differs, delete nothing and overwrite nothing:
 preserve the draft for investigation and prepare a new reviewed version. If a
 published release is partial, it is also immutable and requires a new version.

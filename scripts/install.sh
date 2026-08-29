@@ -3,6 +3,7 @@
 set -eu
 
 REPOSITORY_RELEASES_URL=${_BETTERBORG_RELEASES_URL:-https://github.com/betterborg/betterborg-cli/releases}
+SELECTED_VERSION=${BETTERBORG_VERSION:-}
 INSTALL_HOME=${HOME:-}
 TEMPORARY_DIRECTORY=
 STAGED_EXECUTABLE=
@@ -159,8 +160,20 @@ TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/betterborg-install.XXXXXXXX") |
 MANIFEST="$TEMPORARY_DIRECTORY/release-manifest.json"
 ARTIFACT="$TEMPORARY_DIRECTORY/$TARGET"
 
-download "$REPOSITORY_RELEASES_URL/latest/download/release-manifest.json" \
-    "$MANIFEST" || fail 'could not download the latest release manifest.'
+if [ -n "$SELECTED_VERSION" ]; then
+    case "$SELECTED_VERSION" in
+        [0-9]*) ;;
+        *) fail 'BETTERBORG_VERSION is invalid.' ;;
+    esac
+    case "$SELECTED_VERSION" in
+        *[!0-9A-Za-z._+-]*) fail 'BETTERBORG_VERSION is invalid.' ;;
+    esac
+    MANIFEST_URL="$REPOSITORY_RELEASES_URL/download/v$SELECTED_VERSION/release-manifest.json"
+else
+    MANIFEST_URL="$REPOSITORY_RELEASES_URL/latest/download/release-manifest.json"
+fi
+
+download "$MANIFEST_URL" "$MANIFEST" || fail 'could not download the release manifest.'
 
 VERSION=$(manifest_version "$MANIFEST") || fail 'release manifest metadata is invalid.'
 case "$VERSION" in
@@ -170,6 +183,8 @@ esac
 case "$VERSION" in
     *[!0-9A-Za-z._+-]*) fail 'release manifest version is invalid.' ;;
 esac
+[ -z "$SELECTED_VERSION" ] || [ "$VERSION" = "$SELECTED_VERSION" ] || \
+    fail "release manifest reported $VERSION, expected $SELECTED_VERSION."
 EXPECTED_SHA256=$(manifest_checksum "$MANIFEST" "$TARGET" "$TARGET_OS" "$TARGET_ARCH") || \
     fail "release manifest does not contain the supported target $TARGET."
 case "$EXPECTED_SHA256" in
