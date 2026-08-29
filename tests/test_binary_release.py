@@ -59,6 +59,7 @@ def test_release_manifest_has_exact_stable_shape(tmp_path: Path) -> None:
         "borg-linux-arm64.sha256",
         "borg-linux-x86_64",
         "borg-linux-x86_64.sha256",
+        "install.sh",
         "release-manifest.json",
     }
 
@@ -72,6 +73,18 @@ def test_manifest_rejects_a_stale_checksum(tmp_path: Path) -> None:
     with pytest.raises(
         release_artifacts.ReleaseArtifactError,
         match="checksum sidecar does not match",
+    ):
+        release_artifacts.build_manifest("1.2.3", directory)
+
+
+def test_manifest_rejects_installer_drift(tmp_path: Path) -> None:
+    directory = tmp_path / "release"
+    _artifact_set(directory)
+    (directory / "install.sh").write_text("changed installer\n", encoding="utf-8")
+
+    with pytest.raises(
+        release_artifacts.ReleaseArtifactError,
+        match="does not match the reviewed installer source",
     ):
         release_artifacts.build_manifest("1.2.3", directory)
 
@@ -180,6 +193,8 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     assert workflow.count("uses: actions/attest@v4") == 2
     assert workflow.count("id-token: write") == 2
     assert workflow.count("attestations: write") == 2
+    assert "cp scripts/install.sh release-assets/install.sh" in workflow
+    assert "release-assets/install.sh" in workflow
 
 
 def test_linux_binary_lock_selects_old_glibc_cryptography_wheel() -> None:

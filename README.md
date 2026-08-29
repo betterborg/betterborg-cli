@@ -12,7 +12,24 @@ foundation; repository and service features will be added incrementally.
 
 ## Install and run
 
-Install the CLI from a checkout and print its version:
+Install the latest release binary for Darwin or Linux, verify it, and activate
+integrations for installed supported hosts:
+
+```console
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/betterborg/betterborg-cli/releases/latest/download/install.sh \
+  | sh
+```
+
+The installer selects ARM64 or x86_64 from the release manifest, verifies the
+binary's SHA-256 digest and exact version before atomically replacing
+`~/.local/bin/borg`, and only then runs `borg plugins install --all`. It prints
+PATH guidance when `~/.local/bin` is not already visible. Native Windows and
+WSL1 are unsupported; use a WSL2 shell. For another unsupported target, install
+uv and run `uvx --from betterborg borg version` as a non-persistent fallback;
+plugin activation still requires the persistent installer.
+
+To install the CLI from a checkout and print its version instead:
 
 ```console
 python -m pip install .

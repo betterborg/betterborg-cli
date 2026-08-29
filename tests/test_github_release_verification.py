@@ -70,7 +70,7 @@ def test_complete_release_fixture_verifies_every_asset_and_attestation(
     captured = capsys.readouterr()
     assert result == 0
     assert captured.err == ""
-    assert "9 assets and attestations" in captured.out
+    assert "10 assets and attestations" in captured.out
 
 
 def test_partial_draft_fixture_reports_each_remaining_publication_step(
@@ -243,7 +243,7 @@ def test_live_verification_does_not_credit_attestations_without_subject_bytes(
         if command[1:2] == ["api"]
         and "/attestations/sha256:" in command[2]
     ]
-    expected_queries = 8 if missing is not None else 9
+    expected_queries = 9 if missing is not None else 10
     assert len(attestation_queries) == expected_queries
     if missing is not None:
         missing_digest = verify_github_release.sha256(
@@ -271,7 +271,7 @@ def test_live_verification_does_not_credit_attestations_without_subject_bytes(
         for command in commands
         if command[1:3] == ["attestation", "verify"]
     ]
-    expected_verifications = 8 if missing is not None else 9
+    expected_verifications = 9 if missing is not None else 10
     assert len(verification_commands) == expected_verifications
     assert all(
         command[1] in {"api", "attestation"}

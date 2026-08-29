@@ -12,11 +12,13 @@ from pathlib import Path
 from typing import NoReturn
 
 from release_artifacts import (
+    INSTALLER_FILENAME,
     SCHEMA_VERSION,
     TARGETS,
     ReleaseArtifactError,
     build_manifest,
     sha256,
+    validate_installer,
 )
 
 
@@ -49,7 +51,7 @@ def _expected_names() -> tuple[str, ...]:
         for target in TARGETS
         for name in (target.filename, f"{target.filename}.sha256")
     ]
-    names.append("release-manifest.json")
+    names.extend(("release-manifest.json", INSTALLER_FILENAME))
     return tuple(names)
 
 
@@ -100,6 +102,12 @@ def _validate_available_assets(
     """Reject every mismatch observable in a complete or partial draft."""
     manifest_path = assets.get("release-manifest.json")
     recorded = _read_manifest(manifest_path) if manifest_path else None
+    installer_path = assets.get(INSTALLER_FILENAME)
+    if installer_path is not None:
+        try:
+            validate_installer(installer_path)
+        except ReleaseArtifactError as error:
+            _mismatch(str(error))
     entries: list[object] | None = None
     if recorded is not None:
         if set(recorded) != {"schema_version", "version", "artifacts"}:

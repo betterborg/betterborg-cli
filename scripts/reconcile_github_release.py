@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
-from release_artifacts import TARGETS, ReleaseArtifactError, build_manifest, sha256
+from release_artifacts import (
+    INSTALLER_FILENAME,
+    TARGETS,
+    ReleaseArtifactError,
+    build_manifest,
+    sha256,
+)
 
 
 class ReleaseReconciliationError(RuntimeError):
@@ -52,7 +58,7 @@ def expected_assets(version: str, directory: Path) -> dict[str, str]:
         for target in TARGETS
         for name in (target.filename, f"{target.filename}.sha256")
     ]
-    filenames.append(manifest_path.name)
+    filenames.extend((manifest_path.name, INSTALLER_FILENAME))
     try:
         return {name: sha256(directory / name) for name in filenames}
     except ReleaseArtifactError as error:

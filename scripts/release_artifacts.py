@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NoReturn
 
 SCHEMA_VERSION = 1
+INSTALLER_FILENAME = "install.sh"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,15 @@ def write_checksum(path: Path) -> Path:
     return checksum
 
 
+def validate_installer(path: Path) -> None:
+    """Require the packaged installer to match the reviewed source exactly."""
+    source = Path(__file__).with_name(INSTALLER_FILENAME)
+    if not path.is_file():
+        _fail(f"release installer is missing: {path}")
+    if sha256(path) != sha256(source):
+        _fail("install.sh does not match the reviewed installer source")
+
+
 def _read_checksum(path: Path, artifact: Path) -> str:
     try:
         content = path.read_text(encoding="utf-8")
@@ -69,7 +79,7 @@ def _read_checksum(path: Path, artifact: Path) -> str:
 
 
 def build_manifest(version: str, directory: Path) -> dict[str, object]:
-    """Validate exactly four binaries and return the stable manifest shape."""
+    """Validate the release assets and return the stable binary manifest."""
     if not version or version.startswith("v"):
         _fail("version must be nonempty and must not include the v tag prefix")
 
@@ -78,6 +88,7 @@ def build_manifest(version: str, directory: Path) -> dict[str, object]:
         for target in TARGETS
         for name in (target.filename, f"{target.filename}.sha256")
     }
+    expected_names.add(INSTALLER_FILENAME)
     actual_names = {path.name for path in directory.iterdir() if path.is_file()}
     unexpected = actual_names - expected_names - {"release-manifest.json"}
     missing = expected_names - actual_names
@@ -86,6 +97,7 @@ def build_manifest(version: str, directory: Path) -> dict[str, object]:
             "binary artifact set differs: "
             f"missing {sorted(missing)}, unexpected {sorted(unexpected)}"
         )
+    validate_installer(directory / INSTALLER_FILENAME)
 
     artifacts: list[dict[str, object]] = []
     for target in TARGETS:
