@@ -8,11 +8,15 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     NonProgressingTaskRepairError,
     ProjectManagerError,
     ProjectManagerLoop,
+    SupervisorCancelled,
+    SupervisorError,
+    SupervisorLoop,
     TaskGraphFinding,
     TaskGraphValidationError,
     approved_plan_digest,
@@ -30,6 +34,7 @@ from betterborg_cli.store import (
     SqliteStore,
     TaskComplexity,
     TaskDependency,
+    TaskGenerationStatus,
     TaskRecord,
 )
 
@@ -196,6 +201,42 @@ def _approve_plan(
         new_state=BorgState.PLAN_APPROVAL_PENDING,
     )
     return approval, approved_borg
+
+
+def _planning_context(spec) -> dict:
+    manifest = json.loads(
+        (spec.cwd / ".borg/state/planning/context/manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return json.loads(
+        (spec.cwd / manifest["current_plan"]).read_text(encoding="utf-8")
+    )
+
+
+def _review_response(
+    decision: str, message: str = "The first task needs a narrower scope."
+):
+    def respond(spec):
+        context = _planning_context(spec)
+        task_ref = context["task_batch"]["tasks"][0]["task_ref"]
+        findings = []
+        if decision == "request_changes":
+            findings.append(
+                {
+                    "severity": "major",
+                    "message": message,
+                    "suggestion": "Keep the task independently testable.",
+                    "task_ref": task_ref,
+                }
+            )
+        return {
+            "decision": decision,
+            "summary": f"Supervisor decided to {decision}.",
+            "findings": findings,
+        }
+
+    return respond
 
 
 def _rules(findings: Iterable[TaskGraphFinding]) -> set[str]:
@@ -430,6 +471,397 @@ def test_pm_rejects_plan_content_that_does_not_match_approval_digest(
         assert adapter.calls == []
         assert store.list_planning_attempts(borg.id) == []
         assert store.list_task_batches(borg.id) == []
+
+
+def test_supervisor_approves_one_validated_batch_for_publication_handoff(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-approve.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-approve"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm_result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("approve"))
+        )
+        loop = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+        )
+
+        result = loop.run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert result.approval == approval
+        assert result.batch == pm_result.batch
+        assert result.generation.status is TaskGenerationStatus.CURRENT
+        assert store.get_current_task_generation(borg.id) == result.generation
+        assert len(supervisor.calls) == 1
+        assert loop.run() == result
+        assert len(supervisor.calls) == 1
+
+
+def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    initial_payload = _pm_payload(plan)
+    revised_payload = _pm_payload(plan)
+    revised_payload["tasks"][0]["title"] = "Build a narrow foundation"
+    database = committed_git_repo.parent / "supervisor-revise.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-revise"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=initial_payload)
+            ),
+            approved_plan=plan,
+        ).run()
+
+        def revise_from_findings(spec):
+            context = _planning_context(spec)["_betterborg_task_revision"]
+            assert context["batch_id"] == str(initial.batch.id)
+            assert context["findings"][0]["severity"] == "major"
+            assert "narrower scope" in context["findings"][0]["message"]
+            task_ref = context["findings"][0]["task_ref"]
+            referenced_task = next(
+                task for task in context["tasks"] if task["task_ref"] == task_ref
+            )
+            assert referenced_task["task"]["title"] == initial.tasks[0].title
+            assert f"[{task_ref}]" in spec.user_prompt
+            assert "Supervisor findings" in spec.user_prompt
+            return revised_payload
+
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=revise_from_findings)
+        )
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+        supervisor.queue(MockResponse(dynamic=_review_response("approve")))
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert result.batch.id != initial.batch.id
+        assert result.tasks[0].title == "Build a narrow foundation"
+        assert len(store.list_task_batches(borg.id)) == 2
+        persisted_findings = store.list_task_findings(
+            borg.id, batch_id=initial.batch.id
+        )
+        assert len(persisted_findings) == 1
+        assert persisted_findings[0].message.endswith("narrower scope.")
+        assert len(pm.calls) == 1
+        assert len(supervisor.calls) == 2
+        assert store.get_current_task_generation(borg.id) == result.generation
+
+
+def test_supervisor_rejects_nonprogressing_pm_revisions(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    payload = _pm_payload(plan)
+    database = committed_git_repo.parent / "supervisor-no-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-no-progress"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(MockResponse(payload=payload)),
+            approved_plan=plan,
+        ).run()
+        pm = MockAdapter(name="openai")
+        for _ in range(3):
+            pm.queue(MockResponse(payload=payload))
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+
+        with pytest.raises(
+            SupervisorError, match="exhausted revision retries.*no semantic progress"
+        ):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+            ).run()
+
+        assert store.get_borg(borg.id).state is BorgState.PM_WORKING
+        assert len(store.list_task_batches(borg.id)) == 1
+        revision_attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "pm_tasks"
+            and attempt.request.get("base_batch_id") == str(initial.batch.id)
+        ]
+        assert len(revision_attempts) == 3
+        assert all(
+            attempt.status is PlanningAttemptStatus.FAILED
+            and "no semantic progress" in (attempt.summary or "")
+            for attempt in revision_attempts
+        )
+        with pytest.raises(SupervisorError, match="exhausted revision retries"):
+            SupervisorLoop(
+                repository,
+                store.get_borg(borg.id),
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+            ).run()
+        assert len(pm.calls) == 3
+
+
+def test_supervisor_rejects_order_only_pm_revisions(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    payload = _pm_payload(plan)
+    reordered = _pm_payload(plan)
+    reordered["tasks"].reverse()
+    for task in reordered["tasks"]:
+        task["plan_refs"].reverse()
+        task["scope"].reverse()
+        task["dependencies"].reverse()
+    database = committed_git_repo.parent / "supervisor-order-no-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-order-no-progress"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(MockResponse(payload=payload)),
+            approved_plan=plan,
+        ).run()
+        pm = MockAdapter(name="openai")
+        for _ in range(3):
+            pm.queue(MockResponse(payload=reordered))
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+
+        with pytest.raises(
+            SupervisorError, match="exhausted revision retries.*no semantic progress"
+        ):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+            ).run()
+
+        assert len(store.list_task_batches(borg.id)) == 1
+        assert len(pm.calls) == 3
+
+
+def test_supervisor_resumes_completed_provider_turn_without_replay(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-resume.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-resume"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        adapter = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("approve"))
+        )
+        loop = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            adapter,
+            approved_plan=plan,
+        )
+        original_complete = store.complete_planning_attempt
+        interrupted = False
+
+        def interrupt_after_result(attempt_id, **kwargs):
+            nonlocal interrupted
+            attempt = next(
+                item
+                for item in store.list_planning_attempts(borg.id)
+                if item.id == attempt_id
+            )
+            if (
+                attempt.phase == "supervisor_review"
+                and kwargs["status"] is PlanningAttemptStatus.COMPLETED
+                and not interrupted
+            ):
+                interrupted = True
+                raise RuntimeError("simulated Supervisor interruption")
+            return original_complete(attempt_id, **kwargs)
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(
+                store, "complete_planning_attempt", interrupt_after_result
+            )
+            with pytest.raises(RuntimeError, match="Supervisor interruption"):
+                loop.run()
+
+        running = store.list_planning_attempts(borg.id)[-1]
+        assert running.status is PlanningAttemptStatus.RUNNING
+        assert Path(running.request["result_path"]).is_file()
+        assert len(adapter.calls) == 1
+
+        resumed = loop.run()
+
+        assert resumed.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(adapter.calls) == 1
+
+
+def test_supervisor_cancellation_preserves_resumable_batch(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-cancel.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-cancel"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        cancel = CancellationToken()
+        cancel.cancel()
+        supervisor = MockAdapter(name="openai")
+
+        with pytest.raises(SupervisorCancelled, match="cancelled"):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                approved_plan=plan,
+                cancel=cancel,
+            ).run()
+
+        assert store.get_borg(borg.id).state is BorgState.SUPERVISOR_WORKING
+        assert store.list_task_generations(borg.id)[0].status is (
+            TaskGenerationStatus.PREPARING
+        )
+        assert supervisor.calls == []
+
+
+def test_supervisor_blocks_after_bounded_review_exhaustion(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-cap.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-cap"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        pm = MockAdapter(name="openai")
+        for revision in (1, 2):
+            payload = _pm_payload(plan)
+            payload["tasks"][0]["title"] = f"Foundation revision {revision}"
+            pm.queue(MockResponse(payload=payload))
+        supervisor = MockAdapter(name="openai")
+        for round_number in range(1, 4):
+            supervisor.queue(
+                MockResponse(
+                    dynamic=_review_response(
+                        "request_changes",
+                        f"Round {round_number} still has a scope defect.",
+                    )
+                )
+            )
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+        ).run()
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert len(supervisor.calls) == 3
+        assert len(pm.calls) == 2
+        assert len(store.list_task_batches(borg.id)) == 3
+        assert len(store.list_task_findings(borg.id)) == 3
+        assert store.get_current_task_generation(borg.id) is None
+        assert all(
+            generation.status is TaskGenerationStatus.PREPARING
+            for generation in store.list_task_generations(borg.id)
+        )
 
 
 def test_complete_graph_has_one_owner_per_required_element() -> None:

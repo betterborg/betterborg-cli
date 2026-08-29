@@ -23,6 +23,15 @@ from betterborg_cli.planning.pm import (
     ProjectManagerLoop,
     ProjectManagerResult,
     approved_plan_digest,
+    task_batch_semantic_digest,
+)
+from betterborg_cli.planning.supervisor import (
+    SUPERVISOR_REVIEW_SCHEMA,
+    SUPERVISOR_ROUND_CAP,
+    SupervisorCancelled,
+    SupervisorError,
+    SupervisorLoop,
+    SupervisorResult,
 )
 from betterborg_cli.planning.task_validation import (
     NonProgressingTaskRepairError,
@@ -63,6 +72,12 @@ __all__ = [
     "ProjectManagerError",
     "ProjectManagerLoop",
     "ProjectManagerResult",
+    "SUPERVISOR_REVIEW_SCHEMA",
+    "SUPERVISOR_ROUND_CAP",
+    "SupervisorCancelled",
+    "SupervisorError",
+    "SupervisorLoop",
+    "SupervisorResult",
     "TECH_LEAD_REVIEW_SCHEMA",
     "TECH_REVIEW_ROUND_CAP",
     "TechLeadCancelled",
@@ -75,6 +90,7 @@ __all__ = [
     "PlanValidationError",
     "build_plan_element_catalog",
     "approved_plan_digest",
+    "task_batch_semantic_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
     "task_graph_findings",
