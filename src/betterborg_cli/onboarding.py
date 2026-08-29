@@ -36,8 +36,9 @@ class CreateService:
         store: SqliteStore,
         agent: AgentAdapter | SelectedAgent,
         *,
-        io: InteractiveIO,
+        io: InteractiveIO | None = None,
         editor: Editor | None = None,
+        interactive: bool = True,
     ) -> None:
         self._session = PrdSession(
             repository,
@@ -45,11 +46,18 @@ class CreateService:
             agent,
             io=io,
             editor=editor,
+            interactive=interactive,
         )
 
-    def create(self, name: str, source: Path | None = None) -> PrdSessionResult:
+    def create(
+        self,
+        name: str,
+        source: Path | None = None,
+        *,
+        confirmed: bool = False,
+    ) -> PrdSessionResult:
         """Run the common interview, review, and final confirmation flow."""
-        return self._session.run(name, source)
+        return self._session.run(name, source, confirmed=confirmed)
 
 
 class OnboardingDispatcher:
