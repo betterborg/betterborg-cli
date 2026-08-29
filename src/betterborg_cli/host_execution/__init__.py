@@ -36,6 +36,12 @@ from betterborg_cli.host_execution.preflight import (
     HostSecret,
     HostService,
 )
+from betterborg_cli.host_execution.review import (
+    REVIEW_RESULT_SCHEMA,
+    HostReviewFixConfig,
+    HostReviewFixPhase,
+    ReviewFixPhaseError,
+)
 from betterborg_cli.host_execution.scheduler import (
     HostSchedulerConfig,
     HostSchedulerResult,
@@ -68,6 +74,8 @@ __all__ = [
     "HostPreflightFailure",
     "HostPreflightPlan",
     "HostPreflightResult",
+    "HostReviewFixConfig",
+    "HostReviewFixPhase",
     "HostSchedulerConfig",
     "HostSchedulerResult",
     "HostSecret",
@@ -76,6 +84,8 @@ __all__ = [
     "HostTaskScheduler",
     "PrimaryCheckoutContaminationError",
     "PrimaryCheckoutGuard",
+    "REVIEW_RESULT_SCHEMA",
+    "ReviewFixPhaseError",
     "SafeGit",
     "ScheduledTaskContext",
     "UnsafeGitError",
