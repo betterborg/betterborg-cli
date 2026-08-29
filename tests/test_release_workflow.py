@@ -337,6 +337,15 @@ def test_runbook_pins_identity_authorization_redaction_and_recovery() -> None:
 
     for required in (
         "required reviewer",
+        "dispatching operator must not approve their own deployment",
+        "different required reviewer",
+        "maintainer with push access",
+        "token only read access",
+        "--reviewed-sha REVIEWED_COMMIT_SHA",
+        "remote tag no longer resolves to `REVIEWED_COMMIT_SHA`",
+        "API presence alone cannot prove the attestation's signature",
+        "`refs/heads/main`",
+        "do not publish the draft while any listed attestation-verification",
         "PyPI project: `betterborg`",
         "GitHub owner: `betterborg`",
         "GitHub repository: `betterborg-cli`",

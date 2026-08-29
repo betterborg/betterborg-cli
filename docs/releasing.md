@@ -88,6 +88,85 @@ Only the final, publish-enabled reconciliation job receives `contents: write`;
 the fixture validation path remains read-only and cannot create a GitHub
 Release.
 
+## Authorize and verify the binary publication
+
+The binary publication is authorized only through the reviewed workflow run.
+Two authorized BetterBorg release maintainers must participate: a dispatching
+operator who is allowed to run Actions on `betterborg/betterborg-cli`, and a
+different required reviewer for the protected `pypi` environment. Prevent
+self-review remains enabled, so the dispatching operator must not approve
+their own deployment. Before the reviewer approves, both maintainers confirm
+that `vVERSION` is the reviewed tag, that its peeled commit is the run SHA on
+`main`, that the nonpublishing run passed, and that the requested version
+matches the tag and source. Authenticate `gh` as a maintainer with push access
+to the public repository so the post-publish verifier can see an interrupted
+draft, but give its token only read access. If a fine-grained token is used,
+grant repository contents read and attestations read, but no write permission.
+Do not use an administrator bypass or a personal token with release-write
+scope for verification.
+
+To start the binary path, the dispatching operator runs **Release BetterBorg**
+for that exact reviewed version with `publish` enabled. The different required
+reviewer independently checks the run SHA, tag, version, inputs, and trusted
+publisher identity, then approves the protected environment. To resume an
+interrupted run, the dispatching operator uses **Re-run failed jobs** on the
+same run only after both maintainers reconfirm its inputs, SHA, tag, and any
+assets already visible on the draft; the different required reviewer approves
+the protected deployment if GitHub requests approval again. Do not dispatch a
+newer `main` commit for the old version. The PyPI gate must remain successful
+before the four-platform build and the final GitHub Release reconciliation
+run.
+
+After the final job succeeds, run the read-only public verification from the
+reviewed checkout. First record that checkout's full commit SHA; this trusted
+value lets the verifier reject a tag that has moved since review:
+
+```console
+git rev-parse HEAD
+python scripts/verify_github_release.py \
+  --version VERSION \
+  --repository betterborg/betterborg-cli \
+  --reviewed-sha REVIEWED_COMMIT_SHA
+```
+
+The command downloads the nine expected assets through `gh api`: the four
+binaries, their four `.sha256` sidecars, and `release-manifest.json`. It checks
+the manifest's recorded version, target metadata, sizes, and binary digests;
+checks every checksum sidecar; rejects the release if the remote tag no longer
+resolves to `REVIEWED_COMMIT_SHA`; and verifies the provenance of every asset
+with `gh attestation verify`, pinned to
+`betterborg/betterborg-cli/.github/workflows/binary-release.yml`, the peeled
+`vVERSION` commit (which must equal the supplied reviewed SHA), and
+`refs/heads/main`. It performs no create, upload, edit, delete, or overwrite
+operation. Exit status `0` means
+the published release is complete, `2` means a draft or its attestations are
+partial and the output lists the publication steps that remain, and `1` means
+verification is terminal or could not establish trust.
+
+For exit status `2`, perform only the listed steps, in order, through the same
+reviewed workflow run. Rerun verification after satisfying an upload or
+attestation-publication prerequisite; do not publish the draft while any
+listed attestation-verification step remains. For a missing asset, API presence
+alone cannot prove the attestation's signature or provenance without the
+subject bytes, so the verifier conservatively keeps both its provenance
+publication and verification steps open. The protected workflow may satisfy
+the publication step by retaining provenance that it establishes is already
+the expected record, but the verifier must then cryptographically verify that
+record against the uploaded asset bytes and reviewed source before draft
+publication. If the release is already public but an attestation is missing,
+stop promotion and have a release maintainer complete the attestation for the
+unchanged digest through the protected release process. Never replace an asset
+to repair an attestation.
+
+Release assets are immutable. Matching names and SHA-256 digests are verified
+and retained; a digest, checksum, manifest, tag, or attestation-provenance
+mismatch is terminal for that version. Do not delete an asset, use `--clobber`,
+move the tag, or rerun publication in an attempt to replace bytes. Preserve the
+run and observed digests for investigation, increment to a new reviewed
+version, and repeat the validation and protected publication path. A published
+release missing any of the nine assets is likewise terminal and requires a new
+version.
+
 If a run is interrupted before the upload step starts, use **Re-run failed
 jobs** on the same workflow run after confirming its SHA and inputs. If any
 file may have reached PyPI, do not rerun the publish job. Download the preserved
