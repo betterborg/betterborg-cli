@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
@@ -24,6 +25,7 @@ from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.store import (
     BorgState,
+    ExecutionEvent,
     ExecutionRunStatus,
     SqliteStore,
     TaskComplexity,
@@ -416,6 +418,25 @@ class TaskListResult(ProtocolModel):
     next_actions: tuple[ExecuteNextAction, ...]
 
 
+class ProgressEvent(ProtocolModel):
+    """One phase-07 event projected as reconnectable MCP progress."""
+
+    event_id: UUID
+    operation_id: UUID
+    borg: str
+    task: str | None
+    phase: str
+    message: str
+    completed: int = Field(ge=0)
+    total: int = Field(ge=0)
+
+
+class ProgressStream(ProtocolModel):
+    """An ordered segment of one durable execution operation's events."""
+
+    events: tuple[ProgressEvent, ...]
+
+
 server = FastMCP(
     "BetterBorg",
     instructions=(
@@ -423,6 +444,142 @@ server = FastMCP(
         "was started. Results preserve durable status, artifacts, and next actions."
     ),
 )
+
+
+def _progress_phase(
+    event: ExecutionEvent,
+    attempt_phases: dict[UUID, str],
+) -> str:
+    if event.attempt_id is not None and event.attempt_id in attempt_phases:
+        return attempt_phases[event.attempt_id]
+    if event.kind == "task.phase_transitioned":
+        phase = event.payload.get("to")
+        if isinstance(phase, str) and phase.strip():
+            return phase
+    if event.kind == "task.claimed":
+        phase = event.payload.get("resume_phase")
+        if isinstance(phase, str) and phase.strip():
+            return phase
+    namespace = event.kind.partition(".")[0]
+    return {
+        "base": "merging",
+        "compose": "environment",
+        "environment": "environment",
+        "merge": "merging",
+        "run": "execution",
+        "sanity": "merging",
+        "task": "execution",
+    }.get(namespace, namespace)
+
+
+def _progress_message(event: ExecutionEvent) -> str:
+    for field in ("message", "summary", "reason", "error"):
+        value = event.payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return event.kind
+
+
+def _operation_progress(
+    operation_id: UUID,
+    *,
+    after_event_id: UUID | None = None,
+) -> ProgressStream:
+    paths = _paths(trusted=False)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        operation = store.get_execution_run(operation_id)
+        if operation is None:
+            raise ValueError(f"execution operation {operation_id} does not exist")
+        borg = store.get_borg(operation.borg_id)
+        if borg is None:
+            raise RuntimeError(
+                f"execution operation {operation_id} has no durable Borg identity"
+            )
+        tasks = store.list_task_records(operation.generation_id)
+        tasks_by_id = {task.id: task for task in tasks}
+        events = store.list_execution_events(operation_id)
+
+        attempt_phases: dict[UUID, str] = {}
+        completed_at: dict[UUID, tuple[datetime, UUID]] = {}
+        for task in tasks:
+            attempt_phases.update(
+                (attempt.id, attempt.phase)
+                for attempt in store.list_agent_attempts(task.id)
+            )
+            attempt_phases.update(
+                (attempt.id, "environment")
+                for attempt in store.list_environment_attempts(task.id)
+            )
+            done_events = (
+                event
+                for event in store.list_task_execution_events(task.id)
+                if event.kind == "task.phase_transitioned"
+                and event.payload.get("to") == TaskRuntimeStatus.DONE.value
+            )
+            first_done = min(
+                ((event.created_at, event.id) for event in done_events),
+                default=None,
+            )
+            if first_done is not None:
+                completed_at[task.id] = first_done
+
+    start = 0
+    if after_event_id is not None:
+        try:
+            start = next(
+                index
+                for index, event in enumerate(events, start=1)
+                if event.id == after_event_id
+            )
+        except StopIteration as error:
+            raise ValueError(
+                f"event {after_event_id} does not belong to execution operation "
+                f"{operation_id}"
+            ) from error
+
+    projected = []
+    for event in events[start:]:
+        event_position = (event.created_at, event.id)
+        completed = sum(
+            completed_position <= event_position
+            for completed_position in completed_at.values()
+        )
+        task = tasks_by_id.get(event.task_id) if event.task_id is not None else None
+        projected.append(
+            ProgressEvent(
+                event_id=event.id,
+                operation_id=operation.id,
+                borg=borg.name,
+                task=task.task_ref if task is not None else None,
+                phase=_progress_phase(event, attempt_phases),
+                message=_progress_message(event),
+                completed=completed,
+                total=len(tasks),
+            )
+        )
+    return ProgressStream(events=tuple(projected))
+
+
+@server.resource(
+    "betterborg://progress/{operation_id}",
+    name="operation_progress",
+    description="Read all persisted progress events for an execution operation.",
+    mime_type="application/json",
+)
+def operation_progress(operation_id: UUID) -> ProgressStream:
+    """Read one operation's durable progress from its first event."""
+    return _operation_progress(operation_id)
+
+
+@server.resource(
+    "betterborg://progress/{operation_id}/after/{event_id}",
+    name="operation_progress_after",
+    description="Resume persisted operation progress after an exact event ID.",
+    mime_type="application/json",
+)
+def operation_progress_after(operation_id: UUID, event_id: UUID) -> ProgressStream:
+    """Resume one operation's durable progress after ``event_id``."""
+    return _operation_progress(operation_id, after_event_id=event_id)
 
 
 class ElicitedAnswer(BaseModel):
