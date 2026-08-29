@@ -5,6 +5,16 @@ from betterborg_cli.host_execution.guard import (
     PrimaryCheckoutContaminationError,
     PrimaryCheckoutGuard,
 )
+from betterborg_cli.host_execution.preflight import (
+    HostCommand,
+    HostExecutable,
+    HostPreflight,
+    HostPreflightBlock,
+    HostPreflightFailure,
+    HostPreflightPlan,
+    HostPreflightResult,
+    HostService,
+)
 from betterborg_cli.host_execution.worktrees import (
     HostWorktreeManager,
     WorktreeError,
@@ -13,6 +23,14 @@ from betterborg_cli.host_execution.worktrees import (
 
 __all__ = [
     "HostWorktreeManager",
+    "HostCommand",
+    "HostExecutable",
+    "HostPreflight",
+    "HostPreflightBlock",
+    "HostPreflightFailure",
+    "HostPreflightPlan",
+    "HostPreflightResult",
+    "HostService",
     "PrimaryCheckoutContaminationError",
     "PrimaryCheckoutGuard",
     "SafeGit",
