@@ -16,7 +16,8 @@ VERSION_PATTERN = re.compile(
     r"(?:\.dev[0-9]+)?(?:\+[a-z0-9]+(?:[._-][a-z0-9]+)*)?$",
     re.IGNORECASE,
 )
-PLUGIN_MANIFESTS = (
+JSON_VERSION_SOURCES = (
+    Path("npm/package.json"),
     Path(
         "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
         ".claude-plugin/plugin.json"
@@ -24,6 +25,16 @@ PLUGIN_MANIFESTS = (
     Path(
         "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
         ".codex-plugin/plugin.json"
+    ),
+)
+MARKETPLACE_SOURCES = (
+    Path(
+        "src/betterborg_cli/claude_plugin_bundle/marketplace/.claude-plugin/"
+        "marketplace.json"
+    ),
+    Path(
+        "src/betterborg_cli/codex_plugin_bundle/marketplace/.agents/plugins/"
+        "marketplace.json"
     ),
 )
 
@@ -54,7 +65,22 @@ def _python_version(root: Path) -> str:
     raise ValueError("betterborg_cli.__version__ is missing")
 
 
-def version_errors(root: Path) -> list[str]:
+def _marketplace_version(root: Path, relative_path: Path) -> str | None:
+    marketplace = json.loads(root.joinpath(relative_path).read_text("utf-8"))
+    plugins = marketplace.get("plugins", [])
+    if not isinstance(plugins, list):
+        raise ValueError("plugins must be a list")
+    matches = [
+        plugin
+        for plugin in plugins
+        if isinstance(plugin, dict) and plugin.get("name") == "borg"
+    ]
+    if len(matches) != 1:
+        raise ValueError("must contain exactly one borg plugin entry")
+    return matches[0].get("version")
+
+
+def version_errors(root: Path, tag: str | None = None) -> list[str]:
     """Return release-version inconsistencies below *root*."""
     errors: list[str] = []
     try:
@@ -78,16 +104,37 @@ def version_errors(root: Path) -> list[str]:
     except (KeyError, OSError, tomllib.TOMLDecodeError) as error:
         errors.append(f"cannot read pyproject.toml version metadata: {error}")
 
-    for relative_path in PLUGIN_MANIFESTS:
+    for relative_path in JSON_VERSION_SOURCES:
         try:
             manifest = json.loads(root.joinpath(relative_path).read_text("utf-8"))
-            plugin_version = manifest.get("version")
+            source_version = manifest.get("version")
         except (OSError, json.JSONDecodeError) as error:
             errors.append(f"cannot read {relative_path}: {error}")
             continue
-        if plugin_version != version:
+        if source_version != version:
             errors.append(
-                f"{relative_path} has version {plugin_version!r}; expected {version!r}"
+                f"{relative_path} has version {source_version!r}; expected {version!r}"
+            )
+
+    for relative_path in MARKETPLACE_SOURCES:
+        try:
+            source_version = _marketplace_version(root, relative_path)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            errors.append(f"cannot read {relative_path}: {error}")
+            continue
+        if source_version != version:
+            errors.append(
+                f"{relative_path} borg entry has version {source_version!r}; "
+                f"expected {version!r}"
+            )
+
+    if tag is not None:
+        expected_tag = f"v{version}"
+        if tag != expected_tag:
+            errors.append(
+                "src/betterborg_cli/__init__.py has version "
+                f"{version!r}; prospective tag {tag!r} does not match; "
+                f"expected {expected_tag!r}"
             )
     return errors
 
@@ -104,9 +151,13 @@ def main() -> int:
         "--expected",
         help="also require the reviewed release version to match the source",
     )
+    parser.add_argument(
+        "--tag",
+        help="also require the prospective release tag (in vVERSION form) to match",
+    )
     arguments = parser.parse_args()
     root = arguments.root.resolve()
-    errors = version_errors(root)
+    errors = version_errors(root, arguments.tag)
     if not errors and arguments.expected is not None:
         source_version = _python_version(root)
         if arguments.expected != source_version:

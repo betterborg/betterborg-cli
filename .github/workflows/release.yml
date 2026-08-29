@@ -40,7 +40,7 @@ jobs:
       - name: Validate reviewed version
         env:
           REVIEWED_VERSION: ${{ inputs.version }}
-        run: .venv/bin/python scripts/check_versions.py --expected "$REVIEWED_VERSION"
+        run: .venv/bin/python scripts/check_versions.py --tag "v$REVIEWED_VERSION"
 
       - name: Lint and test
         run: |

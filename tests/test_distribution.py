@@ -19,6 +19,30 @@ from betterborg_cli import __version__
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 CHECK_VERSIONS = REPOSITORY_ROOT / "scripts/check_versions.py"
+VERSION_SOURCES = (
+    ("src/betterborg_cli/__init__.py", "python"),
+    ("npm/package.json", "top-level"),
+    (
+        "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
+        ".claude-plugin/plugin.json",
+        "top-level",
+    ),
+    (
+        "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
+        ".codex-plugin/plugin.json",
+        "top-level",
+    ),
+    (
+        "src/betterborg_cli/claude_plugin_bundle/marketplace/.claude-plugin/"
+        "marketplace.json",
+        "marketplace-entry",
+    ),
+    (
+        "src/betterborg_cli/codex_plugin_bundle/marketplace/.agents/plugins/"
+        "marketplace.json",
+        "marketplace-entry",
+    ),
+)
 PACKAGE_ASSETS = (
     "betterborg_cli/agent_runtime/pricing.py",
     "betterborg_cli/execution_estimate.py",
@@ -196,16 +220,7 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
 def _minimal_version_tree(tmp_path: Path) -> Path:
     for relative in (
         Path("pyproject.toml"),
-        Path("src/betterborg_cli/__init__.py"),
-        *(
-            Path(path)
-            for path in (
-                "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
-                ".claude-plugin/plugin.json",
-                "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
-                ".codex-plugin/plugin.json",
-            )
-        ),
+        *(Path(path) for path, _ in VERSION_SOURCES),
     ):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -214,39 +229,93 @@ def _minimal_version_tree(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "manifest",
-    [
-        (
-            "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
-            ".claude-plugin/plugin.json"
-        ),
-        (
-            "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
-            ".codex-plugin/plugin.json"
-        ),
-    ],
+    ("source", "version_location"),
+    VERSION_SOURCES,
 )
-def test_version_check_rejects_plugin_mismatch(
+def test_version_check_rejects_each_source_mismatch(
     tmp_path: Path,
-    manifest: str,
+    source: str,
+    version_location: str,
 ) -> None:
     root = _minimal_version_tree(tmp_path)
-    path = root / manifest
-    value = json.loads(path.read_text(encoding="utf-8"))
+    path = root / source
     mismatched_version = "0.0.0" if __version__ != "0.0.0" else "0.0.1"
-    value["version"] = mismatched_version
-    path.write_text(json.dumps(value), encoding="utf-8")
+    if version_location == "python":
+        content = path.read_text(encoding="utf-8")
+        path.write_text(
+            content.replace(
+                f'__version__ = "{__version__}"',
+                f'__version__ = "{mismatched_version}"',
+            ),
+            encoding="utf-8",
+        )
+    else:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if version_location == "marketplace-entry":
+            value["plugins"][0]["version"] = mismatched_version
+        else:
+            value["version"] = mismatched_version
+        path.write_text(json.dumps(value), encoding="utf-8")
 
     completed = subprocess.run(
-        [sys.executable, str(CHECK_VERSIONS), "--root", str(root)],
+        [
+            sys.executable,
+            str(CHECK_VERSIONS),
+            "--root",
+            str(root),
+            "--tag",
+            f"v{__version__}",
+        ],
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert completed.returncode == 1
-    assert manifest in completed.stderr
-    assert f"expected {__version__!r}" in completed.stderr
+    assert source in completed.stderr
+
+
+def test_version_check_accepts_all_sources_and_prospective_tag(tmp_path: Path) -> None:
+    root = _minimal_version_tree(tmp_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK_VERSIONS),
+            "--root",
+            str(root),
+            "--tag",
+            f"v{__version__}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == f"release versions match {__version__}"
+
+
+def test_version_check_rejects_mismatched_prospective_tag() -> None:
+    prospective_tag = "v0.0.0" if __version__ != "0.0.0" else "v0.0.1"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK_VERSIONS),
+            "--root",
+            str(REPOSITORY_ROOT),
+            "--tag",
+            prospective_tag,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert f"prospective tag {prospective_tag!r}" in completed.stderr
+    assert f"expected 'v{__version__}'" in completed.stderr
 
 
 def test_version_check_rejects_unreviewed_source_version() -> None:

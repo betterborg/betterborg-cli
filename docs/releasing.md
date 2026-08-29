@@ -33,12 +33,13 @@ and confirm that the workflow run's commit is the reviewed `main` commit.
 
 ## Select the reviewed release
 
-Update `betterborg_cli.__version__` and both bundled plugin manifests in one
-reviewed change. Run `make lint`, `make test`, and `make build`, then create the
-reviewed `vVERSION` tag on that exact commit. Verify that the tag is annotated
-or signed according to the project's release policy, that its version matches
-the source and artifact names, and that the tagged commit is the current tip of
-`main`.
+Update `betterborg_cli.__version__`, `npm/package.json`, both bundled plugin
+manifests, and both marketplace entries in one reviewed change. Run
+`python scripts/check_versions.py --tag vVERSION`, `make lint`, `make test`, and
+`make build`, then create the reviewed `vVERSION` tag on that exact commit.
+Verify that the tag is annotated or signed according to the project's release
+policy, that its version matches the source and artifact names, and that the
+tagged commit is the current tip of `main`.
 
 The workflow's publication guard accepts only `main`, so select `main` in the
 Actions form, not the tag. Before each dispatch, compare the workflow run's SHA
@@ -202,11 +203,11 @@ again.
 If any public filename or digest differs, a publish is partial, or a verified
 artifact contains a release defect, do not delete, replace, or retry with the
 same version. Preserve the failed run and all local and public digests for
-investigation, increment the Python source and both plugin manifests to a new
-version, review and tag that commit, rerun the nonpublishing validation, and
-publish the new version. A transient version or init check may be rerun only as
-read-only verification after the artifact digests have matched; it never
-authorizes another upload for the existing version.
+investigation, increment all six version-bearing sources to a new version,
+review and tag that commit, rerun the nonpublishing validation, and publish the
+new version. A transient version or init check may be rerun only as read-only
+verification after the artifact digests have matched; it never authorizes
+another upload for the existing version.
 
 ## Binary recovery and rollback
 

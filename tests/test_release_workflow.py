@@ -109,7 +109,7 @@ def test_release_is_manual_and_nonpublishing_by_default() -> None:
     assert "pull_request:" not in workflow
     assert re.search(r"^  push:", workflow, re.MULTILINE) is None
     assert "Validate release without publishing" in workflow
-    assert "scripts/check_versions.py --expected" in workflow
+    assert 'scripts/check_versions.py --tag "v$REVIEWED_VERSION"' in workflow
 
 
 def test_protected_job_depends_on_exact_reviewed_artifacts() -> None:
