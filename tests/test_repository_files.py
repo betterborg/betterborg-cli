@@ -7,6 +7,7 @@ import pytest
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
     RepositoryPathError,
+    read_repository_text,
     require_git_trackable,
 )
 
@@ -43,3 +44,15 @@ def test_git_trackability_rejects_path_outside_repository(
 
     with pytest.raises(RepositoryPathError, match="repository path escapes root"):
         require_git_trackable(outside, root=committed_git_repo)
+
+
+def test_repository_text_rejects_symlink_to_file_outside_repository(
+    committed_git_repo: Path,
+) -> None:
+    outside = committed_git_repo.parent / "host-secret.md"
+    outside.write_text("host secret\n", encoding="utf-8")
+    linked = committed_git_repo / "linked.md"
+    linked.symlink_to(outside)
+
+    with pytest.raises(RepositoryPathError, match="not a regular file"):
+        read_repository_text(linked, root=committed_git_repo)

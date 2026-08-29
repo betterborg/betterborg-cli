@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 from functools import wraps
@@ -59,6 +60,7 @@ from betterborg_cli.planning import (
     TechLeadCancelled,
     TechLeadLoop,
     approved_plan_digest,
+    build_project_pr_body,
     render_plan_markdown,
     render_task_markdown,
     task_markdown_digest,
@@ -69,6 +71,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import (
     publish_repository_text,
+    read_repository_text,
     require_git_trackable,
 )
 from betterborg_cli.repository_service import RepositoryService
@@ -587,12 +590,19 @@ def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
     is_flag=True,
     help="Push the completed project branch to origin without forcing.",
 )
+@click.option(
+    "--pr",
+    "open_pull_request",
+    is_flag=True,
+    help="Open a GitHub rollup pull request for the completed project branch.",
+)
 @_trusted_workspace_callback
 def execute_borg(
     repository_path: Path,
     name: str,
     auto_execute: bool,
     push_project: bool,
+    open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
     paths = RepoPaths.discover(repository_path)
@@ -616,6 +626,15 @@ def execute_borg(
                 repository, store
             ).inspect_current_task_files(borg.id)
             generation = publication.generation
+            approval = next(
+                (
+                    item
+                    for item in store.list_plan_approvals(borg.id)
+                    if item.id == generation.plan_approval_id
+                ),
+                None,
+            )
+            prd_session = store.get_prd_session_for_borg(borg.id)
             decision = store.get_current_execution_decision(borg.id)
             if decision is None:
                 estimate = estimate_generation(
@@ -636,14 +655,6 @@ def execute_borg(
                     )
                     source = "interactive"
                     outcome = "approved"
-                approval = next(
-                    (
-                        item
-                        for item in store.list_plan_approvals(borg.id)
-                        if item.id == generation.plan_approval_id
-                    ),
-                    None,
-                )
                 batch = next(
                     (
                         item
@@ -716,6 +727,16 @@ def execute_borg(
         and result.status is ExecutionRunStatus.COMPLETED
     ):
         _push_project_base(paths.root, name)
+    if (
+        open_pull_request
+        and result.active_operation_id is None
+        and result.status is ExecutionRunStatus.COMPLETED
+    ):
+        plan = approval.manifest.get("plan") if approval is not None else None
+        if not isinstance(plan, dict):
+            plan = None
+        prd_path = prd_session.prd_path if prd_session is not None else None
+        _open_rollup_pull_request(paths.root, name, plan, prd_path)
 
 
 def _push_project_base(repository_root: Path, name: str) -> None:
@@ -735,6 +756,168 @@ def _push_project_base(repository_root: Path, name: str) -> None:
             f"Local execution completed, but push of {branch!r} failed: {detail}"
         )
     click.echo(f"Pushed {branch} to origin.")
+
+
+def _open_rollup_pull_request(
+    repository_root: Path,
+    name: str,
+    plan: dict[str, object] | None,
+    prd_path: Path | None,
+) -> None:
+    """Open one authenticated GitHub PR after completed local execution."""
+    branch = f"project/{name}"
+    failure_prefix = "Local execution completed, but rollup PR creation failed"
+    try:
+        prd_markdown = (
+            read_repository_text(prd_path, root=repository_root)
+            if prd_path is not None
+            else None
+        )
+        body = build_project_pr_body(
+            prd_markdown=prd_markdown,
+            plan=plan,
+            project_name=name,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+    if remote.returncode != 0:
+        raise click.ClickException(
+            f"{failure_prefix}: origin remote is missing: "
+            f"{_command_failure(remote, 'git remote get-url failed')}"
+        )
+    repository = _github_repository(remote.stdout.strip())
+    if repository is None:
+        raise click.ClickException(
+            f"{failure_prefix}: origin is not a supported github.com remote"
+        )
+
+    gh = shutil.which("gh")
+    if gh is None:
+        raise click.ClickException(f"{failure_prefix}: gh executable was not found")
+    environment = {**os.environ, "GH_PROMPT_DISABLED": "1"}
+    try:
+        auth = subprocess.run(
+            [gh, "auth", "status", "--active", "--hostname", "github.com"],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+    if auth.returncode != 0:
+        raise click.ClickException(
+            f"{failure_prefix}: GitHub CLI authentication failed: "
+            f"{_command_failure(auth, 'gh auth status failed')}"
+        )
+
+    try:
+        default = subprocess.run(
+            [
+                gh,
+                "repo",
+                "view",
+                repository,
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+    default_branch_lines = default.stdout.splitlines()
+    if (
+        default.returncode != 0
+        or len(default_branch_lines) != 1
+        or not default_branch_lines[0].strip()
+    ):
+        raise click.ClickException(
+            f"{failure_prefix}: GitHub default branch lookup failed: "
+            f"{_command_failure(default, 'gh repo view returned no default branch')}"
+        )
+    default_branch = default_branch_lines[0].strip()
+
+    title_value = plan.get("title") if plan is not None else None
+    title = (
+        " ".join(title_value.split())
+        if isinstance(title_value, str) and title_value.strip()
+        else name
+    )
+    try:
+        created = subprocess.run(
+            [
+                gh,
+                "pr",
+                "create",
+                "--repo",
+                repository,
+                "--head",
+                branch,
+                "--base",
+                default_branch,
+                "--title",
+                title,
+                "--body-file",
+                "-",
+            ],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            input=body,
+            text=True,
+            timeout=60,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise click.ClickException(f"{failure_prefix}: {error}") from error
+    if created.returncode != 0:
+        raise click.ClickException(
+            f"{failure_prefix}: {_command_failure(created, 'gh pr create failed')}"
+        )
+    url = created.stdout.strip()
+    suffix = f": {url}" if url else "."
+    click.echo(f"Opened rollup pull request for {branch}{suffix}")
+
+
+def _github_repository(remote: str) -> str | None:
+    """Return ``owner/repository`` for conventional github.com remotes."""
+    match = re.fullmatch(r"git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?", remote)
+    if match is not None:
+        return f"{match.group(1)}/{match.group(2)}"
+    match = re.fullmatch(
+        r"(?:https|ssh)://(?:git@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?",
+        remote,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def _command_failure(
+    result: subprocess.CompletedProcess[str], fallback: str
+) -> str:
+    return (result.stderr or result.stdout).strip() or fallback
 
 
 def _invoke_host_execution(

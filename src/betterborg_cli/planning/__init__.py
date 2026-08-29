@@ -11,6 +11,7 @@ from betterborg_cli.planning.architect import (
 )
 from betterborg_cli.planning.plan_contracts import (
     PlanValidationError,
+    build_project_pr_body,
     render_plan_markdown,
     validate_plan,
     validate_plan_json,
@@ -104,6 +105,7 @@ __all__ = [
     "TaskPublisher",
     "PlanningWorktreeError",
     "PlanValidationError",
+    "build_project_pr_body",
     "build_plan_element_catalog",
     "approved_plan_digest",
     "task_batch_semantic_digest",

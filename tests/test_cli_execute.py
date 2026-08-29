@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -73,7 +74,19 @@ def _seed_executable_generation(
             approval = PlanApproval(
                 borg_id=borg.id,
                 plan_digest="sha256:approved-plan",
-                manifest={},
+                manifest={
+                    "plan": {
+                        "title": f"Deliver {name}",
+                        "summary": "Ship the completed BetterBorg project.",
+                        "phases": [
+                            {
+                                "name": "01-delivery",
+                                "title": "Deliver the project",
+                                "goal": "Publish the completed local work.",
+                            }
+                        ],
+                    }
+                },
             )
             store.append_plan_approval(approval)
         fixture = approved_task_generation(
@@ -165,6 +178,70 @@ def _remote_project_sha(remote: Path, name: str) -> str | None:
         text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _configure_github_origin(root: Path, remote: Path, repository: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "remote",
+            "set-url",
+            "origin",
+            f"https://github.com/{repository}.git",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            str(remote),
+        ],
+        check=True,
+    )
+
+
+def _install_fake_gh(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    binary_dir = root.parent / f"{root.name}-fake-gh-bin"
+    binary_dir.mkdir()
+    args_path = root.parent / f"{root.name}-fake-gh-args"
+    body_path = root.parent / f"{root.name}-fake-gh-body"
+    executable = binary_dir / "gh"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = auth ]; then\n"
+        "  if [ \"${FAKE_GH_AUTH_FAIL:-}\" = 1 ]; then\n"
+        "    echo 'not logged into github.com' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = repo ]; then\n"
+        "  echo main\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_GH_ARGS\"\n"
+        "cat > \"$FAKE_GH_BODY\"\n"
+        "if [ \"${FAKE_GH_PR_FAIL:-}\" = 1 ]; then\n"
+        "  echo 'pull request creation rejected' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo 'https://github.com/acme/widgets/pull/42'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("FAKE_GH_ARGS", str(args_path))
+    monkeypatch.setenv("FAKE_GH_BODY", str(body_path))
+    monkeypatch.setenv("PATH", f"{binary_dir}:{os.environ['PATH']}")
+    return args_path, body_path
 
 
 def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
@@ -519,7 +596,7 @@ def test_push_credential_failure_preserves_local_branch(
     assert _remote_project_sha(remote, name) is None
 
 
-def test_push_waits_for_local_execution_to_complete(
+def test_push_and_pr_wait_for_local_execution_to_complete(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
@@ -544,12 +621,317 @@ def test_push_waits_for_local_execution_to_complete(
     )
 
     result = cli_runner.invoke(
-        cli, ["execute", name, "--auto-execute", "--push"]
+        cli, ["execute", name, "--auto-execute", "--push", "--pr"]
     )
 
     assert result.exit_code == 0, result.output
     assert f"Execution already active: {active.active_operation_id}" in result.output
     assert "push" not in result.output.casefold()
+    assert "pull request" not in result.output.casefold()
+
+
+def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-success"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    reference = f"refs/heads/project/{name}"
+    subprocess.run(
+        ["git", "-C", str(committed_git_repo), "push", str(remote), reference],
+        check=True,
+        capture_output=True,
+    )
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 0, result.output
+    assert ": completed" in result.output
+    assert "Pushed" not in result.output
+    assert "Opened rollup pull request" in result.output
+    assert args_path.read_text(encoding="utf-8").splitlines() == [
+        "pr",
+        "create",
+        "--repo",
+        "acme/widgets",
+        "--head",
+        f"project/{name}",
+        "--base",
+        "main",
+        "--title",
+        f"Deliver {name}",
+        "--body-file",
+        "-",
+    ]
+    body = body_path.read_text(encoding="utf-8")
+    assert body.startswith(f"# {name}\n\n---\n\n# Deliver {name}")
+    assert "### 01-delivery — Deliver the project" in body
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+    assert _remote_project_sha(remote, name) == local_sha
+
+
+def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "push-and-pr"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, _body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute", "--push", "--pr"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.index("Pushed project/") < result.output.index(
+        "Opened rollup pull request"
+    )
+    assert args_path.exists()
+    assert _remote_project_sha(remote, name) == local_sha
+
+
+def test_pr_missing_remote_preserves_completed_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-missing-remote"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "origin remote is missing" in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_pr_rejects_unsupported_remote_without_invoking_gh(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-unsupported-remote"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    _add_bare_origin(committed_git_repo, name)
+    args_path, _body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "not a supported github.com remote" in result.output
+    assert not args_path.exists()
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_pr_missing_gh_preserves_completed_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-missing-gh"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "gh executable was not found" in result.output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_pr_authentication_failure_preserves_completed_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-auth-failure"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, _body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_AUTH_FAIL", "1")
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "GitHub CLI authentication failed" in result.output
+    assert "not logged into github.com" in result.output
+    assert not args_path.exists()
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_pr_creation_failure_preserves_completed_local_branch(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-create-failure"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_PR_FAIL", "1")
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "pull request creation rejected" in result.output
+    assert args_path.exists()
+    assert body_path.exists()
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_pr_rejects_external_prd_symlink_without_uploading_host_file(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pr-external-prd"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    outside = committed_git_repo.parent / f"{name}-host-secret.md"
+    outside.write_text("host secret must not be uploaded\n", encoding="utf-8")
+    prd_path = committed_git_repo / ".borg/prds" / f"{name}.md"
+    prd_path.unlink()
+    prd_path.symlink_to(outside)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args: _execution_result(),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 1
+    assert ": completed" in result.output
+    assert "repository path is not a regular file" in result.output
+    assert not args_path.exists()
+    assert not body_path.exists()
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
 def test_concurrent_decision_insert_reaches_active_host_execution(
