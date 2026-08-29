@@ -39,3 +39,11 @@ jobs:
 
       - name: Build local one-file binary
         run: make binary
+
+  binary-release-validation:
+    name: Four-platform binary release validation
+    uses: ./.github/workflows/binary-release.yml
+    with:
+      attest: false
+    permissions:
+      contents: read

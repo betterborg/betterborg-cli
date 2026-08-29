@@ -1,4 +1,4 @@
-name: Release to PyPI
+name: Release BetterBorg
 
 on:
   workflow_dispatch:
@@ -111,3 +111,91 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REVIEWED_VERSION: ${{ inputs.version }}
         run: python scripts/verify_pypi_release.py --version "$REVIEWED_VERSION"
+
+  pypi-verification-gate:
+    name: Require verified PyPI release before binaries
+    if: >-
+      ${{ always() && needs.validate-release.result == 'success' &&
+          ((!inputs.publish) || needs.publish-pypi.result == 'success') }}
+    needs: [validate-release, publish-pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out verification fixtures
+        if: ${{ !inputs.publish }}
+        uses: actions/checkout@v4
+
+      - name: Set up fixture test Python
+        if: ${{ !inputs.publish }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate PyPI verification without registry access
+        if: ${{ !inputs.publish }}
+        run: |
+          make sync
+          .venv/bin/pytest tests/test_release_workflow.py
+
+      - name: Confirm protected PyPI verification
+        if: ${{ inputs.publish }}
+        run: echo "Protected PyPI upload and verification completed."
+
+  build-binaries:
+    name: Build four-platform standalone release
+    needs: [pypi-verification-gate]
+    uses: ./.github/workflows/binary-release.yml
+    with:
+      version: ${{ inputs.version }}
+      attest: ${{ inputs.publish }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  validate-github-reconciliation:
+    name: Validate GitHub Release reconciliation without publishing
+    if: ${{ !inputs.publish }}
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out reconciliation fixtures
+        uses: actions/checkout@v4
+
+      - name: Set up fixture test Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Exercise digest reconciliation fixtures
+        run: |
+          make sync
+          .venv/bin/pytest tests/test_binary_release.py
+
+  reconcile-github-release:
+    name: Digest-gate and publish GitHub Release
+    if: ${{ inputs.publish }}
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out reconciliation code
+        uses: actions/checkout@v4
+
+      - name: Retrieve complete reviewed binary release
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-release-${{ inputs.version }}
+          path: release-assets
+
+      - name: Reconcile only matching release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          python3 scripts/reconcile_github_release.py \
+            --version "$REVIEWED_VERSION" \
+            --artifacts release-assets \
+            --publish

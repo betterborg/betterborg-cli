@@ -33,6 +33,13 @@ Issues = "https://github.com/betterborg/betterborg-cli/issues"
 borg = "betterborg_cli.cli:cli"
 
 [dependency-groups]
+binary = [
+  # 50.0.1 omitted glibc 2.17 wheels; keep release builds wheel-only.
+  "cryptography==50.0.0",
+  "pyinstaller>=6.16,<7",
+  "setuptools>=77",
+  "wheel",
+]
 dev = [
   "build>=1.2,<2",
   "pyinstaller>=6.16,<7",
