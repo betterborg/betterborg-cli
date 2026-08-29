@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Any
 from uuid import UUID, uuid4
+
+from betterborg_cli.agent_runtime.base import AgentStatus, AgentUsage, BillingMode
 
 _PROMPT_ROLES = frozenset({"coding", "review", "merge"})
 
@@ -55,6 +58,35 @@ class TaskGenerationStatus(str, Enum):
     PREPARING = "preparing"
     CURRENT = "current"
     SUPERSEDED = "superseded"
+
+
+class ExecutionRunStatus(str, Enum):
+    """Lease-backed lifecycle for one execution of a task generation."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TaskRuntimeStatus(str, Enum):
+    """Durable scheduling state for one generated task."""
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    ENVIRONMENT = "environment"
+    CODING = "coding"
+    REVIEW = "review"
+    FIX = "fix"
+    MERGING = "merging"
+    DONE = "done"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+def _new_ownership_token() -> str:
+    """Return a URL-safe token carrying 256 bits of randomness."""
+    return token_urlsafe(32)
 
 
 def utcnow() -> datetime:
@@ -561,4 +593,254 @@ class TaskDependency:
                 raise TypeError(f"task dependency {name} must be a UUID")
         if self.task_id == self.depends_on_task_id:
             raise ValueError("a task cannot depend on itself")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRun:
+    """One lease-owned execution of an immutable task generation."""
+
+    borg_id: UUID
+    generation_id: UUID
+    lease_expires_at: datetime
+    owner_token: str = field(default_factory=_new_ownership_token, repr=False)
+    status: ExecutionRunStatus = ExecutionRunStatus.RUNNING
+    id: UUID = field(default_factory=uuid4)
+    started_at: datetime = field(default_factory=utcnow)
+    heartbeat_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "generation_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"execution run {name} must be a UUID")
+        if len(self.owner_token) < 32:
+            raise ValueError("execution run owner token must be unguessable")
+        if not isinstance(self.status, ExecutionRunStatus):
+            raise TypeError("execution run status must be an ExecutionRunStatus")
+        for value in (self.started_at, self.lease_expires_at):
+            _validate_utc(value)
+        if self.heartbeat_at is not None:
+            _validate_utc(self.heartbeat_at)
+        if self.finished_at is not None:
+            _validate_utc(self.finished_at)
+        if self.lease_expires_at <= self.started_at:
+            raise ValueError("execution run lease must expire after it starts")
+        if (self.status is ExecutionRunStatus.RUNNING) != (
+            self.finished_at is None
+        ):
+            raise ValueError("only running execution runs may be unfinished")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRuntime:
+    """Mutable execution projection for one immutable generated task."""
+
+    generation_id: UUID
+    task_id: UUID
+    status: TaskRuntimeStatus = TaskRuntimeStatus.PENDING
+    resume_phase: str = "environment"
+    review_round: int = 0
+    state_reason: str | None = None
+    branch: str | None = None
+    worktree_path: str | None = None
+    last_run_id: UUID | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "generation_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task runtime {name} must be a UUID")
+        if self.last_run_id is not None and not isinstance(self.last_run_id, UUID):
+            raise TypeError("task runtime last run ID must be a UUID")
+        if not isinstance(self.status, TaskRuntimeStatus):
+            raise TypeError("task runtime status must be a TaskRuntimeStatus")
+        if not self.resume_phase.strip():
+            raise ValueError("task runtime resume phase must not be empty")
+        if self.review_round < 0:
+            raise ValueError("task runtime review round must not be negative")
+        _validate_utc(self.created_at)
+        _validate_utc(self.updated_at)
+        if self.updated_at < self.created_at:
+            raise ValueError("task runtime cannot be updated before it is created")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskClaim:
+    """A lease-owned claim granting one run authority over one task."""
+
+    run_id: UUID
+    task_id: UUID
+    lease_expires_at: datetime
+    resume_phase: str
+    claim_token: str = field(default_factory=_new_ownership_token, repr=False)
+    id: UUID = field(default_factory=uuid4)
+    claimed_at: datetime = field(default_factory=utcnow)
+    released_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("id", "run_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task claim {name} must be a UUID")
+        if len(self.claim_token) < 32:
+            raise ValueError("task claim token must be unguessable")
+        if not self.resume_phase.strip():
+            raise ValueError("task claim resume phase must not be empty")
+        _validate_utc(self.claimed_at)
+        _validate_utc(self.lease_expires_at)
+        if self.lease_expires_at <= self.claimed_at:
+            raise ValueError("task claim lease must expire after it is claimed")
+        if self.released_at is not None:
+            _validate_utc(self.released_at)
+            if self.released_at < self.claimed_at:
+                raise ValueError("task claim cannot be released before it is claimed")
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentAttempt:
+    """Immutable result of preparing or materializing an execution environment."""
+
+    run_id: UUID
+    claim_id: UUID
+    task_id: UUID
+    kind: str
+    attempt_number: int
+    fingerprint: str
+    status: AgentStatus
+    commands: list[list[str]] = field(default_factory=list)
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    duration_seconds: float | None = None
+    id: UUID = field(default_factory=uuid4)
+    started_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "run_id", "claim_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"environment attempt {name} must be a UUID")
+        for name in ("kind", "fingerprint"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"environment attempt {name} must not be empty")
+        if self.attempt_number < 1:
+            raise ValueError("environment attempt number must be positive")
+        if not isinstance(self.status, AgentStatus):
+            raise TypeError("environment attempt status must be an AgentStatus")
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("environment attempt duration must not be negative")
+        if any(
+            not command or any(not arg for arg in command)
+            for command in self.commands
+        ):
+            raise ValueError("environment attempt commands must contain non-empty argv")
+        _validate_utc(self.started_at)
+        _validate_utc(self.finished_at)
+        if self.finished_at < self.started_at:
+            raise ValueError("environment attempt cannot finish before it starts")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAttempt:
+    """Immutable, billing-aware result of one execution-agent invocation."""
+
+    run_id: UUID
+    claim_id: UUID
+    task_id: UUID
+    phase: str
+    attempt_number: int
+    adapter: str
+    model: str
+    billing_mode: BillingMode
+    status: AgentStatus
+    log_path: str
+    review_round: int = 0
+    result_path: str | None = None
+    result: dict[str, Any] | None = None
+    summary: str | None = None
+    duration_seconds: float | None = None
+    usage: AgentUsage | None = None
+    id: UUID = field(default_factory=uuid4)
+    started_at: datetime = field(default_factory=utcnow)
+    finished_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "run_id", "claim_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"agent attempt {name} must be a UUID")
+        for name in ("phase", "adapter", "model", "log_path"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"agent attempt {name} must not be empty")
+        if self.attempt_number < 1:
+            raise ValueError("agent attempt number must be positive")
+        if self.review_round < 0:
+            raise ValueError("agent attempt review round must not be negative")
+        if not isinstance(self.billing_mode, BillingMode):
+            raise TypeError("agent attempt billing mode must be a BillingMode")
+        if not isinstance(self.status, AgentStatus):
+            raise TypeError("agent attempt status must be an AgentStatus")
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("agent attempt duration must not be negative")
+        if self.usage is not None and not isinstance(self.usage, AgentUsage):
+            raise TypeError("agent attempt usage must be an AgentUsage")
+        _validate_utc(self.started_at)
+        _validate_utc(self.finished_at)
+        if self.finished_at < self.started_at:
+            raise ValueError("agent attempt cannot finish before it starts")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionEvent:
+    """One immutable event emitted by the host-execution pipeline."""
+
+    run_id: UUID
+    kind: str
+    task_id: UUID | None = None
+    attempt_id: UUID | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "run_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"execution event {name} must be a UUID")
+        for name in ("task_id", "attempt_id"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, UUID):
+                raise TypeError(f"execution event {name} must be a UUID")
+        if not self.kind.strip():
+            raise ValueError("execution event kind must not be empty")
+        if not isinstance(self.payload, dict):
+            raise TypeError("execution event payload must be a dictionary")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ComposeResource:
+    """Durable identity for a Compose resource owned by one claimed task."""
+
+    run_id: UUID
+    claim_id: UUID
+    task_id: UUID
+    project_name: str
+    resource_type: str
+    resource_name: str
+    labels: dict[str, str] = field(default_factory=dict)
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "run_id", "claim_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"Compose resource {name} must be a UUID")
+        for name in ("project_name", "resource_type", "resource_name"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"Compose resource {name} must not be empty")
+        if not isinstance(self.labels, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.labels.items()
+        ):
+            raise TypeError("Compose resource labels must map strings to strings")
         _validate_utc(self.created_at)
