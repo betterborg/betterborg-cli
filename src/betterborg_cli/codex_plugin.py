@@ -1,10 +1,9 @@
-"""Owned Claude Code plugin installation for BetterBorg."""
+"""Owned Codex plugin installation for BetterBorg."""
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -31,6 +30,7 @@ from betterborg_cli.plugin_installation import (
     marketplace_entry,
     materialize_bundle,
     owned_marketplace_source,
+    ownership,
     plugin_data_root,
     records,
     run_plugin_command,
@@ -39,19 +39,13 @@ from betterborg_cli.plugin_installation import (
 MARKETPLACE_NAME = "betterborg"
 PLUGIN_NAME = "borg"
 PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
-RELOAD_GUIDANCE = (
-    "Run `/reload-plugins` in any open Claude Code session (or start a new "
-    "session) to load the BetterBorg plugin and its MCP tools."
+NEW_THREAD_GUIDANCE = (
+    "Start a new Codex thread to load the BetterBorg plugin, its skill, and "
+    "its MCP tools."
 )
 
-_MINIMUM_SAFE_CLAUDE_VERSION = (2, 1, 212)
-_MINIMUM_SAFE_CLAUDE_VERSION_TEXT = ".".join(
-    str(part) for part in _MINIMUM_SAFE_CLAUDE_VERSION
-)
-
-
-class ClaudePluginStatus(StrEnum):
-    """Consumer-visible outcome of a Claude plugin installation."""
+class CodexPluginStatus(StrEnum):
+    """Consumer-visible outcome of a Codex plugin installation."""
 
     INSTALLED = "installed"
     UNCHANGED = "unchanged"
@@ -61,22 +55,22 @@ class ClaudePluginStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ClaudePluginInstallation:
-    """Result of installing or reconciling the owned Claude plugin."""
+class CodexPluginInstallation:
+    """Result of installing or reconciling the owned Codex plugin."""
 
-    status: ClaudePluginStatus
+    status: CodexPluginStatus
     preflight: PluginActivationPreflight | None = None
     bundle_path: Path | None = None
     previous_bundle: Path | None = None
     reason: str | None = None
     guidance: str | None = None
-    reload_guidance: str | None = None
+    new_thread_guidance: str | None = None
 
     @property
     def ready(self) -> bool:
         return self.status in {
-            ClaudePluginStatus.INSTALLED,
-            ClaudePluginStatus.UNCHANGED,
+            CodexPluginStatus.INSTALLED,
+            CodexPluginStatus.UNCHANGED,
         }
 
 
@@ -89,16 +83,17 @@ class _PluginState:
 
 @dataclass(slots=True)
 class _HostChanges:
+    marketplace_removed: bool = False
     marketplace_added: bool = False
-    plugin_installed: bool = False
-    plugin_enabled: bool = False
+    plugin_removed: bool = False
+    plugin_added: bool = False
 
 
 ExecutableLookup = Callable[..., str | None]
 McpVerifier = Callable[[PluginActivationPreflight, Mapping[str, str]], None]
 
 
-def install_claude_plugin(
+def install_codex_plugin(
     *,
     launch_environment: Mapping[str, str] | None = None,
     data_home: Path | None = None,
@@ -106,52 +101,24 @@ def install_claude_plugin(
     executable_lookup: ExecutableLookup = shutil.which,
     command_runner: CommandRunner = subprocess.run,
     mcp_verifier: McpVerifier | None = None,
-) -> ClaudePluginInstallation:
-    """Install and verify BetterBorg's user-scoped Claude Code plugin.
+) -> CodexPluginInstallation:
+    """Install and verify BetterBorg's user-scoped Codex plugin.
 
-    Claude's supported CLI owns marketplace and plugin configuration. This
-    function owns only its materialized marketplace bundle and never edits a
-    Claude settings file directly.
+    Codex's supported plugin commands own marketplace and install state. This
+    function owns only its stable materialized marketplace bundle and never
+    edits Codex configuration or personal marketplace files directly.
     """
 
     environment = dict(os.environ if launch_environment is None else launch_environment)
     path = environment.get("PATH", os.defpath)
-    claude = executable_lookup("claude", path=path)
-    if claude is None:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.SETUP_REQUIRED,
-            reason="Claude Code was not found on the host launch PATH.",
+    codex = executable_lookup("codex", path=path)
+    if codex is None:
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.SETUP_REQUIRED,
+            reason="Codex was not found on the host launch PATH.",
             guidance=(
-                "Install Claude Code, ensure `claude` is on the host launch PATH, "
-                "and confirm `claude --version` succeeds."
-            ),
-        )
-    try:
-        version_result = run_plugin_command(
-            (str(Path(claude)), "--version"), environment, command_runner
-        )
-    except PluginCommandError as error:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.SETUP_REQUIRED,
-            reason=str(error),
-            guidance=(
-                "Repair or update Claude Code, then confirm `claude --version` "
-                "succeeds."
-            ),
-        )
-    claude_version = _parse_claude_version(version_result.stdout)
-    if claude_version is None or claude_version < _MINIMUM_SAFE_CLAUDE_VERSION:
-        reported = version_result.stdout.strip() or "an unknown version"
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.SETUP_REQUIRED,
-            reason=(
-                f"Claude Code reported {reported!r}; version "
-                f"{_MINIMUM_SAFE_CLAUDE_VERSION_TEXT} or newer is required for "
-                "collision-safe plugin rollback."
-            ),
-            guidance=(
-                "Update Claude Code, then confirm `claude --version` reports "
-                f"{_MINIMUM_SAFE_CLAUDE_VERSION_TEXT} or newer."
+                "Install Codex, ensure `codex` is on the host launch PATH, and "
+                "confirm `codex --version` succeeds."
             ),
         )
 
@@ -160,32 +127,33 @@ def install_claude_plugin(
         executable_lookup=executable_lookup,
     )
     if not preflight.ready:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.SETUP_REQUIRED,
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.SETUP_REQUIRED,
             preflight=preflight,
             reason=preflight.reason,
             guidance=preflight.guidance,
         )
 
     source = (
-        resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
+        resources.files("betterborg_cli.codex_plugin_bundle") / "marketplace"
         if bundle_source is None
         else bundle_source
     )
     try:
         digest, version = _validate_and_digest_bundle(source)
     except (OSError, ValueError) as error:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.FAILED,
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.FAILED,
             preflight=preflight,
-            reason=f"The packaged Claude plugin bundle is invalid: {error}",
+            reason=f"The packaged Codex plugin bundle is invalid: {error}",
         )
 
     try:
-        root = plugin_data_root(environment, data_home) / "betterborg" / "claude"
+        root = plugin_data_root(environment, data_home) / "betterborg" / "codex"
         marketplace_path = root / "marketplace"
+        owned_bundle_before = ownership(marketplace_path) is not None
         marketplaces = json_plugin_command(
-            (str(Path(claude)), "plugin", "marketplace", "list", "--json"),
+            (str(Path(codex)), "plugin", "marketplace", "list", "--json"),
             environment,
             command_runner,
         )
@@ -194,130 +162,137 @@ def install_claude_plugin(
             registered, marketplace_path
         ):
             raise PluginCollisionError(
-                f"Claude marketplace {MARKETPLACE_NAME!r} is already registered "
+                f"Codex marketplace {MARKETPLACE_NAME!r} is already registered "
                 "from a source BetterBorg does not own; it was left untouched."
             )
         plugins = json_plugin_command(
-            (str(Path(claude)), "plugin", "list", "--json"),
+            (str(Path(codex)), "plugin", "list", "--available", "--json"),
             environment,
             command_runner,
         )
         before = _plugin_state(plugins)
+        if registered is None and before.installed and not owned_bundle_before:
+            raise PluginCollisionError(
+                f"Codex reports an orphaned {PLUGIN_ID} installation without an "
+                "owned BetterBorg marketplace bundle; it was left untouched."
+            )
         change = materialize_bundle(
             source,
             marketplace_path,
             digest,
             version,
-            host_name="Claude",
-            manifest_path="plugins/borg/.claude-plugin/plugin.json",
-            version_change_name="version bump",
+            host_name="Codex",
+            manifest_path="plugins/borg/.codex-plugin/plugin.json",
+            version_change_name="cache-busting version change",
         )
     except PluginCollisionError as error:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.COLLISION,
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.COLLISION,
             preflight=preflight,
             reason=str(error),
         )
-    except (
-        OSError,
-        ValueError,
-        PluginActivationVerificationError,
-        PluginCommandError,
-    ) as error:
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.FAILED,
+    except (OSError, ValueError, PluginCommandError) as error:
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.FAILED,
             preflight=preflight,
             reason=str(error),
         )
 
     host_changes = _HostChanges()
     try:
-        if registered is None:
+        orphaned_install = registered is None and before.installed
+        stale_version = before.installed and before.version != version
+        disabled_install = before.installed and not before.enabled
+        bundle_version_changed = (
+            change.changed
+            and change.previous_version is not None
+            and change.previous_version != version
+        )
+        refresh_marketplace = registered is not None and (
+            stale_version or bundle_version_changed
+        )
+
+        if stale_version or disabled_install or orphaned_install:
+            run_plugin_command(
+                (str(Path(codex)), "plugin", "remove", PLUGIN_ID, "--json"),
+                environment,
+                command_runner,
+            )
+            host_changes.plugin_removed = True
+        if refresh_marketplace:
             run_plugin_command(
                 (
-                    str(Path(claude)),
+                    str(Path(codex)),
+                    "plugin",
+                    "marketplace",
+                    "remove",
+                    MARKETPLACE_NAME,
+                    "--json",
+                ),
+                environment,
+                command_runner,
+            )
+            host_changes.marketplace_removed = True
+
+        if registered is None or refresh_marketplace:
+            run_plugin_command(
+                (
+                    str(Path(codex)),
                     "plugin",
                     "marketplace",
                     "add",
                     str(marketplace_path),
-                    "--scope",
-                    "user",
+                    "--json",
                 ),
                 environment,
                 command_runner,
             )
             host_changes.marketplace_added = True
-        elif change.changed:
-            run_plugin_command(
-                (
-                    str(Path(claude)),
-                    "plugin",
-                    "marketplace",
-                    "update",
-                    MARKETPLACE_NAME,
-                ),
-                environment,
-                command_runner,
-            )
 
-        if not before.installed:
+        if not before.installed or host_changes.plugin_removed:
             run_plugin_command(
-                (
-                    str(Path(claude)),
-                    "plugin",
-                    "install",
-                    PLUGIN_ID,
-                    "--scope",
-                    "user",
-                ),
+                (str(Path(codex)), "plugin", "add", PLUGIN_ID, "--json"),
                 environment,
                 command_runner,
             )
-            host_changes.plugin_installed = True
-        elif change.changed:
-            run_plugin_command(
-                (
-                    str(Path(claude)),
-                    "plugin",
-                    "update",
-                    PLUGIN_ID,
-                    "--scope",
-                    "user",
-                ),
-                environment,
-                command_runner,
-            )
+            host_changes.plugin_added = True
 
-        if not before.installed or change.changed or not before.enabled:
-            run_plugin_command(
-                (
-                    str(Path(claude)),
-                    "plugin",
-                    "enable",
-                    PLUGIN_ID,
-                    "--scope",
-                    "user",
-                ),
+        verified_marketplace = marketplace_entry(
+            json_plugin_command(
+                (str(Path(codex)), "plugin", "marketplace", "list", "--json"),
                 environment,
                 command_runner,
+            ),
+            MARKETPLACE_NAME,
+        )
+        if verified_marketplace is None or not owned_marketplace_source(
+            verified_marketplace, marketplace_path
+        ):
+            raise PluginCommandError(
+                f"Codex did not report marketplace {MARKETPLACE_NAME!r} from "
+                "the owned BetterBorg bundle."
             )
-            host_changes.plugin_enabled = True
-
         verified = _plugin_state(
             json_plugin_command(
-                (str(Path(claude)), "plugin", "list", "--json"),
+                (
+                    str(Path(codex)),
+                    "plugin",
+                    "list",
+                    "--available",
+                    "--json",
+                ),
                 environment,
                 command_runner,
             )
         )
         if not verified.installed or not verified.enabled:
             raise PluginCommandError(
-                f"Claude did not report {PLUGIN_ID} as installed and enabled."
+                f"Codex did not report {PLUGIN_ID} as installed and enabled."
             )
         if verified.version != version:
             reported = verified.version or "an unknown version"
             raise PluginCommandError(
-                f"Claude reported {PLUGIN_ID} at {reported}, expected {version}."
+                f"Codex reported {PLUGIN_ID} at {reported}, expected {version}."
             )
         (mcp_verifier or verify_borg_mcp)(preflight, environment)
     except (
@@ -328,7 +303,7 @@ def install_claude_plugin(
     ) as error:
         rollback_error = _rollback(
             change,
-            claude=str(Path(claude)),
+            codex=str(Path(codex)),
             environment=environment,
             command_runner=command_runner,
             marketplace_preexisting=registered is not None,
@@ -336,47 +311,41 @@ def install_claude_plugin(
             host_changes=host_changes,
         )
         if rollback_error is None:
-            reason = f"Claude plugin activation failed and was rolled back: {error}"
+            reason = f"Codex plugin activation failed and was rolled back: {error}"
         else:
             reason = (
-                f"Claude plugin activation failed: {error} "
+                f"Codex plugin activation failed: {error} "
                 f"Rollback also failed: {rollback_error}"
             )
-        return ClaudePluginInstallation(
-            status=ClaudePluginStatus.FAILED,
+        return CodexPluginInstallation(
+            status=CodexPluginStatus.FAILED,
             preflight=preflight,
             bundle_path=marketplace_path if marketplace_path.exists() else None,
-            previous_bundle=change.previous,
+            previous_bundle=(
+                change.previous
+                if change.previous is not None and change.previous.exists()
+                else None
+            ),
             reason=reason,
         )
 
-    changed = (
-        change.changed
-        or registered is None
-        or not before.installed
-        or not before.enabled
+    changed = change.changed or any(
+        (
+            host_changes.marketplace_removed,
+            host_changes.marketplace_added,
+            host_changes.plugin_removed,
+            host_changes.plugin_added,
+        )
     )
-    return ClaudePluginInstallation(
+    return CodexPluginInstallation(
         status=(
-            ClaudePluginStatus.INSTALLED
-            if changed
-            else ClaudePluginStatus.UNCHANGED
+            CodexPluginStatus.INSTALLED if changed else CodexPluginStatus.UNCHANGED
         ),
         preflight=preflight,
         bundle_path=marketplace_path,
         previous_bundle=change.previous,
-        reload_guidance=RELOAD_GUIDANCE,
+        new_thread_guidance=NEW_THREAD_GUIDANCE,
     )
-
-
-def _parse_claude_version(output: str) -> tuple[int, int, int] | None:
-    match = re.search(
-        r"(?<![\d.])(\d+)\.(\d+)\.(\d+)(?![-+\d.])",
-        output,
-    )
-    if match is None:
-        return None
-    return tuple(int(part) for part in match.groups())
 
 
 def _plugin_state(value: Any) -> _PluginState:
@@ -384,31 +353,41 @@ def _plugin_state(value: Any) -> _PluginState:
     enabled = False
     version = None
     for entry in records(value, "plugins"):
-        identifier = entry.get("id") or entry.get("plugin")
+        identifier = (
+            entry.get("pluginId")
+            or entry.get("id")
+            or entry.get("plugin")
+            or entry.get("selector")
+        )
         name = entry.get("name")
         marketplace = entry.get("marketplace") or entry.get("marketplaceName")
-        if identifier == PLUGIN_ID or (
+        if identifier != PLUGIN_ID and not (
             name == PLUGIN_NAME and marketplace == MARKETPLACE_NAME
         ):
-            scope = entry.get("scope")
-            if not isinstance(scope, str) or scope.casefold() != "user":
-                continue
-            installed = True
-            entry_enabled = entry.get("enabled")
-            if entry_enabled is None:
-                entry_enabled = entry.get("status") == "enabled"
-            enabled = enabled or bool(entry_enabled)
-            if isinstance(entry.get("version"), str):
-                version = entry["version"]
+            continue
+        entry_installed = entry.get("installed")
+        if entry_installed is None:
+            status = entry.get("status")
+            entry_installed = status == "installed" or entry.get("enabled") is True
+        if not entry_installed:
+            continue
+        installed = True
+        entry_enabled = entry.get("enabled")
+        if entry_enabled is None:
+            entry_enabled = entry.get("status") == "enabled"
+        enabled = enabled or bool(entry_enabled)
+        for key in ("installedVersion", "installed_version", "version"):
+            if isinstance(entry.get(key), str):
+                version = entry[key]
+                break
     return _PluginState(installed=installed, enabled=enabled, version=version)
 
 
 def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     required = (
-        ".claude-plugin/marketplace.json",
-        "plugins/borg/.claude-plugin/plugin.json",
+        ".agents/plugins/marketplace.json",
+        "plugins/borg/.codex-plugin/plugin.json",
         "plugins/borg/.mcp.json",
-        "plugins/borg/commands/borg.md",
         "plugins/borg/skills/orchestrate/SKILL.md",
     )
     content: dict[str, bytes] = {}
@@ -424,12 +403,31 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
         raise ValueError("marketplace and plugin manifests must be JSON objects")
     if marketplace.get("name") != MARKETPLACE_NAME:
         raise ValueError("marketplace name is not stable")
+    entries = marketplace.get("plugins")
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise ValueError("marketplace must expose exactly the Borg plugin")
+    entry = entries[0]
+    expected_entry = {
+        "name": PLUGIN_NAME,
+        "source": {"source": "local", "path": "./plugins/borg"},
+        "policy": {
+            "installation": "AVAILABLE",
+            "authentication": "ON_INSTALL",
+        },
+        "category": "Productivity",
+    }
+    if entry != expected_entry:
+        raise ValueError("marketplace Borg entry does not match the Codex contract")
     if manifest.get("name") != PLUGIN_NAME:
         raise ValueError("plugin name is not stable")
     version = manifest.get("version")
     if not isinstance(version, str) or not version.strip():
         raise ValueError("plugin version must be a non-empty string")
-    if mcp != {"mcpServers": {"borg": {"command": "borg", "args": ["mcp"]}}}:
+    if manifest.get("skills") != "./skills/":
+        raise ValueError("plugin manifest must register bundled skills")
+    if manifest.get("mcpServers") != "./.mcp.json":
+        raise ValueError("plugin manifest must register the MCP companion file")
+    if mcp != {"borg": {"command": "borg", "args": ["mcp"]}}:
         raise ValueError("MCP registration must execute `borg mcp`")
     return bundle_digest(source), version
 
@@ -437,7 +435,7 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
 def _rollback(
     change: BundleChange,
     *,
-    claude: str,
+    codex: str,
     environment: Mapping[str, str],
     command_runner: CommandRunner,
     marketplace_preexisting: bool,
@@ -445,51 +443,11 @@ def _rollback(
     host_changes: _HostChanges,
 ) -> str | None:
     errors: list[str] = []
-    restored_previous = False
-    if change.changed and change.previous is not None:
-        failed_name = f"failed-{change.digest[:12]}-{uuid4().hex[:8]}"
-        failed = change.previous.parent / failed_name
-        try:
-            change.path.rename(failed)
-            change.previous.rename(change.path)
-            restored_previous = True
-        except OSError as error:
-            errors.append(str(error))
-    if marketplace_preexisting and restored_previous:
+
+    if host_changes.plugin_added:
         try:
             run_plugin_command(
-                (claude, "plugin", "marketplace", "update", MARKETPLACE_NAME),
-                environment,
-                command_runner,
-            )
-        except PluginCommandError as error:
-            errors.append(str(error))
-    if plugin_before.installed:
-        commands = []
-        if restored_previous:
-            commands.append(
-                (claude, "plugin", "update", PLUGIN_ID, "--scope", "user")
-            )
-        if restored_previous or host_changes.plugin_enabled:
-            commands.append(
-                (
-                    claude,
-                    "plugin",
-                    "enable" if plugin_before.enabled else "disable",
-                    PLUGIN_ID,
-                    "--scope",
-                    "user",
-                )
-            )
-        for command in commands:
-            try:
-                run_plugin_command(command, environment, command_runner)
-            except PluginCommandError as error:
-                errors.append(str(error))
-    elif host_changes.plugin_installed:
-        try:
-            run_plugin_command(
-                (claude, "plugin", "uninstall", PLUGIN_ID, "--scope", "user"),
+                (codex, "plugin", "remove", PLUGIN_ID, "--json"),
                 environment,
                 command_runner,
             )
@@ -499,19 +457,54 @@ def _rollback(
         try:
             run_plugin_command(
                 (
-                    claude,
+                    codex,
                     "plugin",
                     "marketplace",
                     "remove",
                     MARKETPLACE_NAME,
-                    "--scope",
-                    "user",
+                    "--json",
                 ),
                 environment,
                 command_runner,
             )
         except PluginCommandError as error:
             errors.append(str(error))
+
+    if change.changed and change.previous is not None:
+        failed_name = f"failed-{change.digest[:12]}-{uuid4().hex[:8]}"
+        failed = change.previous.parent / failed_name
+        try:
+            change.path.rename(failed)
+            change.previous.rename(change.path)
+        except OSError as error:
+            errors.append(str(error))
+
+    if host_changes.marketplace_removed:
+        try:
+            run_plugin_command(
+                (
+                    codex,
+                    "plugin",
+                    "marketplace",
+                    "add",
+                    str(change.path),
+                    "--json",
+                ),
+                environment,
+                command_runner,
+            )
+        except PluginCommandError as error:
+            errors.append(str(error))
+    if host_changes.plugin_removed:
+        try:
+            run_plugin_command(
+                (codex, "plugin", "add", PLUGIN_ID, "--json"),
+                environment,
+                command_runner,
+            )
+        except PluginCommandError as error:
+            errors.append(str(error))
+
     if change.changed and change.previous is None:
         try:
             shutil.rmtree(change.path)
@@ -527,7 +520,7 @@ def _rollback(
 
     try:
         marketplaces = json_plugin_command(
-            (claude, "plugin", "marketplace", "list", "--json"),
+            (codex, "plugin", "marketplace", "list", "--json"),
             environment,
             command_runner,
         )
@@ -538,22 +531,21 @@ def _rollback(
         if marketplace_preexisting:
             if marketplace_after is None:
                 errors.append(
-                    f"Claude no longer reports marketplace {MARKETPLACE_NAME!r}"
+                    f"Codex no longer reports marketplace {MARKETPLACE_NAME!r}"
                 )
             elif not owned_marketplace_source(marketplace_after, change.path):
                 errors.append(
-                    f"Claude reports marketplace {MARKETPLACE_NAME!r} from an "
+                    f"Codex reports marketplace {MARKETPLACE_NAME!r} from an "
                     "unexpected source after rollback"
                 )
         elif marketplace_after is not None:
             errors.append(
-                f"Claude still reports marketplace {MARKETPLACE_NAME!r} after "
-                "rollback"
+                f"Codex still reports marketplace {MARKETPLACE_NAME!r} after rollback"
             )
 
     try:
         plugins = json_plugin_command(
-            (claude, "plugin", "list", "--json"),
+            (codex, "plugin", "list", "--available", "--json"),
             environment,
             command_runner,
         )
@@ -563,10 +555,11 @@ def _rollback(
         plugin_after = _plugin_state(plugins)
         if plugin_after != plugin_before:
             errors.append(
-                f"Claude reports {PLUGIN_ID} after rollback as "
-                f"installed={plugin_after.installed}, enabled={plugin_after.enabled}, "
-                f"version={plugin_after.version!r}; expected "
-                f"installed={plugin_before.installed}, "
+                f"Codex reports {PLUGIN_ID} after rollback as "
+                f"installed={plugin_after.installed}, "
+                f"enabled={plugin_after.enabled}, "
+                f"version={plugin_after.version!r}; "
+                f"expected installed={plugin_before.installed}, "
                 f"enabled={plugin_before.enabled}, "
                 f"version={plugin_before.version!r}"
             )

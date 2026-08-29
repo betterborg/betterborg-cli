@@ -55,6 +55,10 @@ betterborg_cli = [
   "claude_plugin_bundle/marketplace/plugins/borg/.mcp.json",
   "claude_plugin_bundle/marketplace/plugins/borg/commands/*.md",
   "claude_plugin_bundle/marketplace/plugins/borg/skills/*/*.md",
+  "codex_plugin_bundle/marketplace/.agents/plugins/*.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/.codex-plugin/*.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/.mcp.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/skills/*/*.md",
 ]
 
 [tool.pytest.ini_options]

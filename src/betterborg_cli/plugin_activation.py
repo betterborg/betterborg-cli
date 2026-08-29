@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -56,6 +57,10 @@ class PluginActivationPreparation(Generic[Bundle]):
 
 ExecutableLookup = Callable[..., str | None]
 VersionRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class PluginActivationVerificationError(RuntimeError):
+    """The persistent CLI could not serve the bundled MCP integration."""
 
 
 def preflight_plugin_activation(
@@ -144,6 +149,55 @@ def prepare_plugin_activation(
     return PluginActivationPreparation(
         preflight=preflight,
         bundle=materialize_owned_bundle(preflight),
+    )
+
+
+def verify_borg_mcp(
+    preflight: PluginActivationPreflight,
+    environment: Mapping[str, str],
+) -> None:
+    """Spawn the persistent MCP command and require an initialize response."""
+
+    if preflight.executable is None:
+        raise PluginActivationVerificationError(
+            "persistent borg executable is unavailable"
+        )
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "betterborg-plugin-installer", "version": "1"},
+        },
+    }
+    try:
+        completed = subprocess.run(
+            [str(preflight.executable), "mcp"],
+            input=json.dumps(request) + "\n",
+            capture_output=True,
+            check=False,
+            env=dict(environment),
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PluginActivationVerificationError(
+            f"unable to start `borg mcp`: {error}"
+        ) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "no diagnostic output"
+        raise PluginActivationVerificationError(f"`borg mcp` failed: {detail}")
+    for line in completed.stdout.splitlines():
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if response.get("id") == 1 and isinstance(response.get("result"), dict):
+            return
+    raise PluginActivationVerificationError(
+        "`borg mcp` did not answer the initialize request"
     )
 
 
