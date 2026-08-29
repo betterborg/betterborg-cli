@@ -30,6 +30,17 @@ make build
 `borg version` and `borg --help` are bootstrap commands. They do not create or
 initialize a repository.
 
+Install the user-scoped Claude Code integration after both `borg version` and
+`claude --version` work from the host launch environment:
+
+```console
+borg plugin install claude
+```
+
+The installer uses Claude's supported marketplace and plugin commands; it does
+not edit Claude settings directly. Run `/reload-plugins` in open Claude Code
+sessions after installation or an upgrade.
+
 Before a command can load repository configuration or prompts for a
 host-capable agent, trust the current Git workspace interactively:
 

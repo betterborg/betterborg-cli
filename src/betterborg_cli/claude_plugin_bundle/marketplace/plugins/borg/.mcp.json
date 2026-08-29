@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "borg": {
+      "command": "borg",
+      "args": ["mcp"]
+    }
+  }
+}
