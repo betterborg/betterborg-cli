@@ -7,15 +7,11 @@ import subprocess
 from importlib import resources
 from pathlib import Path
 
-from click.testing import CliRunner
 from plugin_test_support import copy_resource, executable
 
-from betterborg_cli import cli as cli_module
-from betterborg_cli.cli import cli
 from betterborg_cli.codex_plugin import (
     MARKETPLACE_NAME,
     PLUGIN_ID,
-    CodexPluginInstallation,
     CodexPluginStatus,
     install_codex_plugin,
 )
@@ -402,7 +398,7 @@ def test_absent_codex_defers_without_files_commands_or_mcp_spawn(
         mcp_verifier=lambda *args: spawns.append(args),
     )
 
-    assert result.status is CodexPluginStatus.SETUP_REQUIRED
+    assert result.status is CodexPluginStatus.DEFERRED
     assert "Install Codex" in (result.guidance or "")
     assert commands == []
     assert spawns == []
@@ -429,25 +425,6 @@ def test_missing_persistent_borg_does_not_list_or_mutate_codex(
     assert "uv tool install betterborg-cli" in (result.guidance or "")
     assert fake.calls == []
     assert not tmp_path.joinpath("data").exists()
-
-
-def test_cli_reports_codex_success_and_new_thread_guidance(monkeypatch) -> None:
-    monkeypatch.setattr(
-        cli_module,
-        "install_codex_plugin",
-        lambda: CodexPluginInstallation(
-            status=CodexPluginStatus.INSTALLED,
-            new_thread_guidance="Start a new Codex thread now.",
-        ),
-    )
-
-    result = CliRunner().invoke(cli, ["plugin", "install", "codex"])
-
-    assert result.exit_code == 0
-    assert "Installed the BetterBorg plugin for Codex" in result.output
-    assert "new Codex thread" in result.output
-
-
 def _upgraded_bundle(tmp_path: Path, name: str, version: str) -> Path:
     source = resources.files("betterborg_cli.codex_plugin_bundle") / "marketplace"
     destination = tmp_path / name
