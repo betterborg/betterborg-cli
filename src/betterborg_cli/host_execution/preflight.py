@@ -75,6 +75,16 @@ class HostService:
 
 
 @dataclass(frozen=True, slots=True)
+class HostSecret:
+    """One analyzer-declared secret and its permitted execution scope."""
+
+    name: str
+    scope: Literal["all", "build", "agent"]
+    used_by: tuple[str, ...]
+    evidence: str
+
+
+@dataclass(frozen=True, slots=True)
 class HostPreflightPlan:
     """All repository-controlled host inputs validated before task claiming."""
 
@@ -88,6 +98,8 @@ class HostPreflightPlan:
     compose_files: tuple[Path, ...]
     services: tuple[HostService, ...]
     compose_profiles: tuple[str, ...] = ()
+    package_managers: tuple[str, ...] = ()
+    secret_requirements: tuple[HostSecret, ...] = ()
 
 
 HostPreflightResult = HostPreflightPlan | HostPreflightBlock
@@ -153,7 +165,7 @@ class HostPreflight:
             (*commands, *prepare_commands, *materialize_commands),
             failures,
         )
-        required_secrets = self._required_secrets(
+        secret_requirements = self._required_secrets(
             plan, available_secret_names, failures
         )
         compose_files, compose_profiles, services = self._services(
@@ -172,10 +184,14 @@ class HostPreflight:
             materialize_commands=tuple(materialize_commands),
             environment_files=tuple(environment_files),
             executables=tuple(executables),
-            required_secret_names=tuple(required_secrets),
+            required_secret_names=tuple(
+                secret.name for secret in secret_requirements
+            ),
             compose_files=tuple(compose_files),
             services=tuple(services),
             compose_profiles=tuple(compose_profiles),
+            package_managers=tuple(_package_managers(plan)),
+            secret_requirements=tuple(secret_requirements),
         )
 
     def _commands(
@@ -458,7 +474,7 @@ class HostPreflight:
         plan: Mapping[str, Any],
         available: Collection[str],
         failures: list[HostPreflightFailure],
-    ) -> list[str]:
+    ) -> list[HostSecret]:
         records = _mappings(plan.get("required_secrets"))
         by_name: dict[str, Mapping[str, Any]] = {}
         for record in records:
@@ -512,7 +528,31 @@ class HostPreflight:
             )
 
         available_names = set(available)
+        validated: list[HostSecret] = []
         for name, record in by_name.items():
+            scope = record.get("scope")
+            used_by = record.get("used_by")
+            valid_used_by = (
+                isinstance(used_by, Sequence)
+                and not isinstance(used_by, str | bytes)
+                and bool(used_by)
+                and all(isinstance(value, str) and value for value in used_by)
+            )
+            if scope not in {"all", "build", "agent"} or not valid_used_by:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            f"required secret {name!r} must declare a valid scope "
+                            "and non-empty used_by stages"
+                        ),
+                        evidence=_evidence(record, "analyzer required_secrets"),
+                        guidance=(
+                            "Set scope to all, build, or agent and identify the "
+                            "commands that use this secret, then rerun analysis."
+                        ),
+                    )
+                )
+                continue
             if name not in available_names:
                 failures.append(
                     HostPreflightFailure(
@@ -524,7 +564,17 @@ class HostPreflight:
                         ),
                     )
                 )
-        return sorted(by_name)
+            assert isinstance(scope, str)
+            assert isinstance(used_by, Sequence)
+            validated.append(
+                HostSecret(
+                    name=name,
+                    scope=scope,
+                    used_by=tuple(used_by),
+                    evidence=_evidence(record, "analyzer required_secrets"),
+                )
+            )
+        return sorted(validated, key=lambda secret: secret.name)
 
     def _services(
         self,
@@ -908,6 +958,18 @@ def _which(name: str, path: str | None) -> str | None:
 
 def _toolchain_executable_name(name: str) -> str:
     return {"rust": "rustc"}.get(name, name)
+
+
+def _package_managers(plan: Mapping[str, Any]) -> list[str]:
+    environment = plan.get("environment")
+    if not isinstance(environment, Mapping):
+        return []
+    values = environment.get("package_managers")
+    if not isinstance(values, Sequence) or isinstance(values, str | bytes):
+        return []
+    return _unique_strings(
+        [value for value in values if isinstance(value, str) and value]
+    )
 
 
 def _mappings(value: object) -> list[Mapping[str, Any]]:

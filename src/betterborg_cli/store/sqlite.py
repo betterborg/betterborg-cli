@@ -2454,6 +2454,64 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_environment_attempt(row) for row in rows]
 
+    def find_completed_environment_attempt(
+        self,
+        fingerprint: str,
+        *,
+        kind: str,
+        task_id: UUID | None = None,
+    ) -> EnvironmentAttempt | None:
+        """Return the newest successful attempt matching an exact descriptor.
+
+        Preparation caches are reusable across tasks and execution runs, while
+        checkout materialization is task-local.  The optional task filter lets
+        callers enforce that distinction without treating failed, cancelled,
+        or interrupted attempts as cache hits.
+        """
+        if not fingerprint.strip() or not kind.strip():
+            raise ValueError("environment fingerprint and kind must not be empty")
+        task_filter = (
+            "AND environment_attempts.task_id = ?" if task_id is not None else ""
+        )
+        parameters: list[str] = [fingerprint, kind]
+        if task_id is not None:
+            parameters.append(str(task_id))
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT environment_attempts.*,
+                       terminal.kind AS terminal_kind,
+                       terminal.payload_json AS terminal_payload_json,
+                       terminal.created_at AS terminal_at
+                FROM environment_attempts
+                LEFT JOIN execution_events AS terminal
+                  ON terminal.attempt_id = environment_attempts.id
+                 AND terminal.kind IN (
+                    'environment.attempt_finished',
+                    'environment.attempt_interrupted'
+                 )
+                WHERE environment_attempts.fingerprint = ?
+                  AND environment_attempts.kind = ?
+                  {task_filter}
+                  AND (
+                    (
+                      terminal.kind = 'environment.attempt_finished'
+                      AND json_extract(terminal.payload_json, '$.status') = 'completed'
+                    )
+                    OR (
+                      terminal.kind IS NULL
+                      AND environment_attempts.status = 'completed'
+                    )
+                  )
+                ORDER BY COALESCE(terminal.created_at,
+                                  environment_attempts.finished_at) DESC,
+                         environment_attempts.id DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        return _row_to_environment_attempt(row) if row is not None else None
+
     def complete_environment_attempt(
         self,
         attempt_id: UUID,
