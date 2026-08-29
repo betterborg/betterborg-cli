@@ -55,6 +55,10 @@ manifests, and both marketplace entries in one reviewed change. Run
 `make lint`, `make test`, and `make build`, then create the reviewed `vVERSION`
 tag on that exact commit. The final version must remain greater than the
 phase-10 version; the phase-10 tag is never a publication target.
+Phase-10 version `0.1.0` is immutable: never overwrite, reuse, move, or retag
+it. Every synchronized final release must use one newly reviewed version
+strictly greater than `0.1.0`, and that final version becomes equally
+immutable as soon as any registry accepts it.
 Verify that the tag is annotated or signed according to the project's release
 policy, that its version matches the source and artifact names, and that the
 tagged commit is the current tip of `main`.
@@ -102,6 +106,83 @@ different commit under the reviewed tag's version.
    installer, `uvx --from betterborg==VERSION`, and
    `npx @betterborg/cli@VERSION`. Each fixture scans stdout, stderr, paths,
    symlinks, and files for raw and encoded credential forms.
+
+## Verify the synchronized public release
+
+Retain the publish-enabled workflow run ID. The registry inputs exist as soon
+as validation completes, so download them even when the protected run stops at
+PyPI. Do not rebuild an input for verification:
+
+```console
+mkdir -p verified-registry-inputs
+gh run download RUN_ID \
+  --name betterborg-registry-inputs-VERSION \
+  --dir verified-registry-inputs
+git rev-parse HEAD
+```
+
+From the reviewed tagged checkout, provide the one masked provider credential
+and run the read-only cross-surface verifier. `REVIEWED_COMMIT_SHA` is the
+recorded full SHA from the final command above:
+
+```console
+export OPENAI_API_KEY='value supplied by the protected secret manager'
+python scripts/verify_final_release.py \
+  --version VERSION \
+  --reviewed-sha REVIEWED_COMMIT_SHA \
+  --registry-artifacts verified-registry-inputs
+```
+
+This first check can report a missing PyPI version or a not-yet-started GitHub
+Release without the downstream binary artifact. Once the workflow has produced
+`binary-release-VERSION`, download that artifact from the same run and include
+it in every subsequent check:
+
+```console
+mkdir -p verified-github-assets
+gh run download RUN_ID \
+  --name binary-release-VERSION \
+  --dir verified-github-assets
+python scripts/verify_final_release.py \
+  --version VERSION \
+  --reviewed-sha REVIEWED_COMMIT_SHA \
+  --registry-artifacts verified-registry-inputs \
+  --github-artifacts verified-github-assets
+```
+
+The verifier first requires the preserved wheel and sdist SHA-256 digests to
+match PyPI. It then downloads the GitHub Release assets read-only, verifies
+their attestations and SHA-256 digests against the preserved build-once set,
+and finally compares the preserved npm tarball's SHA-512 integrity with the
+exact public npm version. This enforced PyPI → GitHub → npm order rejects a
+later publication when an earlier gate is absent or partial. Only after all
+three surfaces match does it run these exact final-version command shapes in
+three fresh trusted repositories:
+
+```console
+curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  https://github.com/betterborg/betterborg-cli/releases/download/vVERSION/install.sh \
+  --output install.sh
+BETTERBORG_VERSION=VERSION sh ./install.sh
+~/.local/bin/borg version
+uvx --refresh --from betterborg==VERSION borg version
+npx --yes @betterborg/cli@VERSION version
+```
+
+Each path also runs `init --yes --json` with only `OPENAI_API_KEY`, never
+`ANTHROPIC_API_KEY`, and scans captured output plus disposable HOME, cache,
+data, state, paths, symlinks, and files for raw and encoded credential forms.
+The version output from curl, uvx, and npx must be exactly `borg VERSION`.
+
+Exit status `0` means every public digest and smoke matches. Exit status `2`
+means publication is safely partial and lists only the next digest-gated step;
+resume the same reviewed workflow run with **Re-run failed jobs**, then rerun
+the verifier. Exit status `1` means verification could not safely determine a
+resumable state. Inspect its error: only an error that explicitly identifies
+immutable public state and says to prepare a new version is terminal. Retry
+transient registry, GitHub, credential, tooling, and local-input failures after
+correcting the reported cause. The verifier has no registry or GitHub
+publication command and must never be given write-scoped credentials.
 
 Linux binaries are built natively on `ubuntu-24.04` and
 `ubuntu-24.04-arm` inside the architecture-matched PyPA `manylinux2014`

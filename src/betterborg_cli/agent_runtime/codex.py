@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS, ApiAgentRole
+from betterborg_cli.agent_runtime.api_tools import ApiAgentRole, is_read_only_tool_set
 from betterborg_cli.agent_runtime.base import (
     AgentArtifact,
     AgentCapabilities,
@@ -190,7 +190,7 @@ class CodexAdapter(NativeCliAdapter):
 
 
 def _sandbox_for(spec: AgentRunSpec) -> str:
-    if spec.allowed_tools and set(spec.allowed_tools) <= set(READ_ONLY_API_TOOLS):
+    if is_read_only_tool_set(spec.allowed_tools):
         return "read-only"
     return "danger-full-access"
 

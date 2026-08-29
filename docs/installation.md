@@ -18,6 +18,19 @@ binary, verifies its SHA-256 digest and exact version, atomically installs it at
 and plugin hosts. The vanity URL `install.betterborg.ai` is not active yet; do
 not substitute it for the GitHub URL.
 
+To verify or install one immutable release instead of following `latest`, pin
+both the release URL and installer version:
+
+```console
+curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  https://github.com/betterborg/betterborg-cli/releases/download/vVERSION/install.sh \
+  --output install.sh
+BETTERBORG_VERSION=VERSION sh ./install.sh
+~/.local/bin/borg version
+```
+
+The final command must print exactly `borg VERSION`.
+
 Native Windows and WSL1 are unsupported. On Windows, open a WSL2 shell and run
 the Linux installer there. The CLI, machine state, and plugin hosts must all be
 used from that WSL2 environment.
@@ -54,15 +67,24 @@ borg trust
 ```
 
 Use `borg trust --yes` only for a deliberate noninteractive decision. A fresh
-noninteractive initialization can combine explicit trust with one provider:
+initialization needs one agent transport. Every command prefers the `claude`
+or `codex` CLI whenever one is on `PATH`:
+
+```console
+borg init --yes
+```
+
+Selection tests only for the executable, so a CLI on `PATH` must already be
+logged in. An installed but unauthenticated CLI is still chosen, and the run
+fails rather than falling back to a provider key. With neither CLI on `PATH`,
+supply a key instead:
 
 ```console
 export OPENAI_API_KEY='your-provider-key'
 borg init --yes
 ```
 
-Set `ANTHROPIC_API_KEY` instead to use Anthropic. Interactive users may also
-install and log in to the Claude Code or Codex CLI. Never write a provider key
+`ANTHROPIC_API_KEY` is the supported alternative. Never write a provider key
 to `.borg/config.toml`, a PRD, shell output, or any tracked file; use the shell
 environment or a secret manager.
 

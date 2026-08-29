@@ -1,4 +1,4 @@
-"""Integration contracts for TTY-aware agent selection."""
+"""Integration contracts for native-first agent selection."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from test_adapter_harness import (
 )
 
 from betterborg_cli.agent_runtime import (
+    READ_ONLY_API_TOOLS,
     AgentRunSpec,
     AgentSelectionError,
     AgentStatus,
@@ -24,6 +25,7 @@ from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     CancellationToken,
     OpenAIAdapter,
+    SelectedAgent,
     select_agent,
 )
 from betterborg_cli.repo_paths import RepoPaths
@@ -32,6 +34,19 @@ from betterborg_cli.repository_config import (
     AgentChoices,
     RepositoryConfig,
 )
+from betterborg_cli.workspace_trust import UntrustedWorkspaceError
+
+
+def _refusing_trust(*_args: Any, **_kwargs: Any) -> None:
+    raise UntrustedWorkspaceError("workspace is not trusted on this machine")
+
+
+def _spawn_recording(runner: Any, events: list[str]) -> Any:
+    def recording(*args: Any, **kwargs: Any) -> int:
+        events.append("spawn")
+        return runner(*args, **kwargs)
+
+    return recording
 
 
 def _config(**choices: AgentChoice) -> RepositoryConfig:
@@ -66,6 +81,8 @@ def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
     return AgentRunSpec(**values)
 
 
+@pytest.mark.parametrize("interactive", [True, False])
+@pytest.mark.parametrize("role", list(ApiAgentRole))
 @pytest.mark.parametrize(
     ("installed", "credentials", "expected"),
     [
@@ -79,17 +96,19 @@ def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
         (set(), {"OPENAI_API_KEY": "o"}, "openai"),
     ],
 )
-def test_interactive_default_precedence(
+def test_every_role_prefers_an_installed_native_cli_over_a_credential(
     git_repo: Path,
+    interactive: bool,
+    role: ApiAgentRole,
     installed: set[str],
     credentials: Mapping[str, str],
     expected: str,
 ) -> None:
     selected = select_agent(
         _config(),
-        ApiAgentRole.CODING,
+        role,
         RepoPaths.discover(git_repo),
-        interactive=True,
+        interactive=interactive,
         credentials=credentials,
         executable_lookup=lambda binary: (
             f"/bin/{binary}" if binary in installed else None
@@ -97,37 +116,6 @@ def test_interactive_default_precedence(
     )
 
     assert selected.name == expected
-
-
-def test_noninteractive_selection_ignores_installed_native_clis(
-    git_repo: Path,
-) -> None:
-    selected = select_agent(
-        _config(),
-        ApiAgentRole.REVIEW,
-        RepoPaths.discover(git_repo),
-        interactive=False,
-        credentials={"ANTHROPIC_API_KEY": "owner-secret"},
-        executable_lookup=lambda binary: f"/bin/{binary}",
-    )
-
-    assert selected.name == "anthropic"
-
-
-def test_interactive_analysis_uses_a_path_contained_api_adapter(
-    git_repo: Path,
-) -> None:
-    selected = select_agent(
-        _config(),
-        ApiAgentRole.ANALYSIS,
-        RepoPaths.discover(git_repo),
-        interactive=True,
-        credentials={"ANTHROPIC_API_KEY": "owner-secret"},
-        executable_lookup=lambda binary: f"/bin/{binary}",
-    )
-
-    assert selected.name == "anthropic"
-    assert not selected.capabilities.host_capable
 
 
 def test_configured_native_role_applies_overrides_after_trust_before_spawn(
@@ -231,23 +219,116 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
     assert not spawned
 
 
-def test_contained_run_rejects_a_host_capable_adapter_before_spawn(
-    git_repo: Path,
-) -> None:
-    selected = select_agent(
+def _selected_codex(git_repo: Path, **changes: Any) -> SelectedAgent:
+    return select_agent(
         _config(coding=AgentChoice(adapter="codex")),
         ApiAgentRole.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
         executable_lookup=lambda _binary: "/bin/codex",
+        **changes,
+    )
+
+
+def test_contained_run_rejects_a_host_capable_adapter_without_read_only_tools(
+    git_repo: Path,
+) -> None:
+    selected = _selected_codex(git_repo)
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+
+    with pytest.raises(AgentSelectionError, match="read-only tool set"):
+        selected.run_contained(_spec(git_repo, allowed_tools=()))
+
+
+def test_contained_run_rejects_a_host_capable_adapter_granted_a_write_tool(
+    git_repo: Path,
+) -> None:
+    selected = _selected_codex(git_repo)
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+
+    with pytest.raises(AgentSelectionError, match="read-only tool set"):
+        selected.run_contained(
+            _spec(git_repo, allowed_tools=(*READ_ONLY_API_TOOLS, "apply_patch"))
+        )
+
+
+def test_contained_run_reports_cancellation_before_trust_or_spawn(
+    git_repo: Path,
+) -> None:
+    selected = _selected_codex(git_repo, trust_requirement=_refusing_trust)
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+    cancel = CancellationToken()
+    cancel.cancel()
+
+    result = selected.run_contained(
+        _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS), cancel=cancel
+    )
+
+    assert result.status == AgentStatus.CANCELLED
+
+
+def test_contained_run_requires_workspace_trust_for_a_native_cli(
+    git_repo: Path,
+) -> None:
+    selected = _selected_codex(
+        git_repo,
+        trust_requirement=_refusing_trust,
     )
     selected.adapter.proc_runner = (  # type: ignore[attr-defined]
         lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
     )
 
-    with pytest.raises(AgentSelectionError, match="cannot be confined"):
-        selected.run_contained(_spec(git_repo))
+    with pytest.raises(UntrustedWorkspaceError):
+        selected.run_contained(
+            _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS)
+        )
+
+
+def test_contained_run_sandboxes_a_native_cli_under_read_only_tools(
+    git_repo: Path,
+) -> None:
+    commands: list[Sequence[str]] = []
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: Any,
+        _env: Any,
+    ) -> int:
+        commands.append(command)
+        log_path.write_text("", encoding="utf-8")
+        Path(command[command.index("-o") + 1]).write_text(
+            json.dumps({"status": "completed", "version": "1"}), encoding="utf-8"
+        )
+        return 0
+
+    events: list[str] = []
+
+    def require_trust(paths: RepoPaths, **_kwargs: Any) -> None:
+        assert paths.root == git_repo.resolve()
+        events.append("trust")
+
+    selected = _selected_codex(git_repo, trust_requirement=require_trust)
+    selected.adapter.proc_runner = _spawn_recording(  # type: ignore[attr-defined]
+        runner, events
+    )
+
+    result = selected.run_contained(
+        _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS)
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    assert events == ["trust", "spawn"]
+    assert commands[0][commands[0].index("-s") + 1] == "read-only"
 
 
 def test_run_rejects_a_cwd_from_a_different_repository_before_trust_or_spawn(
@@ -413,6 +494,7 @@ def test_api_analysis_remains_contained_without_workspace_trust(
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"OPENAI_API_KEY": "key"},
+        executable_lookup=lambda _binary: None,
         trust_requirement=lambda *_args, **_kwargs: pytest.fail("unexpected trust"),
     )
 
@@ -440,6 +522,7 @@ def test_missing_setup_and_unusable_overrides_name_every_setup_option(
             RepoPaths.discover(git_repo),
             interactive=False,
             credentials={"UNRELATED": secret},
+            executable_lookup=lambda _binary: None,
         )
 
     message = str(captured.value)
@@ -462,6 +545,7 @@ def test_effort_override_skips_unsupported_anthropic_default(
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"},
+        executable_lookup=lambda _binary: None,
     )
 
     assert selected.name == "openai"

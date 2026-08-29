@@ -15,18 +15,20 @@ borg init
 `borg trust` records a machine-local decision for the current Git worktree.
 `borg init` registers and analyzes it, then offers interactive onboarding.
 
-For automation, provide exactly one usable provider credential and make trust
-explicit:
+For automation, make trust explicit and provide one agent transport. A
+`claude` or `codex` CLI on `PATH` is used ahead of any provider credential,
+and must already be logged in because selection tests only for the
+executable:
 
 ```console
-export OPENAI_API_KEY='your-provider-key'
 borg init --yes --json
 ```
 
-`ANTHROPIC_API_KEY` is the supported alternative. `--json` disables prompts
-and returns the repository identifier, initialization status, score, and
-suggested create commands. Credentials belong in the process environment or a
-secret manager and must not be committed.
+With neither CLI on `PATH`, export `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+instead. `--json` disables prompts and returns the repository identifier,
+initialization status, score, and suggested create commands. Credentials
+belong in the process environment or a secret manager and must not be
+committed.
 
 ## Host integrations
 

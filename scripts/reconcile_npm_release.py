@@ -106,6 +106,16 @@ def publication_action(
     return "skip"
 
 
+def version_exists(version: str, *, fixture: Path | None = None) -> bool:
+    """Return whether npm metadata exists without requiring a local tarball."""
+    public = (
+        _fixture_integrity(fixture, version)
+        if fixture is not None
+        else _public_integrity(version)
+    )
+    return public is not None
+
+
 def require_public_match(
     version: str,
     tarball: Path,

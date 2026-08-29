@@ -62,25 +62,10 @@ def _local_distribution_digests(
     return digests
 
 
-def _public_distribution_digests(version: str) -> dict[str, str] | None:
-    quoted_version = urllib.parse.quote(version, safe="")
-    request = urllib.request.Request(
-        PYPI_RELEASE_URL.format(version=quoted_version),
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
+def _distribution_digests_from_payload(payload: object) -> dict[str, str] | None:
+    if payload is None:
+        return None
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read()
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-        _fail("could not retrieve public PyPI release metadata")
-    except (OSError, ValueError):
-        _fail("could not retrieve public PyPI release metadata")
-
-    try:
-        payload = json.loads(body)
         files = payload["urls"]
     except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
         _fail("public PyPI release metadata is malformed")
@@ -106,11 +91,46 @@ def _public_distribution_digests(version: str) -> dict[str, str] | None:
     return digests
 
 
+def _public_distribution_digests(version: str) -> dict[str, str] | None:
+    quoted_version = urllib.parse.quote(version, safe="")
+    request = urllib.request.Request(
+        PYPI_RELEASE_URL.format(version=quoted_version),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        _fail("could not retrieve public PyPI release metadata")
+    except (OSError, ValueError):
+        _fail("could not retrieve public PyPI release metadata")
+
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _fail("public PyPI release metadata is malformed")
+    return _distribution_digests_from_payload(payload)
+
+
+def _fixture_distribution_digests(path: Path) -> dict[str, str] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"could not read PyPI verification fixture: {error}")
+    return _distribution_digests_from_payload(payload)
+
+
 def _compare_public_digests(
     reviewed: dict[str, str], public: dict[str, str]
 ) -> None:
     if public.keys() != reviewed.keys():
-        _fail("public PyPI artifact names do not match the reviewed distributions")
+        _fail(
+            "public PyPI artifact names do not match the reviewed distributions; "
+            "the version is immutable, so prepare a new version"
+        )
     for filename, reviewed_digest in reviewed.items():
         if public[filename] != reviewed_digest:
             _fail(
@@ -127,10 +147,19 @@ def _verify_public_digests(version: str, artifact_directory: Path) -> None:
     _compare_public_digests(reviewed, public)
 
 
-def publication_action(version: str, artifact_directory: Path) -> str:
+def publication_action(
+    version: str,
+    artifact_directory: Path,
+    *,
+    fixture: Path | None = None,
+) -> str:
     """Return ``publish`` or ``skip`` after comparing immutable PyPI bytes."""
     reviewed = _local_distribution_digests(version, artifact_directory)
-    public = _public_distribution_digests(version)
+    public = (
+        _fixture_distribution_digests(fixture)
+        if fixture is not None
+        else _public_distribution_digests(version)
+    )
     if public is None:
         return "publish"
     _compare_public_digests(reviewed, public)

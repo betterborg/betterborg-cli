@@ -12,6 +12,7 @@ from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.selection import (
     AgentSelectionError,
     SelectedAgent,
+    require_read_only_agent,
     resolve_agent_model,
 )
 from betterborg_cli.planning.pm import (
@@ -29,7 +30,7 @@ from betterborg_cli.planning.task_validation import (
     TaskGraphValidationError,
     validate_task_graph,
 )
-from betterborg_cli.planning.turns import DurablePlanningTurns, require_read_only_agent
+from betterborg_cli.planning.turns import DurablePlanningTurns
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
