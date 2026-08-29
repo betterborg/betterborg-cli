@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from betterborg_cli.agent_runtime import AgentResult
+from betterborg_cli.agent_runtime import (
+    AgentResult,
+    AgentStatus,
+    CancellationToken,
+)
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError, TaskPublisher
@@ -35,6 +39,26 @@ class VerifiedTaskInputs:
     task_markdown: str
     dependencies: tuple[tuple[TaskRecord, Path, str], ...]
     system_prompt: str
+
+
+def cancelled_agent_reason(
+    result: AgentResult,
+    cancel: CancellationToken,
+    *,
+    phase: str,
+) -> str | None:
+    """Turn an adapter-level cancellation into a resumable run stop."""
+    if result.status is not AgentStatus.CANCELLED:
+        return None
+    if cancel.is_set():
+        return f"{phase} agent was interrupted"
+
+    # API adapters also use CANCELLED when bounded transient retries are
+    # exhausted. Propagate that resumable stop to the scheduler so it releases
+    # the claim instead of treating the unchanged phase as a task failure (or
+    # immediately invoking another review/fix attempt).
+    cancel.cancel()
+    return result.error or f"{phase} agent requested a resumable stop"
 
 
 def require_ready_worktree(

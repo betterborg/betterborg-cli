@@ -20,6 +20,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -139,7 +140,12 @@ class HostCodingPhase:
                 "repository-local coding artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> TaskRuntimeStatus:
         """Invoke coding once, persist its outcome, and require a new commit."""
         try:
             runtime, worktree = self._require_ready_worktree(context)
@@ -217,7 +223,7 @@ class HostCodingPhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=self._config.allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
         )
@@ -241,6 +247,12 @@ class HostCodingPhase:
                 model=self._config.model,
             )
 
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase="coding",
+        )
+
         try:
             final_head = worktree_git.head_sha()
             branch = current_branch(worktree_git)
@@ -257,6 +269,7 @@ class HostCodingPhase:
             actual_branch=branch,
             git=worktree_git,
             operational_error=operational_error,
+            cancellation_reason=cancellation_reason,
         )
         durable_result = dict(result.payload or {})
         durable_result["_betterborg"] = {
@@ -368,13 +381,20 @@ class HostCodingPhase:
         actual_branch: str,
         git: SafeGit,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> tuple[TaskRuntimeStatus, str]:
         if operational_error is not None:
             return TaskRuntimeStatus.BLOCKED, str(operational_error)
         if actual_branch != expected_branch:
             return TaskRuntimeStatus.BLOCKED, "coding agent changed the task branch"
         if result.status is AgentStatus.CANCELLED:
-            return TaskRuntimeStatus.BLOCKED, "coding agent was interrupted"
+            # The scheduler interruption releases active claims back to pending.
+            # Persisting a terminal block here would make cancellation impossible
+            # to resume because terminal claims are released immediately.
+            return (
+                TaskRuntimeStatus.CODING,
+                cancellation_reason or "coding agent was interrupted",
+            )
         if result.status is AgentStatus.FAILED:
             return TaskRuntimeStatus.FAILED, result.error or "coding agent failed"
         payload_status = (result.payload or {}).get("status")

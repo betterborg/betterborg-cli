@@ -44,6 +44,11 @@ class FakeClock:
         with self._lock:
             return self._now
 
+    @property
+    def now(self) -> datetime:
+        """Return the current instant for assertions."""
+        return self()
+
     def advance(self, delta: timedelta) -> None:
         with self._lock:
             self._now += delta

@@ -796,10 +796,14 @@ class TaskClaim:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentAttempt:
-    """Immutable record of one environment preparation or materialization."""
+    """Immutable record of one environment preparation or materialization.
+
+    Reusable preparation may be owned by the execution run before a task is
+    claimed. Checkout-local materialization always remains claim-owned.
+    """
 
     run_id: UUID
-    claim_id: UUID
+    claim_id: UUID | None
     task_id: UUID
     kind: str
     attempt_number: int
@@ -814,12 +818,16 @@ class EnvironmentAttempt:
     finished_at: datetime | None = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
-        for name in ("id", "run_id", "claim_id", "task_id"):
+        for name in ("id", "run_id", "task_id"):
             if not isinstance(getattr(self, name), UUID):
                 raise TypeError(f"environment attempt {name} must be a UUID")
+        if self.claim_id is not None and not isinstance(self.claim_id, UUID):
+            raise TypeError("environment attempt claim_id must be a UUID or None")
         for name in ("kind", "fingerprint"):
             if not getattr(self, name).strip():
                 raise ValueError(f"environment attempt {name} must not be empty")
+        if self.claim_id is None and self.kind != "prepare":
+            raise ValueError("only preparation may be owned directly by a run")
         if self.attempt_number < 1:
             raise ValueError("environment attempt number must be positive")
         if not isinstance(self.status, ExecutionAttemptStatus | AgentStatus):

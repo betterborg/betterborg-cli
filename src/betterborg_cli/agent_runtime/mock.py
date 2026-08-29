@@ -66,12 +66,21 @@ class MockAdapter(AgentAdapter):
     responses: list[MockResponse] = field(default_factory=list)
     calls: list[AgentRunSpec] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _response_consumed: threading.Event = field(
+        default_factory=threading.Event,
+        repr=False,
+    )
 
     def queue(self, response: MockResponse) -> MockAdapter:
         """Append a response and return this adapter for fluent setup."""
         with self._lock:
             self.responses.append(response)
+            self._response_consumed.clear()
         return self
+
+    def wait_for_response_consumption(self, timeout: float | None = None) -> bool:
+        """Wait until a run has claimed one queued response."""
+        return self._response_consumed.wait(timeout)
 
     def run(
         self,
@@ -92,6 +101,8 @@ class MockAdapter(AgentAdapter):
 
         with self._lock:
             response = self.responses.pop(0) if self.responses else None
+            if response is not None:
+                self._response_consumed.set()
         if response is None:
             return AgentResult(
                 status=AgentStatus.FAILED,

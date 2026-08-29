@@ -179,6 +179,7 @@ class ContainedApiTools:
         role: ApiAgentRole | str,
         *,
         workspace_trusted: bool = False,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         try:
             root = Path(cwd).resolve(strict=True)
@@ -189,6 +190,7 @@ class ContainedApiTools:
         self._cwd = root
         self._role = ApiAgentRole(role)
         self._workspace_trusted = workspace_trusted
+        self._environment = {**os.environ, **(env or {})}
 
     @property
     def cwd(self) -> Path:
@@ -343,6 +345,7 @@ class ContainedApiTools:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=self._environment,
             start_new_session=os.name == "posix",
         )
         while True:

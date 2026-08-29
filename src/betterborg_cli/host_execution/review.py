@@ -20,6 +20,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -150,7 +151,14 @@ class HostReviewFixPhase:
                 "repository-local review artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+        review_environment: Mapping[str, str] | None = None,
+        fix_environment: Mapping[str, str] | None = None,
+    ) -> TaskRuntimeStatus:
         """Drive REVIEW/FIX until approval, a cap, or another durable stop."""
         while True:
             try:
@@ -205,6 +213,10 @@ class HostReviewFixPhase:
                     inputs,
                     base_commit=base_commit,
                     current_commit=current_commit,
+                    environment={
+                        **(environment or {}),
+                        **(review_environment or {}),
+                    },
                 )
             else:
                 status = self._run_fix(
@@ -214,8 +226,15 @@ class HostReviewFixPhase:
                     inputs,
                     base_commit=base_commit,
                     current_commit=current_commit,
+                    environment={
+                        **(environment or {}),
+                        **(fix_environment or {}),
+                    },
                 )
-            if status not in {TaskRuntimeStatus.REVIEW, TaskRuntimeStatus.FIX}:
+            if context.cancel.is_set() or status not in {
+                TaskRuntimeStatus.REVIEW,
+                TaskRuntimeStatus.FIX,
+            }:
                 return status
 
     def _run_review(
@@ -227,6 +246,7 @@ class HostReviewFixPhase:
         *,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         user_prompt = _render_review_prompt(
             inputs,
@@ -250,6 +270,7 @@ class HostReviewFixPhase:
             user_prompt=user_prompt,
             base_commit=base_commit,
             current_commit=current_commit,
+            environment=environment,
         )
 
     def _run_fix(
@@ -261,6 +282,7 @@ class HostReviewFixPhase:
         *,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         findings = self._findings_for_fix(context, runtime.review_round)
         user_prompt = _render_fix_prompt(
@@ -283,6 +305,7 @@ class HostReviewFixPhase:
             user_prompt=user_prompt,
             base_commit=base_commit,
             current_commit=current_commit,
+            environment=environment,
         )
 
     def _invoke(
@@ -302,6 +325,7 @@ class HostReviewFixPhase:
         user_prompt: str,
         base_commit: str,
         current_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
         attempts = context.store.list_agent_attempts(context.claim.task_id)
         attempt_number = 1 + sum(item.phase == phase for item in attempts)
@@ -361,7 +385,7 @@ class HostReviewFixPhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=effort,
             billing_mode=billing_mode,
         )
@@ -387,6 +411,11 @@ class HostReviewFixPhase:
                 provider=adapter.name,
                 model=model,
             )
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase=phase,
+        )
         try:
             final_commit = git.head_sha()
             actual_branch = current_branch(git)
@@ -410,6 +439,7 @@ class HostReviewFixPhase:
                 before_status=before_status,
                 after_status=after_status,
                 operational_error=operational_error,
+                cancellation_reason=cancellation_reason,
             )
         else:
             outcome = self._classify_fix(
@@ -422,6 +452,7 @@ class HostReviewFixPhase:
                 git=git,
                 after_status=after_status,
                 operational_error=operational_error,
+                cancellation_reason=cancellation_reason,
             )
 
         durable_result = dict(result.payload or {})
@@ -472,6 +503,8 @@ class HostReviewFixPhase:
             usage=result.usage,
             now=context.clock(),
         )
+        if outcome.status is runtime.status:
+            return outcome.status
         return self._transition(context, runtime.status, outcome)
 
     def _classify_review(
@@ -486,6 +519,7 @@ class HostReviewFixPhase:
         before_status: str,
         after_status: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> _PhaseOutcome:
         if operational_error is not None:
             return _blocked_outcome(runtime, str(operational_error))
@@ -494,7 +528,12 @@ class HostReviewFixPhase:
         if after_status != before_status:
             return _blocked_outcome(runtime, "review agent modified the task worktree")
         if result.status is AgentStatus.CANCELLED:
-            return _blocked_outcome(runtime, "review agent was interrupted")
+            return _PhaseOutcome(
+                TaskRuntimeStatus.REVIEW,
+                cancellation_reason or "review agent was interrupted",
+                runtime.review_round,
+                "review",
+            )
         if result.status is AgentStatus.FAILED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.FAILED,
@@ -558,6 +597,7 @@ class HostReviewFixPhase:
         git: SafeGit,
         after_status: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> _PhaseOutcome:
         if operational_error is not None:
             return _PhaseOutcome(
@@ -569,7 +609,12 @@ class HostReviewFixPhase:
         if actual_branch != expected_branch:
             reason = "fix agent changed the task branch"
         elif result.status is AgentStatus.CANCELLED:
-            reason = "fix agent was interrupted"
+            return _PhaseOutcome(
+                TaskRuntimeStatus.FIX,
+                cancellation_reason or "fix agent was interrupted",
+                runtime.review_round,
+                "fix",
+            )
         elif result.status is AgentStatus.FAILED:
             return _PhaseOutcome(
                 TaskRuntimeStatus.FAILED,
@@ -666,9 +711,12 @@ class HostReviewFixPhase:
     def _declared_commits(
         self, context: ScheduledTaskContext, worktree: Path
     ) -> tuple[str, str]:
-        attestations: list[tuple[str, str]] = []
+        attestations: list[tuple[int, int, int, str, str]] = []
         for attempt in context.store.list_agent_attempts(context.claim.task_id):
-            if attempt.phase not in {"coding", "fix"}:
+            if (
+                attempt.phase not in {"coding", "fix"}
+                or attempt.status is not ExecutionAttemptStatus.COMPLETED
+            ):
                 continue
             metadata = (attempt.result or {}).get("_betterborg")
             if not isinstance(metadata, Mapping):
@@ -676,13 +724,22 @@ class HostReviewFixPhase:
             base_commit = metadata.get("base_commit")
             commit_sha = metadata.get("commit_sha")
             if isinstance(base_commit, str) and isinstance(commit_sha, str):
-                attestations.append((base_commit, commit_sha))
+                attestations.append(
+                    (
+                        attempt.review_round,
+                        0 if attempt.phase == "coding" else 1,
+                        attempt.attempt_number,
+                        base_commit,
+                        commit_sha,
+                    )
+                )
         if not attestations:
             raise ReviewFixPhaseError(
                 "review requires a completed coding commit attestation"
             )
-        base_commit = attestations[0][0]
-        current_commit = attestations[-1][1]
+        attestations.sort(key=lambda item: item[:3])
+        base_commit = attestations[0][3]
+        current_commit = attestations[-1][4]
         git = SafeGit(worktree)
         if git.head_sha() != current_commit:
             raise ReviewFixPhaseError(

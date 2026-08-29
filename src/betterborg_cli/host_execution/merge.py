@@ -23,6 +23,7 @@ from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
+    cancelled_agent_reason,
     current_branch,
     require_ready_worktree,
     result_summary,
@@ -102,6 +103,7 @@ class HostMergeResult:
     status: TaskRuntimeStatus
     reason: str
     tip: MergeTip | None = None
+    interrupted: bool = False
 
     def __post_init__(self) -> None:
         if self.status is TaskRuntimeStatus.MERGING:
@@ -109,6 +111,8 @@ class HostMergeResult:
                 raise ValueError("a successful merge result requires a tip")
         elif self.tip is not None:
             raise ValueError("a terminal merge result cannot expose a tip")
+        if self.interrupted and self.status is not TaskRuntimeStatus.BLOCKED:
+            raise ValueError("only a blocked merge result may be interrupted")
 
 
 class HostMergePhase:
@@ -152,7 +156,12 @@ class HostMergePhase:
                 "repository-local merge artifacts must be under .borg/state"
             )
 
-    def run(self, context: ScheduledTaskContext) -> HostMergeResult:
+    def run(
+        self,
+        context: ScheduledTaskContext,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> HostMergeResult:
         """Produce an attested merge tip without advancing the project base."""
         try:
             runtime, worktree = require_ready_worktree(
@@ -189,6 +198,7 @@ class HostMergePhase:
                 inputs,
                 project_branch=project_branch,
                 approved_commit=approved_commit,
+                environment=environment,
             )
         except (
             HostAgentPhaseError,
@@ -207,6 +217,8 @@ class HostMergePhase:
         except PrimaryCheckoutContaminationError as error:
             outcome = HostMergeResult(TaskRuntimeStatus.BLOCKED, str(error))
 
+        if context.cancel.is_set() and outcome.interrupted:
+            return outcome
         if outcome.status is TaskRuntimeStatus.MERGING:
             return outcome
         return self._transition(context, outcome.status, outcome.reason)
@@ -220,6 +232,7 @@ class HostMergePhase:
         *,
         project_branch: str,
         approved_commit: str,
+        environment: Mapping[str, str] | None,
     ) -> HostMergeResult:
         git = SafeGit(worktree)
         if current_branch(git) != runtime.branch:
@@ -267,6 +280,7 @@ class HostMergePhase:
                 approved_commit=approved_commit,
                 base_commit=base_commit,
                 unresolved=unresolved,
+                environment=environment,
             )
         if unresolved:
             raise MergePhaseError(
@@ -402,6 +416,7 @@ class HostMergePhase:
             approved_commit=approved_commit,
             base_commit=base_commit,
             unresolved=unresolved,
+            environment=environment,
         )
 
     def _invoke_agent(
@@ -415,6 +430,7 @@ class HostMergePhase:
         approved_commit: str,
         base_commit: str,
         unresolved: tuple[str, ...],
+        environment: Mapping[str, str] | None,
     ) -> HostMergeResult:
         resumed = self._resume_agent_tip(
             context,
@@ -494,7 +510,7 @@ class HostMergePhase:
             log_path=log_path,
             result_path=result_path,
             allowed_tools=self._config.allowed_tools,
-            env=dict(self._config.environment),
+            env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
         )
@@ -516,6 +532,11 @@ class HostMergePhase:
                 model=self._config.model,
             )
 
+        cancellation_reason = cancelled_agent_reason(
+            result,
+            context.cancel,
+            phase="merge",
+        )
         outcome = self._classify_agent(
             result,
             runtime=runtime,
@@ -524,6 +545,7 @@ class HostMergePhase:
             approved_commit=approved_commit,
             base_commit=base_commit,
             operational_error=operational_error,
+            cancellation_reason=cancellation_reason,
         )
         durable_result = dict(result.payload or {})
         durable_result["_betterborg"] = {
@@ -583,12 +605,24 @@ class HostMergePhase:
         approved_commit: str,
         base_commit: str,
         operational_error: BaseException | None,
+        cancellation_reason: str | None,
     ) -> HostMergeResult:
         if operational_error is not None:
             return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(operational_error))
+        try:
+            branch = current_branch(git)
+        except (HostAgentPhaseError, UnsafeGitError, OSError) as error:
+            return HostMergeResult(TaskRuntimeStatus.BLOCKED, str(error))
+        if branch != runtime.branch:
+            return HostMergeResult(
+                TaskRuntimeStatus.BLOCKED,
+                "merge agent changed the task branch",
+            )
         if result.status is AgentStatus.CANCELLED:
             return HostMergeResult(
-                TaskRuntimeStatus.BLOCKED, "merge agent was interrupted"
+                TaskRuntimeStatus.BLOCKED,
+                cancellation_reason or "merge agent was interrupted",
+                interrupted=True,
             )
         if result.status is AgentStatus.FAILED:
             return HostMergeResult(

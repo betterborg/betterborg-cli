@@ -434,6 +434,31 @@ def test_project_base_only_fast_forwards_and_preserves_dirty_completed_work(
     assert manager.ensure_project_base("demo") == project
     assert _git(committed_git_repo, "rev-parse", project).strip() != old_tip
 
+    # Publishing a task advances project/<name> while the configured source
+    # stays put.  A later task or resumed run must preserve that descendant.
+    project_tip = _git(committed_git_repo, "rev-parse", project).strip()
+    project_tree = _git(
+        committed_git_repo, "rev-parse", f"{project_tip}^{{tree}}"
+    ).strip()
+    published_tip = _git(
+        committed_git_repo,
+        "commit-tree",
+        project_tree,
+        "-p",
+        project_tip,
+        "-m",
+        "published task",
+    ).strip()
+    _git(
+        committed_git_repo,
+        "update-ref",
+        f"refs/heads/{project}",
+        published_tip,
+        project_tip,
+    )
+    assert manager.ensure_project_base("demo") == project
+    assert _git(committed_git_repo, "rev-parse", project).strip() == published_tip
+
     branch = "betterborg-tasks/07-host-execution/dirty-0123456789abcdef"
     path = worktree_root / "07-host-execution/dirty-0123456789abcdef"
     SafeGit(committed_git_repo).add_worktree(path, branch, base=project)

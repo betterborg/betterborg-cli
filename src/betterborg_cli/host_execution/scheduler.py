@@ -12,6 +12,7 @@ from uuid import UUID
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.store import (
     ExecutionOwnershipError,
+    ExecutionRunAcquisition,
     ExecutionRunStatus,
     SqliteStore,
     TaskClaim,
@@ -95,9 +96,7 @@ class ScheduledTaskContext:
 class HostTaskBehavior(Protocol):
     """Temporary task-runtime seam used until concrete phases are assembled."""
 
-    def __call__(
-        self, context: ScheduledTaskContext
-    ) -> TaskRuntimeStatus | None: ...
+    def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +144,6 @@ class HostTaskScheduler:
         cancel: CancellationToken | None = None,
     ) -> HostSchedulerResult:
         """Run or observe the Borg's current-generation execution operation."""
-        token = cancel or CancellationToken()
         started_at = self._clock()
         acquisition = self._store.acquire_execution_run(
             borg_id,
@@ -153,12 +151,24 @@ class HostTaskScheduler:
             lease_duration=self._config.lease_duration,
             now=started_at,
         )
+        return self.run_acquired(generation_id, acquisition, cancel=cancel)
+
+    def run_acquired(
+        self,
+        generation_id: UUID,
+        acquisition: ExecutionRunAcquisition,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> HostSchedulerResult:
+        """Schedule a run already acquired by the host integration owner."""
         if not acquisition.acquired:
             return self._result(
                 acquisition.operation_id,
                 generation_id,
                 acquired=False,
             )
+        token = cancel or CancellationToken()
+        started_at = self._clock()
         owner_token = acquisition.owner_token
         if owner_token is None:  # Defensive narrowing of the acquisition contract.
             raise RuntimeError("acquired execution run has no owner token")
@@ -173,13 +183,18 @@ class HostTaskScheduler:
                 while True:
                     now = self._clock()
                     if token.is_set():
+                        self._drain_cancelled(
+                            active,
+                            acquisition.run_id,
+                            owner_token,
+                            next_heartbeat,
+                        )
                         self._store.interrupt_execution_run(
                             acquisition.run_id,
                             owner_token,
                             reason="execution cancelled",
-                            now=now,
+                            now=self._clock(),
                         )
-                        self._drain(active)
                         return self._result(
                             acquisition.run_id, generation_id, acquired=True
                         )
@@ -195,7 +210,7 @@ class HostTaskScheduler:
 
                     self._settle_completed(active, owner_token)
 
-                    while len(active) < self._config.jobs:
+                    while len(active) < self._config.jobs and not token.is_set():
                         claim = self._store.claim_dependency_ready_task(
                             acquisition.run_id,
                             owner_token,
@@ -286,6 +301,31 @@ class HostTaskScheduler:
     ) -> None:
         if active:
             wait(tuple(active))
+
+    def _drain_cancelled(
+        self,
+        active: dict[Future[TaskRuntimeStatus | None], TaskClaim],
+        run_id: UUID,
+        owner_token: str,
+        next_heartbeat: datetime,
+    ) -> None:
+        """Fence interruption behind active work while retaining ownership."""
+        pending = {future for future in active if not future.done()}
+        while pending:
+            _, pending = wait(
+                pending,
+                timeout=self._config.poll_interval_seconds,
+                return_when=FIRST_COMPLETED,
+            )
+            now = self._clock()
+            if now >= next_heartbeat:
+                self._store.renew_execution_run(
+                    run_id,
+                    owner_token,
+                    lease_duration=self._config.lease_duration,
+                    now=now,
+                )
+                next_heartbeat = now + self._config.heartbeat_interval
 
     def _finish(
         self,

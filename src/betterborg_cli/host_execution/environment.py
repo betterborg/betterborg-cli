@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import quote
+from uuid import UUID
 
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
@@ -279,6 +280,64 @@ class HostEnvironmentManager:
         self._clock = clock
         self._guard = PrimaryCheckoutGuard(self.repository_root)
 
+    def prepare_reusable_caches(
+        self,
+        store: SqliteStore,
+        plan: HostPreflightPlan,
+        run_id: UUID,
+        owner_token: str,
+        worktrees: Sequence[tuple[UUID, Path]],
+        *,
+        secret_values: Mapping[str, str] | None = None,
+    ) -> tuple[str, ...]:
+        """Prepare every distinct task fingerprint before claims may dispatch."""
+        if plan.repository_root.resolve() != self.repository_root:
+            raise EnvironmentMaterializationError(
+                "preflight plan belongs to a different repository"
+            )
+        if not plan.prepare_commands:
+            return ()
+
+        prepared: list[str] = []
+        for task_id, source_worktree in worktrees:
+            source = Path(source_worktree).resolve()
+            descriptors = _environment_descriptors(plan, source)
+            fingerprint = _fingerprint_descriptors(plan, descriptors)
+            cache_path = self._cache_path(fingerprint)
+            cache_path.mkdir(parents=True, exist_ok=True)
+            base_environment = self._base_command_environment(plan, cache_path)
+            command_environments = self._command_environments(
+                plan, base_environment, secret_values or {}
+            )
+            with _preparation_lock(cache_path):
+                marker = cache_path / ".betterborg-prepared"
+                completed = store.find_completed_environment_attempt(
+                    fingerprint, kind="prepare"
+                )
+                if completed is not None and _prepared_marker_matches(
+                    marker, fingerprint
+                ):
+                    continue
+                self._record_attempt(
+                    store,
+                    None,
+                    owner_token,
+                    run_id=run_id,
+                    task_id=task_id,
+                    kind="prepare",
+                    fingerprint=fingerprint,
+                    commands=plan.prepare_commands,
+                    worktree=None,
+                    preparation_source=source,
+                    preparation_descriptors=descriptors,
+                    cache_path=cache_path,
+                    completion_marker=marker,
+                    command_environments=command_environments,
+                    prepared_before_dispatch=True,
+                )
+            prepared.append(fingerprint)
+        return tuple(prepared)
+
     def materialize_claimed_task(
         self,
         store: SqliteStore,
@@ -304,10 +363,14 @@ class HostEnvironmentManager:
                 "claimed task has no persisted worktree"
             )
         worktree = Path(runtime.worktree_path).resolve()
-        resumed_from_coding = runtime.status in {
+        preserving_active_phase = runtime.status in {
             TaskRuntimeStatus.CODING,
             TaskRuntimeStatus.MERGING,
         }
+        reclaimed_agent_work = (
+            runtime.status is TaskRuntimeStatus.CLAIMED
+            and claim.resume_phase != TaskRuntimeStatus.ENVIRONMENT.value
+        )
         if runtime.status is TaskRuntimeStatus.CLAIMED:
             runtime = store.transition_task_runtime(
                 claim.run_id,
@@ -316,6 +379,7 @@ class HostEnvironmentManager:
                 claim.claim_token,
                 expected_status=TaskRuntimeStatus.CLAIMED,
                 new_status=TaskRuntimeStatus.ENVIRONMENT,
+                resume_phase=claim.resume_phase,
                 now=self._clock(),
             )
         elif runtime.status not in {
@@ -331,7 +395,7 @@ class HostEnvironmentManager:
         try:
             self._assert_task_worktree(worktree, runtime.branch)
             self._guard.assert_clean("task environment materialization")
-            if not resumed_from_coding:
+            if not preserving_active_phase and not reclaimed_agent_work:
                 self._assert_no_tracked_changes(
                     worktree, "before environment materialization"
                 )
@@ -368,7 +432,7 @@ class HostEnvironmentManager:
             self._block_environment_task(store, claim, owner_token, error)
             raise
 
-        if not resumed_from_coding:
+        if not preserving_active_phase:
             store.transition_task_runtime(
                 claim.run_id,
                 owner_token,
@@ -376,6 +440,7 @@ class HostEnvironmentManager:
                 claim.claim_token,
                 expected_status=TaskRuntimeStatus.ENVIRONMENT,
                 new_status=TaskRuntimeStatus.CODING,
+                resume_phase=(claim.resume_phase if reclaimed_agent_work else None),
                 now=self._clock(),
             )
         return EnvironmentMaterialization(
@@ -412,7 +477,6 @@ class HostEnvironmentManager:
                 marker, fingerprint
             ):
                 return True
-
             self._record_attempt(
                 store,
                 claim,
@@ -479,9 +543,11 @@ class HostEnvironmentManager:
     def _record_attempt(
         self,
         store: SqliteStore,
-        claim: TaskClaim,
+        claim: TaskClaim | None,
         owner_token: str,
         *,
+        run_id: UUID | None = None,
+        task_id: UUID | None = None,
         kind: str,
         fingerprint: str,
         commands: Sequence[HostCommand],
@@ -493,10 +559,17 @@ class HostEnvironmentManager:
         preparation_source: Path | None = None,
         preparation_descriptors: Sequence[_EnvironmentDescriptor] = (),
         completion_marker: Path | None = None,
+        prepared_before_dispatch: bool = False,
     ) -> None:
+        if claim is not None:
+            run_id = claim.run_id
+            task_id = claim.task_id
+        if run_id is None or task_id is None:
+            raise AssertionError("environment attempt requires run and task identity")
+        claim_token = claim.claim_token if claim is not None else None
         prior = [
             attempt
-            for attempt in store.list_environment_attempts(claim.task_id)
+            for attempt in store.list_environment_attempts(task_id)
             if attempt.kind == kind
         ]
         mask_values = tuple(
@@ -512,9 +585,9 @@ class HostEnvironmentManager:
         )
         started_at = self._clock()
         attempt = EnvironmentAttempt(
-            run_id=claim.run_id,
-            claim_id=claim.id,
-            task_id=claim.task_id,
+            run_id=run_id,
+            claim_id=claim.id if claim is not None else None,
+            task_id=task_id,
             kind=kind,
             attempt_number=len(prior) + 1,
             fingerprint=fingerprint,
@@ -529,49 +602,50 @@ class HostEnvironmentManager:
         store.append_environment_attempt(
             attempt,
             owner_token,
-            claim.claim_token,
+            claim_token,
             now=started_at,
         )
 
         started = time.monotonic()
         try:
-            with self._guard.protect(str(claim.task_id), f"environment {kind}"):
-                if preparation_source is None:
-                    if worktree is None:
-                        raise AssertionError(
-                            "materialization worktree is required"
-                        )
+            if preparation_source is None:
+                if worktree is None:
+                    raise AssertionError("materialization worktree is required")
+                with self._guard.protect(str(task_id), f"environment {kind}"):
                     results = self._run_commands(
                         commands,
                         worktree=worktree,
                         command_environments=command_environments,
                     )
-                else:
-                    if worktree is not None:
-                        raise AssertionError(
-                            "preparation cannot use a caller-provided worktree"
-                        )
-                    with self._preparation_worktree(
-                        fingerprint,
-                        preparation_source,
-                        preparation_descriptors,
-                    ) as preparation_worktree:
-                        results = self._run_commands(
-                            commands,
-                            worktree=preparation_worktree,
-                            command_environments=command_environments,
-                        )
-                if completion_marker is not None:
-                    _write_marker(completion_marker, fingerprint)
+                    if completion_marker is not None:
+                        _write_marker(completion_marker, fingerprint)
+            else:
+                if worktree is not None:
+                    raise AssertionError(
+                        "preparation cannot use a caller-provided worktree"
+                    )
+                results = self._run_preparation_commands(
+                    commands,
+                    fingerprint=fingerprint,
+                    source_worktree=preparation_source,
+                    descriptors=preparation_descriptors,
+                    command_environments=command_environments,
+                    completion_marker=completion_marker,
+                )
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = redact_secrets(str(error), mask_values)
+            failure_result: dict[str, object] = {
+                "cache_path": str(cache_path),
+            }
+            if prepared_before_dispatch:
+                failure_result["prepared_before_dispatch"] = True
             store.complete_environment_attempt(
                 attempt.id,
                 owner_token,
-                claim.claim_token,
+                claim_token,
                 status=ExecutionAttemptStatus.FAILED,
-                result={"cache_path": str(cache_path)},
+                result=failure_result,
                 error=redacted,
                 duration_seconds=duration,
                 now=self._clock(),
@@ -580,15 +654,46 @@ class HostEnvironmentManager:
                 raise EnvironmentMaterializationError(redacted) from error
             raise EnvironmentMaterializationError(redacted) from error
 
+        completed_result: dict[str, object] = {
+            "cache_path": str(cache_path),
+            "commands": results,
+        }
+        if prepared_before_dispatch:
+            completed_result["prepared_before_dispatch"] = True
         store.complete_environment_attempt(
             attempt.id,
             owner_token,
-            claim.claim_token,
+            claim_token,
             status=ExecutionAttemptStatus.COMPLETED,
-            result={"cache_path": str(cache_path), "commands": results},
+            result=completed_result,
             duration_seconds=time.monotonic() - started,
             now=self._clock(),
         )
+
+    def _run_preparation_commands(
+        self,
+        commands: Sequence[HostCommand],
+        *,
+        fingerprint: str,
+        source_worktree: Path,
+        descriptors: Sequence[_EnvironmentDescriptor],
+        command_environments: Mapping[
+            str, tuple[Mapping[str, str], Sequence[str]]
+        ],
+        completion_marker: Path | None,
+    ) -> list[dict[str, object]]:
+        with self._guard.protect(fingerprint, "environment prepare"):
+            with self._preparation_worktree(
+                fingerprint, source_worktree, descriptors
+            ) as preparation_worktree:
+                results = self._run_commands(
+                    commands,
+                    worktree=preparation_worktree,
+                    command_environments=command_environments,
+                )
+            if completion_marker is not None:
+                _write_marker(completion_marker, fingerprint)
+            return results
 
     def _run_commands(
         self,

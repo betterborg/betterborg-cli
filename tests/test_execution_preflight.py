@@ -891,7 +891,7 @@ def test_expired_compose_cleanup_timeout_blocks_reclaim_until_retry(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     validated_docker = Path("/opt/validated/bin/docker")
     plan = replace(
         _compose_plan(fixture.repository),
@@ -972,7 +972,7 @@ def test_replayed_cleanup_failure_does_not_block_reclaimed_task(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     plan = _compose_plan(fixture.repository)
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
@@ -1020,7 +1020,7 @@ def test_expiry_during_compose_startup_serializes_cleanup_and_fences_ready(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
         run = store.get_execution_run(fixture.run_id)
@@ -1093,7 +1093,7 @@ def test_compose_subprocess_environment_excludes_host_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     monkeypatch.setenv("BETTERBORG_UNRELATED_TOKEN", "host-secret")
     manager = HostComposeManager(fixture.repository, command_runner=runner)
 
@@ -1117,7 +1117,7 @@ def test_compose_cleanup_metadata_excludes_resolved_env_file_secrets(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     credential = "credential-from-service-env-file"
     worktree = fixture.worktree_paths[0]
     (worktree / "service.env").write_text(
@@ -1156,7 +1156,7 @@ def test_build_images_are_claim_owned_and_exactly_removed(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
 
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
@@ -1189,7 +1189,7 @@ def test_distinct_dependencies_share_one_compose_service(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     plan = replace(
         _compose_plan(fixture.repository),
         services=(
@@ -1246,7 +1246,7 @@ def test_udp_compose_endpoint_preserves_protocol_and_loopback_binding(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     plan = replace(
         _compose_plan(fixture.repository),
         services=(
@@ -1285,7 +1285,7 @@ def test_startup_consumes_preflight_topology_without_revalidation(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     runner.config_services["healthy"]["volumes"] = [
         {
             "type": "bind",
@@ -1313,7 +1313,7 @@ def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     plan = _compose_plan(fixture.repository)
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
@@ -1343,7 +1343,7 @@ def test_compose_service_without_health_status_never_becomes_ready(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
-    runner = _FakeComposeRunner()
+    runner = FakeComposeRunner()
     runner.service_health["healthy"] = ""
 
     with SqliteStore.open(fixture.database) as store:
@@ -1506,7 +1506,7 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
     )
 
 
-class _FakeComposeRunner:
+class FakeComposeRunner:
     def __init__(self) -> None:
         self.active: set[str] = set()
         self.started_services: dict[str, tuple[str, ...]] = {}
@@ -1517,6 +1517,7 @@ class _FakeComposeRunner:
         self.commands: list[tuple[str, ...]] = []
         self.fail_up: set[str] = set()
         self.fail_down: set[str] = set()
+        self.fail_all_down = False
         self.timeout_down: set[str] = set()
         self.pause_up: set[str] = set()
         self.up_entered = threading.Event()
@@ -1528,6 +1529,23 @@ class _FakeComposeRunner:
             "unused": {"networks": {"default": None}},
         }
         self._lock = threading.Lock()
+
+    @property
+    def up_projects(self) -> list[str]:
+        """Return Compose projects in startup order."""
+        return [
+            command[command.index("--project-name") + 1]
+            for command in self.commands
+            if "up" in command
+        ]
+
+    @property
+    def down_projects(self) -> list[str]:
+        """Return Compose projects in teardown order."""
+        return [
+            command[command.index("--project-name") + 1]
+            for command in self.down_commands
+        ]
 
     def __call__(self, argv, **kwargs):
         command = tuple(argv)
@@ -1597,7 +1615,7 @@ class _FakeComposeRunner:
                     return subprocess.CompletedProcess(
                         argv, 11, "", "Compose file disappeared"
                     )
-                if project in self.fail_down:
+                if self.fail_all_down or project in self.fail_down:
                     return subprocess.CompletedProcess(
                         argv, 9, "", "simulated teardown failure"
                     )

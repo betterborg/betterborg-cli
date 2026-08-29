@@ -227,6 +227,7 @@ class AnthropicAdapter:
                 spec.cwd,
                 cast(ApiAgentRole, self.role),
                 workspace_trusted=self.workspace_trusted,
+                env=spec.env,
             )
         except (OSError, ValueError) as error:
             return runtime.result(AgentStatus.FAILED, error=str(error))
