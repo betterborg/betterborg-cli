@@ -42,6 +42,11 @@ from betterborg_cli.store.models import TaskRuntimeStatus, utcnow
         ["checkout", "HEAD", "README.md"],
         ["clean", "-fd"],
         ["push", "--force", "origin", "main"],
+        [
+            "push",
+            "origin",
+            "+refs/heads/project/demo:refs/heads/project/demo",
+        ],
         ["rebase", "main"],
         ["branch", "-D", "task"],
         ["branch", "-df", "task"],

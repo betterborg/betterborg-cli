@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -40,6 +41,7 @@ from betterborg_cli.host_execution import (
     HostSchedulerConfig,
     HostTaskRuntime,
     HostWorktreeManager,
+    SafeGit,
 )
 from betterborg_cli.onboarding import (
     CreateService,
@@ -579,8 +581,19 @@ def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
     is_flag=True,
     help="Record an estimate bypass and execute without asking for approval.",
 )
+@click.option(
+    "--push",
+    "push_project",
+    is_flag=True,
+    help="Push the completed project branch to origin without forcing.",
+)
 @_trusted_workspace_callback
-def execute_borg(repository_path: Path, name: str, auto_execute: bool) -> None:
+def execute_borg(
+    repository_path: Path,
+    name: str,
+    auto_execute: bool,
+    push_project: bool,
+) -> None:
     """Run the current, digest-verified task generation for a Borg."""
     paths = RepoPaths.discover(repository_path)
     try:
@@ -697,6 +710,31 @@ def execute_borg(repository_path: Path, name: str, auto_execute: bool) -> None:
         raise click.ClickException(str(error)) from error
 
     _write_host_execution_result(result)
+    if (
+        push_project
+        and result.active_operation_id is None
+        and result.status is ExecutionRunStatus.COMPLETED
+    ):
+        _push_project_base(paths.root, name)
+
+
+def _push_project_base(repository_root: Path, name: str) -> None:
+    """Publish completed local work while leaving its branch untouched on failure."""
+    branch = f"project/{name}"
+    try:
+        result = SafeGit(repository_root).push_project_branch(branch)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise click.ClickException(
+            f"Local execution completed, but push of {branch!r} failed: {error}"
+        ) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        if not detail:
+            detail = f"git push exited {result.returncode}"
+        raise click.ClickException(
+            f"Local execution completed, but push of {branch!r} failed: {detail}"
+        )
+    click.echo(f"Pushed {branch} to origin.")
 
 
 def _invoke_host_execution(
