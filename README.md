@@ -18,6 +18,10 @@ python -m pip install .
 borg version
 ```
 
+The Python distribution is named `betterborg`; it installs the `borg` console
+command. Release versions are sourced from `betterborg_cli.__version__` and
+checked against the bundled Claude and Codex plugin manifests.
+
 For development, create the locked environment and run the standard checks:
 
 ```console
@@ -25,7 +29,12 @@ make sync
 make lint
 make test
 make build
+make binary
 ```
+
+`make build` creates the wheel and source distribution. `make binary` creates a
+local one-file `dist/borg` executable with the same package assets; neither
+target publishes an artifact.
 
 `borg version` and `borg --help` are bootstrap commands. They do not create or
 initialize a repository.
