@@ -1,0 +1,11 @@
+{
+  "name": "borg",
+  "description": "Plan and execute repository work with BetterBorg",
+  "version": "0.2.0",
+  "author": {
+    "name": "BetterBorg"
+  },
+  "homepage": "https://github.com/betterborg/betterborg-cli",
+  "repository": "https://github.com/betterborg/betterborg-cli",
+  "license": "Apache-2.0"
+}

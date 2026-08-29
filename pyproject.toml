@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betterborg"
+dynamic = ["version"]
+description = "The open source BetterBorg command-line interface"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "BetterBorg" }]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "click>=8.1,<9",
+  "mcp>=1.12,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/betterborg/betterborg-cli"
+Repository = "https://github.com/betterborg/betterborg-cli"
+Issues = "https://github.com/betterborg/betterborg-cli/issues"
+
+[project.scripts]
+borg = "betterborg_cli.cli:cli"
+
+[dependency-groups]
+binary = [
+  # 50.0.1 omitted glibc 2.17 wheels; keep release builds wheel-only.
+  "cryptography==50.0.0",
+  "pyinstaller>=6.16,<7",
+  "setuptools>=77",
+  "wheel",
+]
+dev = [
+  "build>=1.2,<2",
+  "pyinstaller>=6.16,<7",
+  "pytest>=8,<9",
+  "ruff>=0.12.7,<1",
+  "setuptools>=77",
+  "wheel",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "betterborg_cli.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+betterborg_cli = [
+  "planning/prompts/*.md",
+  "planning/schemas/*.json",
+  "repo_analysis/prompts/*.md",
+  "repo_analysis/schemas/*.json",
+  "store/migrations/*.sql",
+  "claude_plugin_bundle/marketplace/.claude-plugin/*.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/.claude-plugin/*.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/.mcp.json",
+  "claude_plugin_bundle/marketplace/plugins/borg/commands/*.md",
+  "claude_plugin_bundle/marketplace/plugins/borg/skills/*/*.md",
+  "codex_plugin_bundle/marketplace/.agents/plugins/*.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/.codex-plugin/*.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/.mcp.json",
+  "codex_plugin_bundle/marketplace/plugins/borg/skills/*/*.md",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+extend-exclude = [".betterborg-analysis", ".betterborg-task", ".orchestry"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

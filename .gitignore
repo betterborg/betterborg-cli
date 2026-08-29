@@ -1,0 +1,13 @@
+.venv/
+.tools/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# >>> BetterBorg managed ignores >>>
+.borg/state/
+# <<< BetterBorg managed ignores <<<

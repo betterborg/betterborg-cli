@@ -1,0 +1,21 @@
+{
+  "name": "betterborg",
+  "interface": {
+    "displayName": "BetterBorg"
+  },
+  "plugins": [
+    {
+      "name": "borg",
+      "version": "0.2.0",
+      "source": {
+        "source": "local",
+        "path": "./plugins/borg"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

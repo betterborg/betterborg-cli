@@ -1,0 +1,6 @@
+{
+  "borg": {
+    "command": "borg",
+    "args": ["mcp"]
+  }
+}

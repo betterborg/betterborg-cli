@@ -1,0 +1,205 @@
+name: Validate standalone binaries
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Exact reviewed version, or empty to use the source version
+        required: false
+        default: ""
+        type: string
+      attest:
+        description: Publish GitHub artifact attestations
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Validate binary release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select reviewed source version
+        id: version
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$REVIEWED_VERSION" ]; then
+            output=$(python3 scripts/check_versions.py --tag "v$REVIEWED_VERSION")
+          else
+            output=$(python3 scripts/check_versions.py)
+          fi
+          version=${output##* }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: [prepare]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: borg-darwin-arm64
+            runner: macos-14
+            family: darwin
+          - artifact: borg-darwin-x86_64
+            runner: macos-15-intel
+            family: darwin
+          - artifact: borg-linux-arm64
+            runner: ubuntu-24.04-arm
+            family: linux
+            image: quay.io/pypa/manylinux2014_aarch64
+          - artifact: borg-linux-x86_64
+            runner: ubuntu-24.04
+            family: linux
+            image: quay.io/pypa/manylinux2014_x86_64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Darwin
+        if: ${{ matrix.family == 'darwin' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build Darwin one-file binary
+        if: ${{ matrix.family == 'darwin' }}
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          make sync
+          make binary
+          mkdir release
+          mv dist/borg "release/$ARTIFACT"
+
+      - name: Build Linux one-file binary on glibc 2.17
+        if: ${{ matrix.family == 'linux' }}
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          MANYLINUX_IMAGE: ${{ matrix.image }}
+        run: |
+          mkdir release
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --workdir /io \
+            --env ARTIFACT \
+            "$MANYLINUX_IMAGE" \
+            bash -euxo pipefail -c '
+              /opt/python/cp313-cp313/bin/python -m venv /tmp/betterborg-build
+              /tmp/betterborg-build/bin/pip download \
+                --only-binary=:all: \
+                --destination-directory /tmp/betterborg-wheels \
+                --requirement requirements-binary.lock
+              /tmp/betterborg-build/bin/pip install \
+                --no-index \
+                --find-links /tmp/betterborg-wheels \
+                --requirement requirements-binary.lock
+              /tmp/betterborg-build/bin/pip install --no-build-isolation --no-deps .
+              /tmp/betterborg-build/bin/pyinstaller \
+                --clean --noconfirm --distpath /tmp/dist betterborg.spec
+              mv /tmp/dist/borg "release/$ARTIFACT"
+            '
+
+      - name: Smoke Darwin binary version
+        if: ${{ matrix.family == 'darwin' }}
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          REVIEWED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          test "$("release/$ARTIFACT" version)" = "borg $REVIEWED_VERSION"
+
+      - name: Smoke Linux binary on glibc 2.17
+        if: ${{ matrix.family == 'linux' }}
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          MANYLINUX_IMAGE: ${{ matrix.image }}
+          REVIEWED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/io:ro" \
+            --workdir /io \
+            --env ARTIFACT \
+            --env REVIEWED_VERSION \
+            "$MANYLINUX_IMAGE" \
+            bash -euxo pipefail -c '
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"
+              test "$("release/$ARTIFACT" version)" = "borg $REVIEWED_VERSION"
+            '
+
+      - name: Create SHA-256 checksum
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: python3 scripts/release_artifacts.py checksum "release/$ARTIFACT"
+
+      - name: Attest binary and checksum
+        if: ${{ inputs.attest }}
+        uses: actions/attest@v4
+        with:
+          subject-path: release/${{ matrix.artifact }}*
+
+      - name: Preserve target artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+          path: release/${{ matrix.artifact }}*
+
+  manifest:
+    name: Validate binary release manifest
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Retrieve all four target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-borg-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate exact release manifest
+        env:
+          REVIEWED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cp scripts/install.sh release-assets/install.sh
+          python3 scripts/release_artifacts.py manifest \
+            --version "$REVIEWED_VERSION" \
+            --directory release-assets \
+            --output release-assets/release-manifest.json
+
+      - name: Attest release manifest
+        if: ${{ inputs.attest }}
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release-assets/release-manifest.json
+            release-assets/install.sh
+
+      - name: Preserve complete binary release
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-release-${{ needs.prepare.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: release-assets/
