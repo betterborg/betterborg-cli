@@ -49,6 +49,13 @@ shell keeps metacharacters literal, but it is not a sandbox: programs invoked
 by the command runner remain host-capable. Native Claude and Codex tools are
 outside this API file-tool boundary.
 
+After plan approval publishes a current task generation, inspect its execution
+commitment with `borg task estimate <name>`. The estimate reports P50/P80 total
+agent work, local sample sizes, and API versus subscription billing separately.
+The bootstrap prior is prominently marked as dummy data and is gradually
+replaced by repository-local completions; subscription work is never assigned
+a fabricated USD value. Add `--json` for the machine-readable shape.
+
 ## Development safety
 
 Follow [AGENTS.md](AGENTS.md) when using the private BetterBorg repository as a

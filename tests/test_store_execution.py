@@ -678,6 +678,112 @@ def test_claims_only_select_dependency_ready_tasks(tmp_path: Path) -> None:
         assert second.task_id == consumer.id
 
 
+def test_completed_task_samples_include_agent_work_and_preserve_missing_usage(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    now = utcnow()
+    with SqliteStore.open(database) as store:
+        acquisition = store.acquire_execution_run(
+            borg.id,
+            generation.id,
+            lease_duration=timedelta(minutes=5),
+            now=now,
+        )
+        assert acquisition.owner_token is not None
+        claim = store.claim_dependency_ready_task(
+            acquisition.run_id,
+            acquisition.owner_token,
+            lease_duration=timedelta(minutes=4),
+            now=now,
+        )
+        assert claim is not None
+
+        statuses = {
+            "coding": AgentStatus.COMPLETED,
+            "review": AgentStatus.COMPLETED,
+            "fix": AgentStatus.FAILED,
+            "merge": AgentStatus.CANCELLED,
+        }
+        for offset, phase in enumerate(statuses, 1):
+            attempt = AgentAttempt(
+                run_id=acquisition.run_id,
+                claim_id=claim.id,
+                task_id=task.id,
+                phase=phase,
+                attempt_number=1,
+                adapter="openai",
+                model="gpt-5",
+                billing_mode=BillingMode.API,
+                status=ExecutionAttemptStatus.RUNNING,
+                log_path=f"artifacts/{phase}.log",
+                started_at=now + timedelta(seconds=offset),
+                finished_at=None,
+            )
+            store.append_agent_attempt(
+                attempt,
+                acquisition.owner_token,
+                claim.claim_token,
+                now=now + timedelta(seconds=offset),
+            )
+            store.complete_agent_attempt(
+                attempt.id,
+                acquisition.owner_token,
+                claim.claim_token,
+                status=statuses[phase],
+                duration_seconds=float(offset * 10),
+                usage=(
+                    AgentUsage(
+                        tokens_input=offset,
+                        tokens_output=offset,
+                        tokens_cache_read=offset,
+                        tokens_cache_write=offset,
+                    )
+                    if phase != "fix"
+                    else AgentUsage(tokens_input=offset)
+                ),
+                now=now + timedelta(seconds=offset + 10),
+            )
+
+        store.transition_task_runtime(
+            acquisition.run_id,
+            acquisition.owner_token,
+            claim.id,
+            claim.claim_token,
+            expected_status=TaskRuntimeStatus.CLAIMED,
+            new_status=TaskRuntimeStatus.DONE,
+            now=now + timedelta(seconds=30),
+        )
+        samples = store.list_task_completion_samples()
+
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample.complexity is TaskComplexity.MEDIUM
+    assert sample.duration_seconds == 100.0
+    assert sample.coding_usage == AgentUsage(
+        tokens_input=1,
+        tokens_output=1,
+        tokens_cache_read=1,
+        tokens_cache_write=1,
+    )
+    assert sample.review_usage == AgentUsage(
+        tokens_input=5,
+        tokens_output=None,
+        tokens_cache_read=None,
+        tokens_cache_write=None,
+        cost_usd=None,
+        num_turns=None,
+    )
+    assert sample.merge_usage == AgentUsage(
+        tokens_input=4,
+        tokens_output=4,
+        tokens_cache_read=4,
+        tokens_cache_write=4,
+    )
+
+
 def test_expiry_closes_open_attempt_and_blocks_reclaim_until_compose_cleanup(
     tmp_path: Path, approved_task_generation
 ) -> None:

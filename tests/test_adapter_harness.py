@@ -196,7 +196,9 @@ def openai_response(
         "model": model,
         "output": output,
         "usage": {
-            "input_tokens": input_tokens,
+            # Responses reports an inclusive input total; the harness arguments
+            # describe the provider-neutral, mutually exclusive buckets.
+            "input_tokens": input_tokens + cache_read + cache_write,
             "output_tokens": output_tokens,
             "input_tokens_details": {
                 "cached_tokens": cache_read,

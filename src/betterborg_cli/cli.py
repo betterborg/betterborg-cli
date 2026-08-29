@@ -12,6 +12,11 @@ import click
 from betterborg_cli import __version__
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
+from betterborg_cli.execution_estimate import (
+    DUMMY_PRIOR_LABEL,
+    estimate_generation,
+    phase_billing_from_config,
+)
 from betterborg_cli.onboarding import (
     CreateService,
     OnboardingDispatcher,
@@ -49,6 +54,7 @@ from betterborg_cli.store import (
     PlanningAttempt,
     PlanningAttemptStatus,
     SqliteStore,
+    TaskGenerationStatus,
     TaskRecord,
     TaskRuntimeCost,
     TaskRuntimeRow,
@@ -450,6 +456,89 @@ def list_tasks(name: str, json_output: bool) -> None:
         f"{_format_duration(totals['duration_seconds'])}, "
         f"{_format_runtime_cost(totals['cost'])}"
     )
+
+
+@task.command(name="estimate")
+@click.argument("name")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit the generation estimate as machine-readable JSON.",
+)
+def estimate_tasks(name: str, json_output: bool) -> None:
+    """Estimate total agent work for the current task generation."""
+    try:
+        paths, publication = _current_task_publication(name)
+        config = load_repository_config(paths)
+        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            generation = store.get_task_generation(publication.generation.id)
+            if (
+                generation is None
+                or generation.status is not TaskGenerationStatus.CURRENT
+            ):
+                raise RuntimeError(
+                    "current task generation changed while it was being estimated"
+                )
+            estimate = estimate_generation(
+                generation.id,
+                [item.task for item in publication.files],
+                store.list_task_completion_samples(),
+                phase_billing_from_config(config),
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+    if json_output:
+        click.echo(json.dumps(estimate, sort_keys=True, separators=(",", ":")))
+        return
+
+    mix = estimate["task_mix"]
+    time = estimate["time"]
+    click.echo(DUMMY_PRIOR_LABEL)
+    click.echo(f"Execution estimate for Borg {name!r}: {estimate['generation_id']}")
+    click.echo(
+        "Task mix: "
+        f"{mix['small']} small, {mix['medium']} medium, {mix['large']} large, "
+        f"{mix['unsized']} unsized"
+    )
+    click.echo(
+        "Total agent work (not calendar time): "
+        f"P50 {_format_duration(time['p50'])}, "
+        f"P80 {_format_duration(time['p80'])}"
+    )
+    if time["unknown_tasks"]:
+        click.echo(f"Unknown time: {time['unknown_tasks']} task(s)")
+    click.echo(f"Local completion sample: {estimate['sample_size']} task(s)")
+    for item in estimate["per_complexity"]:
+        click.echo(
+            f"  {item['complexity']}: {item['task_count']} task(s), "
+            f"n={item['sample_size']}, source={item['source']}, "
+            f"P50 {_format_duration(item['time']['p50'])}, "
+            f"P80 {_format_duration(item['time']['p80'])}"
+        )
+
+    billing = estimate["billing"]
+    api = billing["api"]
+    if api["unknown"]:
+        click.echo("API estimate: unknown (billing, usage, or model price is missing)")
+    elif api["estimate"] is None:
+        click.echo("API estimate: not used")
+    else:
+        click.echo(
+            f"API estimate: P50 ${api['estimate']['p50']:.4f}, "
+            f"P80 ${api['estimate']['p80']:.4f} USD"
+        )
+    subscription = billing["subscription"]
+    if subscription["included"]:
+        click.echo(
+            "Subscription work included for "
+            f"{', '.join(subscription['phases'])}; USD: unknown/not applicable"
+        )
+    if billing["unknown_phases"]:
+        click.echo(
+            "Billing mode unknown for: " + ", ".join(billing["unknown_phases"])
+        )
 
 
 @task.command(name="show")

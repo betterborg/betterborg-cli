@@ -105,7 +105,11 @@ class AgentRunSpec:
 
 @dataclass(frozen=True, slots=True)
 class AgentUsage:
-    """Optional resource accounting reported by an adapter."""
+    """Optional resource accounting reported by an adapter.
+
+    ``tokens_input`` is the uncached input portion. Cache reads and writes are
+    recorded separately so pricing never counts the same input twice.
+    """
 
     cost_usd: float | None = None
     tokens_input: int | None = None
