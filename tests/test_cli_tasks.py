@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 from click.testing import CliRunner
 
+from betterborg_cli.agent_runtime import AgentStatus, AgentUsage, BillingMode
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import (
     TaskPublisher,
     render_task_markdown,
 )
 from betterborg_cli.store import (
+    AgentAttempt,
     BorgState,
+    ExecutionRun,
     PlanApproval,
     SqliteStore,
+    TaskClaim,
     TaskGenerationStatus,
+    TaskRuntime,
+    TaskRuntimeStatus,
 )
+from betterborg_cli.store.models import utcnow
 
 
 def _task_body(stem: str, title: str) -> dict:
@@ -154,15 +162,142 @@ def test_task_list_json_describes_only_verified_current_records(
                 "complexity": "small",
                 "dependencies": [],
                 "digest": current.task.digest,
+                "attempt_count": 0,
+                "cost": {
+                    "api_spend_unknown": True,
+                    "api_spend_usd": None,
+                    "subscription_included": False,
+                },
+                "duration_seconds": None,
                 "path": current.generation.manifest["tasks"][0]["path"],
                 "position": 1,
+                "review_round": 0,
                 "stage": "01-foundation",
+                "state_reason": None,
+                "status": "pending",
                 "stem": "02-current",
                 "task_ref": current.task.task_ref,
                 "title": "Current task",
             }
         ],
+        "totals": {
+            "attempt_count": 0,
+            "cost": {
+                "api_spend_unknown": True,
+                "api_spend_usd": None,
+                "subscription_included": False,
+            },
+            "duration_seconds": None,
+        },
     }
+
+
+def test_task_list_terminal_and_json_share_runtime_totals(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch,
+) -> None:
+    database, superseded, current, _preparing = _multiple_generations(
+        committed_git_repo, planning_cli_repository, approved_task_generation
+    )
+    started_at = utcnow()
+    run = ExecutionRun(
+        borg_id=current.task.borg_id,
+        generation_id=current.generation.id,
+        started_at=started_at,
+        heartbeat_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=5),
+    )
+    runtime = TaskRuntime(
+        generation_id=current.generation.id,
+        task_id=current.task.id,
+        status=TaskRuntimeStatus.FIX,
+        state_reason="review requested changes",
+        review_round=2,
+    )
+    claim = TaskClaim(
+        run_id=run.id,
+        task_id=current.task.id,
+        resume_phase="fix",
+        claimed_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=2),
+    )
+    with SqliteStore.open(database) as store:
+        store.add_execution_run(run)
+        store.add_task_runtime(runtime)
+        store.append_task_claim(claim)
+        for index, (billing, cost, duration) in enumerate(
+            (
+                (BillingMode.API, 0.75, 4.0),
+                (BillingMode.SUBSCRIPTION, 8.0, 6.0),
+            ),
+            start=1,
+        ):
+            store.append_agent_attempt(
+                AgentAttempt(
+                    run_id=run.id,
+                    claim_id=claim.id,
+                    task_id=current.task.id,
+                    phase=f"phase-{index}",
+                    attempt_number=1,
+                    adapter="mock",
+                    model="test-model",
+                    billing_mode=billing,
+                    status=AgentStatus.COMPLETED,
+                    log_path=f"artifacts/{index}.log",
+                    duration_seconds=duration,
+                    usage=AgentUsage(cost_usd=cost),
+                    started_at=started_at,
+                    finished_at=started_at + timedelta(seconds=duration),
+                ),
+                run.owner_token,
+                claim.claim_token,
+                now=started_at,
+            )
+    monkeypatch.chdir(committed_git_repo)
+
+    terminal = cli_runner.invoke(cli, ["task", "list", "inspect-tasks"])
+    machine = cli_runner.invoke(
+        cli, ["task", "list", "inspect-tasks", "--json"]
+    )
+
+    assert terminal.exit_code == 0, terminal.output
+    assert "Status: fix" in terminal.output
+    assert "Reason: review requested changes" in terminal.output
+    assert "Review rounds: 2" in terminal.output
+    assert "Attempts: 2" in terminal.output
+    assert "Duration: 10s" in terminal.output
+    assert "Cost: $0.7500 API + subscription included" in terminal.output
+    assert "Totals: 2 attempt(s), 10s, $0.7500 API + subscription included" in (
+        terminal.output
+    )
+    assert superseded.task.title not in terminal.output
+
+    assert machine.exit_code == 0, machine.output
+    payload = json.loads(machine.output)
+    runtime_fields = {
+        "attempt_count": 2,
+        "cost": {
+            "api_spend_unknown": False,
+            "api_spend_usd": 0.75,
+            "subscription_included": True,
+        },
+        "duration_seconds": 10.0,
+        "review_round": 2,
+        "state_reason": "review requested changes",
+        "status": "fix",
+    }
+    assert {key: payload["tasks"][0][key] for key in runtime_fields} == (
+        runtime_fields
+    )
+    assert payload["totals"] == {
+        "attempt_count": 2,
+        "cost": runtime_fields["cost"],
+        "duration_seconds": 10.0,
+    }
+    assert superseded.task.title not in machine.output
 
 
 def test_task_show_renders_current_markdown_and_json_and_rejects_noncurrent_refs(

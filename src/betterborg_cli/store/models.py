@@ -703,6 +703,63 @@ class TaskRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskRuntimeCost:
+    """Billing-aware cost summary for a task's persisted agent attempts."""
+
+    api_spend_usd: float | None
+    api_spend_unknown: bool
+    subscription_included: bool
+
+    def __post_init__(self) -> None:
+        if self.api_spend_usd is not None and self.api_spend_usd < 0:
+            raise ValueError("task runtime API spend must not be negative")
+        if self.api_spend_unknown and self.api_spend_usd is not None:
+            raise ValueError("unknown API spend cannot have a USD value")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRuntimeRow:
+    """Current-generation task metadata enriched with execution status."""
+
+    generation_id: UUID
+    task_id: UUID
+    task_ref: str
+    stage: str
+    stem: str
+    position: int
+    title: str
+    complexity: TaskComplexity
+    status: TaskRuntimeStatus
+    state_reason: str | None
+    review_round: int
+    attempt_count: int
+    duration_seconds: float | None
+    cost: TaskRuntimeCost
+
+    def __post_init__(self) -> None:
+        for name in ("generation_id", "task_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task runtime row {name} must be a UUID")
+        for name in ("task_ref", "stage", "stem", "title"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"task runtime row {name} must not be empty")
+        if self.position < 1:
+            raise ValueError("task runtime row position must be positive")
+        if not isinstance(self.complexity, TaskComplexity):
+            raise TypeError("task runtime row complexity must be a TaskComplexity")
+        if not isinstance(self.status, TaskRuntimeStatus):
+            raise TypeError("task runtime row status must be a TaskRuntimeStatus")
+        if self.review_round < 0:
+            raise ValueError("task runtime row review round must not be negative")
+        if self.attempt_count < 0:
+            raise ValueError("task runtime row attempt count must not be negative")
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("task runtime row duration must not be negative")
+        if not isinstance(self.cost, TaskRuntimeCost):
+            raise TypeError("task runtime row cost must be a TaskRuntimeCost")
+
+
+@dataclass(frozen=True, slots=True)
 class TaskClaim:
     """A lease-owned claim granting one run authority over one task."""
 

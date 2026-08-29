@@ -33,6 +33,8 @@ from betterborg_cli.store.models import (
     TaskGenerationStatus,
     TaskRecord,
     TaskRuntime,
+    TaskRuntimeCost,
+    TaskRuntimeRow,
     TaskRuntimeStatus,
 )
 from betterborg_cli.store.sqlite import (
@@ -79,5 +81,7 @@ __all__ = [
     "TaskGenerationStatus",
     "TaskRecord",
     "TaskRuntime",
+    "TaskRuntimeCost",
+    "TaskRuntimeRow",
     "TaskRuntimeStatus",
 ]
