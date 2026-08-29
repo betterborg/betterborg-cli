@@ -126,6 +126,21 @@ class HostWorktreeManager:
         """
         if runtime.status is not TaskRuntimeStatus.DONE:
             return False
+        return self._cleanup_task_worktree(runtime)
+
+    def cleanup_published_task_worktree(self, runtime: TaskRuntime) -> bool:
+        """Remove a sanity-published worktree before its terminal transition.
+
+        The sanity phase calls this while holding the repository lock and while
+        the runtime is still ``merging``. Keeping the runtime nonterminal until
+        removal succeeds prevents dependents from racing worktree cleanup.
+        """
+        if runtime.status is not TaskRuntimeStatus.MERGING:
+            return False
+        return self._cleanup_task_worktree(runtime)
+
+    def _cleanup_task_worktree(self, runtime: TaskRuntime) -> bool:
+        """Remove one eligible task worktree without deleting its branch."""
         if runtime.branch is None or runtime.worktree_path is None:
             return False
         path = self._managed_path(Path(runtime.worktree_path))

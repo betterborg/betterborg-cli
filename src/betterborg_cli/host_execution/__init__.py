@@ -50,6 +50,12 @@ from betterborg_cli.host_execution.review import (
     HostReviewFixPhase,
     ReviewFixPhaseError,
 )
+from betterborg_cli.host_execution.sanity import (
+    HostSanityPhase,
+    HostSanityResult,
+    SanityCommandResult,
+    SanityPhaseError,
+)
 from betterborg_cli.host_execution.scheduler import (
     HostSchedulerConfig,
     HostSchedulerResult,
@@ -89,6 +95,8 @@ __all__ = [
     "HostReviewFixPhase",
     "HostSchedulerConfig",
     "HostSchedulerResult",
+    "HostSanityPhase",
+    "HostSanityResult",
     "HostSecret",
     "HostService",
     "HostTaskBehavior",
@@ -102,6 +110,8 @@ __all__ = [
     "MergeTip",
     "SafeGit",
     "ScheduledTaskContext",
+    "SanityCommandResult",
+    "SanityPhaseError",
     "UnsafeGitError",
     "WorktreeError",
     "WorktreeSpec",
