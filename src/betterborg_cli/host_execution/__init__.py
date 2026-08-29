@@ -1,5 +1,10 @@
 """Guarded host Git and sibling-worktree lifecycle."""
 
+from betterborg_cli.host_execution.coding import (
+    CodingPhaseError,
+    HostCodingConfig,
+    HostCodingPhase,
+)
 from betterborg_cli.host_execution.compose import (
     ComposeCleanupResult,
     ComposeStack,
@@ -48,10 +53,13 @@ __all__ = [
     "ComposeCleanupResult",
     "ComposeStack",
     "ComposeStackError",
+    "CodingPhaseError",
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
     "HostEnvironmentManager",
     "HostComposeManager",
+    "HostCodingConfig",
+    "HostCodingPhase",
     "HostWorktreeManager",
     "HostCommand",
     "HostExecutable",
