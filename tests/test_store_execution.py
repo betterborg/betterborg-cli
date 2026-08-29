@@ -265,7 +265,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+        assert reopened.applied_migrations() == tuple(range(1, 12))
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime

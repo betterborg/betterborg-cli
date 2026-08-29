@@ -553,6 +553,41 @@ class TaskGeneration:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionDecision:
+    """One immutable estimate decision bound to an exact task generation."""
+
+    borg_id: UUID
+    generation_id: UUID
+    approved_plan_digest: str
+    task_batch_digest: str
+    estimate_version: str
+    source: str
+    snapshot: dict[str, Any]
+    decision: str
+    id: UUID = field(default_factory=uuid4)
+    decided_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "generation_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"execution decision {name} must be a UUID")
+        for name in (
+            "approved_plan_digest",
+            "task_batch_digest",
+            "estimate_version",
+            "source",
+            "decision",
+        ):
+            if not getattr(self, name).strip():
+                raise ValueError(
+                    f"execution decision {name.replace('_', ' ')} must not be empty"
+                )
+        if not isinstance(self.snapshot, dict):
+            raise TypeError("execution decision snapshot must be a dictionary")
+        _validate_utc(self.decided_at)
+
+
+@dataclass(frozen=True, slots=True)
 class TaskRecord:
     """Immutable structured metadata for one task in a generation."""
 

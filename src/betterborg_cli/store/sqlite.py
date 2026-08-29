@@ -24,6 +24,7 @@ from betterborg_cli.store.models import (
     ComposeResource,
     EnvironmentAttempt,
     ExecutionAttemptStatus,
+    ExecutionDecision,
     ExecutionEvent,
     ExecutionRun,
     ExecutionRunAcquisition,
@@ -1017,6 +1018,63 @@ class SqliteStore:
                 (str(borg_id),),
             ).fetchall()
         return [_row_to_task_generation(row) for row in rows]
+
+    def append_execution_decision(self, decision: ExecutionDecision) -> None:
+        """Persist one immutable decision for an exact current generation."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_decisions(
+                    id, borg_id, generation_id, approved_plan_digest,
+                    task_batch_digest, estimate_version, source, snapshot_json,
+                    decision, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(decision.id),
+                    str(decision.borg_id),
+                    str(decision.generation_id),
+                    decision.approved_plan_digest,
+                    decision.task_batch_digest,
+                    decision.estimate_version,
+                    decision.source,
+                    _encode_json(decision.snapshot),
+                    decision.decision,
+                    decision.decided_at.isoformat(),
+                ),
+            )
+
+    def get_execution_decision(
+        self, borg_id: UUID, generation_id: UUID
+    ) -> ExecutionDecision | None:
+        """Return the durable decision for one Borg generation, if present."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM execution_decisions
+                WHERE borg_id = ? AND generation_id = ?
+                """,
+                (str(borg_id), str(generation_id)),
+            ).fetchone()
+        return _row_to_execution_decision(row) if row is not None else None
+
+    def get_current_execution_decision(
+        self, borg_id: UUID
+    ) -> ExecutionDecision | None:
+        """Return only a decision bound to the SQLite-current generation."""
+        with self.locked_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT decision.*
+                FROM execution_decisions AS decision
+                JOIN task_generations AS generation
+                  ON generation.id = decision.generation_id
+                 AND generation.borg_id = decision.borg_id
+                WHERE decision.borg_id = ? AND generation.status = 'current'
+                """,
+                (str(borg_id),),
+            ).fetchone()
+        return _row_to_execution_decision(row) if row is not None else None
 
     def _promote_published_task_generation(
         self, generation_id: UUID, *, durable_root: Path
@@ -3726,6 +3784,21 @@ def _row_to_task_generation(row: sqlite3.Row) -> TaskGeneration:
             if row["superseded_at"] is not None
             else None
         ),
+    )
+
+
+def _row_to_execution_decision(row: sqlite3.Row) -> ExecutionDecision:
+    return ExecutionDecision(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        generation_id=UUID(row["generation_id"]),
+        approved_plan_digest=row["approved_plan_digest"],
+        task_batch_digest=row["task_batch_digest"],
+        estimate_version=row["estimate_version"],
+        source=row["source"],
+        snapshot=json.loads(row["snapshot_json"]),
+        decision=row["decision"],
+        decided_at=datetime.fromisoformat(row["decided_at"]),
     )
 
 
