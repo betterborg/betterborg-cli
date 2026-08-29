@@ -1,0 +1,113 @@
+name: Release to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact reviewed version from betterborg_cli.__version__
+        required: true
+        type: string
+      publish:
+        description: Publish after validation and protected environment approval
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release:
+    name: Validate release without publishing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install locked development environment
+        run: make sync
+
+      - name: Validate reviewed version
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: .venv/bin/python scripts/check_versions.py --expected "$REVIEWED_VERSION"
+
+      - name: Lint and test
+        run: |
+          make lint
+          make test
+
+      - name: Build wheel and source distribution
+        run: make build
+
+      - name: Require the exact wheel and source distribution
+        env:
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: |
+          .venv/bin/python - "$REVIEWED_VERSION" <<'PY'
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          expected = {
+              f"betterborg-{version}-py3-none-any.whl",
+              f"betterborg-{version}.tar.gz",
+          }
+          actual = {path.name for path in Path("dist").iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(
+                  f"release artifacts differ: expected {sorted(expected)}, "
+                  f"found {sorted(actual)}"
+              )
+          PY
+
+      - name: Preserve reviewed distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: betterborg-${{ inputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/betterborg-${{ inputs.version }}-py3-none-any.whl
+            dist/betterborg-${{ inputs.version }}.tar.gz
+
+  publish-pypi:
+    name: Publish reviewed distributions to PyPI
+    if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+    needs: [validate-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/betterborg/${{ inputs.version }}/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out verification code
+        uses: actions/checkout@v4
+
+      - name: Retrieve reviewed distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: betterborg-${{ inputs.version }}
+          path: dist
+
+      - name: Publish with the PyPI trusted publisher
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: false
+
+      - name: Set up uv for public verification
+        uses: astral-sh/setup-uv@v6
+
+      - name: Verify exact public command and controlled init
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REVIEWED_VERSION: ${{ inputs.version }}
+        run: python scripts/verify_pypi_release.py --version "$REVIEWED_VERSION"
