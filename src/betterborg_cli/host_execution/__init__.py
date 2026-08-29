@@ -1,5 +1,13 @@
 """Guarded host Git and sibling-worktree lifecycle."""
 
+from betterborg_cli.host_execution.compose import (
+    ComposeCleanupResult,
+    ComposeStack,
+    ComposeStackError,
+    HostComposeManager,
+    compose_project_name,
+    service_url_environment,
+)
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterialization,
     EnvironmentMaterializationError,
@@ -30,9 +38,13 @@ from betterborg_cli.host_execution.worktrees import (
 )
 
 __all__ = [
+    "ComposeCleanupResult",
+    "ComposeStack",
+    "ComposeStackError",
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
     "HostEnvironmentManager",
+    "HostComposeManager",
     "HostWorktreeManager",
     "HostCommand",
     "HostExecutable",
@@ -50,5 +62,7 @@ __all__ = [
     "WorktreeError",
     "WorktreeSpec",
     "environment_fingerprint",
+    "compose_project_name",
     "package_manager_cache_environment",
+    "service_url_environment",
 ]

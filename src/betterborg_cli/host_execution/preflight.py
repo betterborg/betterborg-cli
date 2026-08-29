@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
     require_workspace_trust,
 )
+
+_MINIMUM_COMPOSE_VERSION = (2, 24, 4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +74,9 @@ class HostService:
     evidence: str
     compose_service: str | None = None
     url_env: str | None = None
+    port: int | None = None
+    url_targets: tuple[tuple[str, int, Literal["tcp", "udp"]], ...] = ()
+    port_targets: tuple[tuple[str, int, Literal["tcp", "udp"]], ...] = ()
     url: str | None = field(default=None, repr=False)
 
 
@@ -98,6 +104,9 @@ class HostPreflightPlan:
     compose_files: tuple[Path, ...]
     services: tuple[HostService, ...]
     compose_profiles: tuple[str, ...] = ()
+    compose_networks: tuple[str, ...] = ()
+    compose_volumes: tuple[str, ...] = ()
+    compose_build_services: tuple[str, ...] = ()
     package_managers: tuple[str, ...] = ()
     secret_requirements: tuple[HostSecret, ...] = ()
 
@@ -168,7 +177,14 @@ class HostPreflight:
         secret_requirements = self._required_secrets(
             plan, available_secret_names, failures
         )
-        compose_files, compose_profiles, services = self._services(
+        (
+            compose_files,
+            compose_profiles,
+            compose_networks,
+            compose_volumes,
+            compose_build_services,
+            services,
+        ) = self._services(
             plan,
             external_urls or {},
             executables,
@@ -190,6 +206,9 @@ class HostPreflight:
             compose_files=tuple(compose_files),
             services=tuple(services),
             compose_profiles=tuple(compose_profiles),
+            compose_networks=tuple(compose_networks),
+            compose_volumes=tuple(compose_volumes),
+            compose_build_services=tuple(compose_build_services),
             package_managers=tuple(_package_managers(plan)),
             secret_requirements=tuple(secret_requirements),
         )
@@ -582,7 +601,14 @@ class HostPreflight:
         external_urls: Mapping[str, str],
         executables: list[HostExecutable],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[Path], list[str], list[HostService]]:
+    ) -> tuple[
+        list[Path],
+        list[str],
+        list[str],
+        list[str],
+        list[str],
+        list[HostService],
+    ]:
         catalog = plan.get("command_catalog")
         command_records = (
             _mappings(catalog.get("commands")) if isinstance(catalog, Mapping) else []
@@ -600,7 +626,7 @@ class HostPreflight:
                         _evidence(record, catalog_evidence)
                     )
         if not selected:
-            return [], [], []
+            return [], [], [], [], [], []
 
         by_name: dict[str, list[Mapping[str, Any]]] = {}
         for record in _mappings(plan.get("service_dependencies")):
@@ -640,23 +666,28 @@ class HostPreflight:
             compose_service = service.get("compose_service")
             url_env = service.get("url_env")
             has_compose = isinstance(compose_service, str) and bool(compose_service)
-            has_external = isinstance(url_env, str) and bool(url_env)
-            if has_compose and has_external:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"selected service is ambiguous or inferred: {name}"
-                        ),
-                        evidence=evidence,
-                        guidance=(
-                            "Set exactly one of compose_service or url_env in "
-                            "analyzer evidence; preflight will not choose between "
-                            "runtime sources."
-                        ),
-                    )
-                )
-            elif has_compose:
+            has_url_env = isinstance(url_env, str) and bool(url_env)
+            if has_compose:
                 assert isinstance(compose_service, str)
+                url_targets = _compose_service_url_targets(service)
+                port_targets = _compose_service_port_targets(service)
+                if has_url_env and not any(
+                    target_env == url_env
+                    for target_env, _port, _protocol in url_targets
+                ):
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"Compose service {name!r} URL environment "
+                                f"{url_env} requires an exact port"
+                            ),
+                            evidence=evidence,
+                            guidance=(
+                                "Record the service port alongside url_env in "
+                                "analyzer evidence and rerun analysis."
+                            ),
+                        )
+                    )
                 compose_selected.append((compose_service, service))
                 services.append(
                     HostService(
@@ -664,9 +695,24 @@ class HostPreflight:
                         kind="compose",
                         evidence=evidence,
                         compose_service=compose_service,
+                        url_env=url_env if has_url_env else None,
+                        port=(
+                            next(
+                                (
+                                    port
+                                    for target_env, port, _protocol in url_targets
+                                    if target_env == url_env
+                                ),
+                                None,
+                            )
+                            if has_url_env
+                            else None
+                        ),
+                        url_targets=url_targets,
+                        port_targets=port_targets,
                     )
                 )
-            elif has_external:
+            elif has_url_env:
                 assert isinstance(url_env, str)
                 url = external_urls.get(url_env) or self._environment.get(url_env)
                 if not _valid_external_url(url):
@@ -709,6 +755,9 @@ class HostPreflight:
 
         compose_files: list[Path] = []
         compose_profiles: list[str] = []
+        compose_networks: list[str] = []
+        compose_volumes: list[str] = []
+        compose_build_services: list[str] = []
         if compose_selected:
             compose_files, compose_profiles = self._validate_compose(
                 plan, compose_selected, failures
@@ -735,22 +784,169 @@ class HostPreflight:
                 else:
                     docker = HostExecutable("docker", docker_path)
                     executables.append(docker)
-            if docker is not None and self._compose_version_output(docker.path) is None:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            "the Docker Compose plugin must be available on the host"
-                        ),
-                        evidence=", ".join(
-                            _evidence(item, name) for name, item in compose_selected
-                        ),
-                        guidance=(
-                            "Install or enable 'docker compose' and verify "
-                            "'docker compose version' succeeds."
-                        ),
+            if docker is not None:
+                compose_version = self._compose_version_output(docker.path)
+                if compose_version is None:
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                "the Docker Compose plugin must be available on the "
+                                "host"
+                            ),
+                            evidence=", ".join(
+                                _evidence(item, name)
+                                for name, item in compose_selected
+                            ),
+                            guidance=(
+                                "Install or enable 'docker compose' and verify "
+                                "'docker compose version' succeeds."
+                            ),
+                        )
                     )
+                elif not _supported_compose_version(compose_version):
+                    minimum = ".".join(map(str, _MINIMUM_COMPOSE_VERSION))
+                    failures.append(
+                        HostPreflightFailure(
+                            requirement=(
+                                f"Docker Compose {minimum} or newer is required for "
+                                "selected services"
+                            ),
+                            evidence=(
+                                ", ".join(
+                                    _evidence(item, name)
+                                    for name, item in compose_selected
+                                )
+                                + f"; docker compose version reported: "
+                                f"{compose_version}"
+                            ),
+                            guidance=(
+                                "Upgrade the Docker Compose plugin, verify "
+                                f"'docker compose version' reports {minimum} or "
+                                "newer, then retry."
+                            ),
+                        )
+                    )
+                elif compose_files:
+                    (
+                        compose_networks,
+                        compose_volumes,
+                        compose_build_services,
+                    ) = self._compose_topology(
+                        docker.path,
+                        compose_files,
+                        compose_profiles,
+                        compose_selected,
+                        failures,
+                    )
+        return (
+            compose_files,
+            compose_profiles,
+            compose_networks,
+            compose_volumes,
+            compose_build_services,
+            services,
+        )
+
+    def _compose_topology(
+        self,
+        docker: Path,
+        files: Sequence[Path],
+        profiles: Sequence[str],
+        selected: Sequence[tuple[str, Mapping[str, Any]]],
+        failures: list[HostPreflightFailure],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Validate isolation once and retain only secret-free topology keys."""
+        command = [
+            str(docker),
+            "compose",
+            "--project-name",
+            "betterborg-preflight",
+        ]
+        for path in files:
+            command.extend(("--file", str(path)))
+        for profile in profiles:
+            command.extend(("--profile", profile))
+        command.extend(("config", "--format", "json"))
+        evidence = _join_evidence(
+            _evidence(service, name) for name, service in selected
+        )
+        try:
+            result = self._run(
+                command,
+                cwd=self.repository_root,
+                env=self._probe_environment(),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is None or result.returncode != 0:
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "Compose configuration must resolve before task claims"
+                    ),
+                    evidence=evidence,
+                    guidance=(
+                        "Run the validated Compose file stack with the selected "
+                        "profiles, correct its configuration, and rerun preflight."
+                    ),
                 )
-        return compose_files, compose_profiles, services
+            )
+            return [], [], []
+
+        try:
+            model = json.loads(result.stdout)
+            service_records = model["services"]
+            network_records = model.get("networks", {})
+            volume_records = model.get("volumes", {})
+            if not isinstance(service_records, Mapping):
+                raise TypeError
+            selected_records = {
+                name: service_records[name]
+                for name, _service in selected
+                if isinstance(service_records.get(name), Mapping)
+            }
+            if len(selected_records) != len({name for name, _service in selected}):
+                raise KeyError("selected service topology is incomplete")
+            if any(record.get("network_mode") for record in selected_records.values()):
+                raise ValueError("host or service network_mode cannot be isolated")
+            writable_binds = _writable_bind_mounts(selected_records)
+            if writable_binds:
+                raise ValueError(
+                    "writable bind mounts cannot be isolated: "
+                    + ", ".join(writable_binds)
+                )
+            if not isinstance(network_records, Mapping) or not isinstance(
+                volume_records, Mapping
+            ):
+                raise TypeError
+            networks = [str(key) for key in network_records] or ["default"]
+            volumes = [str(key) for key in volume_records]
+            build_services = [
+                name
+                for name, record in selected_records.items()
+                if record.get("build") is not None
+            ]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            detail = str(error) or "selected service topology is incomplete"
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "selected Compose service topology must be isolated: "
+                        f"{detail}"
+                    ),
+                    evidence=evidence,
+                    guidance=(
+                        "Remove host/service network_mode and writable bind mounts, "
+                        "ensure every selected service resolves, then rerun preflight."
+                    ),
+                )
+            )
+            return [], [], []
+        return networks, volumes, build_services
 
     def _validate_compose(
         self,
@@ -987,6 +1183,100 @@ def _string_sequence(value: object) -> bool:
     )
 
 
+def _compose_service_url_targets(
+    service: Mapping[str, Any],
+) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
+    url_env = service.get("url_env")
+    port = service.get("port")
+    protocol: Literal["tcp", "udp"] = "tcp"
+    port_records = _mappings(service.get("ports"))
+    matching_port = next(
+        (
+            record
+            for record in port_records
+            if _service_port(port) and record.get("port") == port
+        ),
+        None,
+    )
+    if matching_port is not None:
+        protocol = _service_protocol(matching_port.get("protocol"))
+    if isinstance(url_env, str) and _service_port(port):
+        return ((url_env, port, protocol),)
+    return ()
+
+
+def _compose_service_port_targets(
+    service: Mapping[str, Any],
+) -> tuple[tuple[str, int, Literal["tcp", "udp"]], ...]:
+    targets: list[tuple[str, int, Literal["tcp", "udp"]]] = []
+    url_env = service.get("url_env")
+    port_records = _mappings(service.get("ports"))
+    for record in port_records:
+        port_env = record.get("env")
+        port_value = record.get("port")
+        if (
+            isinstance(port_env, str)
+            and port_env
+            and port_env != url_env
+            and _service_port(port_value)
+        ):
+            targets.append(
+                (
+                    port_env,
+                    port_value,
+                    _service_protocol(record.get("protocol")),
+                )
+            )
+
+    seen: set[str] = set()
+    deduped: list[tuple[str, int, Literal["tcp", "udp"]]] = []
+    for target in targets:
+        if target[0] in seen:
+            continue
+        seen.add(target[0])
+        deduped.append(target)
+    return tuple(deduped)
+
+
+def _service_port(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 65535
+
+
+def _service_protocol(value: object) -> Literal["tcp", "udp"]:
+    return "udp" if value == "udp" else "tcp"
+
+
+def _writable_bind_mounts(
+    services: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    for service_name, service in services.items():
+        volumes = service.get("volumes")
+        if not isinstance(volumes, Sequence) or isinstance(volumes, str | bytes):
+            continue
+        for index, volume in enumerate(volumes):
+            if not isinstance(volume, Mapping):
+                continue
+            volume_type = volume.get("type")
+            if (
+                isinstance(volume_type, str)
+                and volume_type.casefold() == "bind"
+                and not _volume_read_only(volume)
+            ):
+                violations.append(f"{service_name}.volumes[{index}]")
+    return tuple(violations)
+
+
+def _volume_read_only(volume: Mapping[object, object]) -> bool:
+    if volume.get("read_only") is True or volume.get("readonly") is True:
+        return True
+    mode = volume.get("mode")
+    if not isinstance(mode, str):
+        return False
+    modes = {part.strip().casefold() for part in mode.split(",")}
+    return bool({"ro", "readonly"} & modes)
+
+
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:
     source = record.get("source")
     return source if isinstance(source, str) and source else fallback
@@ -1034,6 +1324,17 @@ def _contains_version(output: str, version: str) -> bool:
         )
         is not None
     )
+
+
+def _supported_compose_version(output: str) -> bool:
+    match = re.search(
+        r"(?<![0-9A-Za-z])v?(\d+)\.(\d+)\.(\d+)(?!\d)",
+        output,
+    )
+    if match is None:
+        return False
+    version = tuple(int(component) for component in match.groups())
+    return version >= _MINIMUM_COMPOSE_VERSION
 
 
 def _valid_external_url(value: object) -> bool:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
@@ -1587,6 +1588,7 @@ class SqliteStore:
         task_id: UUID,
         project_name: str,
         *,
+        command: Iterable[str] | None = None,
         now: datetime | None = None,
     ) -> list[ComposeResource]:
         """Record successful external teardown and release its blocked claim."""
@@ -1616,6 +1618,19 @@ class SqliteStore:
                 )
             ]
             if pending:
+                command_payload = list(command or ())
+                self._insert_execution_event(
+                    connection,
+                    run_id=run_id,
+                    task_id=task_id,
+                    kind="compose.stopped",
+                    payload={
+                        "project_name": project_name,
+                        "resource_ids": [row["id"] for row in pending],
+                        "command": command_payload,
+                    },
+                    created_at=cleaned_at,
+                )
                 self._insert_execution_event(
                     connection,
                     run_id=run_id,
@@ -1624,6 +1639,7 @@ class SqliteStore:
                     payload={
                         "project_name": project_name,
                         "resource_ids": [row["id"] for row in pending],
+                        "command": command_payload,
                     },
                     created_at=cleaned_at,
                 )
@@ -1634,6 +1650,23 @@ class SqliteStore:
                         "SELECT lease_expires_at FROM task_claims WHERE id = ?",
                         (str(claim_id),),
                     ).fetchone()
+                    cleanup_failures = connection.execute(
+                        """
+                        SELECT payload_json FROM execution_events
+                        WHERE run_id = ? AND task_id = ?
+                          AND kind = 'compose.cleanup_failed'
+                          AND json_extract(payload_json, '$.project_name') = ?
+                        """,
+                        (str(run_id), str(task_id), project_name),
+                    ).fetchall()
+                    reclaimable_statuses = {
+                        status.value for status in _ACTIVE_TASK_STATUSES
+                    } | {TaskRuntimeStatus.PENDING.value}
+                    reset_cleanup_block = any(
+                        json.loads(row["payload_json"]).get("previous_status")
+                        in reclaimable_statuses
+                        for row in cleanup_failures
+                    )
                     self._release_reconciled_claim(
                         connection,
                         claim_id,
@@ -1643,8 +1676,90 @@ class SqliteStore:
                             datetime.fromisoformat(claim["lease_expires_at"])
                             <= cleaned_at
                         ),
+                        reset_cleanup_block=reset_cleanup_block,
                     )
         return [_row_to_compose_resource(row) for row in resources]
+
+    def record_compose_cleanup_failure(
+        self,
+        run_id: UUID,
+        task_id: UUID,
+        project_name: str,
+        *,
+        command: Iterable[str],
+        error: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist a failed teardown only while its project remains pending."""
+        failed_at = _execution_time(now)
+        command_payload = list(command)
+        if not project_name.strip() or not command_payload or not error.strip():
+            raise ValueError("Compose cleanup failure details must not be empty")
+        with self.transaction() as connection:
+            resource = connection.execute(
+                """
+                SELECT resource.id
+                FROM compose_resources AS resource
+                WHERE resource.run_id = ?
+                  AND resource.task_id = ?
+                  AND resource.project_name = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM execution_events AS event,
+                           json_each(event.payload_json, '$.resource_ids') AS cleaned
+                      WHERE event.run_id = resource.run_id
+                        AND event.task_id = resource.task_id
+                        AND event.kind = 'compose.cleanup_completed'
+                        AND cleaned.value = resource.id
+                  )
+                LIMIT 1
+                """,
+                (str(run_id), str(task_id), project_name),
+            ).fetchone()
+            if resource is None:
+                known = connection.execute(
+                    """
+                    SELECT 1 FROM compose_resources
+                    WHERE run_id = ? AND task_id = ? AND project_name = ?
+                    LIMIT 1
+                    """,
+                    (str(run_id), str(task_id), project_name),
+                ).fetchone()
+                if known is None:
+                    raise KeyError("Compose project identity not found")
+                return False
+            runtime = connection.execute(
+                "SELECT status FROM task_runtimes WHERE task_id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if runtime is None:
+                raise KeyError("task runtime not found")
+            self._insert_execution_event(
+                connection,
+                run_id=run_id,
+                task_id=task_id,
+                kind="compose.cleanup_failed",
+                payload={
+                    "project_name": project_name,
+                    "command": command_payload,
+                    "error": error,
+                    "previous_status": runtime["status"],
+                },
+                created_at=failed_at,
+            )
+            reason = (
+                f"Compose cleanup failed for project {project_name!r}; command: "
+                f"{shlex.join(command_payload)}; {error}"
+            )
+            connection.execute(
+                """
+                UPDATE task_runtimes
+                SET status = 'blocked', state_reason = ?, updated_at = ?
+                WHERE task_id = ? AND status NOT IN ('done', 'failed')
+                """,
+                (reason, failed_at.isoformat(), str(task_id)),
+            )
+            return True
 
     @staticmethod
     def _insert_execution_run(
@@ -1876,6 +1991,7 @@ class SqliteStore:
         now: datetime,
         reason: str,
         force: bool = False,
+        reset_cleanup_block: bool = False,
     ) -> None:
         claim = connection.execute(
             "SELECT * FROM task_claims WHERE id = ?", (str(claim_id),)
@@ -1900,7 +2016,9 @@ class SqliteStore:
             "UPDATE task_claims SET released_at = ? WHERE id = ?",
             (now.isoformat(), str(claim_id)),
         )
-        if runtime_status in _ACTIVE_TASK_STATUSES:
+        if runtime_status in _ACTIVE_TASK_STATUSES or (
+            runtime_status is TaskRuntimeStatus.BLOCKED and reset_cleanup_block
+        ):
             connection.execute(
                 """
                 UPDATE task_runtimes
@@ -2825,6 +2943,48 @@ class SqliteStore:
                     str(event.id),
                     str(event.run_id),
                     str(event.task_id) if event.task_id else None,
+                    str(event.attempt_id) if event.attempt_id else None,
+                    event.kind,
+                    _encode_json(event.payload),
+                    event.created_at.isoformat(),
+                ),
+            )
+
+    def append_claim_execution_event(
+        self,
+        event: ExecutionEvent,
+        owner_token: str,
+        claim_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Append an event only while its run and task claim are owned."""
+        recorded_at = _execution_time(now)
+        if event.task_id is None:
+            raise ValueError("claim-owned execution events require a task ID")
+        claim_id = event.payload.get("claim_id")
+        if not isinstance(claim_id, str):
+            raise ValueError("claim-owned execution events require a claim ID")
+        with self.transaction() as connection:
+            self._require_live_claim(
+                connection,
+                run_id=event.run_id,
+                owner_token=owner_token,
+                claim_id=UUID(claim_id),
+                claim_token=claim_token,
+                task_id=event.task_id,
+                now=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO execution_events(
+                    id, run_id, task_id, attempt_id, kind, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event.id),
+                    str(event.run_id),
+                    str(event.task_id),
                     str(event.attempt_id) if event.attempt_id else None,
                     event.kind,
                     _encode_json(event.payload),
