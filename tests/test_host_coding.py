@@ -271,7 +271,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
             run_id=acquisition.run_id,
             owner_token=acquisition.owner_token,
             generation_id=generation.id,
-            project_name="coding",
+            project_name=borg.name,
         )
         dependency_claim = store.claim_dependency_ready_task(
             acquisition.run_id,

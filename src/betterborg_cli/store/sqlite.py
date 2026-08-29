@@ -3071,6 +3071,33 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_execution_event(row) for row in rows]
 
+    def list_task_execution_events(
+        self, task_id: UUID, *, kind: str | None = None
+    ) -> list[ExecutionEvent]:
+        """Return durable events for one task across execution runs."""
+        if kind is not None and not kind.strip():
+            raise ValueError("execution event kind must not be empty")
+        with self.locked_connection() as connection:
+            if kind is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM execution_events
+                    WHERE task_id = ?
+                    ORDER BY created_at, id
+                    """,
+                    (str(task_id),),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM execution_events
+                    WHERE task_id = ? AND kind = ?
+                    ORDER BY created_at, id
+                    """,
+                    (str(task_id), kind),
+                ).fetchall()
+        return [_row_to_execution_event(row) for row in rows]
+
     def add_compose_resource(
         self,
         resource: ComposeResource,

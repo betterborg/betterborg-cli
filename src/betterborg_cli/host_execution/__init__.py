@@ -25,6 +25,14 @@ from betterborg_cli.host_execution.guard import (
     PrimaryCheckoutContaminationError,
     PrimaryCheckoutGuard,
 )
+from betterborg_cli.host_execution.merge import (
+    MERGE_RESULT_SCHEMA,
+    HostMergeConfig,
+    HostMergePhase,
+    HostMergeResult,
+    MergePhaseError,
+    MergeTip,
+)
 from betterborg_cli.host_execution.preflight import (
     HostCommand,
     HostExecutable,
@@ -63,6 +71,9 @@ __all__ = [
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
     "HostEnvironmentManager",
+    "HostMergeConfig",
+    "HostMergePhase",
+    "HostMergeResult",
     "HostComposeManager",
     "HostCodingConfig",
     "HostCodingPhase",
@@ -84,8 +95,11 @@ __all__ = [
     "HostTaskScheduler",
     "PrimaryCheckoutContaminationError",
     "PrimaryCheckoutGuard",
+    "MERGE_RESULT_SCHEMA",
     "REVIEW_RESULT_SCHEMA",
     "ReviewFixPhaseError",
+    "MergePhaseError",
+    "MergeTip",
     "SafeGit",
     "ScheduledTaskContext",
     "UnsafeGitError",

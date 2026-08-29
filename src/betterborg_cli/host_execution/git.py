@@ -21,12 +21,14 @@ _SAFE_SUBCOMMANDS = frozenset(
         "check-ignore",
         "checkout",
         "commit",
+        "commit-tree",
         "diff",
         "fetch",
         "log",
         "ls-files",
         "merge",
         "merge-base",
+        "merge-tree",
         "rev-list",
         "rev-parse",
         "show",
@@ -360,6 +362,13 @@ class SafeGit:
             ).returncode
             == 0
         )
+
+    def unmerged_paths(self) -> tuple[str, ...]:
+        """Return paths whose index entries still require merge resolution."""
+        output = self.run(
+            ["diff", "--name-only", "--diff-filter=U", "-z"]
+        ).stdout
+        return tuple(path for path in output.split("\0") if path)
 
     def is_clean(self, *, ignore_path: Callable[[str], bool] | None = None) -> bool:
         output = self.run(["status", "--porcelain=v1", "-z", "-uall"]).stdout
