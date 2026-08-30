@@ -1,61 +1,59 @@
 # Install BetterBorg CLI
 
-## Persistent GitHub installer
+## Persistent install
 
-Darwin and Linux users on ARM64 or x86_64 can install the current release and
-activate available Claude Code and Codex integrations with:
-
-```console
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/betterborg/betterborg-cli/releases/latest/download/install.sh \
-  | sh
-```
-
-The installer reads the GitHub-hosted release manifest, downloads the matching
-binary, verifies its SHA-256 digest and exact version, atomically installs it at
-`~/.local/bin/borg`, verifies the persistent executable, and only then runs
-`borg plugins install --all`. Follow its PATH guidance and restart open shells
-and plugin hosts. The vanity URL `install.betterborg.ai` is not active yet; do
-not substitute it for the GitHub URL.
-
-To verify or install one immutable release instead of following `latest`, pin
-both the release URL and installer version:
+Install the published PyPI package to get a persistent `borg` command:
 
 ```console
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-  https://github.com/betterborg/betterborg-cli/releases/download/vVERSION/install.sh \
-  --output install.sh
-BETTERBORG_VERSION=VERSION sh ./install.sh
-~/.local/bin/borg version
+pip install betterborg
+borg version
 ```
 
-The final command must print exactly `borg VERSION`.
+The distribution is named `betterborg`; it installs the `borg` console command.
+Requires Python 3.11 or newer. Any tool that installs a Python console script
+works — `pipx install betterborg` and `uv tool install betterborg` both produce
+the same persistent command.
 
-Native Windows and WSL1 are unsupported. On Windows, open a WSL2 shell and run
-the Linux installer there. The CLI, machine state, and plugin hosts must all be
-used from that WSL2 environment.
+A persistent install is required for host plugin activation. Activate the
+Claude Code and Codex integrations once `borg version` works from the same
+launch environment your host uses:
 
-## Ephemeral uvx and npx commands
+```console
+borg plugins install --all
+```
+
+## Ephemeral wrappers
 
 Use either public package wrapper without a persistent install:
 
 ```console
-uvx --from betterborg borg version
 npx --yes @betterborg/cli version
+uvx --from betterborg borg version
 ```
 
-For an immutable invocation, pin the synchronized version:
+The npm package is a launcher, not a second CLI implementation. It resolves an
+exact compatible `borg`, or uses exact-version `uvx`. Plugin activation
+deliberately refuses to run from these wrappers: it resolves `borg` on the host
+launch PATH and rejects transient extraction directories, so a plugin can never
+point at a path that disappears.
+
+## Version pinning
+
+Pin the synchronized version whenever reproducibility matters:
 
 ```console
+pip install betterborg==VERSION
 uvx --from betterborg==VERSION borg version
 npx --yes @betterborg/cli@VERSION version
 ```
 
-The npm package is a launcher, not a second CLI implementation. It resolves an
-exact compatible `borg`, downloads and checksum-verifies the matching GitHub
-binary when supported, or uses exact-version `uvx`. Native Windows has no
-standalone binary, so the npm launcher requires `uvx` there; WSL2 remains the
-supported persistent Windows installation path.
+`borg version` must print exactly `borg VERSION`.
+
+## Platforms
+
+macOS and Linux are supported. Native Windows and WSL1 are not; on Windows,
+open a WSL2 shell and install there. The CLI, machine state, and plugin hosts
+must all be used from that WSL2 environment.
 
 ## Trust and provider setup
 
@@ -88,26 +86,21 @@ borg init --yes
 to `.borg/config.toml`, a PRD, shell output, or any tracked file; use the shell
 environment or a secret manager.
 
-The same initialization is available through pinned wrappers:
-
-```console
-OPENAI_API_KEY='your-provider-key' \
-  uvx --from betterborg==VERSION borg init --yes
-OPENAI_API_KEY='your-provider-key' \
-  npx --yes @betterborg/cli@VERSION init --yes
-```
-
 ## Recovery
 
-If checksum or staged-version verification fails, the installer does not
-replace an existing `~/.local/bin/borg` and does not activate plugins. Retry
-only after confirming the requested GitHub Release is complete. A plugin
-activation failure happens after the verified CLI is installed; rerun
-`~/.local/bin/borg plugins install --all` after fixing the host setup.
+If `borg` is installed but not found, confirm that the console-script directory
+your installer used is on `PATH`, then restart open terminals and plugin hosts.
 
-If the install directory is absent from PATH, apply the printed export and
-restart terminals. On an unsupported target, install
-[uv](https://docs.astral.sh/uv/) and use the `uvx` command above. For a bad or
-digest-mismatched public release, do not bypass verification or reuse that
-version; use the last known-good version while maintainers fix forward with a
-new release.
+A plugin activation failure leaves the CLI installed and working. Fix the host
+setup, then rerun `borg plugins install --all`. Run `/reload-plugins` in open
+Claude Code sessions after installation or an upgrade, and start a new Codex
+session when the installer requests it.
+
+For a bad public release, do not work around it: install the last known-good
+version with an explicit pin while maintainers fix forward with a new release.
+
+## Not yet available
+
+The standalone binary installer, its vanity URL `install.betterborg.ai`, and a
+Homebrew formula are planned and not published. Use the PyPI package or the npm
+launcher above.

@@ -1,141 +1,73 @@
 # BetterBorg CLI
 
-BetterBorg CLI is the open source, local-first command-line interface for
-BetterBorg. This repository currently contains the public Python package
-foundation; repository and service features will be added incrementally.
+[![PyPI](https://img.shields.io/pypi/v/betterborg.svg?style=flat-square)](https://pypi.org/project/betterborg/)
+[![npm](https://img.shields.io/npm/v/@betterborg/cli.svg?style=flat-square)](https://www.npmjs.com/package/@betterborg/cli)
+![Python](https://img.shields.io/badge/Python-3.11%2B-brightgreen?style=flat-square)
 
-## Requirements
+BetterBorg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them — each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
 
-- Python 3.11 or newer
-- Python's `venv` module
-- Node.js 18 or newer (for npm launcher checks)
+> [!NOTE]
+> Pre-alpha. Interfaces may change between releases.
 
-## Install and run
+## Get started
 
-Install the latest release binary for Darwin or Linux, verify it, and activate
-integrations for installed supported hosts:
+1. Install the CLI:
 
-```console
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/betterborg/betterborg-cli/releases/latest/download/install.sh \
-  | sh
-```
+    ```bash
+    pip install betterborg
+    ```
 
-The installer selects ARM64 or x86_64 from the release manifest, verifies the
-binary's SHA-256 digest and exact version before atomically replacing
-`~/.local/bin/borg`, and only then runs `borg plugins install --all`. It prints
-PATH guidance when `~/.local/bin` is not already visible. Native Windows and
-WSL1 are unsupported; use a WSL2 shell. For another unsupported target, install
-uv and run `uvx --from betterborg borg version` as a non-persistent fallback;
-plugin activation still requires the persistent installer.
+2. Activate the agent-host integrations:
 
-For an ephemeral exact Python package invocation, or the npm launcher, use:
+    ```bash
+    borg plugins install --all
+    ```
 
-```console
-uvx --from betterborg borg version
+    Then run `/reload-plugins` in any open Claude Code session, and start a new Codex session when prompted.
+
+3. From inside a Git repository, run the loop:
+
+    ```bash
+    borg trust                     # trust this worktree (machine-local)
+    borg init                      # register and analyze the repository
+    borg create my-feature         # or: borg create my-feature --prd spec.md
+    borg plan start my-feature     # agents plan, review, and iterate
+    borg plan approve my-feature   # your gate — nothing is decomposed before this
+    borg task estimate my-feature  # P50/P80 work and cost
+    borg execute my-feature        # approve the estimate, then run
+    ```
+
+`borg execute` hands off reviewed local branches. Add `--push` or `--pr` to publish them. `borg --help` is the full command index.
+
+To try it without installing:
+
+```bash
 npx --yes @betterborg/cli version
 ```
 
-Pin `betterborg==VERSION` or `@betterborg/cli@VERSION` when reproducibility
-matters. The npm launcher uses a compatible installed CLI or a verified
-version-matched GitHub binary and falls back to exact-version `uvx`. See the
-[installation guide](docs/installation.md) for trust, provider, WSL2, and
-recovery guidance. `install.betterborg.ai` remains pending; use the live GitHub
-installer URL above.
+Plugin activation needs a persistent install, so it is skipped under `npx`.
 
-To install the CLI from a checkout and print its version instead:
+## Requirements
 
-```console
-python -m pip install .
-borg version
-```
+- Python 3.11+, on macOS or Linux. On Windows, use a WSL2 shell.
+- One agent transport: a `claude` or `codex` CLI on `PATH` and **already logged in**, or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` exported in your shell.
 
-The Python distribution is named `betterborg`; it installs the `borg` console
-command. Release versions are sourced from `betterborg_cli.__version__` and
-checked against npm metadata plus the bundled Claude and Codex plugin and
-marketplace manifests.
+Keep provider keys in your shell or a secret manager, never in `.borg/config.toml` or any tracked file.
 
-For development, create the locked environment and run the standard checks:
+## Documentation
 
-```console
-make sync
-make lint
-make test
-make build
-make binary
-```
+- [Installation guide](docs/installation.md) — version pinning, WSL2, providers, recovery
+- [Command guide](docs/commands.md) — bootstrap and initialization
+- [Release runbook](docs/releasing.md) — for maintainers
 
-`make build` creates the wheel and source distribution. `make binary` creates a
-local one-file `dist/borg` executable with the same package assets; neither
-target publishes an artifact.
+## Reporting bugs
 
-Release maintainers use the protected, manual process in
-[the release runbook](docs/releasing.md). Its default validation path does not
-publish. The protected path verifies PyPI before building attested one-file
-binaries for Darwin and Linux on ARM64 and x86_64.
+File a [GitHub issue](https://github.com/betterborg/betterborg-cli/issues).
 
-`borg version` and `borg --help` are bootstrap commands. They do not create or
-initialize a repository.
+## Contributing
 
-Install the user-scoped integrations for every available supported host after
-`borg version` works from the host launch environment:
-
-```console
-borg plugins install
-```
-
-Use `--host claude` or `--host codex` to select one host; `--all` makes the
-default explicit. The installer uses each host's supported marketplace and
-plugin commands and does not edit host settings directly. Run
-`/reload-plugins` in open Claude Code sessions after installation or an upgrade.
-
-Before a command can load repository configuration or prompts for a
-host-capable agent, trust the current Git workspace interactively:
-
-```console
-borg trust
-```
-
-For a deliberate noninteractive decision, use `borg trust --yes`. Trust is
-bound to the resolved repository and Git common-directory paths and is stored
-in the user's machine-local state directory, not in the repository.
-
-Noninteractive initialization also needs one agent transport. A `claude` or
-`codex` CLI on `PATH` is preferred; with neither installed, supply a provider
-API credential:
-
-```console
-export OPENAI_API_KEY='your-provider-key'
-borg init --yes
-```
-
-`ANTHROPIC_API_KEY` is supported as an alternative. Keep provider credentials
-in your shell or secret manager, never in `.borg/config.toml` or another
-tracked file. See the [command guide](docs/commands.md) for the bootstrap and
-initialization command shapes.
-
-Provider API agents use contained file tools that reject absolute paths,
-traversal, and symlinks escaping the run directory. Analysis and planning
-agents receive only those file tools. Coding, review, and merge agents may
-also receive an argv-only command runner after workspace trust. Avoiding a
-shell keeps metacharacters literal, but it is not a sandbox: programs invoked
-by the command runner remain host-capable. Native Claude and Codex tools are
-outside this API file-tool boundary.
-
-After plan approval publishes a current task generation, inspect its execution
-commitment with `borg task estimate <name>`. The estimate reports P50/P80 total
-agent work, local sample sizes, and API versus subscription billing separately.
-The bootstrap prior is prominently marked as dummy data and is gradually
-replaced by repository-local completions; subscription work is never assigned
-a fabricated USD value. Add `--json` for the machine-readable shape.
-
-## Development safety
-
-Follow [AGENTS.md](AGENTS.md) when using the private BetterBorg repository as a
-reference. In particular, reference checkouts are read-only: all changes for
-this package belong in this public repository.
+See [AGENTS.md](AGENTS.md) for repository rules and the standard `make` targets.
 
 ## License
 
-Copyright 2026 BetterBorg. Licensed under the
-[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+Copyright 2026 BetterBorg. Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

@@ -38,8 +38,9 @@ borg plugins install --host claude
 borg plugins install --host codex
 ```
 
-The persistent installer runs `--all` after binary verification. Re-run it
-after installing or logging in to a host. Open Claude Code sessions require
+Run `--all` once after installing the CLI, and again after installing or
+logging in to a host. Activation requires a persistent install and is refused
+under the `npx` and `uvx` wrappers. Open Claude Code sessions require
 `/reload-plugins` after installation or upgrade; start a new Codex session when
 the installer requests it.
 
