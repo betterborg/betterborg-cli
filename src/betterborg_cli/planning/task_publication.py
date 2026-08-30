@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.planning.pm import approved_plan_digest
 from betterborg_cli.planning.task_render import (
     render_task_markdown,
@@ -68,14 +69,16 @@ class TaskPublisher:
         store: SqliteStore,
         *,
         failure_injector: FailureInjector | None = None,
+        cancel: CancellationToken | None = None,
     ) -> None:
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository
         self.store = store
         self.paths = paths
         self.failure_injector = failure_injector
+        self.cancel = cancel
 
     def publish(self, generation_id: UUID) -> TaskPublication:
         """Durably publish one approved generation, resuming any prior attempt."""
@@ -382,7 +385,11 @@ class TaskPublisher:
     ) -> None:
         for published in files:
             try:
-                require_git_trackable(published.path, root=self.paths.root)
+                require_git_trackable(
+                    published.path,
+                    root=self.paths.root,
+                    cancel=self.cancel,
+                )
             except (RepositoryGitVisibilityError, RepositoryPathError) as error:
                 raise TaskPublicationError(str(error)) from error
 

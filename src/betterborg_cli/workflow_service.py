@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.execution_estimate import (
     EXECUTION_ESTIMATE_VERSION,
     estimate_generation,
@@ -88,12 +89,18 @@ def approve_plan_workflow(
     *,
     planning_agent: PlanningAgentFactory,
     on_bound: Callable[[], None] | None = None,
+    cancel: CancellationToken | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = _repository(store, config)
         borg = _borg(store, repository, name)
-        approval, plan_path = bind_plan_approval(paths, store, borg)
+        approval, plan_path = bind_plan_approval(
+            paths,
+            store,
+            borg,
+            cancel=cancel,
+        )
         if on_bound is not None:
             on_bound()
         borg = store.get_borg(borg.id)
@@ -110,11 +117,16 @@ def approve_plan_workflow(
                 pm_agent=agent,
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
+                cancel=cancel,
             ).run().borg
 
         publication = None
         if borg.state is BorgState.READY_TO_EXECUTE:
-            publication = TaskPublisher(repository, store).reconcile(borg.id)
+            publication = TaskPublisher(
+                repository,
+                store,
+                cancel=cancel,
+            ).reconcile(borg.id)
             if publication is None:
                 raise RuntimeError(
                     f"Borg {name!r} is ready to execute but has no current tasks"
@@ -134,6 +146,7 @@ def execute_workflow(
     *,
     decide: Callable[[dict[str, Any]], ExecutionDecisionRequest | None],
     invoke_host: HostInvoker,
+    cancel: CancellationToken | None = None,
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -143,7 +156,9 @@ def execute_workflow(
             raise ValueError(f"Borg {name!r} is not ready to execute")
 
         publication = TaskPublisher(
-            repository, store
+            repository,
+            store,
+            cancel=cancel,
         ).inspect_current_task_files(borg.id)
         generation = publication.generation
         approval = next(
@@ -243,6 +258,8 @@ def bind_plan_approval(
     paths: RepoPaths,
     store: SqliteStore,
     borg: Borg,
+    *,
+    cancel: CancellationToken | None = None,
 ) -> tuple[PlanApproval, Path]:
     """Bind or recover one approval for the latest exact Architect plan."""
     plan_attempt = validated_current_plan_attempt(paths, store, borg)
@@ -276,7 +293,7 @@ def bind_plan_approval(
         else:
             if existing != body:
                 raise ValueError(f"approved plan Markdown drifted: {relative_path}")
-        require_git_trackable(relative_path, root=paths.root)
+        require_git_trackable(relative_path, root=paths.root, cancel=cancel)
         return approval, plan_path
 
     if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
@@ -285,7 +302,7 @@ def bind_plan_approval(
             f"{borg.state.value!r}; a plan must be awaiting approval"
         )
     publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
-    require_git_trackable(relative_path, root=paths.root)
+    require_git_trackable(relative_path, root=paths.root, cancel=cancel)
     approval = PlanApproval(
         borg_id=borg.id,
         attempt_id=plan_attempt.id,

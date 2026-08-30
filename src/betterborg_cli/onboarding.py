@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
-from betterborg_cli.agent_runtime.base import AgentAdapter
+from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.prd_session import (
     Editor,
@@ -39,6 +39,7 @@ class CreateService:
         io: InteractiveIO | None = None,
         editor: Editor | None = None,
         interactive: bool = True,
+        cancel: CancellationToken | None = None,
     ) -> None:
         self._session = PrdSession(
             repository,
@@ -47,6 +48,7 @@ class CreateService:
             io=io,
             editor=editor,
             interactive=interactive,
+            cancel=cancel,
         )
 
     def create(

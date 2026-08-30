@@ -265,7 +265,7 @@ def _trusted_workspace_callback(function):
             )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             raise click.ClickException(str(error)) from error
-        return function(*args, repository_path=paths.root, **kwargs)
+        return function(*args, paths=paths, cancel=cancel, **kwargs)
 
     return guarded
 
@@ -278,9 +278,12 @@ def _trusted_workspace_callback(function):
     help="Trust without prompting after accepting the host-access consequence.",
 )
 @_trusted_workspace_callback
-def trust_workspace(repository_path: Path) -> None:
+def trust_workspace(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+) -> None:
     """Trust this workspace for host-capable agent operations."""
-    click.echo(f"Trusted workspace: {repository_path}")
+    click.echo(f"Trusted workspace: {paths.root}")
 
 
 @cli.command(name="init")
@@ -298,11 +301,11 @@ def trust_workspace(repository_path: Path) -> None:
 )
 @_trusted_workspace_callback
 def initialize_repository(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     json_output: bool,
 ) -> None:
     """Register and analyze the current Git repository."""
-    paths = RepoPaths.discover(repository_path)
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
     try:
@@ -318,6 +321,7 @@ def initialize_repository(
                     paths,
                     interactive=interactive,
                 ),
+                cancel=cancel,
             )
             result = service.initialize()
 
@@ -336,6 +340,7 @@ def initialize_repository(
                     ),
                     io=io,
                     editor=_edit_markdown,
+                    cancel=cancel,
                 )
                 OnboardingDispatcher(
                     result.repository,
@@ -384,11 +389,11 @@ def initialize_repository(
 )
 @_trusted_workspace_callback
 def analyze_repository(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     json_output: bool,
 ) -> None:
     """Re-analyze an initialized Git repository and refresh its outputs."""
-    paths = RepoPaths.discover(repository_path)
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
     try:
@@ -404,6 +409,7 @@ def analyze_repository(
                     paths,
                     interactive=interactive,
                 ),
+                cancel=cancel,
             ).analyze()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
@@ -450,7 +456,8 @@ def analyze_repository(
 )
 @_trusted_workspace_callback
 def create_borg(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     name: str,
     source: Path | None,
 ) -> None:
@@ -461,7 +468,6 @@ def create_borg(
         raise click.ClickException(str(error)) from error
     if not _stdin_is_interactive():
         raise click.ClickException("borg create requires an interactive terminal")
-    paths = RepoPaths.discover(repository_path)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -480,6 +486,7 @@ def create_borg(
                 ),
                 io=io,
                 editor=_edit_markdown,
+                cancel=cancel,
             ).create(name, source)
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
@@ -507,9 +514,13 @@ def plan() -> None:
     help="Trust this workspace without prompting before planning.",
 )
 @_trusted_workspace_callback
-def start_plan(repository_path: Path, name: str) -> None:
+def start_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+) -> None:
     """Start or resume planning for the named Borg."""
-    borg = _continue_planning(repository_path, name)
+    borg = _continue_planning(paths, name, cancel=cancel)
     _write_planning_gate(name, borg, changed=False)
 
 
@@ -734,15 +745,14 @@ def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
 )
 @_trusted_workspace_callback
 def execute_borg(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     name: str,
     auto_execute: bool,
     push_project: bool,
     open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
-    paths = RepoPaths.discover(repository_path)
-
     def decide(estimate):
         _write_execution_estimate(name, estimate)
         if auto_execute:
@@ -762,6 +772,7 @@ def execute_borg(
             name,
             decide=decide,
             invoke_host=_invoke_host_execution,
+            cancel=cancel,
         )
         generation = workflow.publication.generation
         if workflow.decision_event == "concurrent":
@@ -1339,9 +1350,12 @@ def _format_runtime_cost(value: object) -> str:
     help="Trust this workspace without prompting before decomposition.",
 )
 @_trusted_workspace_callback
-def approve_plan(repository_path: Path, name: str) -> None:
+def approve_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+) -> None:
     """Approve the current plan and prepare its executable task generation."""
-    paths = RepoPaths.discover(repository_path)
     resumable = False
 
     def mark_resumable() -> None:
@@ -1361,6 +1375,7 @@ def approve_plan(repository_path: Path, name: str) -> None:
                 interactive=_stdin_is_interactive(),
             ),
             on_bound=mark_resumable,
+            cancel=cancel,
         )
     except (SupervisorCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
@@ -1405,7 +1420,12 @@ def approve_plan(repository_path: Path, name: str) -> None:
     help="Trust this workspace without prompting before revising the plan.",
 )
 @_trusted_workspace_callback
-def change_plan(repository_path: Path, name: str, note: str | None) -> None:
+def change_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+    note: str | None,
+) -> None:
     """Request changes to a plan awaiting human approval."""
     if note is None:
         note = _prompt("Change note")
@@ -1413,19 +1433,19 @@ def change_plan(repository_path: Path, name: str, note: str | None) -> None:
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
-    borg = _continue_planning(repository_path, name, change_note=note)
+    borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
     _write_planning_gate(name, borg, changed=True)
 
 
 def _continue_planning(
-    repository_path: Path,
+    paths: RepoPaths,
     name: str,
     *,
     change_note: str | None = None,
     io: InteractiveIO | None = None,
+    cancel: CancellationToken | None = None,
 ) -> Borg:
     """Load and drain one initial or change-request planning lifecycle."""
-    paths = RepoPaths.discover(repository_path)
     change_requested = change_note is not None
     resumable = False
     try:
@@ -1480,6 +1500,7 @@ def _continue_planning(
                         store,
                         agent,
                         io=planning_io,
+                        cancel=cancel,
                     ).run().borg
                 borg = TechLeadLoop(
                     repository,
@@ -1488,6 +1509,7 @@ def _continue_planning(
                     agent,
                     architect_agent=agent,
                     io=planning_io,
+                    cancel=cancel,
                 ).run().borg
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()

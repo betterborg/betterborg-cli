@@ -112,6 +112,8 @@ class TechLeadLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise TechLeadCancelled("Tech Lead run cancelled")
         architect = architect_agent or agent
         require_read_only_agent(
             agent, role="Tech Lead", error_factory=TechLeadError
@@ -127,7 +129,7 @@ class TechLeadLoop:
         except AgentSelectionError as error:
             raise TechLeadError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository

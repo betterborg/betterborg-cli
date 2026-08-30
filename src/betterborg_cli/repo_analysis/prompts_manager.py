@@ -131,7 +131,7 @@ def generate_role_prompts(
     if resolved_config.effort is not None and agent.name == "anthropic":
         raise AnalyzerError("Anthropic does not support an effort override")
     model = resolve_analysis_model(agent, resolved_config.model)
-    paths = RepoPaths.discover(repository.root)
+    paths = RepoPaths.discover(repository.root, cancel=cancel)
     if paths.root != repository.root:
         raise ValueError("repository root does not match its discovered Git root")
 

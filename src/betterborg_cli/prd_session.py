@@ -140,7 +140,7 @@ class PrdSession:
     ) -> None:
         if store.get_repository(repository.id) != repository:
             raise ValueError("repository must already be present in the supplied store")
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         if interactive and io is None:

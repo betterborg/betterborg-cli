@@ -1,9 +1,12 @@
 """Filesystem contracts for repository-local BetterBorg data."""
 
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.repo_paths import (
@@ -12,6 +15,26 @@ from betterborg_cli.repo_paths import (
     RepoPaths,
     ensure_managed_gitignore,
 )
+
+
+@pytest.mark.parametrize(
+    "module",
+    (
+        "betterborg_cli.repo_paths",
+        "betterborg_cli.repository_config",
+        "betterborg_cli.repository_files",
+        "betterborg_cli.workspace_trust",
+    ),
+)
+def test_repository_modules_support_cold_imports(module: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_discover_uses_nearest_git_root(git_repo: Path) -> None:

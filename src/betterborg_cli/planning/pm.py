@@ -217,6 +217,8 @@ class ProjectManagerLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise ProjectManagerCancelled("Project Manager run cancelled")
         require_read_only_agent(
             agent, role="Project Manager", error_factory=ProjectManagerError
         )
@@ -225,7 +227,7 @@ class ProjectManagerLoop:
         except AgentSelectionError as error:
             raise ProjectManagerError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository

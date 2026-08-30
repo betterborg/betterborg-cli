@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
-from betterborg_cli.agent_runtime.base import AgentAdapter
+from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
@@ -77,10 +77,13 @@ class RepositoryService:
         paths: RepoPaths,
         store: SqliteStore,
         agent_factory: AgentFactory,
+        *,
+        cancel: CancellationToken | None = None,
     ) -> None:
         self.paths = paths
         self.store = store
         self._agent_factory = agent_factory
+        self.cancel = cancel
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
@@ -107,6 +110,7 @@ class RepositoryService:
                 self.store,
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "analysis",
+                cancel=self.cancel,
             )
 
         self._write_score(analysis)
@@ -147,6 +151,7 @@ class RepositoryService:
             self.store,
             agent,
             artifact_dir=self.paths.artifacts_dir / "analysis",
+            cancel=self.cancel,
         )
         previous_analysis = self.store.get_prior_ready_analysis(
             repository.id,
@@ -166,6 +171,7 @@ class RepositoryService:
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=PROMPT_ROLES,
+                cancel=self.cancel,
             )
         )
         _require_complete_prompts(prompt_runs)
@@ -280,6 +286,7 @@ class RepositoryService:
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=missing_roles,
+                cancel=self.cancel,
             )
         )
 

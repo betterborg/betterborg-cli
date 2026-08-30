@@ -232,6 +232,7 @@ class DurablePlanningTurns:
             current_plan=current_plan,
             dirty_borg_documents=self.dirty_borg_documents,
             worktrees_root=self.worktrees_root,
+            cancel=self.cancel,
         ) as worktree:
             yield worktree
 

@@ -67,14 +67,6 @@ from betterborg_cli.agent_runtime.retry import (
     retry_outcome_to_result,
     run_with_transient_retry,
 )
-from betterborg_cli.agent_runtime.selection import (
-    AgentSelectionError,
-    SelectedAgent,
-    require_read_only_agent,
-    resolve_adapter_model,
-    resolve_agent_model,
-    select_agent,
-)
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     extract_json,
@@ -83,6 +75,26 @@ from betterborg_cli.agent_runtime.structured import (
     validate_structured_result,
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
+
+_SELECTION_EXPORTS = {
+    "AgentSelectionError",
+    "SelectedAgent",
+    "require_read_only_agent",
+    "resolve_adapter_model",
+    "resolve_agent_model",
+    "select_agent",
+}
+
+
+def __getattr__(name: str):
+    """Load selection exports without imposing its repository import graph."""
+    if name not in _SELECTION_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from betterborg_cli.agent_runtime import selection
+
+    value = getattr(selection, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "DEFAULT_TRANSIENT_BACKOFF_SECONDS",

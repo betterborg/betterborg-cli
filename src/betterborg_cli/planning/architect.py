@@ -228,6 +228,8 @@ class ArchitectLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise ArchitectCancelled("Architect run cancelled")
         require_read_only_agent(
             agent, role="Architect", error_factory=ArchitectError
         )
@@ -236,7 +238,7 @@ class ArchitectLoop:
         except AgentSelectionError as error:
             raise ArchitectError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository

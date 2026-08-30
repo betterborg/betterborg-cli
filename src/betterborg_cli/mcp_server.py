@@ -1020,7 +1020,7 @@ def _plan(
         raise ValueError("plan change note must not be empty")
     try:
         borg = cli_module._continue_planning(
-            paths.root,
+            paths,
             name,
             change_note=note.strip() if action == "change" and note else None,
             io=io,

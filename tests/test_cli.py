@@ -683,6 +683,41 @@ def test_trust_command_forwards_root_cancellation_token(
     assert observed == [("paths", cancel), ("trust", cancel)]
 
 
+def test_trusted_callback_reuses_discovered_paths_and_root_token(
+    cli_runner: CliRunner,
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    cancel = cli_module.CancellationToken()
+    run = cli_module.CliRunContext(cancel, RunProgress())
+    paths = RepoPaths.discover(git_repo)
+    discoveries: list[object] = []
+    callback_arguments: list[tuple[RepoPaths, object]] = []
+
+    def discover(cls, start=None, *, cancel=None, command_runner=None):
+        discoveries.append(cancel)
+        return paths
+
+    @click.command()
+    @cli_module._trusted_workspace_callback
+    def command(paths: RepoPaths, cancel: object) -> None:
+        callback_arguments.append((paths, cancel))
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(discover))
+    monkeypatch.setattr(
+        cli_module,
+        "require_workspace_trust",
+        lambda _paths, **_kwargs: None,
+    )
+
+    result = cli_runner.invoke(command, obj=run)
+
+    assert result.exit_code == 0, result.output
+    assert discoveries == [cancel]
+    assert callback_arguments == [(paths, cancel)]
+
+
 def test_untrusted_noninteractive_command_rejects_before_callback(
     cli_runner: CliRunner,
     git_repo: Path,

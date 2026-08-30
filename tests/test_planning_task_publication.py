@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.planning import (
     TaskDigestDriftError,
+    TaskPublicationError,
     TaskPublisher,
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.planning import task_publication as publication_module
+from betterborg_cli.repository_files import require_git_trackable
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -144,6 +153,93 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
         expected.write_text("# drifted\n", encoding="utf-8")
         with pytest.raises(TaskDigestDriftError, match="digest drifted"):
             TaskPublisher(repository, store).current_task_files(borg.id)
+
+
+def test_publication_visibility_uses_run_token_before_database_promotion(
+    committed_git_repo: Path,
+    approved_task_generation,
+    real_process_harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = committed_git_repo.parent / "cancelled-publication.sqlite3"
+    repository, borg, approval = _publication_context(committed_git_repo, database)
+    with SqliteStore.open(database) as store:
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-cancelled"),
+            round_number=1,
+        ).generation
+
+    publication_cancel = CancellationToken()
+    errors: list[BaseException] = []
+    checkpoints: list[str] = []
+
+    def blocked_visibility(path: Path, *, root: Path, cancel=None) -> None:
+        assert cancel is publication_cancel
+
+        def runner(
+            _command: list[str], **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            return run_captured(
+                real_process_harness.resistant_argv("publication-visibility"),
+                check=kwargs["check"],
+                cancel=kwargs["cancel"],
+            )
+
+        require_git_trackable(
+            path,
+            root=root,
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    monkeypatch.setattr(
+        publication_module,
+        "require_git_trackable",
+        blocked_visibility,
+    )
+
+    def publish() -> None:
+        try:
+            with SqliteStore.open(database) as store:
+                TaskPublisher(
+                    repository,
+                    store,
+                    failure_injector=checkpoints.append,
+                    cancel=publication_cancel,
+                ).publish(generation.id)
+        except BaseException as error:
+            errors.append(error)
+
+    exits: list[int] = []
+    control = RunControl(publication_cancel, exit_function=exits.append).install()
+    worker = threading.Thread(target=publish)
+    try:
+        worker.start()
+        real_process_harness.wait_for_marker("publication-visibility.parent.pid")
+        real_process_harness.wait_for_marker("publication-visibility.child.pid")
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except KeyboardInterrupt:
+            pass
+        assert control.wait_for_cancellation(timeout=1)
+        worker.join(timeout=2)
+    finally:
+        control.close()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TaskPublicationError)
+    assert "before_db_commit" not in checkpoints
+    assert exits == [130]
+    with SqliteStore.open(database) as store:
+        persisted = store.get_task_generation(generation.id)
+    assert persisted is not None
+    assert persisted.status is TaskGenerationStatus.PREPARING
+    real_process_harness.assert_tree_absent("publication-visibility")
 
 
 @pytest.mark.parametrize(

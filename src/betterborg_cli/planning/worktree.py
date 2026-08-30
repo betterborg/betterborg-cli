@@ -11,6 +11,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.repo_analysis import (
     build_machine_report,
     render_markdown_report,
@@ -53,6 +54,7 @@ def materialize_planning_worktree(
     current_plan: str | None = None,
     dirty_borg_documents: Sequence[Path] = (),
     worktrees_root: Path | None = None,
+    cancel: CancellationToken | None = None,
 ) -> Iterator[Path]:
     """Yield an ephemeral detached worktree with current planning evidence.
 
@@ -61,7 +63,7 @@ def materialize_planning_worktree(
     cross the checkout boundary only when the caller names a dirty ``.borg``
     document explicitly.
     """
-    paths = _validate_inputs(repository, borg, store)
+    paths = _validate_inputs(repository, borg, store, cancel=cancel)
     supplied_documents = _read_deliberate_borg_documents(
         paths.root, dirty_borg_documents
     )
@@ -134,7 +136,11 @@ def materialize_planning_worktree(
 
 
 def _validate_inputs(
-    repository: Repository, borg: Borg, store: SqliteStore
+    repository: Repository,
+    borg: Borg,
+    store: SqliteStore,
+    *,
+    cancel: CancellationToken | None = None,
 ) -> RepoPaths:
     if store.get_repository(repository.id) != repository:
         raise PlanningWorktreeError(
@@ -144,7 +150,7 @@ def _validate_inputs(
         raise PlanningWorktreeError(
             "Borg must already belong to the supplied repository and store"
         )
-    paths = RepoPaths.discover(repository.root)
+    paths = RepoPaths.discover(repository.root, cancel=cancel)
     if paths.root != repository.root:
         raise PlanningWorktreeError(
             "repository root does not match its discovered Git root"

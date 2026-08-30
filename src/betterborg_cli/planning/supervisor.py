@@ -140,6 +140,8 @@ class SupervisorLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise SupervisorCancelled("Supervisor run cancelled")
         project_manager = pm_agent or agent
         require_read_only_agent(
             agent, role="Supervisor", error_factory=SupervisorError
@@ -153,7 +155,7 @@ class SupervisorLoop:
         except AgentSelectionError as error:
             raise SupervisorError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository
@@ -303,7 +305,11 @@ class SupervisorLoop:
             if decision == "approve":
                 try:
                     generation = (
-                        TaskPublisher(self.repository, self.store)
+                        TaskPublisher(
+                            self.repository,
+                            self.store,
+                            cancel=self.cancel,
+                        )
                         .publish(generation.id)
                         .generation
                     )
@@ -595,7 +601,9 @@ class SupervisorLoop:
         }:
             try:
                 publication = TaskPublisher(
-                    self.repository, self.store
+                    self.repository,
+                    self.store,
+                    cancel=self.cancel,
                 ).reconcile(self.borg_id)
                 if publication is None or publication.generation.id != generation.id:
                     return None
