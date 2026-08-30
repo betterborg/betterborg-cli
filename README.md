@@ -3,6 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/betterborg.svg?style=flat-square)](https://pypi.org/project/betterborg/)
 [![npm](https://img.shields.io/npm/v/@betterborg/cli.svg?style=flat-square)](https://www.npmjs.com/package/@betterborg/cli)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-brightgreen?style=flat-square)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
 BetterBorg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them — each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
 
@@ -70,4 +71,4 @@ See [AGENTS.md](AGENTS.md) for repository rules and the standard `make` targets.
 
 ## License
 
-Copyright 2026 BetterBorg. Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+Copyright 2026 BetterBorg. Licensed under the [MIT License](LICENSE). See [NOTICE](NOTICE) for attribution.
