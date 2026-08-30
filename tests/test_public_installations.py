@@ -8,8 +8,8 @@ import urllib.parse
 from pathlib import Path
 
 import pytest
-
 from release_test_support import load_script
+
 from scripts import protected_smoke
 
 verify_public_installations = load_script("verify_public_installations")

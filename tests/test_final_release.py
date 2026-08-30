@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from release_test_support import (
     REPOSITORY_ROOT,
     load_script,

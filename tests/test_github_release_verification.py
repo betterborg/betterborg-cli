@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from release_test_support import load_script, write_binary_artifact_set
 
 verify_github_release = load_script("verify_github_release")
