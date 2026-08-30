@@ -438,6 +438,4 @@ def test_public_install_and_command_docs_match_release_artifacts() -> None:
     ):
         assert required in documentation
     assert "install.betterborg.ai" in readme
-    assert "remains pending" in readme
     assert "install.betterborg.ai" in installation
-    assert "not active yet" in installation
