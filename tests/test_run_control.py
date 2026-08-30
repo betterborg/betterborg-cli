@@ -120,6 +120,69 @@ def test_second_sigint_waits_for_every_window_and_rejects_new_windows() -> None:
     control.close()
 
 
+def test_second_sigint_directly_signals_already_published_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel = CancellationToken()
+    forced = threading.Event()
+    registration = cancel.register(
+        lambda: None,
+        forced.set,
+        force_target=ForceTarget("published-worker", process_group_id=4242),
+    )
+    calls: list[tuple[int, signal.Signals, int]] = []
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group_id, sent_signal: calls.append(
+            (process_group_id, sent_signal, threading.get_ident())
+        ),
+    )
+    dispatcher_force_started = threading.Event()
+    release_dispatcher_force = threading.Event()
+    exits: list[int] = []
+    output = io.StringIO()
+    control = RunControl(
+        cancel,
+        force_stream=output,
+        exit_function=exits.append,
+    ).install()
+    original_request_force = control._request_force
+
+    def delayed_dispatcher_force(windows: tuple[object, ...]) -> None:
+        dispatcher_force_started.set()
+        release_dispatcher_force.wait()
+        original_request_force(windows)
+
+    monkeypatch.setattr(control, "_request_force", delayed_dispatcher_force)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _press_sigint()
+        assert control.wait_for_cancellation(1)
+
+        handler_thread = threading.get_ident()
+        _press_sigint()
+
+        try:
+            assert dispatcher_force_started.wait(1)
+            assert calls == [(4242, signal.SIGKILL, handler_thread)]
+            assert not forced.is_set()
+        finally:
+            release_dispatcher_force.set()
+        assert control.wait_for_force(1)
+        assert forced.is_set()
+        deadline = time.monotonic() + 1
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert exits == [INTERRUPTED_EXIT_CODE]
+        assert output.getvalue() == "Force stopping...\n"
+        assert registration.unregister()
+    finally:
+        release_dispatcher_force.set()
+        registration.unregister()
+        control.close()
+
+
 def test_precreation_failure_settles_forced_exit_without_target() -> None:
     cancel = CancellationToken()
     window = cancel.registration_window()
@@ -142,27 +205,38 @@ def test_precreation_failure_settles_forced_exit_without_target() -> None:
     control.close()
 
 
-def test_watchdog_uses_bounded_grace_and_forces_after_deadline() -> None:
+def test_watchdog_uses_production_grace_boundary() -> None:
     assert DEFAULT_FORCE_GRACE_SECONDS == 1.0
-    cancel = CancellationToken(grace_seconds=0.02)
+    now = [10.0]
+
+    def clock() -> float:
+        return now[0]
+
     exits: list[int] = []
     control = RunControl(
-        cancel,
-        force_grace_seconds=0.02,
+        clock=clock,
+        force_stream=io.StringIO(),
         exit_function=exits.append,
     ).install()
-    section = control.protected()
-    section.__enter__()
-    _press_sigint()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _press_sigint()
+        assert control.wait_for_cancellation(1)
 
-    assert control.wait_for_force(1)
-    deadline = time.monotonic() + 1
-    while not exits and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert exits == [INTERRUPTED_EXIT_CODE]
-    with pytest.raises(KeyboardInterrupt):
-        section.__exit__(None, None, None)
-    control.close()
+        now[0] += DEFAULT_FORCE_GRACE_SECONDS - 0.001
+        control._wake_dispatcher(b"t")
+        assert not control.wait_for_force(0.05)
+        assert exits == []
+
+        now[0] += 0.001
+        control._wake_dispatcher(b"t")
+        assert control.wait_for_force(1)
+        deadline = time.monotonic() + 1
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert exits == [INTERRUPTED_EXIT_CODE]
+    finally:
+        control.close()
 
 
 def test_force_includes_window_published_during_snapshot_capture(
