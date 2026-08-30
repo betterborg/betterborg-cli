@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_adapter_harness import claude_spec, write_native_output
+from test_adapter_harness import (
+    claude_spec,
+    native_event_stream,
+    write_native_output,
+)
 
 from betterborg_cli.agent_runtime import (
     AgentActivity,
@@ -50,12 +54,6 @@ def _envelope(
     if turns is not None:
         payload["num_turns"] = turns
     return json.dumps(payload)
-
-
-def _stream(*events: str | Mapping[str, Any]) -> str:
-    return "\n".join(
-        event if isinstance(event, str) else json.dumps(event) for event in events
-    )
 
 
 def _tool_event(name: str, tool_input: Mapping[str, Any]) -> dict[str, Any]:
@@ -132,7 +130,7 @@ def test_native_tool_events_emit_neutral_activity_without_changing_logs(
     expected: AgentActivity,
 ) -> None:
     activities: list[AgentActivity] = []
-    transcript = _stream(
+    transcript = native_event_stream(
         _tool_event(tool_name, tool_input),
         _envelope(
             {"status": "completed", "version": "activity"},
@@ -169,7 +167,7 @@ def test_fragmented_large_tool_event_emits_activity_without_changing_log(
     tmp_path: Path,
 ) -> None:
     activities: list[AgentActivity] = []
-    transcript = _stream(
+    transcript = native_event_stream(
         _tool_event(
             "Write",
             {
@@ -213,7 +211,7 @@ def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
     tmp_path: Path,
 ) -> None:
     activities: list[AgentActivity] = []
-    transcript = _stream(
+    transcript = native_event_stream(
         "not-json",
         _tool_event("UnknownProviderTool", {"provider_detail": "secret"}),
         _tool_event("Read", {"path": "missing-file-path"}),
@@ -248,7 +246,7 @@ def test_activity_callback_failure_does_not_change_native_result(
     tmp_path: Path,
 ) -> None:
     callback_calls = 0
-    transcript = _stream(
+    transcript = native_event_stream(
         _tool_event("Read", {"file_path": "README.md"}),
         _envelope({"status": "completed", "version": "callback"}),
     )
@@ -305,7 +303,7 @@ def test_native_command_validates_and_persists_result_metadata(
         )
         write_native_output(
             log_path,
-            _stream(
+            native_event_stream(
                 {"type": "system", "subtype": "init", "session_id": "test"},
                 {"type": "assistant", "message": {"content": [{"type": "text"}]}},
                 _envelope(
@@ -578,7 +576,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
 def test_stream_json_and_prose_wrapped_result_are_supported(
     tmp_path: Path,
 ) -> None:
-    transcript = _stream(
+    transcript = native_event_stream(
         {"type": "system", "subtype": "init"},
         {"type": "assistant", "message": {"content": []}},
         _envelope(

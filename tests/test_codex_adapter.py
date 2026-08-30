@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_adapter_harness import codex_spec, write_native_output
+from test_adapter_harness import (
+    codex_spec,
+    native_event_stream,
+    write_native_output,
+)
 
 from betterborg_cli.agent_runtime import (
     AgentActivity,
@@ -47,12 +51,6 @@ def _usage_event(
 def _write_invocation_result(command: Sequence[str], payload: Any) -> None:
     result_path = Path(command[command.index("-o") + 1])
     result_path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def _stream(*events: str | Mapping[str, Any]) -> str:
-    return "\n".join(
-        event if isinstance(event, str) else json.dumps(event) for event in events
-    )
 
 
 def _item_event(
@@ -144,7 +142,7 @@ def test_native_item_events_emit_neutral_activity_without_changing_logs(
     expected: AgentActivity,
 ) -> None:
     activities: list[AgentActivity] = []
-    transcript = _stream(
+    transcript = native_event_stream(
         _item_event(event_type, item_type, **item),
         _usage_event(10, 4, 3),
     )
@@ -222,7 +220,7 @@ def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
     tmp_path: Path,
 ) -> None:
     activities: list[AgentActivity] = []
-    transcript = _stream(
+    transcript = native_event_stream(
         "not-json",
         {"type": "item.started", "item": "malformed"},
         _item_event("item.started", "unknown_provider_item", provider_name="secret"),
