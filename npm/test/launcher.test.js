@@ -31,6 +31,14 @@ function executable(directory, name, content = "") {
   return pathname;
 }
 
+// Windows has no POSIX permission bits; chmod there only toggles read-only.
+function assertExecutableMode(pathname) {
+  if (process.platform === "win32") {
+    return;
+  }
+  assert.equal(fs.statSync(pathname).mode & 0o777, 0o755);
+}
+
 test("package metadata exposes the public scoped borg command", () => {
   assert.equal(metadata.name, "@betterborg/cli");
   assert.equal(metadata.bin.borg, "bin/borg.js");
@@ -290,7 +298,7 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
     "borg-darwin-arm64",
     "borg-darwin-arm64.sha256",
   ]);
-  assert.equal(fs.statSync(resolved.command).mode & 0o777, 0o755);
+  assertExecutableMode(resolved.command);
 
   fs.chmodSync(resolved.command, 0o600);
   const reused = await resolveCli("1.2.3", {
@@ -303,7 +311,7 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
     platform: "darwin",
   });
   assert.equal(reused.command, resolved.command);
-  assert.equal(fs.statSync(reused.command).mode & 0o777, 0o755);
+  assertExecutableMode(reused.command);
 });
 
 test(
