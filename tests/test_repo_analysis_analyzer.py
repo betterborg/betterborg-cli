@@ -5,17 +5,28 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.base import AgentCapabilities
 from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent, select_agent
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repo_analysis import (
     DIMENSIONS,
     AnalyzerConfig,
@@ -233,6 +244,133 @@ def test_invalid_analyzer_output_is_not_persisted(git_repo: Path) -> None:
             )
 
         assert store.list_analyses(repository.id) == []
+
+
+def test_git_head_cancellation_stops_discovery_before_workspace_or_agent(
+    git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    _commit_repository(git_repo)
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=_payload()))
+    cancel = CancellationToken(grace_seconds=0.05)
+    progress = RunProgress(
+        [
+            StageSpec("discover", "Discover evidence"),
+            StageSpec("analyze", "Analyze repository"),
+        ],
+        stream=StringIO(),
+    )
+    workspace = git_repo.parent / "analysis-workspace"
+    errors: list[BaseException] = []
+
+    def command_runner(
+        _command: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return run_captured(
+            real_process_harness.resistant_argv("git-head"),
+            cancel=kwargs["cancel"],
+            check=bool(kwargs["check"]),
+        )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+
+        def analyze() -> None:
+            try:
+                run_analyzer(
+                    repository,
+                    store,
+                    adapter,
+                    artifact_dir=git_repo / "artifacts",
+                    workspace_dir=workspace,
+                    cancel=cancel,
+                    progress=progress,
+                    command_runner=command_runner,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=analyze)
+        worker.start()
+        real_process_harness.wait_for_marker("git-head.parent.pid")
+        real_process_harness.wait_for_marker("git-head.child.pid")
+        cancel.cancel()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], KeyboardInterrupt)
+        assert progress.stages["discover"].state is StageState.STOPPED
+        assert progress.stages["analyze"].state is StageState.PENDING
+        assert store.list_analyses(repository.id) == []
+
+    real_process_harness.assert_tree_absent("git-head")
+    assert not workspace.exists()
+    assert adapter.calls == []
+
+
+def test_git_head_keeps_ordinary_unreadable_head_classification(
+    git_repo: Path,
+) -> None:
+    _commit_repository(git_repo)
+    repository = Repository(root=git_repo)
+    command: list[str] = []
+
+    def rejected(
+        argv: Sequence[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        command.extend(argv)
+        return subprocess.CompletedProcess(argv, 128, "", "unreadable")
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="readable Git HEAD"):
+            run_analyzer(
+                repository,
+                store,
+                MockAdapter(),
+                artifact_dir=git_repo / "artifacts",
+                command_runner=rejected,
+            )
+
+    assert command[-2:] == ["rev-parse", "HEAD"]
+
+
+def test_analyzer_forwards_agent_activity_and_completes_after_persistence(
+    git_repo: Path,
+) -> None:
+    _commit_repository(git_repo)
+    repository = Repository(root=git_repo)
+    activity = AgentActivity(AgentActivityKind.READING, "README.md")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=_payload(), activities=(activity,))
+    )
+    progress = RunProgress(
+        [
+            StageSpec("discover", "Discover evidence"),
+            StageSpec("analyze", "Analyze repository"),
+        ],
+        stream=StringIO(),
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+            progress=progress,
+        )
+
+        assert store.list_analyses(repository.id) == [analysis]
+
+    assert progress.stages["discover"].state is StageState.COMPLETED
+    analyze = progress.stages["analyze"]
+    assert analyze.state is StageState.COMPLETED
+    assert analyze.activity == activity
+    assert analyze.result == "score 3.00/5"
 
 
 def test_analyzer_resolves_the_anthropic_default_model(git_repo: Path) -> None:

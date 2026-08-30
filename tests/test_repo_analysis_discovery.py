@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 
 import pytest
+from pytest import MonkeyPatch
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.repo_analysis.discovery import (
     DiscoveryLimits,
     build_discovery_workspace,
@@ -226,6 +228,35 @@ def test_discovery_stops_on_monotonic_deadline(tmp_path: Path) -> None:
     assert manifest.files == []
     assert any(omission.reason == "deadline_exceeded" for omission in manifest.omitted)
     assert (workspace / "analysis_input.json").is_file()
+
+
+def test_discovery_cancellation_stops_further_copying(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    (repo / "README.md").write_text("docs", encoding="utf-8")
+    (repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    cancel = CancellationToken()
+    copied: list[Path] = []
+    original_write_bytes = Path.write_bytes
+
+    def cancel_after_first_copy(path: Path, data: bytes) -> int:
+        written = original_write_bytes(path, data)
+        if path.is_relative_to(workspace / "files"):
+            copied.append(path)
+            cancel.cancel()
+        return written
+
+    monkeypatch.setattr(Path, "write_bytes", cancel_after_first_copy)
+
+    with pytest.raises(KeyboardInterrupt):
+        build_discovery_workspace(repo, workspace, cancel=cancel)
+
+    assert len(copied) == 1
+    assert len(list((workspace / "files").rglob("*.*"))) == 1
+    assert not (workspace / "analysis_input.json").exists()
 
 
 def test_discovery_workspace_is_sanitized_and_manifest_matches_files(

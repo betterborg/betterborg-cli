@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import TypeAlias
 
 from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.progress import RunProgress, StageSpec
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
     ImprovementPrd,
@@ -79,11 +81,16 @@ class RepositoryService:
         agent_factory: AgentFactory,
         *,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self.paths = paths
         self.store = store
         self._agent_factory = agent_factory
         self.cancel = cancel
+        self.progress = progress
+        if progress is not None:
+            progress.declare(StageSpec("discover", "Discover evidence"))
+            progress.declare(StageSpec("analyze", "Analyze repository"))
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
@@ -91,6 +98,8 @@ class RepositoryService:
         ensure_managed_gitignore(self.paths)
 
         analysis = self.store.get_prior_ready_analysis(repository.id)
+        if analysis is not None:
+            self._seed_retained_analysis(analysis)
         if self._is_initialized(repository):
             if analysis is None:
                 raise RepositoryInitializationError(
@@ -111,6 +120,7 @@ class RepositoryService:
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "analysis",
                 cancel=self.cancel,
+                progress=self.progress,
             )
 
         self._write_score(analysis)
@@ -152,6 +162,7 @@ class RepositoryService:
             agent,
             artifact_dir=self.paths.artifacts_dir / "analysis",
             cancel=self.cancel,
+            progress=self.progress,
         )
         previous_analysis = self.store.get_prior_ready_analysis(
             repository.id,
@@ -226,7 +237,7 @@ class RepositoryService:
         return repository, config
 
     def _write_initial_config(self, repository: Repository) -> None:
-        default_branch = _default_branch(self.paths.root)
+        default_branch = _default_branch(self.paths.root, cancel=self.cancel)
         body = (
             f"version = {CONFIG_VERSION}\n\n"
             "[repository]\n"
@@ -250,6 +261,18 @@ class RepositoryService:
         return any(
             operation.kind == _INITIALIZED_OPERATION
             for operation in self.store.list_operations(repository.id)
+        )
+
+    def _seed_retained_analysis(self, analysis: RepositoryAnalysis) -> None:
+        if self.progress is None:
+            return
+        self.progress.seed_completed(
+            "discover",
+            f"evidence retained for analysis {analysis.id}",
+        )
+        self.progress.seed_completed(
+            "analyze",
+            f"score {analysis.overall_score:.2f}/5",
         )
 
     def _write_score(self, analysis: RepositoryAnalysis) -> None:
@@ -285,19 +308,30 @@ class RepositoryService:
         )
 
 
-def _default_branch(repository_root: Path) -> str:
+def _default_branch(
+    repository_root: Path,
+    *,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+) -> str:
+    command = ["git", "-C", str(repository_root), "symbolic-ref", "--short", "HEAD"]
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repository_root), "symbolic-ref", "--short", "HEAD"],
+        result = command_runner(
+            command,
             check=True,
-            capture_output=True,
-            text=True,
+            cancel=cancel,
         )
     except subprocess.CalledProcessError as error:
         raise RepositoryInitializationError(
             "cannot initialize a repository while Git HEAD is detached"
         ) from error
+    if result.returncode == -1 and cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
     branch = result.stdout.strip()
+    if result.returncode != 0:
+        raise RepositoryInitializationError(
+            "cannot initialize a repository while Git HEAD is detached"
+        )
     if not branch:
         raise RepositoryInitializationError("cannot determine the default Git branch")
     return branch

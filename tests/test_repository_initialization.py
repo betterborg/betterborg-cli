@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import threading
+from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -13,16 +17,20 @@ from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli import repository_files as repository_files_module
+from betterborg_cli import repository_service as repository_service_module
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
-from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
+from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES, run_analyzer
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
 from betterborg_cli.repository_service import (
     RepositoryInitializationError,
     RepositoryService,
+    _default_branch,
 )
 from betterborg_cli.store import (
     Borg,
@@ -162,7 +170,11 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     second = cli_runner.invoke(cli, ["init", "--yes"])
 
     assert second.exit_code == 0, second.output
-    assert second.output == f"Repository already initialized: {config.repository_id}\n"
+    assert "completed Discover evidence" in second.output
+    assert "completed Analyze repository" in second.output
+    assert second.output.endswith(
+        f"Repository already initialized: {config.repository_id}\n"
+    )
     assert paths.gitignore.read_text(encoding="utf-8") == first_ignore
     assert first_ignore.count(MANAGED_IGNORE_BEGIN) == 1
     assert len(adapter.calls) == 4
@@ -433,10 +445,12 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     result = cli_runner.invoke(cli, ["analyze"])
 
     assert result.exit_code == 0, result.output
-    assert result.output == (
+    assert result.output.endswith(
         f"Analyzed repository {config.repository_id}: score 4.00/5 "
         "(previous 3.00/5, delta +1.00).\n"
     )
+    assert "completed Discover evidence — 1 evidence files" in result.output
+    assert "completed Analyze repository — score 4.00/5" in result.output
     assert load_repository_config(paths).repository_id == config.repository_id
     assert confirmed_path.read_text(encoding="utf-8") == confirmed_body
     assert not paths.improvement_prds_dir.joinpath("theme-ci.md").exists()
@@ -613,3 +627,143 @@ def test_analyze_rejects_an_uninitialized_repository(
     assert result.exit_code == 1
     assert "repository is not initialized; run 'borg init' first" in result.output
     assert not paths.tracked_dir.joinpath("config.toml").exists()
+
+
+def test_default_branch_cancellation_reaps_process_tree_and_starts_no_later_work(
+    committed_git_repo: Path,
+    real_process_harness: Any,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    cancel = CancellationToken(grace_seconds=0.05)
+    factory_calls = 0
+    errors: list[BaseException] = []
+
+    def command_runner(
+        _command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return run_captured(
+            real_process_harness.resistant_argv("default-branch"),
+            cancel=kwargs["cancel"],
+            check=bool(kwargs["check"]),
+        )
+
+    def blocking_default_branch(
+        repository_root: Path, *, cancel: CancellationToken | None = None
+    ) -> str:
+        return _default_branch(
+            repository_root,
+            cancel=cancel,
+            command_runner=command_runner,
+        )
+
+    def agent_factory(_config):
+        nonlocal factory_calls
+        factory_calls += 1
+        return MockAdapter()
+
+    monkeypatch.setattr(
+        repository_service_module,
+        "_default_branch",
+        blocking_default_branch,
+    )
+    with SqliteStore.open(paths.state_dir / "cancel-default.sqlite3") as store:
+        service = RepositoryService(paths, store, agent_factory, cancel=cancel)
+
+        def initialize() -> None:
+            try:
+                service.initialize()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=initialize)
+        worker.start()
+        real_process_harness.wait_for_marker("default-branch.parent.pid")
+        real_process_harness.wait_for_marker("default-branch.child.pid")
+        cancel.cancel()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], KeyboardInterrupt)
+    real_process_harness.assert_tree_absent("default-branch")
+    assert not (paths.tracked_dir / CONFIG_FILENAME).exists()
+    assert factory_calls == 0
+
+
+def test_default_branch_keeps_detached_head_classification(
+    committed_git_repo: Path,
+) -> None:
+    def rejected(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", "detached")
+
+    with pytest.raises(
+        RepositoryInitializationError,
+        match="Git HEAD is detached",
+    ):
+        _default_branch(committed_git_repo, command_runner=rejected)
+
+
+def test_incomplete_initialization_seeds_retained_analysis_without_restart(
+    committed_git_repo: Path,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    initial_adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=_analysis_payload())
+    )
+
+    with SqliteStore.open(paths.state_dir / "retained.sqlite3") as store:
+        setup = RepositoryService(paths, store, lambda _config: initial_adapter)
+        repository, _config = setup._ensure_repository()
+        analysis = run_analyzer(
+            repository,
+            store,
+            initial_adapter,
+            artifact_dir=paths.artifacts_dir / "analysis",
+        )
+        paths.prompts_dir.mkdir(parents=True, exist_ok=True)
+        for role in ("coding", "merge"):
+            body = f"# {role.title()} agent\n\nRetained role instructions."
+            (paths.prompts_dir / f"{role}.system.md").write_text(
+                body,
+                encoding="utf-8",
+            )
+            store.append_generated_prompt(
+                repository_id=repository.id,
+                analysis_id=analysis.id,
+                role=role,
+                body_md=body,
+            )
+
+        retry_adapter = MockAdapter(name="openai").queue(
+            MockResponse(
+                payload={
+                    "body_md": (
+                        "# Review agent\n\nComplete repository-specific review "
+                        "instructions."
+                    )
+                }
+            )
+        )
+        progress = RunProgress(stream=StringIO())
+        result = RepositoryService(
+            paths,
+            store,
+            lambda _config: retry_adapter,
+            progress=progress,
+        ).initialize()
+
+        assert result.analysis == analysis
+        assert [call.result_path.name for call in retry_adapter.calls] == [
+            f"{analysis.id}.review.json"
+        ]
+
+    for key in ("discover", "analyze"):
+        record = progress.stages[key]
+        assert record.state is StageState.COMPLETED
+        assert record.retained is True
+        assert record.started_at is None
+        assert record.finished_at is None
+        assert record.duration_seconds is None
