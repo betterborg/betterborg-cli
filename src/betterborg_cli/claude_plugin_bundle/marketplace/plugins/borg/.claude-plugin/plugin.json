@@ -1,7 +1,7 @@
 {
   "name": "borg",
   "description": "Plan and execute repository work with BetterBorg",
-  "version": "0.2.0",
+  "version": "0.1.0a1",
   "author": {
     "name": "BetterBorg"
   },

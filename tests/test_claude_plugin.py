@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from plugin_test_support import copy_resource, executable
 
+from betterborg_cli import __version__
 from betterborg_cli.claude_plugin import (
     MARKETPLACE_NAME,
     PLUGIN_ID,
@@ -119,7 +120,7 @@ class _FakeClaude:
 
 def _host(tmp_path: Path, fake: _FakeClaude):
     bin_dir = tmp_path / "host-bin"
-    borg = executable(bin_dir / "borg", "printf 'borg 0.2.0\\n'")
+    borg = executable(bin_dir / "borg", f"printf 'borg {__version__}\\n'")
     claude = executable(bin_dir / "claude", "exit 0")
 
     def lookup(name: str, *, path: str):
@@ -291,7 +292,10 @@ def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
     assert result.previous_bundle is not None
     assert result.previous_bundle.is_dir()
     old_manifest = result.previous_bundle / "plugins/borg/.claude-plugin/plugin.json"
-    assert json.loads(old_manifest.read_text(encoding="utf-8"))["version"] == "0.2.0"
+    assert (
+        json.loads(old_manifest.read_text(encoding="utf-8"))["version"]
+        == __version__
+    )
     current_manifest = result.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
     assert json.loads(current_manifest.read_text(encoding="utf-8"))["version"] == (
         "0.3.0"
@@ -317,7 +321,7 @@ def test_owned_bundle_change_requires_a_new_plugin_version(tmp_path: Path) -> No
     result, spawns = _install(tmp_path, fake, bundle_source=changed)
 
     assert result.status is ClaudePluginStatus.FAILED
-    assert "without a version bump from 0.2.0" in (result.reason or "")
+    assert f"without a version bump from {__version__}" in (result.reason or "")
     assert first.bundle_path.joinpath("plugins/borg/commands/borg.md").read_text(
         encoding="utf-8"
     ) == original_command
@@ -345,14 +349,15 @@ def test_owned_upgrade_requires_claude_to_report_the_new_version(
     result, spawns = _install(tmp_path, fake, bundle_source=upgraded)
 
     assert result.status is ClaudePluginStatus.FAILED
-    assert "reported borg@betterborg at 0.2.0, expected 0.3.0" in (
+    assert f"reported borg@betterborg at {__version__}, expected 0.3.0" in (
         result.reason or ""
     )
     restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
-    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
-        "0.2.0"
+    assert (
+        json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
+        == __version__
     )
-    assert fake.installed_version == "0.2.0"
+    assert fake.installed_version == __version__
     assert spawns == []
 
 
@@ -378,7 +383,7 @@ def test_reinstall_repairs_materialized_bundle_contents(
     assert command.read_text(encoding="utf-8") == expected
     assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) in fake.calls
     assert ("plugin", "update", PLUGIN_ID, "--scope", "user") in fake.calls
-    assert fake.installed_version == "0.2.0"
+    assert fake.installed_version == __version__
     assert len(spawns) == 1
 
 
@@ -476,10 +481,11 @@ def test_failed_upgrade_reports_no_op_plugin_rollback(tmp_path: Path) -> None:
     assert result.status is ClaudePluginStatus.FAILED
     assert "Rollback also failed" in (result.reason or "")
     assert "version='0.3.0'; expected" in (result.reason or "")
-    assert "version='0.2.0'" in (result.reason or "")
+    assert f"version='{__version__}'" in (result.reason or "")
     restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
-    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
-        "0.2.0"
+    assert (
+        json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
+        == __version__
     )
     assert fake.installed_version == "0.3.0"
     assert spawns == []
@@ -518,11 +524,12 @@ def test_failed_bundle_promotion_immediately_restores_previous_bundle(
         original_marker
     )
     restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
-    assert json.loads(restored_manifest.read_text(encoding="utf-8"))["version"] == (
-        "0.2.0"
+    assert (
+        json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
+        == __version__
     )
     assert fake.marketplace_source == str(first.bundle_path)
-    assert fake.installed_version == "0.2.0"
+    assert fake.installed_version == __version__
     assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) not in fake.calls
     assert ("plugin", "update", PLUGIN_ID, "--scope", "user") not in fake.calls
     assert spawns == []
