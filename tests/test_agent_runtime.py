@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -263,6 +265,149 @@ def test_force_delivers_before_return_without_waiting_for_cancel_callback() -> N
     assert not release_cancel.is_set()
     release_cancel.set()
     assert registration.unregister()
+
+
+def test_cancelled_late_registration_dispatches_cancel_before_force(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel = CancellationToken()
+    cancel.cancel()
+    cancel_claimed = threading.Event()
+    release_cancel = threading.Event()
+    force_returned = threading.Event()
+    delivered: list[str] = []
+    registrations = []
+    registration_errors: list[Exception] = []
+    force_errors: list[Exception] = []
+    original_claim_cancel = cancel._claim_cancel
+
+    def claim_cancel_with_gate(entry: Any) -> Callable[[], None] | None:
+        callback = original_claim_cancel(entry)
+        if callback is None:
+            return None
+
+        def gated_callback() -> None:
+            cancel_claimed.set()
+            release_cancel.wait()
+            callback()
+
+        return gated_callback
+
+    monkeypatch.setattr(cancel, "_claim_cancel", claim_cancel_with_gate)
+
+    def register_late() -> None:
+        try:
+            registrations.append(
+                cancel.register(
+                    lambda: delivered.append("cancel"),
+                    lambda: delivered.append("force"),
+                    force_target=ForceTarget("late-worker"),
+                )
+            )
+        except Exception as error:
+            registration_errors.append(error)
+
+    def force_late() -> None:
+        try:
+            cancel.force()
+        except Exception as error:
+            force_errors.append(error)
+        finally:
+            force_returned.set()
+
+    registration_thread = threading.Thread(target=register_late, daemon=True)
+    registration_thread.start()
+    assert cancel_claimed.wait(1)
+
+    force_thread = threading.Thread(target=force_late, daemon=True)
+    force_thread.start()
+    try:
+        assert cancel.wait_for_force(1)
+        assert not force_returned.wait(0.05)
+        assert delivered == []
+    finally:
+        release_cancel.set()
+    registration_thread.join(timeout=1)
+    force_thread.join(timeout=1)
+
+    assert not registration_thread.is_alive()
+    assert not force_thread.is_alive()
+    assert force_returned.is_set()
+    assert registration_errors == []
+    assert force_errors == []
+    assert delivered == ["cancel", "force"]
+    assert registrations[0].unregister()
+
+
+def test_late_cancel_callback_failure_propagates() -> None:
+    cancel = CancellationToken()
+    cancel.cancel()
+
+    def fail_cancel() -> None:
+        raise RuntimeError("cancel delivery failed")
+
+    with pytest.raises(RuntimeError, match="cancel delivery failed"):
+        cancel.register(fail_cancel)
+
+
+def test_late_forced_registration_attempts_force_after_cancel_failure() -> None:
+    cancel = CancellationToken()
+    cancel.force()
+    force_delivered = threading.Event()
+
+    def fail_cancel() -> None:
+        raise RuntimeError("cancel delivery failed")
+
+    with pytest.raises(RuntimeError, match="cancel delivery failed"):
+        cancel.register(
+            fail_cancel,
+            force_delivered.set,
+            force_target=ForceTarget("late-worker"),
+        )
+
+    assert force_delivered.is_set()
+
+
+def test_force_callback_failure_propagates_and_remains_failed() -> None:
+    cancel = CancellationToken()
+
+    def fail_force() -> None:
+        raise RuntimeError("force delivery failed")
+
+    registration = cancel.register(
+        lambda: None,
+        fail_force,
+        force_target=ForceTarget("worker"),
+    )
+    cancel.cancel()
+
+    with pytest.raises(RuntimeError, match="force delivery failed"):
+        cancel.force()
+    with pytest.raises(RuntimeError, match="force delivery failed"):
+        cancel.force()
+
+    assert cancel.force_targets == (ForceTarget("worker"),)
+    assert registration.unregister()
+
+
+def test_failed_force_delivery_keeps_registration_window_active() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+    cancel.force()
+
+    def fail_force() -> None:
+        raise RuntimeError("created resource was not forced")
+
+    with pytest.raises(RuntimeError, match="created resource was not forced"):
+        window.register(
+            lambda: None,
+            fail_force,
+            force_target=ForceTarget("created-worker"),
+        )
+
+    assert not window.is_settled
+    assert cancel.active_windows == (window,)
+    assert cancel.force_targets == (ForceTarget("created-worker"),)
 
 
 def test_registration_window_retains_created_resource_until_late_force() -> None:

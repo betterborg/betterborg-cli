@@ -69,7 +69,9 @@ class _CancellationEntry:
     force_target: ForceTarget | None
     cancel_claimed: bool = False
     force_claimed: bool = False
+    cancel_started: threading.Event = field(default_factory=threading.Event)
     force_finished: threading.Event = field(default_factory=threading.Event)
+    force_error: Exception | None = None
 
 
 @dataclass(slots=True)
@@ -157,6 +159,7 @@ class CancellationToken:
         self._grace_seconds = grace_seconds
         self._state = CancellationState.ACTIVE
         self._force_deadline: float | None = None
+        self._force_delivery_error: Exception | None = None
         self._next_registration_id = 0
         self._next_window_id = 0
         self._registrations: dict[int, _CancellationEntry] = {}
@@ -258,6 +261,10 @@ class CancellationToken:
 
         if already_forced:
             self._force_delivery_finished.wait()
+            with self._lock:
+                force_delivery_error = self._force_delivery_error
+            if force_delivery_error is not None:
+                raise force_delivery_error
             return
 
         try:
@@ -269,6 +276,10 @@ class CancellationToken:
             else:
                 self._cancel_delivery_started.wait()
             self._broadcast(force_callbacks, "force", wait_for_completion=True)
+        except Exception as error:
+            with self._lock:
+                self._force_delivery_error = error
+            raise
         finally:
             self._force_delivery_finished.set()
 
@@ -343,10 +354,18 @@ class CancellationToken:
         )
         # Late delivery is synchronous, but callbacks are never invoked while
         # the token lock is held.
-        if cancel_callback is not None:
-            self._invoke_late(cancel_callback)
-        if force_callback is not None:
-            self._invoke_late(force_callback)
+        callback_errors: list[Exception] = []
+        for callback in (cancel_callback, force_callback):
+            if callback is None:
+                continue
+            try:
+                callback()
+            except Exception as error:
+                callback_errors.append(error)
+        if len(callback_errors) == 1:
+            raise callback_errors[0]
+        if callback_errors:
+            raise ExceptionGroup("late cancellation callbacks failed", callback_errors)
         if window_id is not None and not window_settled:
             self._settle_published_window(window_id, entry)
         return registration
@@ -376,9 +395,12 @@ class CancellationToken:
             )
 
         if force_callback is not None:
-            self._invoke_late(force_callback)
+            force_callback()
         elif wait_for_force:
             cancellation_entry.force_finished.wait()
+
+        if cancellation_entry.force_error is not None:
+            raise cancellation_entry.force_error
 
         with self._lock:
             entry = self._registration_windows.pop(window_id, None)
@@ -394,7 +416,12 @@ class CancellationToken:
         ):
             return None
         entry.cancel_claimed = True
-        return entry.on_cancel
+
+        def deliver_cancel() -> None:
+            entry.cancel_started.set()
+            entry.on_cancel()
+
+        return deliver_cancel
 
     def _claim_force(self, entry: _CancellationEntry) -> Callable[[], None] | None:
         if (
@@ -408,8 +435,13 @@ class CancellationToken:
 
         def deliver_force() -> None:
             try:
+                if entry.cancel_claimed:
+                    entry.cancel_started.wait()
                 if entry.on_force is not None:
                     entry.on_force()
+            except Exception as error:
+                entry.force_error = error
+                raise
             finally:
                 entry.force_finished.set()
 
@@ -438,15 +470,24 @@ class CancellationToken:
     ) -> None:
         started: list[threading.Event] = []
         completed: list[threading.Event] = []
+        errors: list[Exception | None] = [None] * len(callbacks)
         release = threading.Event()
-        for callback in callbacks:
+        for index, callback in enumerate(callbacks):
             callback_started = threading.Event()
             callback_completed = threading.Event()
             started.append(callback_started)
             completed.append(callback_completed)
             thread = threading.Thread(
                 target=self._invoke_broadcast,
-                args=(callback, callback_started, callback_completed, release),
+                args=(
+                    callback,
+                    callback_started,
+                    callback_completed,
+                    release,
+                    errors,
+                    index,
+                    wait_for_completion,
+                ),
                 name=f"betterborg-{label}-callback",
                 daemon=True,
             )
@@ -457,6 +498,11 @@ class CancellationToken:
         if wait_for_completion:
             for callback_completed in completed:
                 callback_completed.wait()
+            errors = [error for error in errors if error is not None]
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise ExceptionGroup(f"{label} callbacks failed", errors)
 
     def _invoke_broadcast(
         self,
@@ -464,19 +510,20 @@ class CancellationToken:
         started: threading.Event,
         completed: threading.Event,
         release: threading.Event,
+        errors: list[Exception | None],
+        index: int,
+        capture_errors: bool,
     ) -> None:
         started.set()
         release.wait()
         try:
-            self._invoke_late(callback)
+            callback()
+        except Exception as error:
+            if not capture_errors:
+                raise
+            errors[index] = error
         finally:
             completed.set()
-
-    def _invoke_late(self, callback: Callable[[], None]) -> None:
-        try:
-            callback()
-        except Exception:
-            return
 
 
 @dataclass(frozen=True, slots=True)
