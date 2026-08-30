@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from pathlib import Path
 
@@ -310,6 +310,7 @@ def test_native_analyzer_runs_read_only_in_the_bounded_workspace(
         log_path: Path,
         _cancel: object,
         _env: object,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         observed.update(
             command=list(command),

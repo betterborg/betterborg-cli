@@ -33,6 +33,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     extract_json,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 _PROVIDER = "claude"
 _CLAUDE_TOOL_NAMES = {
@@ -125,6 +126,7 @@ class ClaudeAdapter(NativeCliAdapter):
                 command=claude_command,
                 stdin_text=spec.user_prompt,
                 load_payload=lambda: self._load_payload(spec.log_path),
+                translate_event=_translate_event,
             )
         finally:
             system_prompt_path.unlink(missing_ok=True)
@@ -181,6 +183,38 @@ def _write_system_prompt(directory: Path, system_prompt: str) -> Path:
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+def _translate_event(event: Mapping[str, Any]) -> AgentActivity | None:
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, Mapping):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+
+    activity_kinds = {
+        "Read": (AgentActivityKind.READING, "file_path"),
+        "Glob": (AgentActivityKind.SEARCHING, "pattern"),
+        "Grep": (AgentActivityKind.SEARCHING, "pattern"),
+        "Bash": (AgentActivityKind.COMMAND, "command"),
+        "Edit": (AgentActivityKind.WRITING, "file_path"),
+        "Write": (AgentActivityKind.WRITING, "file_path"),
+    }
+    for block in reversed(content):
+        if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+            continue
+        mapping = activity_kinds.get(block.get("name"))
+        tool_input = block.get("input")
+        if mapping is None or not isinstance(tool_input, Mapping):
+            continue
+        kind, detail_key = mapping
+        detail = tool_input.get(detail_key)
+        if isinstance(detail, str) and detail:
+            return AgentActivity(kind, detail)
+    return None
 
 
 def _result_envelope(log_path: Path) -> dict[str, Any] | None:

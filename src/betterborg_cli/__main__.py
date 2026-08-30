@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from betterborg_cli.cli import cli
+from betterborg_cli.cli import main
 
 if __name__ == "__main__":
-    cli()
+    raise SystemExit(main())

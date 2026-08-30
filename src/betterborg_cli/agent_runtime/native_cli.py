@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,9 @@ class NativeInvocation:
     load_payload: Callable[[], NativePayload]
     before_attempt: Callable[[], None] | None = None
     accept_payload_on_nonzero_exit: bool = False
+    translate_event: (
+        Callable[[Mapping[str, Any]], AgentActivity | None] | None
+    ) = None
 
 
 class NativeCliAdapter:
@@ -131,16 +135,28 @@ class NativeCliAdapter:
         def run_once() -> int:
             nonlocal attempts
             attempts += 1
+            _emit_activity(
+                spec.activity_sink,
+                AgentActivity(AgentActivityKind.THINKING),
+            )
             if invocation.before_attempt is not None:
                 invocation.before_attempt()
-            exit_code = self.proc_runner(
-                invocation.command,
-                spec.cwd,
-                invocation.stdin_text,
-                spec.log_path,
-                cancel,
-                environment,
+            line_observer = _line_observer(
+                spec.activity_sink, invocation.translate_event
             )
+            try:
+                exit_code = self.proc_runner(
+                    invocation.command,
+                    spec.cwd,
+                    invocation.stdin_text,
+                    spec.log_path,
+                    cancel,
+                    environment,
+                    line_observer,
+                )
+            finally:
+                if line_observer is not None:
+                    line_observer.finish()
             attempt_usage.append(self._extract_usage(spec.log_path))
             return exit_code
 
@@ -340,3 +356,66 @@ class NativeCliAdapter:
 
     def _terminal_error(self, log_path: Path, exit_code: int) -> str:
         raise NotImplementedError
+
+
+class _JsonlActivityObserver:
+    """Translate complete JSONL records from bounded process fragments."""
+
+    def __init__(
+        self,
+        activity_sink: Callable[[AgentActivity], None],
+        translate_event: Callable[[Mapping[str, Any]], AgentActivity | None],
+    ) -> None:
+        self._activity_sink = activity_sink
+        self._translate_event = translate_event
+        self._pending = ""
+        self._thinking = AgentActivity(AgentActivityKind.THINKING)
+
+    def __call__(self, fragment: str) -> None:
+        self._pending += fragment
+        while "\n" in self._pending:
+            record, _, self._pending = self._pending.partition("\n")
+            self._observe_record(record)
+
+    def finish(self) -> None:
+        """Observe a final record when the stream omits its trailing newline."""
+        if not self._pending:
+            return
+        record = self._pending
+        self._pending = ""
+        self._observe_record(record)
+
+    def _observe_record(self, record: str) -> None:
+        activity = self._thinking
+        try:
+            event = json.loads(record)
+            if isinstance(event, Mapping):
+                activity = self._translate_event(event) or self._thinking
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        except Exception:
+            # Provider translation is observational and cannot affect a run.
+            pass
+        _emit_activity(self._activity_sink, activity)
+
+
+def _line_observer(
+    activity_sink: Callable[[AgentActivity], None] | None,
+    translate_event: Callable[[Mapping[str, Any]], AgentActivity | None] | None,
+) -> _JsonlActivityObserver | None:
+    if activity_sink is None or translate_event is None:
+        return None
+    return _JsonlActivityObserver(activity_sink, translate_event)
+
+
+def _emit_activity(
+    activity_sink: Callable[[AgentActivity], None] | None,
+    activity: AgentActivity,
+) -> None:
+    if activity_sink is None:
+        return
+    try:
+        activity_sink(activity)
+    except Exception:
+        # Rendering and reporting callbacks are observational only.
+        return

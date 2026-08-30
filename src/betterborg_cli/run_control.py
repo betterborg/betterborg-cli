@@ -7,6 +7,7 @@ import os
 import select
 import selectors
 import signal
+import socket
 import stat
 import sys
 import threading
@@ -39,9 +40,9 @@ class RunControl:
 
     The installed Python handler deliberately performs no application callback,
     rendering, locking, waiting, or joining. First-press work is dispatched from
-    a wakeup pipe. On a second press, only validated process-group identities are
-    signalled in the handler; all callback delivery and creation-window waiting
-    remains owned by the dispatcher.
+    a wakeup socket pair. On a second press, only validated process-group
+    identities are signalled in the handler; all callback delivery and
+    creation-window waiting remains owned by the dispatcher.
     """
 
     def __init__(
@@ -74,8 +75,8 @@ class RunControl:
         self._force_descriptor = -1
         self._exit_function = exit_function
 
-        self._read_fd = -1
-        self._write_fd = -1
+        self._read_socket: socket.socket | None = None
+        self._write_socket: socket.socket | None = None
         self._previous_handler: signal.Handlers | None = None
         self._previous_wakeup_fd = -1
         self._dispatcher: threading.Thread | None = None
@@ -121,6 +122,11 @@ class RunControl:
         """Return an exception raised by deferred cancellation delivery."""
         return self._dispatcher_error
 
+    @property
+    def interruption_requested(self) -> bool:
+        """Return whether this controller received a first SIGINT."""
+        return self._interrupt_count >= 1
+
     def install(self) -> RunControl:
         """Install SIGINT and wakeup dispatch, returning this controller."""
         if self._installed:
@@ -128,16 +134,16 @@ class RunControl:
         if threading.current_thread() is not threading.main_thread():
             raise RuntimeError("run control must be installed on the main thread")
 
-        read_fd, write_fd = os.pipe()
-        os.set_blocking(read_fd, False)
-        os.set_blocking(write_fd, False)
-        self._read_fd = read_fd
-        self._write_fd = write_fd
+        read_socket, write_socket = socket.socketpair()
+        read_socket.setblocking(False)
+        write_socket.setblocking(False)
+        self._read_socket = read_socket
+        self._write_socket = write_socket
         self._force_descriptor = self._open_nonblocking_force_descriptor()
         try:
             self._previous_handler = signal.getsignal(signal.SIGINT)
             self._previous_wakeup_fd = signal.set_wakeup_fd(
-                write_fd, warn_on_full_buffer=False
+                write_socket.fileno(), warn_on_full_buffer=False
             )
             signal.signal(signal.SIGINT, self._handle_sigint)
         except BaseException:
@@ -146,12 +152,12 @@ class RunControl:
             if self._previous_handler is not None:
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(signal.SIGINT, self._previous_handler)
-            os.close(read_fd)
-            os.close(write_fd)
+            read_socket.close()
+            write_socket.close()
             if self._force_descriptor >= 0:
                 os.close(self._force_descriptor)
-            self._read_fd = -1
-            self._write_fd = -1
+            self._read_socket = None
+            self._write_socket = None
             self._force_descriptor = -1
             raise
 
@@ -178,16 +184,14 @@ class RunControl:
         dispatcher = self._dispatcher
         if dispatcher is not None and dispatcher is not threading.current_thread():
             dispatcher.join(timeout=1.0)
-        for descriptor in (
-            self._read_fd,
-            self._write_fd,
-            self._force_descriptor,
-        ):
-            if descriptor >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
-        self._read_fd = -1
-        self._write_fd = -1
+        for wakeup_socket in (self._read_socket, self._write_socket):
+            if wakeup_socket is not None:
+                wakeup_socket.close()
+        if self._force_descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(self._force_descriptor)
+        self._read_socket = None
+        self._write_socket = None
         self._force_descriptor = -1
 
     def __enter__(self) -> RunControl:
@@ -209,7 +213,7 @@ class RunControl:
                 raise KeyboardInterrupt
 
     def wait_for_cancellation(self, timeout: float | None = None) -> bool:
-        """Wait until the dispatcher has recorded first cancellation."""
+        """Wait until first cancellation and progress acknowledgement finish."""
         return self._cancel_dispatched.wait(timeout)
 
     def wait_for_force(self, timeout: float | None = None) -> bool:
@@ -253,14 +257,17 @@ class RunControl:
     def _dispatch(self) -> None:
         selector = selectors.DefaultSelector()
         try:
-            selector.register(self._read_fd, selectors.EVENT_READ)
+            read_socket = self._read_socket
+            if read_socket is None:
+                raise RuntimeError("run control wakeup socket is unavailable")
+            selector.register(read_socket, selectors.EVENT_READ)
             while True:
                 timeout = self._deadline_timeout()
                 events = selector.select(timeout)
                 stop_requested = False
                 if events:
                     try:
-                        payload = os.read(self._read_fd, 4096)
+                        payload = read_socket.recv(4096)
                     except BlockingIOError:
                         payload = b""
                     stop_requested = _STOP_BYTE in payload and self._closed
@@ -273,6 +280,8 @@ class RunControl:
         except BaseException as error:
             self._dispatcher_error = error
         finally:
+            if self._cancel_worker is None:
+                self._cancel_dispatched.set()
             selector.close()
             self._dispatcher_stopped.set()
 
@@ -294,11 +303,12 @@ class RunControl:
     def _deliver_cancellation(self) -> None:
         try:
             self.cancellation.cancel()
-            self._cancel_dispatched.set()
             if self._progress is not None:
                 self._progress.begin_cancellation()
         except BaseException as error:
             self._record_dispatcher_error(error)
+        finally:
+            self._cancel_dispatched.set()
 
     def _request_force(
         self, windows: tuple[CancellationRegistrationWindow, ...]
@@ -491,10 +501,11 @@ class RunControl:
             return -1
 
     def _wake_dispatcher(self, payload: bytes) -> None:
-        if self._write_fd < 0:
+        write_socket = self._write_socket
+        if write_socket is None:
             return
         with contextlib.suppress(BlockingIOError, OSError):
-            os.write(self._write_fd, payload)
+            write_socket.send(payload)
 
     def _invoke_exit(self) -> None:
         if self._exit_invoked:
