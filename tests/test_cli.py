@@ -245,6 +245,38 @@ def test_main_surfaces_reconciliation_failure_after_interrupt(
     assert captured.err == "Error: could not reconcile interruption\n"
 
 
+@pytest.mark.parametrize("wrapper", [click.ClickException, click.Abort])
+def test_main_refuses_interrupted_exit_with_unreconciled_started_work(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    wrapper: type[click.ClickException] | type[click.Abort],
+) -> None:
+    observed: dict[str, cli_module.CliRunContext] = {}
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        observed["run"] = run
+        run.progress.declare(StageSpec("work", "Work"))
+        run.progress.start("work")
+        raise wrapper("workflow interrupted") from KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="borg")
+
+    captured = capsys.readouterr()
+    progress = observed["run"].progress
+    assert exit_code == 1
+    assert progress.closed is False
+    assert progress.stages["work"].state is StageState.RUNNING
+    assert captured.out == ""
+    assert captured.err.endswith(
+        "Error: cannot close progress with unresolved started records: "
+        "stage 'work'\n"
+    )
+
+
 def test_create_help_registers_required_positional_name(
     cli_runner: CliRunner,
 ) -> None:

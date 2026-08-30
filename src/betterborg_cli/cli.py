@@ -72,7 +72,7 @@ from betterborg_cli.plugins import (
     PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
-from betterborg_cli.progress import RunProgress
+from betterborg_cli.progress import ProgressError, RunProgress
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import read_repository_text
@@ -142,12 +142,12 @@ def main(
             )
         except click.ClickException as error:
             if _caused_by_interruption(error):
-                return INTERRUPTED_EXIT_CODE
+                return _interrupted_exit_code(run.progress)
             error.show()
             return error.exit_code
         except click.Abort as error:
             if _caused_by_interruption(error):
-                return INTERRUPTED_EXIT_CODE
+                return _interrupted_exit_code(run.progress)
             click.echo("Aborted!", err=True)
             return 1
         except OSError as error:
@@ -166,6 +166,17 @@ def _caused_by_interruption(error: BaseException) -> bool:
     if cause is None and not error.__suppress_context__:
         cause = error.__context__
     return isinstance(cause, KeyboardInterrupt)
+
+
+def _interrupted_exit_code(progress: RunProgress) -> int:
+    """Map interruption only after strict progress reconciliation succeeds."""
+
+    try:
+        progress.close()
+    except ProgressError as error:
+        click.ClickException(str(error)).show()
+        return 1
+    return INTERRUPTED_EXIT_CODE
 
 
 @cli.command()
