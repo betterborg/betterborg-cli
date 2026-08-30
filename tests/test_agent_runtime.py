@@ -640,6 +640,14 @@ def test_force_target_rejects_unvalidated_identity(identity: object) -> None:
         ForceTarget(identity)
 
 
+@pytest.mark.parametrize("process_group_id", [True, 0, -1])
+def test_force_target_rejects_unvalidated_process_group(
+    process_group_id: int,
+) -> None:
+    with pytest.raises(ValueError, match="process group"):
+        ForceTarget("worker", process_group_id=process_group_id)
+
+
 def test_cancellation_token_requires_force_callback_and_target_together() -> None:
     cancel = CancellationToken()
 

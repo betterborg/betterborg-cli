@@ -47,6 +47,7 @@ class ForceTarget:
     """
 
     identity: Hashable
+    process_group_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.identity is None or isinstance(self.identity, bool):
@@ -59,6 +60,12 @@ class ForceTarget:
             raise ValueError("force target integer identity must be positive")
         if isinstance(self.identity, str) and not self.identity:
             raise ValueError("force target string identity must not be empty")
+        if self.process_group_id is not None:
+            if (
+                isinstance(self.process_group_id, bool)
+                or self.process_group_id <= 0
+            ):
+                raise ValueError("process group identity must be a positive integer")
 
 
 @dataclass(slots=True)
@@ -176,12 +183,18 @@ class CancellationToken:
         self._clock = clock
         self._grace_seconds = grace_seconds
         self._state = CancellationState.ACTIVE
+        self._force_requested_signal = False
         self._force_deadline: float | None = None
         self._force_delivery_error: Exception | None = None
         self._next_registration_id = 0
         self._next_window_id = 0
+        self._window_opening_count = 0
         self._registrations: dict[int, _CancellationEntry] = {}
         self._registration_windows: dict[int, _RegistrationWindowEntry] = {}
+        self._force_targets_snapshot: tuple[ForceTarget, ...] = ()
+        self._active_windows_snapshot: tuple[
+            CancellationRegistrationWindow, ...
+        ] = ()
 
     @property
     def state(self) -> CancellationState:
@@ -197,32 +210,39 @@ class CancellationToken:
 
     @property
     def force_targets(self) -> tuple[ForceTarget, ...]:
-        """Return an immutable snapshot of force targets retained for cleanup."""
-        with self._lock:
-            return tuple(
-                entry.force_target
-                for entry in self._registrations.values()
-                if entry.force_target is not None
-            )
+        """Return a lock-free immutable snapshot retained for signal delivery."""
+        return self._force_targets_snapshot
 
     @property
     def active_windows(self) -> tuple[CancellationRegistrationWindow, ...]:
-        """Return an immutable snapshot of unresolved creation windows."""
-        with self._lock:
-            return tuple(
-                entry.window for entry in self._registration_windows.values()
-            )
+        """Return a lock-free immutable snapshot of unresolved creation windows."""
+        return self._active_windows_snapshot
+
+    @property
+    def has_window_opening(self) -> bool:
+        """Return whether a caller is entering the registry but not published yet."""
+        return self._window_opening_count > 0
 
     def registration_window(self) -> CancellationRegistrationWindow:
         """Register a unique creation window before an OS resource is created."""
-        with self._lock:
-            if self._state is CancellationState.FORCED:
-                raise RuntimeError("cannot open a registration window after force")
-            window_id = self._next_window_id
-            self._next_window_id += 1
-            window = CancellationRegistrationWindow(self, window_id)
-            self._registration_windows[window_id] = _RegistrationWindowEntry(window)
-            return window
+        self._window_opening_count += 1
+        try:
+            with self._lock:
+                if (
+                    self._state is CancellationState.FORCED
+                    or self._force_requested_signal
+                ):
+                    raise RuntimeError("cannot open a registration window after force")
+                window_id = self._next_window_id
+                self._next_window_id += 1
+                window = CancellationRegistrationWindow(self, window_id)
+                self._registration_windows[window_id] = _RegistrationWindowEntry(
+                    window
+                )
+                self._refresh_registry_snapshots()
+                return window
+        finally:
+            self._window_opening_count -= 1
 
     def register(
         self,
@@ -260,6 +280,7 @@ class CancellationToken:
 
     def force(self) -> None:
         """Record forced cancellation and broadcast every validated force callback."""
+        self._force_requested_signal = True
         with self._lock:
             if self._state is CancellationState.FORCED:
                 already_forced = True
@@ -339,6 +360,7 @@ class CancellationToken:
                         )
                         if window_entry is not None:
                             window_entry.window._settled.set()
+                    self._refresh_registry_snapshots()
                     return True
 
             for finished in pending_deliveries:
@@ -383,12 +405,14 @@ class CancellationToken:
                 window_id=window_id,
             )
             self._registrations[registration_id] = entry
+            self._refresh_registry_snapshots()
             cancel_callback = self._claim_cancel(entry)
             force_callback = self._claim_force(entry)
             window_settled = False
             if window_id is not None and self._state is CancellationState.ACTIVE:
                 settled_entry = self._registration_windows.pop(window_id)
                 settled_entry.window._settled.set()
+                self._refresh_registry_snapshots()
                 window_settled = True
 
         registration = CancellationRegistration(
@@ -431,6 +455,7 @@ class CancellationToken:
                 raise RuntimeError("registration window is already settled")
             self._registration_windows.pop(window_id)
             entry.window._settled.set()
+            self._refresh_registry_snapshots()
 
     def _settle_published_window(
         self, window_id: int, cancellation_entry: _CancellationEntry
@@ -441,6 +466,7 @@ class CancellationToken:
                 if entry is None:
                     raise RuntimeError("registration window is already settled")
                 entry.window._settled.set()
+                self._refresh_registry_snapshots()
                 return
             force_callback = self._claim_force(cancellation_entry)
             wait_for_force = (
@@ -461,6 +487,18 @@ class CancellationToken:
             if entry is None:
                 raise RuntimeError("registration window is already settled")
             entry.window._settled.set()
+            self._refresh_registry_snapshots()
+
+    def _refresh_registry_snapshots(self) -> None:
+        """Publish registry state atomically while the token lock is held."""
+        self._force_targets_snapshot = tuple(
+            entry.force_target
+            for entry in self._registrations.values()
+            if entry.force_target is not None
+        )
+        self._active_windows_snapshot = tuple(
+            entry.window for entry in self._registration_windows.values()
+        )
 
     def _claim_cancel(self, entry: _CancellationEntry) -> Callable[[], None] | None:
         if (

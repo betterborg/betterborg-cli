@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
+import signal
 import sqlite3
 import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +83,151 @@ class RecordingProgress:
         self.child_activities.append((stage_key, child_key, activity))
 
 
+@dataclass
+class RealProcessHarness:
+    """Own real-process markers, gates, signals, deadlines, and cleanup."""
+
+    root: Path
+    deadline_seconds: float = 5.0
+    processes: list[subprocess.Popen[str]] = field(default_factory=list)
+
+    def launch_python(
+        self,
+        source: str,
+        *arguments: str,
+        name: str = "wrapper",
+    ) -> subprocess.Popen[str]:
+        """Launch a generated Python wrapper in a separately killable session."""
+        script = self.root / f"{name}.py"
+        script.write_text(source, encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, str(script), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        self.processes.append(process)
+        return process
+
+    def resistant_argv(self, name: str) -> tuple[str, ...]:
+        """Return argv for a SIGTERM-resistant process group with a descendant."""
+        helper = self.root / "resistant_descendant.py"
+        if not helper.exists():
+            helper.write_text(
+                """from __future__ import annotations
+
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+root = Path(sys.argv[1])
+name = sys.argv[2]
+mode = sys.argv[3]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode == "child":
+    (root / f"{name}.child.pid").write_text(str(__import__("os").getpid()))
+    while True:
+        time.sleep(1)
+child = subprocess.Popen([sys.executable, __file__, str(root), name, "child"])
+(root / f"{name}.parent.pid").write_text(str(__import__("os").getpid()))
+child.wait()
+""",
+                encoding="utf-8",
+            )
+        return (sys.executable, str(helper), str(self.root), name, "parent")
+
+    def marker(self, name: str) -> Path:
+        return self.root / name
+
+    def wait_for_marker(
+        self, name: str, *, timeout: float | None = None
+    ) -> str:
+        """Wait for a nonempty marker or raise with process-state diagnostics."""
+        marker = self.marker(name)
+        deadline = time.monotonic() + (
+            self.deadline_seconds if timeout is None else timeout
+        )
+        while time.monotonic() < deadline:
+            if marker.exists():
+                value = marker.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+            time.sleep(0.01)
+        states = ", ".join(
+            f"pid={process.pid}:returncode={process.poll()}"
+            for process in self.processes
+        ) or "no tracked processes"
+        existing = ", ".join(path.name for path in sorted(self.root.iterdir()))
+        raise TimeoutError(
+            f"deadline waiting for marker {name!r}; {states}; markers=[{existing}]"
+        )
+
+    def release(self, name: str) -> None:
+        """Open a named file gate."""
+        self.marker(name).write_text("released\n", encoding="utf-8")
+
+    @staticmethod
+    def signal(process: subprocess.Popen[str], signum: int) -> None:
+        """Deliver a signal to a tracked wrapper process."""
+        os.kill(process.pid, signum)
+
+    def wait_for_exit(
+        self, process: subprocess.Popen[str], *, timeout: float | None = None
+    ) -> int:
+        """Wait for wrapper exit with captured-output diagnostics."""
+        duration = self.deadline_seconds if timeout is None else timeout
+        try:
+            return process.wait(timeout=duration)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError(
+                f"deadline waiting for pid {process.pid}; "
+                f"returncode={process.poll()}; "
+                f"markers={[path.name for path in sorted(self.root.iterdir())]}"
+            ) from error
+
+    def assert_tree_absent(
+        self, name: str, *, timeout: float | None = None
+    ) -> None:
+        """Assert a named resistant process group and descendant are both gone."""
+        pids = (
+            int(self.wait_for_marker(f"{name}.parent.pid")),
+            int(self.wait_for_marker(f"{name}.child.pid")),
+        )
+        deadline = time.monotonic() + (
+            self.deadline_seconds if timeout is None else timeout
+        )
+        while time.monotonic() < deadline:
+            if all(not self._pid_exists(pid) for pid in pids):
+                return
+            time.sleep(0.01)
+        surviving = [pid for pid in pids if self._pid_exists(pid)]
+        raise AssertionError(f"process tree {name!r} survived: {surviving}")
+
+    def cleanup(self) -> None:
+        """Kill all tracked wrappers and every marked resistant process group."""
+        for marker in self.root.glob("*.parent.pid"):
+            with contextlib.suppress(ValueError, ProcessLookupError, PermissionError):
+                os.killpg(int(marker.read_text(encoding="utf-8")), signal.SIGKILL)
+        for process in self.processes:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        stat = Path(f"/proc/{pid}/stat")
+        try:
+            fields = stat.read_text(encoding="utf-8").split()
+        except FileNotFoundError:
+            return False
+        return len(fields) < 3 or fields[2] != "Z"
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """Return Click's isolated command-line test runner."""
@@ -88,6 +238,16 @@ def cli_runner() -> CliRunner:
 def recording_progress() -> RecordingProgress:
     """Return a progress recorder that understands only shared activity types."""
     return RecordingProgress()
+
+
+@pytest.fixture
+def real_process_harness(tmp_path: Path) -> Iterator[RealProcessHarness]:
+    """Provide the project-wide real-process cancellation harness."""
+    harness = RealProcessHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.cleanup()
 
 
 @pytest.fixture
