@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -111,6 +111,7 @@ def test_selected_codex_agent_runs_architect_in_read_only_sandbox(
         _log_path: Path,
         _cancel: object,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         commands.append(list(command))
         invocation_result = Path(command[command.index("-o") + 1])

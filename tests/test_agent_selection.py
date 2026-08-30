@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -135,6 +135,7 @@ def test_configured_native_role_applies_overrides_after_trust_before_spawn(
         log_path: Path,
         _cancel: object,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         events.append("spawn")
         captured.update(command=list(command), cwd=cwd, stdin=stdin_text)
@@ -303,6 +304,7 @@ def test_contained_run_sandboxes_a_native_cli_under_read_only_tools(
         log_path: Path,
         _cancel: Any,
         _env: Any,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         commands.append(command)
         log_path.write_text("", encoding="utf-8")

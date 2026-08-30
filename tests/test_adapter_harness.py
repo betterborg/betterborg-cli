@@ -25,6 +25,18 @@ Provider = Literal["anthropic", "openai"]
 RunProvider = Literal["anthropic", "openai", "claude", "codex"]
 
 
+def write_native_output(
+    log_path: Path,
+    text: str,
+    on_line: Callable[[str], None] | None,
+) -> None:
+    """Persist native output and present the same text to its line observer."""
+    log_path.write_text(text, encoding="utf-8")
+    if on_line is not None:
+        for line in text.splitlines(keepends=True):
+            on_line(line)
+
+
 @dataclass
 class FakeApiTransport:
     """Queue responses while recording JSON-safe copies of provider requests."""
