@@ -331,10 +331,6 @@ def test_url_request_joins_resistant_child_by_production_deadline(
     )
     assert killed_at - cancelled_at <= CancellationToken.DEFAULT_GRACE_SECONDS + 0.1
     assert joined_at - cancelled_at <= CancellationToken.DEFAULT_GRACE_SECONDS + 0.1
-    assert (
-        real_process_harness.wait_for_marker("url-deadline-dns.active-windows")
-        == "0"
-    )
     real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
 
 

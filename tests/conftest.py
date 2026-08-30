@@ -217,85 +217,11 @@ child.wait()
         fail_registration: bool = False,
     ) -> subprocess.Popen[str]:
         """Run a URL request behind a post-start registration gate."""
-        source = r'''
-from __future__ import annotations
-
-import sys
-import time
-from pathlib import Path
-
-from betterborg_cli.agent_runtime import (
-    CancellationRegistrationWindow,
-    CancellationToken,
-    MultiprocessUrlRequest,
-    UrlRequestSpec,
-)
-from betterborg_cli.run_control import RunControl
-
-
-def main() -> None:
-    root = Path(sys.argv[1])
-    name = sys.argv[2]
-    fail_registration = sys.argv[3] == "fail"
-    url = sys.argv[4]
-    cancel = CancellationToken()
-    original_register = CancellationRegistrationWindow.register
-
-    def gated_register(self, *args, **kwargs):
-        target = kwargs["force_target"]
-        (root / f"{name}.request.pid").write_text(str(target.identity))
-        (root / f"{name}.registration-gate").write_text("blocked")
-        while not (root / f"release-{name}").exists():
-            time.sleep(0.01)
-        if fail_registration:
-            raise RuntimeError("injected registration failure")
-        return original_register(self, *args, **kwargs)
-
-    CancellationRegistrationWindow.register = gated_register
-
-    class Progress:
-        def begin_cancellation(self):
-            (root / f"{name}.cancelled").write_text("cancelled")
-            return True
-
-    try:
-        request = MultiprocessUrlRequest(
-            UrlRequestSpec(
-                url,
-                "GET",
-                {"authorization": "Bearer request-private-value"},
-                None,
-            ),
-            cancel,
-        )
-        if fail_registration:
-            request.run()
-        else:
-            control = RunControl(cancel, progress=Progress())
-            with control:
-                with control.protected():
-                    request.run()
-    except KeyboardInterrupt:
-        raise SystemExit(130) from None
-    except RuntimeError as error:
-        (root / f"{name}.error").write_text(str(error))
-        (root / f"{name}.active-windows").write_text(
-            str(len(cancel.active_windows))
-        )
-        raise SystemExit(73) from None
-
-
-if __name__ == "__main__":
-    main()
-'''
-        mode = "fail" if fail_registration else "signal"
-        return self.launch_python(
-            source,
-            str(self.root),
-            name,
-            mode,
-            url,
-            name=f"{name}-wrapper",
+        return self._launch_registration_wrapper(
+            (url,),
+            name=name,
+            runner="url",
+            fail_registration=fail_registration,
         )
 
     def launch_blocked_url_wrapper(
@@ -430,6 +356,8 @@ from pathlib import Path
 from betterborg_cli.agent_runtime import (
     CancellationRegistrationWindow,
     CancellationToken,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
     run_captured,
     run_streamed,
 )
@@ -444,6 +372,9 @@ cancel = CancellationToken()
 original_register = CancellationRegistrationWindow.register
 
 def gated_register(self, *args, **kwargs):
+    if runner == "url":
+        target = kwargs["force_target"]
+        (root / f"{name}.request.pid").write_text(str(target.identity))
     (root / f"{name}.registration-gate").write_text("blocked")
     while not (root / f"release-{name}").exists():
         time.sleep(0.01)
@@ -458,22 +389,30 @@ class Progress:
         (root / f"{name}.cancelled").write_text("cancelled")
         return True
 
+def run():
+    if runner == "streamed":
+        return run_streamed(command, root, "", root / f"{name}.log", cancel)
+    if runner == "captured":
+        return run_captured(command, cwd=root, input="", cancel=cancel)
+    request = MultiprocessUrlRequest(
+        UrlRequestSpec(
+            command[0],
+            "GET",
+            {"authorization": "Bearer request-private-value"},
+            None,
+        ),
+        cancel,
+    )
+    return request.run()
+
 try:
     if fail_registration:
-        if runner == "streamed":
-            run_streamed(command, root, "", root / f"{name}.log", cancel)
-        else:
-            run_captured(command, cwd=root, input="", cancel=cancel)
+        run()
     else:
         control = RunControl(cancel, progress=Progress())
         with control:
             with control.protected():
-                if runner == "streamed":
-                    run_streamed(
-                        command, root, "", root / f"{name}.log", cancel
-                    )
-                else:
-                    run_captured(command, cwd=root, input="", cancel=cancel)
+                run()
 except KeyboardInterrupt:
     raise SystemExit(130) from None
 except RuntimeError as error:
