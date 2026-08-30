@@ -86,6 +86,7 @@ class _CancellationEntry:
 @dataclass(slots=True)
 class _RegistrationWindowEntry:
     window: CancellationRegistrationWindow
+    resource_created: bool = False
     publication_started: bool = False
 
 
@@ -156,6 +157,10 @@ class CancellationRegistrationWindow:
             force_target=force_target,
             window_id=self._window_id,
         )
+
+    def resource_created(self) -> None:
+        """Record successful creation before publication can be delayed."""
+        self._token._mark_resource_created(self._window_id)
 
     def no_resource(self) -> None:
         """Settle a window after creation conclusively produced no resource."""
@@ -394,6 +399,11 @@ class CancellationToken:
                 window_entry = self._registration_windows.get(window_id)
                 if window_entry is None or window_entry.publication_started:
                     raise RuntimeError("registration window is already settled")
+                if not window_entry.resource_created:
+                    raise RuntimeError(
+                        "registration window must record resource creation "
+                        "before publication"
+                    )
                 window_entry.publication_started = True
             registration_id = self._next_registration_id
             self._next_registration_id += 1
@@ -448,11 +458,22 @@ class CancellationToken:
             )
         return registration
 
+    def _mark_resource_created(self, window_id: int) -> None:
+        with self._lock:
+            entry = self._registration_windows.get(window_id)
+            if entry is None or entry.publication_started:
+                raise RuntimeError("registration window is already settled")
+            if entry.resource_created:
+                raise RuntimeError("resource creation is already recorded")
+            entry.resource_created = True
+
     def _settle_no_resource(self, window_id: int) -> None:
         with self._lock:
             entry = self._registration_windows.get(window_id)
             if entry is None or entry.publication_started:
                 raise RuntimeError("registration window is already settled")
+            if entry.resource_created:
+                raise RuntimeError("created resource must be published")
             self._registration_windows.pop(window_id)
             entry.window._settled.set()
             self._refresh_registry_snapshots()

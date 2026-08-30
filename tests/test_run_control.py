@@ -71,6 +71,8 @@ def test_second_sigint_waits_for_every_window_and_rejects_new_windows() -> None:
     ).install()
     windows = (cancel.registration_window(), cancel.registration_window())
     assert windows[0] is not windows[1]
+    for window in windows:
+        window.resource_created()
     releases = (threading.Event(), threading.Event())
     forced = (threading.Event(), threading.Event())
     registrations = []
@@ -159,6 +161,74 @@ def test_watchdog_uses_bounded_grace_and_forces_after_deadline() -> None:
     control.close()
 
 
+def test_watchdog_escalates_while_cancellation_and_progress_locks_are_held(
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.02)
+    progress = _LockedProgress()
+    exits: list[int] = []
+    control = RunControl(
+        cancel,
+        progress=progress,
+        force_grace_seconds=0.02,
+        exit_function=exits.append,
+    ).install()
+    section = control.protected()
+    section.__enter__()
+    cancel._lock.acquire()
+    progress.lock.acquire()
+    try:
+        _press_sigint()
+        deadline = time.monotonic() + 1
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert exits == [INTERRUPTED_EXIT_CODE]
+        assert control._force_requested
+        assert not cancel.is_set()
+        assert not progress.called.is_set()
+    finally:
+        cancel._lock.release()
+        progress.lock.release()
+
+    assert control.wait_for_force(1)
+    assert progress.called.wait(1)
+    with pytest.raises(KeyboardInterrupt):
+        section.__exit__(None, None, None)
+    control.close()
+
+
+def test_failed_force_delivery_prevents_exit() -> None:
+    cancel = CancellationToken()
+    exits: list[int] = []
+
+    def fail_force() -> None:
+        raise RuntimeError("force delivery failed")
+
+    registration = cancel.register(
+        lambda: None,
+        fail_force,
+        force_target=ForceTarget("worker-without-process-group"),
+    )
+    control = RunControl(cancel, exit_function=exits.append).install()
+    section = control.protected()
+    section.__enter__()
+    _press_sigint()
+    assert control.wait_for_cancellation(1)
+    _press_sigint()
+
+    deadline = time.monotonic() + 1
+    while control.dispatcher_error is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert isinstance(control.dispatcher_error, RuntimeError)
+    assert str(control.dispatcher_error) == "force delivery failed"
+    assert not control.wait_for_force(0)
+    assert exits == []
+
+    assert registration.unregister()
+    with pytest.raises(KeyboardInterrupt):
+        section.__exit__(None, None, None)
+    control.close()
+
+
 def test_install_and_close_restore_handler_and_wakeup_fd() -> None:
     read_fd, write_fd = os.pipe()
     os.set_blocking(write_fd, False)
@@ -217,6 +287,7 @@ def worker(name, window):
         [sys.executable, str(helper), str(root), name, "parent"],
         start_new_session=True,
     )
+    window.resource_created()
     (root / f"{name}.spawned").write_text(str(process.pid))
     gate = root / f"release-{name}"
     while not gate.exists():

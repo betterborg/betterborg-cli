@@ -23,6 +23,7 @@ DEFAULT_FORCE_GRACE_SECONDS = 1.0
 INTERRUPTED_EXIT_CODE = 130
 _FORCE_NOTICE = b"Force stopping...\n"
 _STOP_BYTE = b"\x00"
+_ARBITRATION_POLL_SECONDS = 0.01
 
 
 class CancellationProgress(Protocol):
@@ -87,6 +88,9 @@ class RunControl:
         self._deferred_interrupt = False
         self._force_requested = False
         self._forced_windows: tuple[CancellationRegistrationWindow, ...] = ()
+        self._force_snapshot_captured = False
+        self._direct_force_complete = False
+        self._force_delivery_started = False
         self._exit_invoked = False
         self._force_notice_written = False
 
@@ -95,6 +99,8 @@ class RunControl:
         self._dispatcher_stopped = threading.Event()
         self._dispatcher_error: BaseException | None = None
         self._force_deadline: float | None = None
+        self._cancel_worker: threading.Thread | None = None
+        self._force_worker: threading.Thread | None = None
 
     @property
     def is_installed(self) -> bool:
@@ -214,12 +220,13 @@ class RunControl:
         windows = self.cancellation.active_windows
         targets = self.cancellation.force_targets
         self._forced_windows = windows
-        undeliverable_target = self._signal_process_groups(targets)
+        self._force_snapshot_captured = True
+        self._direct_force_complete = self._signal_process_groups(targets)
         self._force_notice_written = self._write_force_notice_signal_safe()
         if (
             not windows
             and not self.cancellation.has_window_opening
-            and not undeliverable_target
+            and self._direct_force_complete
         ):
             self._invoke_exit()
 
@@ -227,19 +234,22 @@ class RunControl:
         selector = selectors.DefaultSelector()
         try:
             selector.register(self._read_fd, selectors.EVENT_READ)
-            while not self._closed:
+            while True:
                 timeout = self._deadline_timeout()
                 events = selector.select(timeout)
+                stop_requested = False
                 if events:
                     try:
                         payload = os.read(self._read_fd, 4096)
                     except BlockingIOError:
                         payload = b""
-                    if _STOP_BYTE in payload and self._closed:
-                        break
+                    stop_requested = _STOP_BYTE in payload and self._closed
                 self._dispatch_interrupts()
                 if self._deadline_reached():
                     self._request_force(())
+                self._arbitrate_exit()
+                if stop_requested:
+                    break
         except BaseException as error:
             self._dispatcher_error = error
         finally:
@@ -250,64 +260,106 @@ class RunControl:
         interrupt_count = self._interrupt_count
         if self._handled_interrupt_count == 0 and interrupt_count >= 1:
             self._handled_interrupt_count = 1
-            self.cancellation.cancel()
-            if self._progress is not None:
-                self._progress.begin_cancellation()
             self._force_deadline = self._clock() + self._force_grace_seconds
-            self._cancel_dispatched.set()
+            self._cancel_worker = threading.Thread(
+                target=self._deliver_cancellation,
+                name="betterborg-cancellation-dispatch",
+                daemon=True,
+            )
+            self._cancel_worker.start()
         if self._handled_interrupt_count < 2 and interrupt_count >= 2:
             self._handled_interrupt_count = 2
             self._request_force(self._forced_windows)
 
+    def _deliver_cancellation(self) -> None:
+        try:
+            self.cancellation.cancel()
+            self._cancel_dispatched.set()
+            if self._progress is not None:
+                self._progress.begin_cancellation()
+        except BaseException as error:
+            self._record_dispatcher_error(error)
+
     def _request_force(
         self, windows: tuple[CancellationRegistrationWindow, ...]
     ) -> None:
-        if self._force_dispatched.is_set():
+        if self._force_delivery_started:
             return
         self._force_requested = True
         self.cancellation._force_requested_signal = True
-        if not self._forced_windows:
+        if not self._force_snapshot_captured:
             self._forced_windows = windows or self.cancellation.active_windows
-        self._signal_process_groups(self.cancellation.force_targets)
+            self._force_snapshot_captured = True
+        self._direct_force_complete = self._signal_process_groups(
+            self.cancellation.force_targets
+        )
         if not self._force_notice_written:
             self._write_force_notice_deferred()
+        self._force_delivery_started = True
+        self._force_worker = threading.Thread(
+            target=self._deliver_force,
+            name="betterborg-force-dispatch",
+            daemon=True,
+        )
+        self._force_worker.start()
+        if self._direct_force_complete:
+            self._arbitrate_exit()
+
+    def _deliver_force(self) -> None:
         try:
             self.cancellation.force()
         except BaseException as error:
-            self._dispatcher_error = error
-        finally:
+            self._record_dispatcher_error(error)
+        else:
             self._force_dispatched.set()
+        finally:
+            self._wake_dispatcher(b"f")
 
-        for window in self._forced_windows:
-            window.wait()
-        if all(window.is_settled for window in self._forced_windows):
+    def _arbitrate_exit(self) -> None:
+        if not self._force_delivery_started or self._exit_invoked:
+            return
+        if self.cancellation.has_window_opening:
+            return
+        if any(not window.is_settled for window in self._forced_windows):
+            return
+        if self._direct_force_complete:
+            self._invoke_exit()
+        elif self._force_dispatched.is_set():
             self._invoke_exit()
 
+    def _record_dispatcher_error(self, error: BaseException) -> None:
+        if self._dispatcher_error is None:
+            self._dispatcher_error = error
+
     def _deadline_timeout(self) -> float | None:
-        if self._force_deadline is None or self._force_dispatched.is_set():
+        if self._force_delivery_started:
+            return _ARBITRATION_POLL_SECONDS
+        if self._force_deadline is None:
             return None
         return max(0.0, self._force_deadline - self._clock())
 
     def _deadline_reached(self) -> bool:
         return (
             self._force_deadline is not None
-            and not self._force_dispatched.is_set()
+            and not self._force_delivery_started
             and self._clock() >= self._force_deadline
         )
 
     @staticmethod
     def _signal_process_groups(targets: tuple[ForceTarget, ...]) -> bool:
-        undeliverable = False
+        delivery_complete = True
         for target in targets:
             process_group_id = target.process_group_id
             if process_group_id is None:
-                undeliverable = True
+                delivery_complete = False
                 continue
             try:
                 os.killpg(process_group_id, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
-        return undeliverable
+            except OSError:
+                delivery_complete = False
+        return delivery_complete
 
     def _write_force_notice_signal_safe(self) -> bool:
         if self._force_descriptor < 0:

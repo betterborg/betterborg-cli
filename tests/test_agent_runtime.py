@@ -404,6 +404,7 @@ def test_force_callback_failure_propagates_and_remains_failed() -> None:
 def test_failed_force_delivery_keeps_registration_window_active() -> None:
     cancel = CancellationToken()
     window = cancel.registration_window()
+    window.resource_created()
     cancel.force()
 
     def fail_force() -> None:
@@ -431,6 +432,7 @@ def test_failed_force_delivery_keeps_registration_window_active() -> None:
 def test_failed_late_cancel_settles_window_after_successful_force() -> None:
     cancel = CancellationToken()
     window = cancel.registration_window()
+    window.resource_created()
     cancel.force()
     force_delivered = threading.Event()
 
@@ -464,6 +466,7 @@ def test_registration_window_retains_created_resource_until_late_force() -> None
     registrations = []
 
     def create_and_publish() -> None:
+        window.resource_created()
         created.set()
         publish.wait()
         registrations.append(
@@ -530,6 +533,7 @@ def test_registration_window_settles_conclusive_precreation_failure() -> None:
 def test_registration_window_requires_force_target_and_single_settlement() -> None:
     cancel = CancellationToken()
     window = cancel.registration_window()
+    window.resource_created()
 
     with pytest.raises(ValueError, match="validated force target"):
         window.register(lambda: None)
@@ -548,6 +552,33 @@ def test_registration_window_requires_force_target_and_single_settlement() -> No
             lambda: None,
             force_target=ForceTarget("other-worker"),
         )
+    assert registration.unregister()
+
+
+def test_registration_window_rejects_no_resource_after_creation() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+
+    with pytest.raises(RuntimeError, match="record resource creation"):
+        window.register(
+            lambda: None,
+            lambda: None,
+            force_target=ForceTarget("created-worker"),
+        )
+    window.resource_created()
+
+    with pytest.raises(RuntimeError, match="created resource must be published"):
+        window.no_resource()
+    with pytest.raises(RuntimeError, match="already recorded"):
+        window.resource_created()
+    assert cancel.active_windows == (window,)
+
+    registration = window.register(
+        lambda: None,
+        lambda: None,
+        force_target=ForceTarget("created-worker"),
+    )
+    assert window.is_settled
     assert registration.unregister()
 
 
