@@ -40,6 +40,188 @@ class ProcessRunner(Protocol):
     ) -> int: ...
 
 
+def run_captured(
+    command: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    input: str | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    check: bool = False,
+    cancel: CancellationToken | None = None,
+    terminate_on_cancel: bool = True,
+    deadline: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an argv sequence and capture text output with registered cleanup.
+
+    Ordinary work stops when ``cancel`` is set. Shutdown cleanup may opt out of
+    first-cancel termination, but only while bounded by the token's absolute
+    force deadline or an explicit absolute deadline. Forced cancellation always
+    terminates the process group.
+    """
+    if isinstance(command, str | bytes) or not command:
+        raise ValueError("command must be a non-empty argv sequence")
+    argv = list(command)
+    _validate_cleanup_mode(cancel, terminate_on_cancel, deadline)
+    if cancel is not None and cancel.is_set() and terminate_on_cancel:
+        return subprocess.CompletedProcess(argv, -1, "", "")
+
+    window = None
+    process: subprocess.Popen[str] | None = None
+    registration: CancellationRegistration | None = None
+    process_group_id: int | None = None
+    force_target: ForceTarget | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    timed_out = False
+    deadline_expired = False
+
+    try:
+        try:
+            window = (
+                cancel.registration_window() if cancel is not None else None
+            )
+        except CancellationRegistrationRejected:
+            return subprocess.CompletedProcess(argv, -1, "", "")
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.PIPE if input is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(env) if env is not None else None,
+                text=True,
+                start_new_session=os.name == "posix",
+            )
+        except BaseException:
+            if window is not None:
+                window.no_resource()
+            raise
+
+        if window is not None:
+            window.resource_created()
+        process_group_id = _validated_process_group(process)
+        if window is not None:
+            force_target = ForceTarget(
+                process.pid,
+                process_group_id=process_group_id,
+            )
+            try:
+                registration = window.register(
+                    lambda: _request_termination(process, process_group_id),
+                    lambda: terminate_process(
+                        process,
+                        pgid=process_group_id,
+                        force_deadline=time.monotonic(),
+                    ),
+                    terminate_on_cancel=terminate_on_cancel,
+                    force_target=force_target,
+                )
+            except CancellationDeliveryError as error:
+                registration = error.registration
+                raise
+
+        started = time.monotonic()
+        input_text = input
+        timeout_deadline = None if timeout is None else started + timeout
+        while True:
+            if cancel is not None and cancel.is_set() and terminate_on_cancel:
+                break
+
+            active_deadline = _captured_deadline(
+                timeout_deadline,
+                deadline,
+                cancel,
+                terminate_on_cancel,
+            )
+            if active_deadline is not None and active_deadline <= time.monotonic():
+                if cancel is not None and cancel.is_set():
+                    deadline_expired = True
+                elif (
+                    timeout_deadline is not None
+                    and active_deadline == timeout_deadline
+                ):
+                    timed_out = True
+                else:
+                    deadline_expired = True
+                break
+
+            wait_timeout = (
+                _PROCESS_POLL_SECONDS
+                if active_deadline is None
+                else min(
+                    _PROCESS_POLL_SECONDS,
+                    max(0.0, active_deadline - time.monotonic()),
+                )
+            )
+            try:
+                stdout, stderr = process.communicate(
+                    input=input_text,
+                    timeout=wait_timeout,
+                )
+                break
+            except subprocess.TimeoutExpired:
+                # ``communicate`` retains both buffered output and unwritten
+                # input across retries. Input must only be supplied initially.
+                input_text = None
+                continue
+    finally:
+        if process is not None:
+            force_deadline = (
+                time.monotonic()
+                if timed_out or deadline_expired
+                else (cancel.force_deadline if cancel is not None else None)
+            )
+            terminate_process(
+                process,
+                pgid=process_group_id,
+                force_deadline=force_deadline,
+            )
+            if stdout is None or stderr is None:
+                stdout, stderr = process.communicate()
+            if registration is not None:
+                registration.unregister()
+            elif window is not None and not window.is_settled:
+                if force_target is None:
+                    force_target = ForceTarget(
+                        process.pid,
+                        process_group_id=process_group_id,
+                    )
+                window.publish_cleaned_resource(
+                    lambda: _request_termination(process, process_group_id),
+                    lambda: terminate_process(
+                        process,
+                        pgid=process_group_id,
+                        force_deadline=time.monotonic(),
+                    ),
+                    force_target=force_target,
+                )
+
+    assert process is not None
+    assert stdout is not None
+    assert stderr is not None
+    cancelled = cancel is not None and (
+        (terminate_on_cancel and cancel.is_set())
+        or cancel.is_forced()
+        or (deadline_expired and cancel.is_set())
+    )
+    if cancelled:
+        return subprocess.CompletedProcess(argv, -1, stdout, stderr)
+    if timed_out or deadline_expired:
+        duration = timeout if timed_out else max(0.0, time.monotonic() - started)
+        raise subprocess.TimeoutExpired(
+            argv,
+            duration,
+            output=stdout,
+            stderr=stderr,
+        )
+    result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
+
+
 def run_streamed(
     command: Sequence[str],
     cwd: Path,
@@ -195,6 +377,44 @@ def run_streamed(
         return -1
     assert process is not None
     return process.returncode
+
+
+def _validate_cleanup_mode(
+    cancel: CancellationToken | None,
+    terminate_on_cancel: bool,
+    deadline: float | None,
+) -> None:
+    if terminate_on_cancel:
+        return
+    if cancel is None:
+        raise ValueError("cleanup mode requires a cancellation token")
+    token_deadline = cancel.force_deadline
+    if deadline is None and token_deadline is None:
+        raise ValueError("cleanup mode requires an absolute deadline")
+    if (
+        deadline is not None
+        and token_deadline is not None
+        and deadline > token_deadline
+    ):
+        raise ValueError("cleanup deadline cannot exceed the token deadline")
+
+
+def _captured_deadline(
+    timeout_deadline: float | None,
+    deadline: float | None,
+    cancel: CancellationToken | None,
+    terminate_on_cancel: bool,
+) -> float | None:
+    deadlines = [
+        value for value in (timeout_deadline, deadline) if value is not None
+    ]
+    if (
+        not terminate_on_cancel
+        and cancel is not None
+        and cancel.force_deadline is not None
+    ):
+        deadlines.append(cancel.force_deadline)
+    return min(deadlines, default=None)
 
 
 def terminate_process(
