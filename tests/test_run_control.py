@@ -155,7 +155,83 @@ def test_watchdog_uses_bounded_grace_and_forces_after_deadline() -> None:
     _press_sigint()
 
     assert control.wait_for_force(1)
+    deadline = time.monotonic() + 1
+    while not exits and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert exits == [INTERRUPTED_EXIT_CODE]
+    with pytest.raises(KeyboardInterrupt):
+        section.__exit__(None, None, None)
+    control.close()
+
+
+def test_force_includes_window_published_during_snapshot_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel = CancellationToken()
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    force_worker_started = threading.Event()
+    release_force_worker = threading.Event()
+    original_refresh = cancel._refresh_registry_snapshots
+    original_force = cancel.force
+
+    def delayed_refresh() -> None:
+        publication_started.set()
+        release_publication.wait()
+        original_refresh()
+
+    def delayed_force() -> None:
+        force_worker_started.set()
+        release_force_worker.wait()
+        original_force()
+
+    monkeypatch.setattr(cancel, "_refresh_registry_snapshots", delayed_refresh)
+    monkeypatch.setattr(cancel, "force", delayed_force)
+    exits: list[int] = []
+    control = RunControl(cancel, exit_function=exits.append).install()
+    section = control.protected()
+    section.__enter__()
+    _press_sigint()
+    assert control.wait_for_cancellation(1)
+
+    windows = []
+    opener = threading.Thread(
+        target=lambda: windows.append(cancel.registration_window())
+    )
+    opener.start()
+    assert publication_started.wait(1)
+    _press_sigint()
+    assert force_worker_started.wait(1)
+    assert exits == []
+
+    release_publication.set()
+    opener.join(timeout=1)
+    assert not opener.is_alive()
+    window = windows[0]
+    window.resource_created()
+    deadline = time.monotonic() + 1
+    while not control._force_snapshot_captured and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert control._forced_windows == (window,)
+    assert not window.is_settled
+    assert exits == []
+
+    forced = threading.Event()
+    registration = window.register(
+        lambda: None,
+        forced.set,
+        force_target=ForceTarget("opening-worker"),
+    )
+    assert forced.is_set()
+    assert window.is_settled
+    deadline = time.monotonic() + 1
+    while not exits and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert exits == [INTERRUPTED_EXIT_CODE]
+
+    release_force_worker.set()
+    assert control.wait_for_force(1)
+    assert registration.unregister()
     with pytest.raises(KeyboardInterrupt):
         section.__exit__(None, None, None)
     control.close()

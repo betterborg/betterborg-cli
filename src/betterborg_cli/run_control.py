@@ -217,15 +217,21 @@ class RunControl:
             return
         self._force_requested = True
         self.cancellation._force_requested_signal = True
+        opening_in_progress = self.cancellation.has_window_opening
         windows = self.cancellation.active_windows
         targets = self.cancellation.force_targets
         self._forced_windows = windows
-        self._force_snapshot_captured = True
+        # An opener that passed its post-force check is already part of the
+        # force boundary even when it has not published its window object yet.
+        # Finalize the immutable snapshot in the dispatcher after such openers
+        # drain; reading the opening marker before the snapshot means that a
+        # newly starting, post-force opener can only be rejected.
+        self._force_snapshot_captured = not opening_in_progress
         self._direct_force_complete = self._signal_process_groups(targets)
         self._force_notice_written = self._write_force_notice_signal_safe()
         if (
-            not windows
-            and not self.cancellation.has_window_opening
+            self._force_snapshot_captured
+            and not windows
             and self._direct_force_complete
         ):
             self._invoke_exit()
@@ -288,8 +294,8 @@ class RunControl:
         self._force_requested = True
         self.cancellation._force_requested_signal = True
         if not self._force_snapshot_captured:
-            self._forced_windows = windows or self.cancellation.active_windows
-            self._force_snapshot_captured = True
+            self._forced_windows = windows
+            self._finalize_force_window_snapshot()
         self._direct_force_complete = self._signal_process_groups(
             self.cancellation.force_targets
         )
@@ -318,7 +324,7 @@ class RunControl:
     def _arbitrate_exit(self) -> None:
         if not self._force_delivery_started or self._exit_invoked:
             return
-        if self.cancellation.has_window_opening:
+        if not self._finalize_force_window_snapshot():
             return
         if any(not window.is_settled for window in self._forced_windows):
             return
@@ -326,6 +332,21 @@ class RunControl:
             self._invoke_exit()
         elif self._force_dispatched.is_set():
             self._invoke_exit()
+
+    def _finalize_force_window_snapshot(self) -> bool:
+        """Capture every window whose opening began before force was requested."""
+        if self._force_snapshot_captured:
+            return True
+        if self.cancellation.has_window_opening:
+            return False
+
+        windows = list(self._forced_windows)
+        for window in self.cancellation.active_windows:
+            if window not in windows:
+                windows.append(window)
+        self._forced_windows = tuple(windows)
+        self._force_snapshot_captured = True
+        return True
 
     def _record_dispatcher_error(self, error: BaseException) -> None:
         if self._dispatcher_error is None:

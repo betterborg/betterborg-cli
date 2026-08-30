@@ -185,6 +185,7 @@ class CancellationToken:
         self._cancel_delivery_started = threading.Event()
         self._force_delivery_finished = threading.Event()
         self._lock = threading.Lock()
+        self._window_opening_lock = threading.Lock()
         self._clock = clock
         self._grace_seconds = grace_seconds
         self._state = CancellationState.ACTIVE
@@ -230,7 +231,8 @@ class CancellationToken:
 
     def registration_window(self) -> CancellationRegistrationWindow:
         """Register a unique creation window before an OS resource is created."""
-        self._window_opening_count += 1
+        with self._window_opening_lock:
+            self._window_opening_count += 1
         try:
             with self._lock:
                 if (
@@ -247,7 +249,8 @@ class CancellationToken:
                 self._refresh_registry_snapshots()
                 return window
         finally:
-            self._window_opening_count -= 1
+            with self._window_opening_lock:
+                self._window_opening_count -= 1
 
     def register(
         self,
@@ -419,7 +422,11 @@ class CancellationToken:
             cancel_callback = self._claim_cancel(entry)
             force_callback = self._claim_force(entry)
             window_settled = False
-            if window_id is not None and self._state is CancellationState.ACTIVE:
+            if (
+                window_id is not None
+                and self._state is CancellationState.ACTIVE
+                and not self._force_requested_signal
+            ):
                 settled_entry = self._registration_windows.pop(window_id)
                 settled_entry.window._settled.set()
                 self._refresh_registry_snapshots()
@@ -482,7 +489,10 @@ class CancellationToken:
         self, window_id: int, cancellation_entry: _CancellationEntry
     ) -> None:
         with self._lock:
-            if self._state is not CancellationState.FORCED:
+            if (
+                self._state is not CancellationState.FORCED
+                and not self._force_requested_signal
+            ):
                 entry = self._registration_windows.pop(window_id, None)
                 if entry is None:
                     raise RuntimeError("registration window is already settled")
@@ -541,7 +551,10 @@ class CancellationToken:
 
     def _claim_force(self, entry: _CancellationEntry) -> Callable[[], None] | None:
         if (
-            self._state is not CancellationState.FORCED
+            (
+                self._state is not CancellationState.FORCED
+                and not self._force_requested_signal
+            )
             or entry.force_claimed
             or entry.on_force is None
             or entry.force_target is None
