@@ -121,6 +121,11 @@ class RunControl:
         """Return an exception raised by deferred cancellation delivery."""
         return self._dispatcher_error
 
+    @property
+    def interruption_requested(self) -> bool:
+        """Return whether this controller received a first SIGINT."""
+        return self._interrupt_count >= 1
+
     def install(self) -> RunControl:
         """Install SIGINT and wakeup dispatch, returning this controller."""
         if self._installed:
@@ -209,7 +214,7 @@ class RunControl:
                 raise KeyboardInterrupt
 
     def wait_for_cancellation(self, timeout: float | None = None) -> bool:
-        """Wait until the dispatcher has recorded first cancellation."""
+        """Wait until first cancellation and progress acknowledgement finish."""
         return self._cancel_dispatched.wait(timeout)
 
     def wait_for_force(self, timeout: float | None = None) -> bool:
@@ -273,6 +278,8 @@ class RunControl:
         except BaseException as error:
             self._dispatcher_error = error
         finally:
+            if self._interrupt_count >= 1 and self._cancel_worker is None:
+                self._cancel_dispatched.set()
             selector.close()
             self._dispatcher_stopped.set()
 
@@ -294,11 +301,12 @@ class RunControl:
     def _deliver_cancellation(self) -> None:
         try:
             self.cancellation.cancel()
-            self._cancel_dispatched.set()
             if self._progress is not None:
                 self._progress.begin_cancellation()
         except BaseException as error:
             self._record_dispatcher_error(error)
+        finally:
+            self._cancel_dispatched.set()
 
     def _request_force(
         self, windows: tuple[CancellationRegistrationWindow, ...]

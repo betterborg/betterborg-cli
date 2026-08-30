@@ -54,7 +54,7 @@ def test_first_sigint_defers_protected_exception_and_application_locks() -> None
         progress.lock.release()
 
     assert control.wait_for_cancellation(1)
-    assert progress.called.wait(1)
+    assert progress.called.is_set()
     with pytest.raises(KeyboardInterrupt):
         section.__exit__(None, None, None)
     control.close()

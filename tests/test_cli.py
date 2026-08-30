@@ -3,6 +3,7 @@
 import io
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -187,6 +188,68 @@ def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
         f"{observed['before_interrupt']}stopping...\n"
     )
     assert "stopped" in stream.getvalue()
+
+
+def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    stream = io.StringIO()
+    cancellation_started = threading.Event()
+    release_cancellation = threading.Event()
+    observed: dict[str, object] = {}
+    original_cancel = cli_module.CancellationToken.cancel
+
+    monkeypatch.setattr(
+        cli_module,
+        "RunProgress",
+        lambda **kwargs: RunProgress(stream=stream, **kwargs),
+    )
+
+    def delayed_cancel(token: cli_module.CancellationToken) -> None:
+        cancellation_started.set()
+        assert release_cancellation.wait(1)
+        original_cancel(token)
+
+    monkeypatch.setattr(cli_module.CancellationToken, "cancel", delayed_cancel)
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        observed["run"] = run
+        os.kill(os.getpid(), signal.SIGINT)
+
+    def inspect_before_release() -> None:
+        assert cancellation_started.wait(1)
+        run = observed["run"]
+        assert isinstance(run, cli_module.CliRunContext)
+        observed["cancelled_before_release"] = run.cancellation.is_set()
+        observed["cancelling_before_release"] = run.progress.cancelling
+        observed["closed_before_release"] = run.progress.closed
+        release_cancellation.set()
+
+    observer = threading.Thread(target=inspect_before_release)
+    monkeypatch.setattr(cli_module, "cli", command)
+    observer.start()
+    try:
+        exit_code = cli_module.main([], prog_name="borg")
+    finally:
+        release_cancellation.set()
+        observer.join(timeout=1)
+
+    run = observed["run"]
+    assert isinstance(run, cli_module.CliRunContext)
+    assert exit_code == 130
+    assert not observer.is_alive()
+    assert observed["cancelled_before_release"] is False
+    assert observed["cancelling_before_release"] is False
+    assert observed["closed_before_release"] is False
+    assert run.cancellation.is_set()
+    assert run.progress.cancelling
+    assert run.progress.closed
+    assert stream.getvalue().splitlines() == [
+        "stopping...",
+        "summary: 0 completed, 0 failed, 0 stopped — 0 retained",
+    ]
 
 
 def test_main_preserves_click_usage_error_formatting(

@@ -142,12 +142,12 @@ def main(
             )
         except click.ClickException as error:
             if _caused_by_interruption(error):
-                return _interrupted_exit_code(run.progress)
+                return _interrupted_exit_code(control, run.progress)
             error.show()
             return error.exit_code
         except click.Abort as error:
             if _caused_by_interruption(error):
-                return _interrupted_exit_code(run.progress)
+                return _interrupted_exit_code(control, run.progress)
             click.echo("Aborted!", err=True)
             return 1
         except OSError as error:
@@ -168,9 +168,16 @@ def _caused_by_interruption(error: BaseException) -> bool:
     return isinstance(cause, KeyboardInterrupt)
 
 
-def _interrupted_exit_code(progress: RunProgress) -> int:
+def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
     """Map interruption only after strict progress reconciliation succeeds."""
 
+    if control.interruption_requested:
+        control.wait_for_cancellation()
+        if dispatch_error := control.dispatcher_error:
+            click.ClickException(
+                f"cancellation dispatch failed: {dispatch_error}"
+            ).show()
+            return 1
     try:
         progress.close()
     except ProgressError as error:
