@@ -340,6 +340,7 @@ class AnthropicAdapter:
                         block,
                         tools,
                         allowed,
+                        runtime=runtime,
                         redactor=runtime.redactor,
                         cancel=cancel,
                     )
@@ -378,6 +379,7 @@ def _execute_tool_use(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
+    runtime: ApiRunContext,
     redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
@@ -399,6 +401,7 @@ def _execute_tool_use(
         return redacted_result()
     try:
         value = tools.execute(name, arguments, cancel=cancel)
+        runtime.emit_tool_activity(name, arguments)
         result["content"] = json.dumps(value, sort_keys=True)
     except Exception as error:
         result.update(content=str(error), is_error=True)

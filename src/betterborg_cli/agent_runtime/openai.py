@@ -346,6 +346,7 @@ class OpenAIAdapter:
                         call,
                         tools,
                         allowed,
+                        runtime=runtime,
                         redactor=runtime.redactor,
                         cancel=cancel,
                     )
@@ -445,6 +446,7 @@ def _execute_tool_call(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
+    runtime: ApiRunContext,
     redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
@@ -462,6 +464,7 @@ def _execute_tool_call(
         try:
             arguments = _tool_arguments(call)
             value = tools.execute(name, arguments, cancel=cancel)
+            runtime.emit_tool_activity(name, arguments)
         except Exception as error:
             value = {"error": str(error)}
     result["output"] = json.dumps(
