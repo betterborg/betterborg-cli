@@ -16,6 +16,7 @@ from betterborg_cli.agent_runtime import (
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationRegistrationWindow,
     CancellationState,
     CancellationToken,
     ForceTarget,
@@ -235,6 +236,130 @@ def test_cancellation_token_late_force_delivery_preserves_order() -> None:
     assert delivered == ["cancel", "force"]
     assert registrations[0].unregister()
     assert cancel.force_targets == ()
+
+
+def test_force_delivers_before_return_without_waiting_for_cancel_callback() -> None:
+    cancel = CancellationToken()
+    cancel_entered = threading.Event()
+    release_cancel = threading.Event()
+    force_delivered = threading.Event()
+
+    def on_cancel() -> None:
+        cancel_entered.set()
+        release_cancel.wait()
+
+    registration = cancel.register(
+        on_cancel,
+        force_delivered.set,
+        force_target=ForceTarget("worker"),
+    )
+
+    cancel.cancel()
+    assert cancel_entered.wait(1)
+
+    cancel.force()
+
+    assert force_delivered.is_set()
+    assert not release_cancel.is_set()
+    release_cancel.set()
+    assert registration.unregister()
+
+
+def test_registration_window_retains_created_resource_until_late_force() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+    snapshot = cancel.active_windows
+    created = threading.Event()
+    publish = threading.Event()
+    forced = threading.Event()
+    registrations = []
+
+    def create_and_publish() -> None:
+        created.set()
+        publish.wait()
+        registrations.append(
+            window.register(
+                lambda: None,
+                forced.set,
+                force_target=ForceTarget("created-worker"),
+            )
+        )
+
+    worker = threading.Thread(target=create_and_publish)
+    worker.start()
+    assert created.wait(1)
+    assert snapshot == (window,)
+    assert isinstance(snapshot, tuple)
+
+    cancel.force()
+
+    assert not window.is_settled
+    assert cancel.active_windows == (window,)
+    with pytest.raises(RuntimeError, match="after force"):
+        cancel.registration_window()
+
+    publish.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert forced.is_set()
+    assert window.wait(0)
+    assert cancel.active_windows == ()
+    assert registrations[0].force_target == ForceTarget("created-worker")
+    assert registrations[0].unregister()
+
+
+def test_registration_window_settles_conclusive_precreation_failure() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+    failure_confirmed = threading.Event()
+    release = threading.Event()
+
+    def fail_before_creation() -> None:
+        release.wait()
+        failure_confirmed.set()
+        window.no_resource()
+
+    worker = threading.Thread(target=fail_before_creation)
+    worker.start()
+    snapshot = cancel.active_windows
+    cancel.force()
+
+    assert snapshot == (window,)
+    assert not window.wait(0)
+    release.set()
+    worker.join(timeout=1)
+
+    assert failure_confirmed.is_set()
+    assert window.is_settled
+    assert snapshot[0].wait(0)
+    assert cancel.active_windows == ()
+    with pytest.raises(RuntimeError, match="already settled"):
+        window.no_resource()
+
+
+def test_registration_window_requires_force_target_and_single_settlement() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+
+    with pytest.raises(ValueError, match="validated force target"):
+        window.register(lambda: None)
+
+    registration = window.register(
+        lambda: None,
+        lambda: None,
+        force_target=ForceTarget("worker"),
+    )
+
+    assert isinstance(window, CancellationRegistrationWindow)
+    assert window.is_settled
+    with pytest.raises(RuntimeError, match="already settled"):
+        window.register(
+            lambda: None,
+            lambda: None,
+            force_target=ForceTarget("other-worker"),
+        )
+    assert registration.unregister()
 
 
 def test_cancellation_token_unregister_before_cancel_prevents_delivery() -> None:

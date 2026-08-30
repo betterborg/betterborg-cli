@@ -69,7 +69,13 @@ class _CancellationEntry:
     force_target: ForceTarget | None
     cancel_claimed: bool = False
     force_claimed: bool = False
-    cancel_finished: threading.Event = field(default_factory=threading.Event)
+    force_finished: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(slots=True)
+class _RegistrationWindowEntry:
+    window: CancellationRegistrationWindow
+    publication_started: bool = False
 
 
 class CancellationRegistration:
@@ -90,6 +96,45 @@ class CancellationRegistration:
         return self._token._unregister(self._registration_id)
 
 
+class CancellationRegistrationWindow:
+    """Pre-creation entry retained until resource creation is resolved."""
+
+    def __init__(self, token: CancellationToken, window_id: int) -> None:
+        self._token = token
+        self._window_id = window_id
+        self._settled = threading.Event()
+
+    @property
+    def is_settled(self) -> bool:
+        """Return whether creation has been conclusively resolved."""
+        return self._settled.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for target registration or conclusive creation failure."""
+        return self._settled.wait(timeout)
+
+    def register(
+        self,
+        on_cancel: Callable[[], None],
+        on_force: Callable[[], None] | None = None,
+        *,
+        terminate_on_cancel: bool = True,
+        force_target: ForceTarget | None = None,
+    ) -> CancellationRegistration:
+        """Publish a created resource and atomically register its callbacks."""
+        return self._token._register(
+            on_cancel,
+            on_force,
+            terminate_on_cancel=terminate_on_cancel,
+            force_target=force_target,
+            window_id=self._window_id,
+        )
+
+    def no_resource(self) -> None:
+        """Settle a window after creation conclusively produced no resource."""
+        self._token._settle_no_resource(self._window_id)
+
+
 class CancellationToken:
     """Atomic active/cancelled/forced lifecycle for cooperative resources."""
 
@@ -106,13 +151,16 @@ class CancellationToken:
         self._event = threading.Event()
         self._force_event = threading.Event()
         self._cancel_delivery_started = threading.Event()
+        self._force_delivery_finished = threading.Event()
         self._lock = threading.Lock()
         self._clock = clock
         self._grace_seconds = grace_seconds
         self._state = CancellationState.ACTIVE
         self._force_deadline: float | None = None
         self._next_registration_id = 0
+        self._next_window_id = 0
         self._registrations: dict[int, _CancellationEntry] = {}
+        self._registration_windows: dict[int, _RegistrationWindowEntry] = {}
 
     @property
     def state(self) -> CancellationState:
@@ -136,6 +184,25 @@ class CancellationToken:
                 if entry.force_target is not None
             )
 
+    @property
+    def active_windows(self) -> tuple[CancellationRegistrationWindow, ...]:
+        """Return an immutable snapshot of unresolved creation windows."""
+        with self._lock:
+            return tuple(
+                entry.window for entry in self._registration_windows.values()
+            )
+
+    def registration_window(self) -> CancellationRegistrationWindow:
+        """Register a unique creation window before an OS resource is created."""
+        with self._lock:
+            if self._state is CancellationState.FORCED:
+                raise RuntimeError("cannot open a registration window after force")
+            window_id = self._next_window_id
+            self._next_window_id += 1
+            window = CancellationRegistrationWindow(self, window_id)
+            self._registration_windows[window_id] = _RegistrationWindowEntry(window)
+            return window
+
     def register(
         self,
         on_cancel: Callable[[], None],
@@ -150,38 +217,12 @@ class CancellationToken:
         delivery. The resource owner must unregister it only after cleanup has
         verified the target no longer exists.
         """
-        if not callable(on_cancel):
-            raise TypeError("on_cancel must be callable")
-        if on_force is not None and not callable(on_force):
-            raise TypeError("on_force must be callable")
-        if (on_force is None) != (force_target is None):
-            raise ValueError("on_force and force_target must be provided together")
-        if not terminate_on_cancel and on_force is None:
-            raise ValueError("cleanup registrations must remain force-deliverable")
-
-        with self._lock:
-            registration_id = self._next_registration_id
-            self._next_registration_id += 1
-            entry = _CancellationEntry(
-                on_cancel=on_cancel,
-                on_force=on_force,
-                terminate_on_cancel=terminate_on_cancel,
-                force_target=force_target,
-            )
-            self._registrations[registration_id] = entry
-            cancel_callback = self._claim_cancel(entry)
-            force_callback = self._claim_force(entry)
-
-        registration = CancellationRegistration(
-            self, registration_id, force_target
+        return self._register(
+            on_cancel,
+            on_force,
+            terminate_on_cancel=terminate_on_cancel,
+            force_target=force_target,
         )
-        # Late delivery is synchronous, but callbacks are never invoked while
-        # the token lock is held.
-        if cancel_callback is not None:
-            self._invoke_late(cancel_callback)
-        if force_callback is not None:
-            self._invoke_late(force_callback)
-        return registration
 
     def cancel(self) -> None:
         """Record first cancellation and concurrently broadcast eligible callbacks."""
@@ -193,29 +234,43 @@ class CancellationToken:
             self._event.set()
             callbacks = self._claim_cancel_callbacks()
 
-        self._broadcast(callbacks, "cancel")
+        self._broadcast(callbacks, "cancel", wait_for_completion=False)
         self._cancel_delivery_started.set()
 
     def force(self) -> None:
         """Record forced cancellation and broadcast every validated force callback."""
         with self._lock:
             if self._state is CancellationState.FORCED:
-                return
-            was_active = self._state is CancellationState.ACTIVE
-            if was_active:
-                self._force_deadline = self._clock()
-                self._event.set()
-            self._state = CancellationState.FORCED
-            self._force_event.set()
-            cancel_callbacks = self._claim_cancel_callbacks()
-            force_callbacks = self._claim_force_callbacks()
+                already_forced = True
+                was_active = False
+                cancel_callbacks = []
+                force_callbacks = []
+            else:
+                already_forced = False
+                was_active = self._state is CancellationState.ACTIVE
+                if was_active:
+                    self._force_deadline = self._clock()
+                    self._event.set()
+                self._state = CancellationState.FORCED
+                self._force_event.set()
+                cancel_callbacks = self._claim_cancel_callbacks()
+                force_callbacks = self._claim_force_callbacks()
 
-        if was_active:
-            self._broadcast(cancel_callbacks, "cancel")
-            self._cancel_delivery_started.set()
-        else:
-            self._cancel_delivery_started.wait()
-        self._broadcast(force_callbacks, "force")
+        if already_forced:
+            self._force_delivery_finished.wait()
+            return
+
+        try:
+            if was_active:
+                self._broadcast(
+                    cancel_callbacks, "cancel", wait_for_completion=False
+                )
+                self._cancel_delivery_started.set()
+            else:
+                self._cancel_delivery_started.wait()
+            self._broadcast(force_callbacks, "force", wait_for_completion=True)
+        finally:
+            self._force_delivery_finished.set()
 
     def is_set(self) -> bool:
         """Return whether cancellation was requested."""
@@ -237,6 +292,100 @@ class CancellationToken:
         with self._lock:
             return self._registrations.pop(registration_id, None) is not None
 
+    def _register(
+        self,
+        on_cancel: Callable[[], None],
+        on_force: Callable[[], None] | None = None,
+        *,
+        terminate_on_cancel: bool,
+        force_target: ForceTarget | None,
+        window_id: int | None = None,
+    ) -> CancellationRegistration:
+        if not callable(on_cancel):
+            raise TypeError("on_cancel must be callable")
+        if on_force is not None and not callable(on_force):
+            raise TypeError("on_force must be callable")
+        if (on_force is None) != (force_target is None):
+            raise ValueError("on_force and force_target must be provided together")
+        if not terminate_on_cancel and on_force is None:
+            raise ValueError("cleanup registrations must remain force-deliverable")
+        if window_id is not None and on_force is None:
+            raise ValueError(
+                "registration windows require a validated force target"
+            )
+
+        with self._lock:
+            window_entry = None
+            if window_id is not None:
+                window_entry = self._registration_windows.get(window_id)
+                if window_entry is None or window_entry.publication_started:
+                    raise RuntimeError("registration window is already settled")
+                window_entry.publication_started = True
+            registration_id = self._next_registration_id
+            self._next_registration_id += 1
+            entry = _CancellationEntry(
+                on_cancel=on_cancel,
+                on_force=on_force,
+                terminate_on_cancel=terminate_on_cancel,
+                force_target=force_target,
+            )
+            self._registrations[registration_id] = entry
+            cancel_callback = self._claim_cancel(entry)
+            force_callback = self._claim_force(entry)
+            window_settled = False
+            if window_id is not None and self._state is CancellationState.ACTIVE:
+                settled_entry = self._registration_windows.pop(window_id)
+                settled_entry.window._settled.set()
+                window_settled = True
+
+        registration = CancellationRegistration(
+            self, registration_id, force_target
+        )
+        # Late delivery is synchronous, but callbacks are never invoked while
+        # the token lock is held.
+        if cancel_callback is not None:
+            self._invoke_late(cancel_callback)
+        if force_callback is not None:
+            self._invoke_late(force_callback)
+        if window_id is not None and not window_settled:
+            self._settle_published_window(window_id, entry)
+        return registration
+
+    def _settle_no_resource(self, window_id: int) -> None:
+        with self._lock:
+            entry = self._registration_windows.get(window_id)
+            if entry is None or entry.publication_started:
+                raise RuntimeError("registration window is already settled")
+            self._registration_windows.pop(window_id)
+            entry.window._settled.set()
+
+    def _settle_published_window(
+        self, window_id: int, cancellation_entry: _CancellationEntry
+    ) -> None:
+        with self._lock:
+            if self._state is not CancellationState.FORCED:
+                entry = self._registration_windows.pop(window_id, None)
+                if entry is None:
+                    raise RuntimeError("registration window is already settled")
+                entry.window._settled.set()
+                return
+            force_callback = self._claim_force(cancellation_entry)
+            wait_for_force = (
+                force_callback is None
+                and not cancellation_entry.force_finished.is_set()
+            )
+
+        if force_callback is not None:
+            self._invoke_late(force_callback)
+        elif wait_for_force:
+            cancellation_entry.force_finished.wait()
+
+        with self._lock:
+            entry = self._registration_windows.pop(window_id, None)
+            if entry is None:
+                raise RuntimeError("registration window is already settled")
+            entry.window._settled.set()
+
     def _claim_cancel(self, entry: _CancellationEntry) -> Callable[[], None] | None:
         if (
             self._state is CancellationState.ACTIVE
@@ -245,14 +394,7 @@ class CancellationToken:
         ):
             return None
         entry.cancel_claimed = True
-
-        def deliver_cancel() -> None:
-            try:
-                entry.on_cancel()
-            finally:
-                entry.cancel_finished.set()
-
-        return deliver_cancel
+        return entry.on_cancel
 
     def _claim_force(self, entry: _CancellationEntry) -> Callable[[], None] | None:
         if (
@@ -265,10 +407,11 @@ class CancellationToken:
         entry.force_claimed = True
 
         def deliver_force() -> None:
-            if entry.cancel_claimed:
-                entry.cancel_finished.wait()
-            if entry.on_force is not None:
-                entry.on_force()
+            try:
+                if entry.on_force is not None:
+                    entry.on_force()
+            finally:
+                entry.force_finished.set()
 
         return deliver_force
 
@@ -286,15 +429,24 @@ class CancellationToken:
             if (callback := self._claim_force(entry)) is not None
         ]
 
-    def _broadcast(self, callbacks: list[Callable[[], None]], label: str) -> None:
+    def _broadcast(
+        self,
+        callbacks: list[Callable[[], None]],
+        label: str,
+        *,
+        wait_for_completion: bool,
+    ) -> None:
         started: list[threading.Event] = []
+        completed: list[threading.Event] = []
         release = threading.Event()
         for callback in callbacks:
             callback_started = threading.Event()
+            callback_completed = threading.Event()
             started.append(callback_started)
+            completed.append(callback_completed)
             thread = threading.Thread(
                 target=self._invoke_broadcast,
-                args=(callback, callback_started, release),
+                args=(callback, callback_started, callback_completed, release),
                 name=f"betterborg-{label}-callback",
                 daemon=True,
             )
@@ -302,16 +454,23 @@ class CancellationToken:
         for callback_started in started:
             callback_started.wait()
         release.set()
+        if wait_for_completion:
+            for callback_completed in completed:
+                callback_completed.wait()
 
     def _invoke_broadcast(
         self,
         callback: Callable[[], None],
         started: threading.Event,
+        completed: threading.Event,
         release: threading.Event,
     ) -> None:
         started.set()
         release.wait()
-        self._invoke_late(callback)
+        try:
+            self._invoke_late(callback)
+        finally:
+            completed.set()
 
     def _invoke_late(self, callback: Callable[[], None]) -> None:
         try:
