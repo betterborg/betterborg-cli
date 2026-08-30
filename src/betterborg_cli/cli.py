@@ -160,16 +160,12 @@ def main(
 
 
 def _caused_by_interruption(error: BaseException) -> bool:
-    """Return whether Click or a workflow reconciler wrapped an interrupt."""
+    """Return whether Click directly wrapped an unsuppressed interrupt."""
 
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        if isinstance(current, KeyboardInterrupt):
-            return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return False
+    cause = error.__cause__
+    if cause is None and not error.__suppress_context__:
+        cause = error.__context__
+    return isinstance(cause, KeyboardInterrupt)
 
 
 @cli.command()

@@ -219,6 +219,32 @@ def test_main_preserves_click_exception_formatting(
     assert captured.err == "Error: ordinary failure\n"
 
 
+def test_main_surfaces_reconciliation_failure_after_interrupt(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    @click.command()
+    def command() -> None:
+        try:
+            try:
+                raise KeyboardInterrupt
+            except KeyboardInterrupt as interruption:
+                raise RuntimeError("durability reconciliation failed") from interruption
+        except RuntimeError as failure:
+            raise click.ClickException(
+                "could not reconcile interruption"
+            ) from failure
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="borg")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Error: could not reconcile interruption\n"
+
+
 def test_create_help_registers_required_positional_name(
     cli_runner: CliRunner,
 ) -> None:
