@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
+from conftest import RealProcessHarness
 
 from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     ApiToolError,
+    CancellationRegistrationWindow,
     CancellationToken,
     ContainedApiTools,
     PathContainmentError,
@@ -205,6 +208,70 @@ def test_run_command_terminates_when_cancelled(tmp_path: Path) -> None:
     assert result.returncode == -1
     assert started.exists()
     assert not finished.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_command_forced_cancellation_reaps_resistant_descendant(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    tools = ContainedApiTools(
+        real_process_harness.root,
+        ApiAgentRole.CODING,
+        workspace_trusted=True,
+    )
+    cancel = CancellationToken()
+    results: list[int] = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            tools.run_command(
+                real_process_harness.resistant_argv("contained-force"),
+                cancel=cancel,
+            ).returncode
+        )
+    )
+    thread.start()
+    real_process_harness.wait_for_marker("contained-force.parent.pid")
+    real_process_harness.wait_for_marker("contained-force.child.pid")
+
+    cancel.force()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert results == [-1]
+    real_process_harness.assert_tree_absent("contained-force")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_command_registration_failure_reaps_resistant_descendant(
+    real_process_harness: RealProcessHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = ContainedApiTools(
+        real_process_harness.root,
+        ApiAgentRole.CODING,
+        workspace_trusted=True,
+    )
+    cancel = CancellationToken()
+
+    def fail_registration(
+        _window: CancellationRegistrationWindow,
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        real_process_harness.wait_for_marker("contained-failure.parent.pid")
+        real_process_harness.wait_for_marker("contained-failure.child.pid")
+        raise RuntimeError("injected contained registration failure")
+
+    monkeypatch.setattr(CancellationRegistrationWindow, "register", fail_registration)
+
+    with pytest.raises(RuntimeError, match="injected contained registration failure"):
+        tools.run_command(
+            real_process_harness.resistant_argv("contained-failure"),
+            cancel=cancel,
+        )
+
+    assert cancel.active_windows == ()
+    real_process_harness.assert_tree_absent("contained-failure")
 
 
 def test_patch_validates_every_path_before_writing(tmp_path: Path) -> None:
