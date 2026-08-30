@@ -335,12 +335,12 @@ class AnthropicAdapter:
             for block in tool_uses:
                 if cancel is not None and cancel.is_set():
                     return runtime.cancelled()
-                _emit_tool_activity(block, allowed, runtime)
                 try:
                     tool_result = _execute_tool_use(
                         block,
                         tools,
                         allowed,
+                        runtime=runtime,
                         redactor=runtime.redactor,
                         cancel=cancel,
                     )
@@ -355,24 +355,6 @@ class AnthropicAdapter:
             AgentStatus.FAILED,
             error=f"Anthropic exceeded the {self.max_turns}-turn limit",
         )
-
-
-def _emit_tool_activity(
-    block: Mapping[str, Any],
-    allowed: frozenset[str],
-    runtime: ApiRunContext,
-) -> None:
-    tool_id = block.get("id")
-    name = block.get("name")
-    arguments = block.get("input")
-    if (
-        isinstance(tool_id, str)
-        and tool_id
-        and isinstance(name, str)
-        and name in allowed
-        and isinstance(arguments, Mapping)
-    ):
-        runtime.emit_tool_activity(name, arguments)
 
 
 def _tool_definition(name: str) -> dict[str, Any]:
@@ -397,6 +379,7 @@ def _execute_tool_use(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
+    runtime: ApiRunContext,
     redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
@@ -418,6 +401,7 @@ def _execute_tool_use(
         return redacted_result()
     try:
         value = tools.execute(name, arguments, cancel=cancel)
+        runtime.emit_tool_activity(name, arguments)
         result["content"] = json.dumps(value, sort_keys=True)
     except Exception as error:
         result.update(content=str(error), is_error=True)

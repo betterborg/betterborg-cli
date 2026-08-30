@@ -77,6 +77,43 @@ _API_TOOL_ACTIVITY_CASES = (
     ),
 )
 
+_REJECTED_ACTIVITY_CALLS = (
+    pytest.param(
+        "read_file",
+        {
+            "path": "provider-payload-must-stay-hidden",
+            "unexpected": "value",
+        },
+        "unexpected",
+        id="unexpected-read-argument",
+    ),
+    pytest.param(
+        "list_files",
+        {"path": ""},
+        "non-empty string",
+        id="empty-list-path",
+    ),
+    pytest.param(
+        "run_command",
+        {"argv": ["printf", "provider-payload-must-stay-hidden\0"]},
+        "without NUL bytes",
+        id="nul-command-argument",
+    ),
+    pytest.param(
+        "apply_patch",
+        {
+            "patch": (
+                "*** Begin Patch\n"
+                "*** Add File: ../provider-payload-must-stay-hidden\n"
+                "+rejected\n"
+                "*** End Patch"
+            )
+        },
+        "traversal is forbidden",
+        id="traversal-patch",
+    ),
+)
+
 
 @pytest.fixture(params=API_ADAPTER_HARNESSES, ids=lambda harness: harness.provider)
 def harness(request: pytest.FixtureRequest) -> ApiAdapterHarness:
@@ -629,11 +666,54 @@ def test_rejected_calls_emit_no_provider_payload_activity(
     assert provider_payload not in repr(activities)
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "error_fragment"),
+    _REJECTED_ACTIVITY_CALLS,
+)
+def test_execution_rejected_calls_emit_no_tool_activity(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    tool_name: str,
+    arguments: dict[str, object],
+    error_fragment: str,
+) -> None:
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [harness.tool_call(tool_name, arguments, call_id="rejected")],
+                response_id="rejected_response",
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "safe"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.CODING,
+        transport=transport,
+        workspace_trusted=True,
+    ).run(harness.spec(tmp_path, activity_sink=activities.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert error_fragment in harness.extract_tool_output(transport.payloads[1])
+    assert activities == [AgentActivity(AgentActivityKind.THINKING)] * 2
+    assert "provider-payload-must-stay-hidden" not in repr(activities)
+
+
 def test_api_tool_activity_detail_is_credential_redacted(
     tmp_path: Path,
     harness: ApiAdapterHarness,
 ) -> None:
     credential = harness.credential
+    (tmp_path / credential).write_text("redacted\n", encoding="utf-8")
     activities: list[AgentActivity] = []
     transport = FakeApiTransport(
         [
