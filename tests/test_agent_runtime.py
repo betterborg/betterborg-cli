@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,9 @@ from betterborg_cli.agent_runtime import (
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationState,
     CancellationToken,
+    ForceTarget,
     MockAdapter,
     MockResponse,
     StructuredResultError,
@@ -126,6 +129,170 @@ def test_mock_honors_preexisting_cancellation_without_consuming_response(
     assert result.status == AgentStatus.CANCELLED
     assert result.resumable
     assert len(adapter.responses) == 1
+
+
+def test_cancellation_token_broadcasts_with_one_absolute_deadline() -> None:
+    clock_values = iter([10.0, 99.0])
+    cancel = CancellationToken(grace_seconds=0.75, clock=lambda: next(clock_values))
+    release = threading.Event()
+    entered = [threading.Event() for _ in range(3)]
+    deadlines: list[float | None] = []
+
+    def blocking_callback(index: int) -> None:
+        deadlines.append(cancel.force_deadline)
+        entered[index].set()
+        release.wait()
+
+    registrations = [
+        cancel.register(lambda index=index: blocking_callback(index))
+        for index in range(3)
+    ]
+
+    cancel.cancel()
+
+    assert all(event.wait(1) for event in entered)
+    assert cancel.state is CancellationState.CANCELLED
+    assert cancel.force_deadline == 10.75
+    assert deadlines == [10.75, 10.75, 10.75]
+    cancel.cancel()
+    assert cancel.force_deadline == 10.75
+    release.set()
+    assert all(registration.unregister() for registration in registrations)
+
+
+def test_cancellation_token_late_delivery_is_synchronous_and_exactly_once() -> None:
+    cancel = CancellationToken(clock=lambda: 5.0)
+    cancel.cancel()
+    delivered: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    registrations = []
+
+    def on_cancel() -> None:
+        delivered.append("cancel")
+        entered.set()
+        release.wait()
+
+    def register_late() -> None:
+        registrations.append(cancel.register(on_cancel))
+        returned.set()
+
+    thread = threading.Thread(target=register_late)
+    thread.start()
+    assert entered.wait(1)
+    assert not returned.is_set()
+    release.set()
+    thread.join(timeout=1)
+
+    assert returned.is_set()
+    assert delivered == ["cancel"]
+    cancel.cancel()
+    assert delivered == ["cancel"]
+    assert registrations[0].unregister()
+    assert not registrations[0].unregister()
+
+
+def test_cancellation_token_late_force_delivery_preserves_order() -> None:
+    cancel = CancellationToken(clock=lambda: 7.0)
+    cancel.force()
+    delivered: list[str] = []
+    cancel_entered = threading.Event()
+    release_cancel = threading.Event()
+    registration_returned = threading.Event()
+    registrations = []
+    target = ForceTarget("worker-1")
+
+    def on_cancel() -> None:
+        delivered.append("cancel")
+        cancel_entered.set()
+        release_cancel.wait()
+
+    def register_late() -> None:
+        registrations.append(
+            cancel.register(
+                on_cancel,
+                lambda: delivered.append("force"),
+                force_target=target,
+            )
+        )
+        registration_returned.set()
+
+    thread = threading.Thread(target=register_late)
+    thread.start()
+    assert cancel_entered.wait(1)
+    assert delivered == ["cancel"]
+    assert not registration_returned.is_set()
+    release_cancel.set()
+    thread.join(timeout=1)
+
+    assert registration_returned.is_set()
+    assert delivered == ["cancel", "force"]
+    assert cancel.state is CancellationState.FORCED
+    assert cancel.force_deadline == 7.0
+    assert cancel.force_targets == (target,)
+    cancel.force()
+    assert delivered == ["cancel", "force"]
+    assert registrations[0].unregister()
+    assert cancel.force_targets == ()
+
+
+def test_cancellation_token_unregister_before_cancel_prevents_delivery() -> None:
+    cancel = CancellationToken()
+    delivered: list[str] = []
+    registration = cancel.register(lambda: delivered.append("cancel"))
+
+    assert registration.unregister()
+    cancel.cancel()
+
+    assert delivered == []
+
+
+def test_cleanup_registration_skips_cancel_but_remains_force_deliverable() -> None:
+    cancel = CancellationToken(grace_seconds=0.5, clock=lambda: 3.0)
+    delivered: list[str] = []
+    forced = threading.Event()
+    target = ForceTarget(123)
+
+    def on_force() -> None:
+        delivered.append("force")
+        forced.set()
+
+    registration = cancel.register(
+        lambda: delivered.append("cancel"),
+        on_force,
+        terminate_on_cancel=False,
+        force_target=target,
+    )
+
+    cancel.cancel()
+    assert delivered == []
+    assert cancel.force_deadline == 3.5
+    assert cancel.force_targets == (target,)
+
+    cancel.force()
+    assert forced.wait(1)
+    assert delivered == ["force"]
+    assert cancel.force_targets == (target,)
+    assert registration.unregister()
+    assert cancel.force_targets == ()
+
+
+@pytest.mark.parametrize("identity", [None, True, 0, -1, ""])
+def test_force_target_rejects_unvalidated_identity(identity: object) -> None:
+    with pytest.raises(ValueError):
+        ForceTarget(identity)
+
+
+def test_cancellation_token_requires_force_callback_and_target_together() -> None:
+    cancel = CancellationToken()
+
+    with pytest.raises(ValueError, match="provided together"):
+        cancel.register(lambda: None, lambda: None)
+    with pytest.raises(ValueError, match="provided together"):
+        cancel.register(lambda: None, force_target=ForceTarget("worker"))
+    with pytest.raises(ValueError, match="force-deliverable"):
+        cancel.register(lambda: None, terminate_on_cancel=False)
 
 
 def test_mock_dynamic_response_uses_run_spec(tmp_path: Path) -> None:

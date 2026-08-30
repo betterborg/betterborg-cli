@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable, Mapping
+import time
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -27,23 +28,296 @@ class BillingMode(StrEnum):
     SUBSCRIPTION = "subscription"
 
 
-class CancellationToken:
-    """Thread-safe cooperative cancellation signal."""
+class CancellationState(StrEnum):
+    """Lifecycle states shared by cancellation-aware resources."""
 
-    def __init__(self) -> None:
+    ACTIVE = "active"
+    CANCELLED = "cancelled"
+    FORCED = "forced"
+
+
+@dataclass(frozen=True, slots=True)
+class ForceTarget:
+    """Stable identity for a resource that has been validated for force delivery.
+
+    The resource owner is responsible for constructing this record only after it
+    has validated the identity against the live resource. Keeping the identity
+    separate from the callback prevents an untracked force callback from being
+    registered and lets cleanup code prove the registration remains retained.
+    """
+
+    identity: Hashable
+
+    def __post_init__(self) -> None:
+        if self.identity is None or isinstance(self.identity, bool):
+            raise ValueError("force target identity must be a stable value")
+        try:
+            hash(self.identity)
+        except TypeError as error:
+            raise TypeError("force target identity must be hashable") from error
+        if isinstance(self.identity, int) and self.identity <= 0:
+            raise ValueError("force target integer identity must be positive")
+        if isinstance(self.identity, str) and not self.identity:
+            raise ValueError("force target string identity must not be empty")
+
+
+@dataclass(slots=True)
+class _CancellationEntry:
+    on_cancel: Callable[[], None]
+    on_force: Callable[[], None] | None
+    terminate_on_cancel: bool
+    force_target: ForceTarget | None
+    cancel_claimed: bool = False
+    force_claimed: bool = False
+    cancel_finished: threading.Event = field(default_factory=threading.Event)
+
+
+class CancellationRegistration:
+    """Handle retained until a registered resource has verified cleanup."""
+
+    def __init__(
+        self,
+        token: CancellationToken,
+        registration_id: int,
+        force_target: ForceTarget | None,
+    ) -> None:
+        self._token = token
+        self._registration_id = registration_id
+        self.force_target = force_target
+
+    def unregister(self) -> bool:
+        """Remove the registration after cleanup, returning whether it was active."""
+        return self._token._unregister(self._registration_id)
+
+
+class CancellationToken:
+    """Atomic active/cancelled/forced lifecycle for cooperative resources."""
+
+    DEFAULT_GRACE_SECONDS = 1.0
+
+    def __init__(
+        self,
+        *,
+        grace_seconds: float = DEFAULT_GRACE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if grace_seconds < 0 or grace_seconds > self.DEFAULT_GRACE_SECONDS:
+            raise ValueError("cancellation grace must be between zero and one second")
         self._event = threading.Event()
+        self._force_event = threading.Event()
+        self._cancel_delivery_started = threading.Event()
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._grace_seconds = grace_seconds
+        self._state = CancellationState.ACTIVE
+        self._force_deadline: float | None = None
+        self._next_registration_id = 0
+        self._registrations: dict[int, _CancellationEntry] = {}
+
+    @property
+    def state(self) -> CancellationState:
+        """Return a consistent snapshot of the lifecycle state."""
+        with self._lock:
+            return self._state
+
+    @property
+    def force_deadline(self) -> float | None:
+        """Return the absolute monotonic deadline fixed by first cancellation."""
+        with self._lock:
+            return self._force_deadline
+
+    @property
+    def force_targets(self) -> tuple[ForceTarget, ...]:
+        """Return an immutable snapshot of force targets retained for cleanup."""
+        with self._lock:
+            return tuple(
+                entry.force_target
+                for entry in self._registrations.values()
+                if entry.force_target is not None
+            )
+
+    def register(
+        self,
+        on_cancel: Callable[[], None],
+        on_force: Callable[[], None] | None = None,
+        *,
+        terminate_on_cancel: bool = True,
+        force_target: ForceTarget | None = None,
+    ) -> CancellationRegistration:
+        """Atomically register lifecycle callbacks and deliver recorded state.
+
+        A returned registration is deliberately not removed after callback
+        delivery. The resource owner must unregister it only after cleanup has
+        verified the target no longer exists.
+        """
+        if not callable(on_cancel):
+            raise TypeError("on_cancel must be callable")
+        if on_force is not None and not callable(on_force):
+            raise TypeError("on_force must be callable")
+        if (on_force is None) != (force_target is None):
+            raise ValueError("on_force and force_target must be provided together")
+        if not terminate_on_cancel and on_force is None:
+            raise ValueError("cleanup registrations must remain force-deliverable")
+
+        with self._lock:
+            registration_id = self._next_registration_id
+            self._next_registration_id += 1
+            entry = _CancellationEntry(
+                on_cancel=on_cancel,
+                on_force=on_force,
+                terminate_on_cancel=terminate_on_cancel,
+                force_target=force_target,
+            )
+            self._registrations[registration_id] = entry
+            cancel_callback = self._claim_cancel(entry)
+            force_callback = self._claim_force(entry)
+
+        registration = CancellationRegistration(
+            self, registration_id, force_target
+        )
+        # Late delivery is synchronous, but callbacks are never invoked while
+        # the token lock is held.
+        if cancel_callback is not None:
+            self._invoke_late(cancel_callback)
+        if force_callback is not None:
+            self._invoke_late(force_callback)
+        return registration
 
     def cancel(self) -> None:
-        """Signal cancellation and wake any waiters."""
-        self._event.set()
+        """Record first cancellation and concurrently broadcast eligible callbacks."""
+        with self._lock:
+            if self._state is not CancellationState.ACTIVE:
+                return
+            self._state = CancellationState.CANCELLED
+            self._force_deadline = self._clock() + self._grace_seconds
+            self._event.set()
+            callbacks = self._claim_cancel_callbacks()
+
+        self._broadcast(callbacks, "cancel")
+        self._cancel_delivery_started.set()
+
+    def force(self) -> None:
+        """Record forced cancellation and broadcast every validated force callback."""
+        with self._lock:
+            if self._state is CancellationState.FORCED:
+                return
+            was_active = self._state is CancellationState.ACTIVE
+            if was_active:
+                self._force_deadline = self._clock()
+                self._event.set()
+            self._state = CancellationState.FORCED
+            self._force_event.set()
+            cancel_callbacks = self._claim_cancel_callbacks()
+            force_callbacks = self._claim_force_callbacks()
+
+        if was_active:
+            self._broadcast(cancel_callbacks, "cancel")
+            self._cancel_delivery_started.set()
+        else:
+            self._cancel_delivery_started.wait()
+        self._broadcast(force_callbacks, "force")
 
     def is_set(self) -> bool:
         """Return whether cancellation was requested."""
         return self._event.is_set()
 
+    def is_forced(self) -> bool:
+        """Return whether forced cancellation was requested."""
+        return self._force_event.is_set()
+
     def wait(self, timeout: float | None = None) -> bool:
         """Wait for cancellation, returning whether it was requested."""
         return self._event.wait(timeout)
+
+    def wait_for_force(self, timeout: float | None = None) -> bool:
+        """Wait for forced cancellation, returning whether it was requested."""
+        return self._force_event.wait(timeout)
+
+    def _unregister(self, registration_id: int) -> bool:
+        with self._lock:
+            return self._registrations.pop(registration_id, None) is not None
+
+    def _claim_cancel(self, entry: _CancellationEntry) -> Callable[[], None] | None:
+        if (
+            self._state is CancellationState.ACTIVE
+            or entry.cancel_claimed
+            or not entry.terminate_on_cancel
+        ):
+            return None
+        entry.cancel_claimed = True
+
+        def deliver_cancel() -> None:
+            try:
+                entry.on_cancel()
+            finally:
+                entry.cancel_finished.set()
+
+        return deliver_cancel
+
+    def _claim_force(self, entry: _CancellationEntry) -> Callable[[], None] | None:
+        if (
+            self._state is not CancellationState.FORCED
+            or entry.force_claimed
+            or entry.on_force is None
+            or entry.force_target is None
+        ):
+            return None
+        entry.force_claimed = True
+
+        def deliver_force() -> None:
+            if entry.cancel_claimed:
+                entry.cancel_finished.wait()
+            if entry.on_force is not None:
+                entry.on_force()
+
+        return deliver_force
+
+    def _claim_cancel_callbacks(self) -> list[Callable[[], None]]:
+        return [
+            callback
+            for entry in self._registrations.values()
+            if (callback := self._claim_cancel(entry)) is not None
+        ]
+
+    def _claim_force_callbacks(self) -> list[Callable[[], None]]:
+        return [
+            callback
+            for entry in self._registrations.values()
+            if (callback := self._claim_force(entry)) is not None
+        ]
+
+    def _broadcast(self, callbacks: list[Callable[[], None]], label: str) -> None:
+        started: list[threading.Event] = []
+        release = threading.Event()
+        for callback in callbacks:
+            callback_started = threading.Event()
+            started.append(callback_started)
+            thread = threading.Thread(
+                target=self._invoke_broadcast,
+                args=(callback, callback_started, release),
+                name=f"betterborg-{label}-callback",
+                daemon=True,
+            )
+            thread.start()
+        for callback_started in started:
+            callback_started.wait()
+        release.set()
+
+    def _invoke_broadcast(
+        self,
+        callback: Callable[[], None],
+        started: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        started.set()
+        release.wait()
+        self._invoke_late(callback)
+
+    def _invoke_late(self, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception:
+            return
 
 
 @dataclass(frozen=True, slots=True)
