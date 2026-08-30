@@ -353,6 +353,44 @@ def test_plain_heartbeats_cover_only_fresh_running_work() -> None:
     ]
 
 
+def test_plain_starts_emit_only_new_row_without_postponing_heartbeat() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [
+            StageSpec("one", "One", children=(ChildSpec("child", "Child"),)),
+            StageSpec("two", "Two"),
+        ],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+
+    progress.start("one")
+    clock.advance(1)
+    progress.start("two")
+    clock.advance(1)
+    progress.start_child("one", "child")
+
+    assert stream.getvalue().splitlines() == [
+        "running One (0.0s)",
+        "running Two (0.0s)",
+        "running One: Child (0.0s)",
+    ]
+
+    clock.advance(2.9)
+    progress.refresh()
+    assert len(stream.getvalue().splitlines()) == 3
+    clock.advance(0.1)
+    progress.refresh()
+
+    assert stream.getvalue().splitlines()[3:] == [
+        "running One (5.0s)",
+        "running One: Child (3.0s)",
+        "running Two (4.0s)",
+    ]
+
+
 def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() -> None:
     stream = StringIO()
     clock = FakeClock()

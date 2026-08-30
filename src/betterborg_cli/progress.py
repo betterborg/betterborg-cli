@@ -234,7 +234,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_new_work_allowed()
             self._start_record(record, f"stage {stage_key!r}")
-            self._refresh_transient(force_plain=True)
+            self._refresh_transient(started=record)
             return record
 
     def update(self, stage_key: str, detail: str | None) -> StageRecord:
@@ -320,7 +320,7 @@ class RunProgress:
             self._require_new_work_allowed()
             self._require_running(parent, f"stage {stage_key!r}")
             self._start_record(child, f"child {child_key!r}")
-            self._refresh_transient(force_plain=True)
+            self._refresh_transient(started=child, parent_label=parent.label)
             return child
 
     def update_child(
@@ -658,7 +658,12 @@ class RunProgress:
             self._refresh_transient()
         self._write_permanent(line)
 
-    def _refresh_transient(self, *, force_plain: bool = False) -> None:
+    def _refresh_transient(
+        self,
+        *,
+        started: StageRecord | ChildRecord | None = None,
+        parent_label: str | None = None,
+    ) -> None:
         if not self._enabled or self._suspension_depth:
             return
         if self._interactive:
@@ -686,11 +691,13 @@ class RunProgress:
             self._next_heartbeat_at = None
             return
         now = self._clock()
-        if force_plain or self._next_heartbeat_at is None:
-            for line in lines:
-                self._write_plain(line)
-            self._next_heartbeat_at = now + self._heartbeat_interval
-        elif now >= self._next_heartbeat_at:
+        if started is not None:
+            self._write_plain(
+                self._format_running_line(started, parent_label=parent_label)
+            )
+            if self._next_heartbeat_at is None:
+                self._next_heartbeat_at = now + self._heartbeat_interval
+        elif self._next_heartbeat_at is None or now >= self._next_heartbeat_at:
             for line in lines:
                 self._write_plain(line)
             self._next_heartbeat_at = now + self._heartbeat_interval
