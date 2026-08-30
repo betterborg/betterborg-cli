@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from packaging.requirements import Requirement
 from packaging.version import Version
+from test_adapter_harness import LocalHttpServer
 
 from betterborg_cli import __version__
 
@@ -69,6 +70,27 @@ PACKAGE_ASSETS = (
         ".codex-plugin/plugin.json"
     ),
 )
+
+SPAWNED_URL_REQUEST = """
+import multiprocessing
+import sys
+
+from betterborg_cli.agent_runtime import (
+    CancellationToken,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+)
+
+if len(sys.argv) == 3:
+    multiprocessing.set_executable(sys.argv[2])
+    sys.frozen = True
+
+response = MultiprocessUrlRequest(
+    UrlRequestSpec(sys.argv[1], "GET", {}, None),
+    CancellationToken(),
+).run()
+print(response.status_code, response.body.decode("utf-8"))
+"""
 
 
 @dataclass(frozen=True)
@@ -235,6 +257,15 @@ multiprocessing.freeze_support = freeze_support
     environment_variables["BETTERBORG_FREEZE_MARKER"] = str(freeze_marker)
 
     completed = _run(borg, "version", env=environment_variables)
+    with LocalHttpServer(
+        lambda _request: (200, {}, b"installed-worker-response")
+    ) as server:
+        worker = _run(
+            python,
+            "-c",
+            SPAWNED_URL_REQUEST,
+            server.url("/installed-worker"),
+        )
     metadata = _run(
         python,
         "-c",
@@ -248,6 +279,8 @@ multiprocessing.freeze_support = freeze_support
 
     assert completed.stdout.strip() == f"borg {__version__}"
     assert freeze_marker.read_text(encoding="utf-8") == "called"
+    assert worker.stdout.strip() == "200 installed-worker-response"
+    assert [request.path for request in server.requests] == ["/installed-worker"]
     assert metadata.stdout.strip() == __version__
     assert Version(rich_metadata.stdout.strip()).major == 15
 
@@ -274,24 +307,18 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
     binary = output / ("borg.exe" if os.name == "nt" else "borg")
 
     assert _run(binary, "version").stdout.strip() == f"borg {__version__}"
-    worker = subprocess.run(
-        [
-            str(binary),
-            # PyInstaller's frozen interpreter flags precede helper commands.
-            "-B",
-            "-S",
-            "-I",
+    with LocalHttpServer(
+        lambda _request: (200, {}, b"frozen-worker-response")
+    ) as server:
+        worker = _run(
+            sys.executable,
             "-c",
-            "from multiprocessing.resource_tracker import main;main(0)",
-        ],
-        check=False,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-    )
-    assert worker.returncode == 0
-    assert worker.stdout == ""
-    assert worker.stderr == ""
+            SPAWNED_URL_REQUEST,
+            server.url("/frozen-worker"),
+            binary,
+        )
+    assert worker.stdout.strip() == "200 frozen-worker-response"
+    assert [request.path for request in server.requests] == ["/frozen-worker"]
     from PyInstaller.archive.readers import CArchiveReader
 
     bundled = set(CArchiveReader(str(binary)).toc)
