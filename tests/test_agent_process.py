@@ -112,7 +112,12 @@ def test_terminate_process_reaps_group_after_leader_exit(
 
     terminate_process(process, pgid=process.pid, force_deadline=time.monotonic())
 
-    real_process_harness.assert_tree_absent("exited")
+    parent_pid = int(real_process_harness.wait_for_marker("exited.parent.pid"))
+    child_pid = int(real_process_harness.wait_for_marker("exited.child.pid"))
+    assert not real_process_harness._pid_exists(parent_pid)
+    assert not real_process_harness._pid_exists(child_pid)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
@@ -248,6 +253,10 @@ def test_registration_exception_directly_cleans_created_process(
     assert (
         real_process_harness.wait_for_marker("registration-error.error")
         == "injected registration failure"
+    )
+    assert (
+        real_process_harness.wait_for_marker("registration-error.active-windows")
+        == "0"
     )
     real_process_harness.assert_tree_absent("registration-error")
 

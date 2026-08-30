@@ -66,6 +66,7 @@ def run_streamed(
     process: subprocess.Popen[bytes] | None = None
     registration: CancellationRegistration | None = None
     process_group_id: int | None = None
+    force_target: ForceTarget | None = None
     pump_errors: list[BaseException] = []
     stdout_thread: threading.Thread | None = None
     stdin_thread: threading.Thread | None = None
@@ -89,9 +90,10 @@ def run_streamed(
                     window.no_resource()
                 raise
 
-            process_group_id = _validated_process_group(process)
             if window is not None:
                 window.resource_created()
+            process_group_id = _validated_process_group(process)
+            if window is not None:
                 force_target = ForceTarget(
                     process.pid,
                     process_group_id=process_group_id,
@@ -159,6 +161,27 @@ def run_streamed(
                 _join_pump(stdout_thread)
                 if registration is not None:
                     registration.unregister()
+                elif window is not None and not window.is_settled:
+                    # The process has been verified absent, but a failure around
+                    # the registration boundary returned no cleanup handle. A
+                    # created window must still publish a validated identity;
+                    # it cannot be misreported as a pre-creation failure.
+                    if force_target is None:
+                        force_target = ForceTarget(
+                            process.pid,
+                            process_group_id=process_group_id,
+                        )
+                    window.publish_cleaned_resource(
+                        lambda: _request_termination(
+                            process, process_group_id
+                        ),
+                        lambda: terminate_process(
+                            process,
+                            pgid=process_group_id,
+                            force_deadline=time.monotonic(),
+                        ),
+                        force_target=force_target,
+                    )
 
     if pump_errors:
         raise pump_errors[0]
@@ -201,6 +224,11 @@ def terminate_process(
     if _process_group_exists(process_group_id):
         _signal_process_group(process_group_id, signal.SIGKILL)
     _reap_direct_child(process)
+    cleanup_deadline = time.monotonic() + CancellationToken.DEFAULT_GRACE_SECONDS
+    if not _wait_for_process_group_absence(process_group_id, cleanup_deadline):
+        raise TimeoutError(
+            f"process group {process_group_id} still exists after SIGKILL"
+        )
 
 
 def _validated_process_group(process: subprocess.Popen[object]) -> int | None:
@@ -285,6 +313,17 @@ def _process_group_exists(process_group_id: int) -> bool:
         os.killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
+    return True
+
+
+def _wait_for_process_group_absence(
+    process_group_id: int, deadline: float
+) -> bool:
+    while _process_group_exists(process_group_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_PROCESS_POLL_SECONDS, remaining))
     return True
 
 

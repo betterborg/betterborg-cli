@@ -582,6 +582,25 @@ def test_registration_window_rejects_no_resource_after_creation() -> None:
     assert registration.unregister()
 
 
+def test_registration_window_publishes_cleaned_resource_after_failure() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+    window.resource_created()
+    cancel.force()
+    delivered: list[str] = []
+
+    window.publish_cleaned_resource(
+        lambda: delivered.append("cancel"),
+        lambda: delivered.append("force"),
+        force_target=ForceTarget("cleaned-worker"),
+    )
+
+    assert delivered == ["cancel", "force"]
+    assert window.is_settled
+    assert cancel.active_windows == ()
+    assert cancel.force_targets == ()
+
+
 def test_cancellation_token_unregister_before_cancel_prevents_delivery() -> None:
     cancel = CancellationToken()
     delivered: list[str] = []

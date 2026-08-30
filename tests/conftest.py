@@ -203,6 +203,9 @@ except KeyboardInterrupt:
     raise SystemExit(130) from None
 except RuntimeError as error:
     (root / f"{name}.error").write_text(str(error))
+    (root / f"{name}.active-windows").write_text(
+        str(len(cancel.active_windows))
+    )
     raise SystemExit(73) from None
 '''
         mode = "fail" if fail_registration else "signal"

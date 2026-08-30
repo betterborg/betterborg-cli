@@ -163,6 +163,30 @@ class CancellationRegistrationWindow:
         """Record successful creation before publication can be delayed."""
         self._token._mark_resource_created(self._window_id)
 
+    def publish_cleaned_resource(
+        self,
+        on_cancel: Callable[[], None],
+        on_force: Callable[[], None],
+        *,
+        force_target: ForceTarget,
+    ) -> None:
+        """Publish and retire a created resource after verified local cleanup.
+
+        Resource owners use this recovery path only when their normal
+        registration boundary failed before returning a cleanup handle. The
+        validated target is still published through the token's registration
+        machinery, so a recorded force request is delivered before the window
+        settles, and the temporary registration is then removed immediately.
+        """
+        registration = self._token._register(
+            on_cancel,
+            on_force,
+            terminate_on_cancel=True,
+            force_target=force_target,
+            window_id=self._window_id,
+        )
+        registration.unregister()
+
     def no_resource(self) -> None:
         """Settle a window after creation conclusively produced no resource."""
         self._token._settle_no_resource(self._window_id)
