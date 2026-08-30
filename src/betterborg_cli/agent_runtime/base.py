@@ -61,10 +61,11 @@ class ForceTarget:
         if isinstance(self.identity, str) and not self.identity:
             raise ValueError("force target string identity must not be empty")
         if self.process_group_id is not None:
-            if (
-                isinstance(self.process_group_id, bool)
-                or self.process_group_id <= 0
+            if isinstance(self.process_group_id, bool) or not isinstance(
+                self.process_group_id, int
             ):
+                raise TypeError("process group identity must be an integer")
+            if self.process_group_id <= 0:
                 raise ValueError("process group identity must be a positive integer")
 
 

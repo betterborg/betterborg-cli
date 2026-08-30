@@ -220,9 +220,19 @@ child.wait()
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
-        stat = Path(f"/proc/{pid}/stat")
         try:
-            fields = stat.read_text(encoding="utf-8").split()
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return True
+        process_stat = proc_root / str(pid) / "stat"
+        try:
+            fields = process_stat.read_text(encoding="utf-8").split()
         except FileNotFoundError:
             return False
         return len(fields) < 3 or fields[2] != "Z"

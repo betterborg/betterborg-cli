@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from conftest import RealProcessHarness
@@ -305,6 +306,29 @@ def test_failed_force_delivery_prevents_exit() -> None:
     control.close()
 
 
+def test_second_sigint_defers_exit_until_force_notice_is_written() -> None:
+    output = io.StringIO()
+    exits: list[tuple[int, str]] = []
+    control = RunControl(
+        force_stream=output,
+        exit_function=lambda code: exits.append((code, output.getvalue())),
+    ).install()
+    section = control.protected()
+    section.__enter__()
+    _press_sigint()
+    assert control.wait_for_cancellation(1)
+
+    _press_sigint()
+
+    deadline = time.monotonic() + 1
+    while not exits and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert exits == [(INTERRUPTED_EXIT_CODE, "Force stopping...\n")]
+    with pytest.raises(KeyboardInterrupt):
+        section.__exit__(None, None, None)
+    control.close()
+
+
 @pytest.mark.skipif(
     not hasattr(signal, "setitimer"), reason="POSIX interval timer required"
 )
@@ -378,6 +402,7 @@ def test_install_and_close_restore_handler_and_wakeup_fd() -> None:
 
 def test_real_process_harness_deadline_diagnostic_and_cleanup(
     real_process_harness: RealProcessHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(TimeoutError, match="missing.*no tracked processes"):
         real_process_harness.wait_for_marker("missing", timeout=0.01)
@@ -387,6 +412,12 @@ def test_real_process_harness_deadline_diagnostic_and_cleanup(
     )
     real_process_harness.cleanup()
     assert process.poll() is not None
+
+    checked: list[tuple[int, int]] = []
+    monkeypatch.setattr(Path, "is_dir", lambda _path: False)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: checked.append((pid, sig)))
+    assert real_process_harness._pid_exists(12345)
+    assert checked == [(12345, 0)]
 
 
 _WRAPPER_SOURCE = r"""

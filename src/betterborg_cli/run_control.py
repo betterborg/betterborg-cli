@@ -244,6 +244,7 @@ class RunControl:
             self._force_snapshot_captured
             and not windows
             and self._direct_force_complete
+            and self._force_notice_allows_exit()
         ):
             self._invoke_exit()
 
@@ -339,6 +340,8 @@ class RunControl:
             return
         if any(not window.is_settled for window in self._forced_windows):
             return
+        if not self._force_notice_allows_exit():
+            return
         if self._direct_force_complete:
             self._invoke_exit()
         elif self._force_dispatched.is_set():
@@ -389,7 +392,7 @@ class RunControl:
                 os.killpg(process_group_id, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            except OSError:
+            except (OSError, TypeError):
                 delivery_complete = False
         return delivery_complete
 
@@ -410,8 +413,17 @@ class RunControl:
             self._force_stream.write(_FORCE_NOTICE.decode("ascii"))
             self._force_stream.flush()
             self._force_notice_written = True
-        except (AttributeError, OSError, ValueError):
-            pass
+        except (AttributeError, OSError, ValueError) as error:
+            self._record_dispatcher_error(error)
+
+    def _force_notice_allows_exit(self) -> bool:
+        """Return whether notification is complete or safely best-effort.
+
+        A prepared nonblocking descriptor lets the handler attempt notification
+        without waiting, even when the destination is already full. Without one,
+        the dispatcher must confirm the ordinary stream write before exit.
+        """
+        return self._force_notice_written or self._force_descriptor >= 0
 
     def _open_nonblocking_force_descriptor(self) -> int:
         """Open an independently nonblocking descriptor for handler output."""
