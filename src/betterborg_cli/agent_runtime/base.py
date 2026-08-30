@@ -125,6 +125,10 @@ class CancellationDeliveryError(RuntimeError):
         self.errors = errors
 
 
+class CancellationRegistrationRejected(RuntimeError):
+    """A creation window rejected because forced cancellation already began."""
+
+
 class CancellationRegistrationWindow:
     """Pre-creation entry retained until resource creation is resolved."""
 
@@ -162,6 +166,30 @@ class CancellationRegistrationWindow:
     def resource_created(self) -> None:
         """Record successful creation before publication can be delayed."""
         self._token._mark_resource_created(self._window_id)
+
+    def publish_cleaned_resource(
+        self,
+        on_cancel: Callable[[], None],
+        on_force: Callable[[], None],
+        *,
+        force_target: ForceTarget,
+    ) -> None:
+        """Publish and retire a created resource after verified local cleanup.
+
+        Resource owners use this recovery path only when their normal
+        registration boundary failed before returning a cleanup handle. The
+        validated target is still published through the token's registration
+        machinery, so a recorded force request is delivered before the window
+        settles, and the temporary registration is then removed immediately.
+        """
+        registration = self._token._register(
+            on_cancel,
+            on_force,
+            terminate_on_cancel=True,
+            force_target=force_target,
+            window_id=self._window_id,
+        )
+        registration.unregister()
 
     def no_resource(self) -> None:
         """Settle a window after creation conclusively produced no resource."""
@@ -240,7 +268,9 @@ class CancellationToken:
                     self._state is CancellationState.FORCED
                     or self._force_requested_signal
                 ):
-                    raise RuntimeError("cannot open a registration window after force")
+                    raise CancellationRegistrationRejected(
+                        "cannot open a registration window after force"
+                    )
                 window_id = self._next_window_id
                 self._next_window_id += 1
                 window = CancellationRegistrationWindow(self, window_id)

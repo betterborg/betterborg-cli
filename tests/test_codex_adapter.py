@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +71,7 @@ def test_native_command_validates_and_persists_result_metadata(
         log_path: Path,
         cancel: CancellationToken | None,
         env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         invocation_result_path = Path(command[command.index("-o") + 1])
@@ -168,6 +169,7 @@ def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         captured_command.extend(command)
         log_path.write_text("{}\n", encoding="utf-8")
@@ -197,6 +199,7 @@ def test_schema_invalid_result_fails_without_persisting_result(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("{}\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
@@ -221,6 +224,7 @@ def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> No
         _log_path: Path,
         runner_cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         assert runner_cancel is cancel
         cancel.cancel()
@@ -250,6 +254,7 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         calls.append((list(command), stdin_text))
         if len(calls) == 1:
@@ -303,6 +308,7 @@ def test_schema_invalid_partial_result_does_not_suppress_transient_retry(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         nonlocal calls
         calls += 1
@@ -386,6 +392,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text(
             '{"type":"error","message":"status 429: rate limit"}\n',
@@ -415,6 +422,7 @@ def test_nonzero_exit_with_fresh_valid_result_completes(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("Codex completed before exiting\n", encoding="utf-8")
         _write_invocation_result(
@@ -440,6 +448,7 @@ def test_nonzero_exit_with_invalid_result_still_fails(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("Codex exited after a partial result\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
@@ -467,6 +476,7 @@ def test_valid_result_prevents_transient_retry_despite_nonzero_exit(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         nonlocal calls
         calls += 1
@@ -518,6 +528,7 @@ def test_optional_schema_fields_are_normalized_for_strict_transport(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
@@ -590,6 +601,7 @@ def test_optional_typed_enum_and_const_accept_null_transport_placeholders(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
@@ -627,6 +639,7 @@ def test_unconstrained_optional_null_is_preserved(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("ok\n", encoding="utf-8")
         _write_invocation_result(
@@ -667,6 +680,7 @@ def test_unrepresentable_strict_schema_falls_back_to_prompt_and_local_validation
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         captured["command"] = list(command)
         captured["stdin"] = stdin_text
@@ -709,6 +723,7 @@ def test_constraints_removed_from_transport_remain_authoritative_locally(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("ok\n", encoding="utf-8")
         _write_invocation_result(

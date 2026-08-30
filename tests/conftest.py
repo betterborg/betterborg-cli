@@ -110,7 +110,9 @@ class RealProcessHarness:
         self.processes.append(process)
         return process
 
-    def resistant_argv(self, name: str) -> tuple[str, ...]:
+    def resistant_argv(
+        self, name: str, *, leader_exits: bool = False
+    ) -> tuple[str, ...]:
         """Return argv for a SIGTERM-resistant process group with a descendant."""
         helper = self.root / "resistant_descendant.py"
         if not helper.exists():
@@ -133,11 +135,129 @@ if mode == "child":
         time.sleep(1)
 child = subprocess.Popen([sys.executable, __file__, str(root), name, "child"])
 (root / f"{name}.parent.pid").write_text(str(__import__("os").getpid()))
+while not (root / f"{name}.child.pid").exists():
+    time.sleep(0.01)
+print("process-tree-ready", flush=True)
+if mode == "exit":
+    raise SystemExit(0)
 child.wait()
 """,
                 encoding="utf-8",
             )
-        return (sys.executable, str(helper), str(self.root), name, "parent")
+        mode = "exit" if leader_exits else "parent"
+        return (sys.executable, str(helper), str(self.root), name, mode)
+
+    def launch_streamed_registration_wrapper(
+        self,
+        command: tuple[str, ...],
+        *,
+        name: str,
+        fail_registration: bool = False,
+    ) -> subprocess.Popen[str]:
+        """Run ``run_streamed`` behind a post-creation registration gate."""
+        return self._launch_registration_wrapper(
+            command,
+            name=name,
+            runner="streamed",
+            fail_registration=fail_registration,
+        )
+
+    def launch_captured_registration_wrapper(
+        self,
+        command: tuple[str, ...],
+        *,
+        name: str,
+        fail_registration: bool = False,
+    ) -> subprocess.Popen[str]:
+        """Run ``run_captured`` behind a post-creation registration gate."""
+        return self._launch_registration_wrapper(
+            command,
+            name=name,
+            runner="captured",
+            fail_registration=fail_registration,
+        )
+
+    def _launch_registration_wrapper(
+        self,
+        command: tuple[str, ...],
+        *,
+        name: str,
+        runner: str,
+        fail_registration: bool,
+    ) -> subprocess.Popen[str]:
+        source = r'''
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+from betterborg_cli.agent_runtime import (
+    CancellationRegistrationWindow,
+    CancellationToken,
+    run_captured,
+    run_streamed,
+)
+from betterborg_cli.run_control import RunControl
+
+root = Path(sys.argv[1])
+name = sys.argv[2]
+fail_registration = sys.argv[3] == "fail"
+runner = sys.argv[4]
+command = sys.argv[5:]
+cancel = CancellationToken()
+original_register = CancellationRegistrationWindow.register
+
+def gated_register(self, *args, **kwargs):
+    (root / f"{name}.registration-gate").write_text("blocked")
+    while not (root / f"release-{name}").exists():
+        time.sleep(0.01)
+    if fail_registration:
+        raise RuntimeError("injected registration failure")
+    return original_register(self, *args, **kwargs)
+
+CancellationRegistrationWindow.register = gated_register
+
+class Progress:
+    def begin_cancellation(self):
+        (root / f"{name}.cancelled").write_text("cancelled")
+        return True
+
+try:
+    if fail_registration:
+        if runner == "streamed":
+            run_streamed(command, root, "", root / f"{name}.log", cancel)
+        else:
+            run_captured(command, cwd=root, input="", cancel=cancel)
+    else:
+        control = RunControl(cancel, progress=Progress())
+        with control:
+            with control.protected():
+                if runner == "streamed":
+                    run_streamed(
+                        command, root, "", root / f"{name}.log", cancel
+                    )
+                else:
+                    run_captured(command, cwd=root, input="", cancel=cancel)
+except KeyboardInterrupt:
+    raise SystemExit(130) from None
+except RuntimeError as error:
+    (root / f"{name}.error").write_text(str(error))
+    (root / f"{name}.active-windows").write_text(
+        str(len(cancel.active_windows))
+    )
+    raise SystemExit(73) from None
+'''
+        mode = "fail" if fail_registration else "signal"
+        return self.launch_python(
+            source,
+            str(self.root),
+            name,
+            mode,
+            runner,
+            *command,
+            name=f"{name}-wrapper",
+        )
 
     def marker(self, name: str) -> Path:
         return self.root / name
