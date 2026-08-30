@@ -39,13 +39,11 @@ jobs:
       - name: Install locked development environment
         run: make sync
 
-      - name: Validate greater synchronized reviewed tag
+      - name: Validate synchronized reviewed tag
         env:
           REVIEWED_VERSION: ${{ inputs.version }}
         run: |
-          .venv/bin/python scripts/check_versions.py \
-            --tag "v$REVIEWED_VERSION" \
-            --greater-than 0.1.0
+          .venv/bin/python scripts/check_versions.py --tag "v$REVIEWED_VERSION"
           test "$(git rev-list -n 1 "v$REVIEWED_VERSION")" = "$GITHUB_SHA"
 
       - name: Lint and test

@@ -43,22 +43,18 @@ an `NPM_TOKEN`.
 
 If `@betterborg/cli` does not exist yet, an npm owner must complete a separate,
 reviewed lower-version package-claim checkpoint before configuring its trusted
-publisher. Do not claim it with the phase-10 version or the synchronized final
-version, and do not dispatch this workflow until the trusted publisher is
-active. Restrict token-based publishing after OIDC succeeds.
+publisher. Do not claim it with the reviewed release version, and do not
+dispatch this workflow until the trusted publisher is active. Restrict
+token-based publishing after OIDC succeeds.
 
 ## Select the reviewed release
 
 Update `betterborg_cli.__version__`, `npm/package.json`, both bundled plugin
 manifests, and both marketplace entries in one reviewed change. Run
-`python scripts/check_versions.py --tag vVERSION --greater-than 0.1.0`,
-`make lint`, `make test`, and `make build`, then create the reviewed `vVERSION`
-tag on that exact commit. The final version must remain greater than the
-phase-10 version; the phase-10 tag is never a publication target.
-Phase-10 version `0.1.0` is immutable: never overwrite, reuse, move, or retag
-it. Every synchronized final release must use one newly reviewed version
-strictly greater than `0.1.0`, and that final version becomes equally
-immutable as soon as any registry accepts it.
+`python scripts/check_versions.py --tag vVERSION`, `make lint`, `make test`,
+and `make build`, then create the reviewed `vVERSION` tag on that exact commit.
+A release version becomes immutable as soon as any registry accepts it: never
+overwrite, reuse, move, or retag one.
 Verify that the tag is annotated or signed according to the project's release
 policy, that its version matches the source and artifact names, and that the
 tagged commit is the current tip of `main`.

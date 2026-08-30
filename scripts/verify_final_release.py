@@ -13,20 +13,17 @@ from typing import NoReturn
 
 try:
     from scripts import (
-        check_versions,
         reconcile_npm_release,
         verify_github_release,
         verify_public_installations,
         verify_pypi_release,
     )
 except ModuleNotFoundError:  # Direct execution adds scripts/, not the repository root.
-    import check_versions
     import reconcile_npm_release
     import verify_github_release
     import verify_public_installations
     import verify_pypi_release
 
-PHASE_10_VERSION = "0.1.0"
 REPOSITORY = "betterborg/betterborg-cli"
 
 
@@ -44,18 +41,6 @@ class VerificationResult:
 
 def _fail(message: str) -> NoReturn:
     raise FinalReleaseVerificationError(message)
-
-
-def _validate_version(version: str) -> None:
-    try:
-        greater = check_versions.is_greater_version(version, PHASE_10_VERSION)
-    except ValueError as error:
-        _fail(str(error))
-    if not greater:
-        _fail(
-            "final version must be greater than immutable phase-10 version "
-            f"{PHASE_10_VERSION}"
-        )
 
 
 def _pypi_status(
@@ -309,7 +294,6 @@ def verify_final_release(
     retry_delay: float = 10.0,
 ) -> VerificationResult:
     """Verify ordered public bytes, then smoke all exact installation paths."""
-    _validate_version(version)
     with tempfile.TemporaryDirectory(prefix="betterborg-final-release-") as temporary:
         temporary_root = Path(temporary)
         result = _surface_result(

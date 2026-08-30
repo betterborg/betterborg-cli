@@ -83,7 +83,6 @@ def test_release_is_manual_and_nonpublishing_by_default() -> None:
     assert re.search(r"^  push:", workflow, re.MULTILINE) is None
     assert "Validate final tag and build release inputs once" in workflow
     assert '--tag "v$REVIEWED_VERSION"' in workflow
-    assert "--greater-than 0.1.0" in workflow
     assert 'git rev-list -n 1 "v$REVIEWED_VERSION"' in workflow
 
 
