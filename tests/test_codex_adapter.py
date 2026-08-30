@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_adapter_harness import codex_spec
+from test_adapter_harness import codex_spec, write_native_output
 
 from betterborg_cli.agent_runtime import (
+    AgentActivity,
+    AgentActivityKind,
     AgentArtifact,
     AgentStatus,
     AgentUsage,
@@ -47,6 +49,20 @@ def _write_invocation_result(command: Sequence[str], payload: Any) -> None:
     result_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _stream(*events: str | Mapping[str, Any]) -> str:
+    return "\n".join(
+        event if isinstance(event, str) else json.dumps(event) for event in events
+    )
+
+
+def _item_event(
+    event_type: str,
+    item_type: str,
+    **item: Any,
+) -> dict[str, Any]:
+    return {"type": event_type, "item": {"type": item_type, **item}}
+
+
 @pytest.mark.parametrize("role", list(ApiAgentRole))
 def test_every_role_discloses_native_host_capability(role: ApiAgentRole) -> None:
     adapter = CodexAdapter(role, proc_runner=lambda *_args: 0)
@@ -56,6 +72,200 @@ def test_every_role_discloses_native_host_capability(role: ApiAgentRole) -> None
     assert not adapter.capabilities.supports_billing(BillingMode.API)
     assert not adapter.capabilities.tool_allowlist
     assert adapter.capabilities.read_only_sandbox
+
+
+@pytest.mark.parametrize(
+    ("event_type", "item_type", "item", "expected"),
+    (
+        (
+            "item.started",
+            "command_execution",
+            {"command": "cat README.md"},
+            AgentActivity(AgentActivityKind.READING, "cat README.md"),
+        ),
+        (
+            "item.completed",
+            "command_execution",
+            {"command": "/bin/bash -lc 'rg NativeInvocation src'"},
+            AgentActivity(
+                AgentActivityKind.SEARCHING,
+                "/bin/bash -lc 'rg NativeInvocation src'",
+            ),
+        ),
+        (
+            "item.started",
+            "command_execution",
+            {"command": "make test"},
+            AgentActivity(AgentActivityKind.COMMAND, "make test"),
+        ),
+        (
+            "item.completed",
+            "file_change",
+            {"changes": [{"path": "src/betterborg_cli/agent_runtime/codex.py"}]},
+            AgentActivity(
+                AgentActivityKind.WRITING,
+                "src/betterborg_cli/agent_runtime/codex.py",
+            ),
+        ),
+        (
+            "item.started",
+            "web_search",
+            {"query": "Codex JSONL events"},
+            AgentActivity(AgentActivityKind.SEARCHING, "Codex JSONL events"),
+        ),
+        (
+            "item.started",
+            "mcp_tool_call",
+            {"tool": "filesystem.read_file", "arguments": {"path": "pyproject.toml"}},
+            AgentActivity(AgentActivityKind.READING, "pyproject.toml"),
+        ),
+        (
+            "item.completed",
+            "mcp_tool_call",
+            {
+                "tool": "filesystem.search_files",
+                "arguments": {"pattern": "test_*.py"},
+            },
+            AgentActivity(AgentActivityKind.SEARCHING, "test_*.py"),
+        ),
+        (
+            "item.started",
+            "mcp_tool_call",
+            {"tool": "filesystem.write_file", "arguments": {"path": "result.json"}},
+            AgentActivity(AgentActivityKind.WRITING, "result.json"),
+        ),
+    ),
+)
+def test_native_item_events_emit_neutral_activity_without_changing_logs(
+    tmp_path: Path,
+    event_type: str,
+    item_type: str,
+    item: Mapping[str, Any],
+    expected: AgentActivity,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = _stream(
+        _item_event(event_type, item_type, **item),
+        _usage_event(10, 4, 3),
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "activity"}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, activity_sink=activities.append)
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.usage == AgentUsage(
+        tokens_input=6,
+        tokens_output=3,
+        tokens_cache_read=4,
+        tokens_cache_write=0,
+        num_turns=1,
+    )
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        expected,
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
+def test_generic_command_activity_is_single_line_and_bounded(tmp_path: Path) -> None:
+    activities: list[AgentActivity] = []
+    command_text = "python -c '" + ("x" * 200) + "'\nwith another line"
+    transcript = json.dumps(
+        _item_event("item.started", "command_execution", command=command_text)
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "bounded"}
+        )
+        return 0
+
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(
+        codex_spec(tmp_path, activity_sink=activities.append)
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    command_activity = activities[1]
+    assert command_activity.kind is AgentActivityKind.COMMAND
+    assert command_activity.detail is not None
+    assert len(command_activity.detail) == 160
+    assert "\n" not in command_activity.detail
+    assert command_activity.detail.endswith("…")
+
+
+def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
+    tmp_path: Path,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = _stream(
+        "not-json",
+        {"type": "item.started", "item": "malformed"},
+        _item_event("item.started", "unknown_provider_item", provider_name="secret"),
+        _item_event(
+            "item.started",
+            "mcp_tool_call",
+            tool="provider_specific_tool",
+            arguments={"secret": "value"},
+        ),
+        _item_event("item.completed", "command_execution", command=42),
+        _item_event("item.completed", "agent_message", text="final result"),
+        _usage_event(8, 3, 2),
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "fallback"}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, activity_sink=activities.append)
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "fallback"}
+    assert result.usage == AgentUsage(
+        tokens_input=5,
+        tokens_output=2,
+        tokens_cache_read=3,
+        tokens_cache_write=0,
+        num_turns=1,
+    )
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [AgentActivity(AgentActivityKind.THINKING)] * 8
 
 
 def test_native_command_validates_and_persists_result_metadata(
