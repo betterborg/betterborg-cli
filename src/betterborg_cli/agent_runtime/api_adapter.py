@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from betterborg_cli.agent_runtime.base import (
     AgentResult,
@@ -17,6 +16,8 @@ from betterborg_cli.agent_runtime.base import (
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationDeliveryError,
+    CancellationRegistration,
     CancellationToken,
     combine_agent_usage,
 )
@@ -51,6 +52,25 @@ class ApiCredentialRedactor:
         if isinstance(value, list):
             return [self.value(item) for item in value]
         return value
+
+
+class AbortableApiRequest(Protocol):
+    """One attempt-local API request owned until execution is cleaned up."""
+
+    def execute(self) -> Mapping[str, Any]:
+        """Execute the request and return its decoded provider response."""
+
+    def abort(self) -> None:
+        """Request nonblocking graceful cancellation; repeated calls are safe."""
+
+    def force(self) -> None:
+        """Request nonblocking forced cancellation; repeated calls are safe."""
+
+
+ApiRequestFactory = Callable[
+    [CancellationToken | None],
+    AbortableApiRequest,
+]
 
 
 @dataclass(slots=True)
@@ -154,58 +174,62 @@ class ApiRunContext:
 
     def request(
         self,
-        send: Callable[[CancellationToken | None], Mapping[str, Any]],
+        factory: ApiRequestFactory,
         *,
         api_error_type: type[Exception],
         cancel: CancellationToken | None,
-        thread_name: str,
         backoff_seconds: float,
         max_attempts: int,
     ) -> Mapping[str, Any] | AgentResult:
         """Send one cancellable request with bounded transient retries."""
-        state = _RequestState()
+        state: _RequestState | None = None
 
         def request_once() -> int:
-            state.response = None
-            state.error = None
-            if cancel is None:
-                try:
-                    state.response = send(None)
-                except Exception as error:
-                    state.error = error
-            else:
-                if cancel.is_set():
-                    return -1
-                completed = threading.Event()
+            nonlocal state
+            attempt = _RequestState()
+            state = attempt
+            if cancel is not None and cancel.is_set():
+                return -1
 
-                def send_request() -> None:
+            request: AbortableApiRequest | None = None
+            registration: CancellationRegistration | None = None
+            try:
+                request = factory(cancel)
+                if cancel is not None:
                     try:
-                        state.response = send(cancel)
-                    except Exception as error:
-                        state.error = error
-                    finally:
-                        completed.set()
+                        registration = cancel.register(request.abort)
+                    except CancellationDeliveryError as error:
+                        registration = error.registration
+                        raise
+                attempt.response = request.execute()
+            except Exception as error:
+                attempt.error = error
+            finally:
+                try:
+                    if (
+                        request is not None
+                        and cancel is not None
+                        and cancel.is_set()
+                    ):
+                        request.abort()
+                finally:
+                    if registration is not None:
+                        registration.unregister()
 
-                threading.Thread(
-                    target=send_request,
-                    name=thread_name,
-                    daemon=True,
-                ).start()
-                while not completed.wait(0.05):
-                    if cancel.is_set():
-                        return -1
-                if cancel.is_set():
-                    return -1
-            if state.error is not None:
-                self.append_log({"error": str(state.error)})
-                if isinstance(state.error, api_error_type):
-                    status_code = getattr(state.error, "status_code", None)
+            if cancel is not None and cancel.is_set():
+                return -1
+            if attempt.error is not None:
+                self.append_log({"error": str(attempt.error)})
+                if isinstance(attempt.error, api_error_type):
+                    status_code = getattr(attempt.error, "status_code", None)
                     return status_code if isinstance(status_code, int) else 1
                 return 1
             return 0
 
         def classify_request(_exit_code: int) -> str | None:
-            if isinstance(state.error, api_error_type) and getattr(
+            if state is not None and isinstance(
+                state.error, api_error_type
+            ) and getattr(
                 state.error, "transient", False
             ):
                 return str(state.error)
@@ -227,6 +251,7 @@ class ApiRunContext:
                 error=f"transient retry exhausted: {retry.transient_reason}",
                 retryable=True,
             )
-        if retry.exit_code != 0 or state.response is None:
-            return self.result(AgentStatus.FAILED, error=str(state.error))
+        if retry.exit_code != 0 or state is None or state.response is None:
+            error = state.error if state is not None else None
+            return self.result(AgentStatus.FAILED, error=str(error))
         return state.response

@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import http.client
 import json
-import urllib.error
 from pathlib import Path
-from typing import Any
 
 import pytest
 from test_adapter_harness import (
-    ChunkedHttpResponse as _ChunkedHttpResponse,
+    FakeApiTransport as FakeTransport,
 )
 from test_adapter_harness import (
-    FakeApiTransport as FakeTransport,
+    FakeUrlRequestFactory,
 )
 from test_adapter_harness import (
     anthropic_message as _message,
@@ -23,10 +20,13 @@ from test_adapter_harness import (
 )
 
 from betterborg_cli.agent_runtime import (
+    ANTHROPIC_API_VERSION,
     AgentStatus,
     AnthropicAdapter,
     ApiAgentRole,
     UrllibAnthropicTransport,
+    UrlResponse,
+    UrlTransportError,
 )
 
 
@@ -126,7 +126,7 @@ def test_truncated_tool_response_does_not_dispatch_tool(tmp_path: Path) -> None:
     "disconnect",
     [
         ConnectionResetError("connection reset during response"),
-        http.client.IncompleteRead(b'{"type":"message"'),
+        OSError("incomplete response body"),
     ],
 )
 def test_mid_response_disconnect_retries_through_urllib_transport(
@@ -146,25 +146,20 @@ def test_mid_response_disconnect_retries_through_urllib_transport(
             ]
         )
     ).encode()
-    response_chunks: list[list[bytes | Exception]] = [
-        [disconnect],
-        [response_body, b""],
-    ]
-    request_bodies: list[bytes | None] = []
-
-    def urlopen(request: Any, *, timeout: float) -> _ChunkedHttpResponse:
-        assert timeout > 0
-        request_bodies.append(request.data)
-        return _ChunkedHttpResponse(response_chunks.pop(0))
-
+    requests = FakeUrlRequestFactory(
+        [
+            UrlTransportError("response", str(disconnect)),
+            UrlResponse(200, "OK", response_body),
+        ]
+    )
     monkeypatch.setattr(
-        "betterborg_cli.agent_runtime.anthropic.urllib.request.urlopen",
-        urlopen,
+        "betterborg_cli.agent_runtime.anthropic.MultiprocessUrlRequest",
+        requests,
     )
     adapter = AnthropicAdapter(
         ApiAgentRole.ANALYSIS,
         api_key="key",
-        transport=UrllibAnthropicTransport(),
+        transport=UrllibAnthropicTransport("https://provider.invalid/messages"),
         transient_backoff_seconds=0,
     )
 
@@ -172,8 +167,15 @@ def test_mid_response_disconnect_retries_through_urllib_transport(
 
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
-    assert len(request_bodies) == 2
-    assert request_bodies[0] == request_bodies[1]
+    assert len(requests.specs) == 2
+    assert requests.specs[0] == requests.specs[1]
+    assert requests.specs[0].url == "https://provider.invalid/messages"
+    assert requests.specs[0].timeout_seconds == 60.0
+    assert requests.specs[0].headers == {
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "content-type": "application/json",
+        "x-api-key": "key",
+    }
 
 
 @pytest.mark.parametrize("status_code", [429, 529])
@@ -194,26 +196,20 @@ def test_transient_http_error_retries_when_error_body_disconnects(
             ]
         )
     ).encode()
-    request_bodies: list[bytes | None] = []
-
-    def urlopen(request: Any, *, timeout: float) -> _ChunkedHttpResponse:
-        assert timeout > 0
-        request_bodies.append(request.data)
-        if len(request_bodies) == 1:
-            raise urllib.error.HTTPError(
-                request.full_url,
-                status_code,
-                "transient error",
-                {},
-                _ChunkedHttpResponse(
-                    [http.client.IncompleteRead(b'{"type":"error"')]
-                ),
-            )
-        return _ChunkedHttpResponse([response_body, b""])
-
+    requests = FakeUrlRequestFactory(
+        [
+            UrlTransportError(
+                "response",
+                "incomplete response body",
+                status_code=status_code,
+                reason="transient error",
+            ),
+            UrlResponse(200, "OK", response_body),
+        ]
+    )
     monkeypatch.setattr(
-        "betterborg_cli.agent_runtime.anthropic.urllib.request.urlopen",
-        urlopen,
+        "betterborg_cli.agent_runtime.anthropic.MultiprocessUrlRequest",
+        requests,
     )
     adapter = AnthropicAdapter(
         ApiAgentRole.ANALYSIS,
@@ -226,5 +222,5 @@ def test_transient_http_error_retries_when_error_body_disconnects(
 
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
-    assert len(request_bodies) == 2
-    assert request_bodies[0] == request_bodies[1]
+    assert len(requests.specs) == 2
+    assert requests.specs[0] == requests.specs[1]

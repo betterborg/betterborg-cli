@@ -17,6 +17,7 @@ from test_adapter_harness import (
     ApiAdapterHarness,
     BlockingTcpServer,
     FakeApiTransport,
+    FakeUrlRequestFactory,
     LocalHttpServer,
     LocalTlsServer,
 )
@@ -29,7 +30,10 @@ from betterborg_cli.agent_runtime import (
     BillingMode,
     CancellationToken,
     MultiprocessUrlRequest,
+    UrllibAnthropicTransport,
+    UrllibOpenAITransport,
     UrlRequestSpec,
+    UrlResponse,
     UrlTransportError,
 )
 
@@ -80,6 +84,23 @@ def test_url_request_settles_window_when_prestart_setup_fails(
 
     assert cancel.active_windows == ()
     assert all(connection.closed for connection in connections)
+
+
+def test_url_request_abort_and_force_are_idempotent_before_execute() -> None:
+    request = MultiprocessUrlRequest(
+        UrlRequestSpec("http://127.0.0.1/", "GET", {}, None),
+        CancellationToken(),
+    )
+
+    request.abort()
+    request.abort()
+    request.force()
+    request.force()
+
+    with pytest.raises(UrlTransportError, match="cancelled") as captured:
+        request.execute()
+
+    assert captured.value.kind == "cancelled"
 
 
 def test_multiprocess_url_request_preserves_http_behavior() -> None:
@@ -451,6 +472,74 @@ def test_structured_result_persists_usage_and_metadata(
     assert json.loads(result.result_path.read_text(encoding="utf-8")) == result.payload
 
 
+def test_standard_transport_rejects_malformed_response_body(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = FakeUrlRequestFactory([UrlResponse(200, "OK", b"{not-json")])
+    module = f"betterborg_cli.agent_runtime.{harness.provider}"
+    monkeypatch.setattr(f"{module}.MultiprocessUrlRequest", requests)
+    transport = (
+        UrllibAnthropicTransport()
+        if harness.provider == "anthropic"
+        else UrllibOpenAITransport()
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        transport=transport,
+    ).run(harness.spec(tmp_path))
+
+    assert result.status == AgentStatus.FAILED
+    assert result.error == (
+        f"{'Anthropic' if harness.provider == 'anthropic' else 'OpenAI'} "
+        "returned malformed JSON"
+    )
+    assert len(requests.specs) == 1
+
+
+def test_standard_transport_cancellation_joins_request_before_return(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    request_started = threading.Event()
+    release_response = threading.Event()
+    cancel = CancellationToken()
+
+    def respond(_request):
+        request_started.set()
+        release_response.wait()
+        return 200, {}, b"too late"
+
+    with LocalHttpServer(respond) as server:
+        transport = (
+            UrllibAnthropicTransport(server.url("/messages"))
+            if harness.provider == "anthropic"
+            else UrllibOpenAITransport(server.url("/responses"))
+        )
+        adapter = harness.adapter(
+            ApiAgentRole.ANALYSIS,
+            transport=transport,
+        )
+
+        def cancel_when_started() -> None:
+            assert request_started.wait(2)
+            cancel.cancel()
+
+        canceller = threading.Thread(target=cancel_when_started)
+        canceller.start()
+        try:
+            result = adapter.run(harness.spec(tmp_path), cancel=cancel)
+        finally:
+            release_response.set()
+            canceller.join()
+
+    assert result.status == AgentStatus.CANCELLED
+    assert cancel.active_windows == ()
+    assert not (tmp_path / "result.json").exists()
+
+
 def test_execution_role_advertises_command_only_after_trust(
     tmp_path: Path,
     harness: ApiAdapterHarness,
@@ -572,17 +661,20 @@ def test_cancellation_interrupts_blocked_transport(
     harness: ApiAdapterHarness,
 ) -> None:
     started = threading.Event()
-    release = threading.Event()
+    finished = threading.Event()
 
-    def block_request(_cancel: CancellationToken | None):
+    def block_request(request_cancel: CancellationToken | None):
+        assert request_cancel is not None
         started.set()
-        release.wait()
+        assert request_cancel.wait(1)
+        finished.set()
         return harness.response([])
 
     cancel = CancellationToken()
+    transport = FakeApiTransport([block_request])
     adapter = harness.adapter(
         ApiAgentRole.ANALYSIS,
-        transport=FakeApiTransport([block_request]),
+        transport=transport,
     )
 
     def cancel_when_started() -> None:
@@ -592,15 +684,14 @@ def test_cancellation_interrupts_blocked_transport(
     canceller = threading.Thread(target=cancel_when_started)
     canceller.start()
     before = time.monotonic()
-    try:
-        result = adapter.run(harness.spec(tmp_path), cancel=cancel)
-    finally:
-        release.set()
-        canceller.join()
+    result = adapter.run(harness.spec(tmp_path), cancel=cancel)
+    canceller.join()
 
     assert time.monotonic() - before < 1
     assert result.status == AgentStatus.CANCELLED
     assert result.resumable
+    assert finished.is_set()
+    assert transport.requests[0].abort_calls >= 1
 
 
 def test_cancellation_terminates_in_flight_command(
@@ -686,6 +777,8 @@ def test_transient_failure_retries_same_turn_and_then_completes(
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert transport.payloads[0] == transport.payloads[1]
+    assert len(transport.requests) == 2
+    assert transport.requests[0] is not transport.requests[1]
 
 
 def test_transient_exhaustion_is_cancelled_and_resumable(

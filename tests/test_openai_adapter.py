@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import http.client
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 from test_adapter_harness import (
-    ChunkedHttpResponse as _ChunkedHttpResponse,
+    FakeApiTransport as FakeTransport,
 )
 from test_adapter_harness import (
-    FakeApiTransport as FakeTransport,
+    FakeUrlRequestFactory,
 )
 from test_adapter_harness import (
     openai_function_call as _call,
@@ -29,6 +28,8 @@ from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     OpenAIAdapter,
     UrllibOpenAITransport,
+    UrlResponse,
+    UrlTransportError,
 )
 
 
@@ -182,25 +183,20 @@ def test_mid_response_disconnect_retries_through_urllib_transport(
             ]
         )
     ).encode()
-    response_chunks: list[list[bytes | Exception]] = [
-        [http.client.IncompleteRead(b'{"object":"response"')],
-        [response_body, b""],
-    ]
-    requests: list[Any] = []
-
-    def urlopen(request: Any, *, timeout: float) -> _ChunkedHttpResponse:
-        assert timeout > 0
-        requests.append(request)
-        return _ChunkedHttpResponse(response_chunks.pop(0))
-
+    requests = FakeUrlRequestFactory(
+        [
+            UrlTransportError("response", "incomplete response body"),
+            UrlResponse(200, "OK", response_body),
+        ]
+    )
     monkeypatch.setattr(
-        "betterborg_cli.agent_runtime.openai.urllib.request.urlopen",
-        urlopen,
+        "betterborg_cli.agent_runtime.openai.MultiprocessUrlRequest",
+        requests,
     )
     adapter = OpenAIAdapter(
         ApiAgentRole.ANALYSIS,
         api_key="key",
-        transport=UrllibOpenAITransport(),
+        transport=UrllibOpenAITransport("https://provider.invalid/responses"),
         transient_backoff_seconds=0,
     )
 
@@ -208,9 +204,14 @@ def test_mid_response_disconnect_retries_through_urllib_transport(
 
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
-    assert len(requests) == 2
-    assert requests[0].data == requests[1].data
-    assert requests[0].get_header("Authorization") == "Bearer key"
+    assert len(requests.specs) == 2
+    assert requests.specs[0] == requests.specs[1]
+    assert requests.specs[0].url == "https://provider.invalid/responses"
+    assert requests.specs[0].timeout_seconds == 60.0
+    assert requests.specs[0].headers == {
+        "authorization": "Bearer key",
+        "content-type": "application/json",
+    }
 
 
 def test_malformed_json_submission_fails_without_persisting_result(

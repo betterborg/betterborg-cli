@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from betterborg_cli.agent_runtime import (
+    AbortableApiRequest,
     AgentAdapter,
     AgentRunSpec,
     AnthropicAdapter,
@@ -29,6 +30,8 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
     OpenAIAdapter,
     OpenAIApiError,
+    UrlRequestSpec,
+    UrlResponse,
 )
 
 Response = Mapping[str, Any]
@@ -267,6 +270,7 @@ class FakeApiTransport:
     responses: list[QueuedResponse]
     payloads: list[dict[str, Any]] = field(default_factory=list)
     api_keys: list[str] = field(default_factory=list, repr=False)
+    requests: list[FakeApiRequest] = field(default_factory=list)
 
     def create_message(
         self,
@@ -274,8 +278,8 @@ class FakeApiTransport:
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]:
-        return self._dequeue(payload, api_key=api_key, cancel=cancel)
+    ) -> AbortableApiRequest:
+        return self._create(payload, api_key=api_key, cancel=cancel)
 
     def create_response(
         self,
@@ -283,24 +287,84 @@ class FakeApiTransport:
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]:
-        return self._dequeue(payload, api_key=api_key, cancel=cancel)
+    ) -> AbortableApiRequest:
+        return self._create(payload, api_key=api_key, cancel=cancel)
 
-    def _dequeue(
+    def _create(
         self,
         payload: Mapping[str, Any],
         *,
         api_key: str,
         cancel: CancellationToken | None,
-    ) -> Mapping[str, Any]:
+    ) -> FakeApiRequest:
         self.payloads.append(json.loads(json.dumps(payload)))
         self.api_keys.append(api_key)
         response = self.responses.pop(0)
+        request = FakeApiRequest(response, cancel)
+        self.requests.append(request)
+        return request
+
+
+@dataclass
+class FakeApiRequest:
+    """Attempt-local request handle for provider-neutral adapter tests."""
+
+    response: QueuedResponse
+    cancel: CancellationToken | None
+    abort_calls: int = 0
+    force_calls: int = 0
+    executed: bool = False
+
+    def execute(self) -> Mapping[str, Any]:
+        self.executed = True
+        response = self.response
         if isinstance(response, Exception):
             raise response
         if callable(response):
-            return response(cancel)
+            return response(self.cancel)
         return response
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+
+    def force(self) -> None:
+        self.force_calls += 1
+
+
+@dataclass
+class FakeUrlRequestFactory:
+    """Record URL envelopes and return attempt-local transport handles."""
+
+    responses: list[UrlResponse | Exception]
+    specs: list[UrlRequestSpec] = field(default_factory=list)
+    cancels: list[CancellationToken | None] = field(default_factory=list)
+
+    def __call__(
+        self,
+        spec: UrlRequestSpec,
+        cancel: CancellationToken | None,
+    ) -> FakeUrlRequest:
+        self.specs.append(spec)
+        self.cancels.append(cancel)
+        return FakeUrlRequest(self.responses.pop(0))
+
+
+@dataclass
+class FakeUrlRequest:
+    response: UrlResponse | Exception
+    abort_calls: int = 0
+    force_calls: int = 0
+
+    def execute(self) -> UrlResponse:
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+
+    def force(self) -> None:
+        self.force_calls += 1
 
 
 class ChunkedHttpResponse:

@@ -8,6 +8,7 @@ from betterborg_cli.agent_runtime.anthropic import (
     AnthropicTransport,
     UrllibAnthropicTransport,
 )
+from betterborg_cli.agent_runtime.api_adapter import AbortableApiRequest
 from betterborg_cli.agent_runtime.api_http import (
     MultiprocessUrlRequest,
     UrlRequestSpec,
@@ -102,6 +103,7 @@ __all__ = [
     "AnthropicAdapter",
     "AnthropicApiError",
     "AnthropicTransport",
+    "AbortableApiRequest",
     "ApiAgentRole",
     "ApiToolDefinition",
     "ApiToolError",

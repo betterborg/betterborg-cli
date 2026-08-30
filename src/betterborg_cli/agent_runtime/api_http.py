@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import multiprocessing
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -66,15 +67,27 @@ class UrlResponse:
 class UrlTransportError(RuntimeError):
     """A provider-neutral URL transport failure."""
 
-    def __init__(self, kind: str, message: str) -> None:
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
         self.message = message
+        self.status_code = status_code
+        self.reason = reason
 
 
 _ResponseMessage: TypeAlias = tuple[str, int, str, bytes]
 _ErrorMessage: TypeAlias = tuple[str, str, str]
-_WorkerMessage: TypeAlias = _ResponseMessage | _ErrorMessage
+_HttpBodyErrorMessage: TypeAlias = tuple[str, int, str, str]
+_WorkerMessage: TypeAlias = (
+    _ResponseMessage | _ErrorMessage | _HttpBodyErrorMessage
+)
 
 
 class _ReadableResponse(Protocol):
@@ -91,10 +104,22 @@ class MultiprocessUrlRequest:
     ) -> None:
         self.spec = spec
         self.cancel = cancel
+        self._lock = threading.Lock()
+        self._process: BaseProcess | None = None
+        self._execute_started = False
+        self._abort_requested = False
+        self._force_requested = False
 
-    def run(self) -> UrlResponse:
+    def execute(self) -> UrlResponse:
         """Return a captured response or raise a typed transport failure."""
+        with self._lock:
+            if self._execute_started:
+                raise RuntimeError("URL request handles can only execute once")
+            self._execute_started = True
+            cancelled = self._abort_requested or self._force_requested
         if self.cancel is not None and self.cancel.is_set():
+            cancelled = True
+        if cancelled:
             raise UrlTransportError("cancelled", "URL request was cancelled")
 
         window = None
@@ -127,6 +152,7 @@ class MultiprocessUrlRequest:
                     daemon=False,
                 )
                 process.start()
+                self._publish_process(process)
             except BaseException:
                 if window is not None:
                     window.no_resource()
@@ -143,7 +169,7 @@ class MultiprocessUrlRequest:
             if window is not None:
                 try:
                     registration = window.register(
-                        lambda: _terminate_process(process),
+                        self.abort,
                         lambda: _force_process(process),
                         force_target=force_target,
                     )
@@ -158,6 +184,14 @@ class MultiprocessUrlRequest:
             if message[0] == "response":
                 _, status_code, reason, body = message
                 return UrlResponse(status_code, reason, body)
+            if message[0] == "http_body_error":
+                _, status_code, reason, detail = message
+                raise UrlTransportError(
+                    "response",
+                    detail,
+                    status_code=status_code,
+                    reason=reason,
+                )
             _, kind, detail = message
             raise UrlTransportError(kind, detail)
         finally:
@@ -186,7 +220,41 @@ class MultiprocessUrlRequest:
                         lambda: _force_process(process),
                         force_target=force_target,
                     )
+                with self._lock:
+                    if self._process is process:
+                        self._process = None
                 process.close()
+
+    def run(self) -> UrlResponse:
+        """Compatibility alias for :meth:`execute`."""
+        return self.execute()
+
+    def abort(self) -> None:
+        """Idempotently request nonblocking termination of the active child."""
+        with self._lock:
+            self._abort_requested = True
+            process = self._process
+        if process is not None:
+            _terminate_process(process)
+
+    def force(self) -> None:
+        """Idempotently request a nonblocking kill of the active child."""
+        with self._lock:
+            self._abort_requested = True
+            self._force_requested = True
+            process = self._process
+        if process is not None:
+            _kill_process(process)
+
+    def _publish_process(self, process: BaseProcess) -> None:
+        with self._lock:
+            self._process = process
+            abort_requested = self._abort_requested
+            force_requested = self._force_requested
+        if force_requested:
+            _kill_process(process)
+        elif abort_requested:
+            _terminate_process(process)
 
     def _receive(
         self,
@@ -250,7 +318,12 @@ def _url_request_worker(spec: UrlRequestSpec, sender: Connection) -> None:
             try:
                 body = _read_body(error)
             except (OSError, http.client.HTTPException) as body_error:
-                message = ("error", "response", str(body_error))
+                message = (
+                    "http_body_error",
+                    int(error.code),
+                    str(error.reason),
+                    str(body_error),
+                )
             else:
                 message = (
                     "response",
@@ -296,6 +369,13 @@ def _valid_worker_message(message: object) -> bool:
             len(message) == 3
             and isinstance(message[1], str)
             and isinstance(message[2], str)
+        )
+    if message[0] == "http_body_error":
+        return (
+            len(message) == 4
+            and isinstance(message[1], int)
+            and isinstance(message[2], str)
+            and isinstance(message[3], str)
         )
     return False
 

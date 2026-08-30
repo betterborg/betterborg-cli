@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import http.client
 import json
 import re
-import urllib.error
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from betterborg_cli.agent_runtime.api_adapter import (
+    AbortableApiRequest,
     ApiCredentialRedactor,
     ApiRunContext,
+)
+from betterborg_cli.agent_runtime.api_http import (
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    UrlResponse,
+    UrlTransportError,
 )
 from betterborg_cli.agent_runtime.api_tools import (
     ApiAgentRole,
@@ -59,7 +63,7 @@ class AnthropicTransport(Protocol):
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]: ...
+    ) -> AbortableApiRequest: ...
 
 
 class AnthropicApiError(RuntimeError):
@@ -97,68 +101,86 @@ class UrllibAnthropicTransport:
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]:
-        if cancel is not None and cancel.is_set():
-            raise AnthropicApiError("agent run cancelled")
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "anthropic-version": ANTHROPIC_API_VERSION,
-                "content-type": "application/json",
-                "x-api-key": api_key,
-            },
-            method="POST",
+    ) -> AbortableApiRequest:
+        return _AnthropicRequest(
+            MultiprocessUrlRequest(
+                UrlRequestSpec(
+                    self.url,
+                    "POST",
+                    {
+                        "anthropic-version": ANTHROPIC_API_VERSION,
+                        "content-type": "application/json",
+                        "x-api-key": api_key,
+                    },
+                    json.dumps(payload).encode("utf-8"),
+                    timeout_seconds=_HTTP_TIMEOUT_SECONDS,
+                ),
+                cancel,
+            )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _AnthropicRequest:
+    request: MultiprocessUrlRequest
+
+    def execute(self) -> Mapping[str, Any]:
         try:
-            chunks: list[bytes] = []
-            with urllib.request.urlopen(
-                request,
-                timeout=_HTTP_TIMEOUT_SECONDS,
-            ) as response:
-                while chunk := response.read(64 * 1024):
-                    chunks.append(chunk)
-                    if cancel is not None and cancel.is_set():
-                        raise AnthropicApiError("agent run cancelled")
-            body = b"".join(chunks).decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as error:
-            try:
-                body = error.read().decode("utf-8", errors="replace")
-            except (OSError, http.client.HTTPException) as body_error:
-                raise AnthropicApiError(
-                    f"Anthropic HTTP {error.code} response body failed: {body_error}",
-                    status_code=error.code,
-                ) from body_error
-            error_type, message = _api_error_details(body, str(error.reason))
-            raise AnthropicApiError(
-                message,
-                status_code=error.code,
-                error_type=error_type,
-            ) from error
-        except urllib.error.URLError as error:
-            raise AnthropicApiError(
-                f"Anthropic network error: {error.reason}",
-                error_type="api_error",
-            ) from error
-        except TimeoutError as error:
-            raise AnthropicApiError(
-                "Anthropic network request timed out",
-                error_type="api_error",
-            ) from error
-        except (OSError, http.client.HTTPException) as error:
-            raise AnthropicApiError(
-                f"Anthropic network response failed: {error}",
-                error_type="api_error",
-            ) from error
-        if cancel is not None and cancel.is_set():
-            raise AnthropicApiError("agent run cancelled")
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as error:
-            raise AnthropicApiError("Anthropic returned malformed JSON") from error
-        if not isinstance(decoded, Mapping):
-            raise AnthropicApiError("Anthropic returned a non-object response")
-        return decoded
+            response = self.request.execute()
+        except UrlTransportError as error:
+            raise _transport_error(error) from error
+        return _decode_response(response)
+
+    def abort(self) -> None:
+        self.request.abort()
+
+    def force(self) -> None:
+        self.request.force()
+
+
+def _decode_response(response: UrlResponse) -> Mapping[str, Any]:
+    body = response.body.decode("utf-8", errors="replace")
+    if not 200 <= response.status_code < 300:
+        error_type, message = _api_error_details(body, response.reason)
+        raise AnthropicApiError(
+            message,
+            status_code=response.status_code,
+            error_type=error_type,
+        )
+    try:
+        decoded = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise AnthropicApiError("Anthropic returned malformed JSON") from error
+    if not isinstance(decoded, Mapping):
+        raise AnthropicApiError("Anthropic returned a non-object response")
+    return decoded
+
+
+def _transport_error(error: UrlTransportError) -> AnthropicApiError:
+    if error.kind == "cancelled":
+        return AnthropicApiError("agent run cancelled")
+    if error.status_code is not None:
+        return AnthropicApiError(
+            (
+                f"Anthropic HTTP {error.status_code} response body failed: "
+                f"{error.message}"
+            ),
+            status_code=error.status_code,
+        )
+    if error.kind == "timeout":
+        return AnthropicApiError(
+            "Anthropic network request timed out",
+            error_type="api_error",
+        )
+    if error.kind == "network":
+        return AnthropicApiError(
+            f"Anthropic network error: {error.message}",
+            error_type="api_error",
+        )
+    return AnthropicApiError(
+        f"Anthropic network response failed: {error.message}",
+        error_type="api_error",
+    )
 
 
 @dataclass(slots=True)
@@ -259,7 +281,6 @@ class AnthropicAdapter:
                 ),
                 api_error_type=AnthropicApiError,
                 cancel=cancel,
-                thread_name="betterborg-anthropic-request",
                 backoff_seconds=self.transient_backoff_seconds,
                 max_attempts=self.transient_max_attempts,
             )
