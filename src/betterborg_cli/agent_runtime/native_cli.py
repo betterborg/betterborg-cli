@@ -141,15 +141,22 @@ class NativeCliAdapter:
             )
             if invocation.before_attempt is not None:
                 invocation.before_attempt()
-            exit_code = self.proc_runner(
-                invocation.command,
-                spec.cwd,
-                invocation.stdin_text,
-                spec.log_path,
-                cancel,
-                environment,
-                _line_observer(spec.activity_sink, invocation.translate_event),
+            line_observer = _line_observer(
+                spec.activity_sink, invocation.translate_event
             )
+            try:
+                exit_code = self.proc_runner(
+                    invocation.command,
+                    spec.cwd,
+                    invocation.stdin_text,
+                    spec.log_path,
+                    cancel,
+                    environment,
+                    line_observer,
+                )
+            finally:
+                if line_observer is not None:
+                    line_observer.finish()
             attempt_usage.append(self._extract_usage(spec.log_path))
             return exit_code
 
@@ -351,29 +358,54 @@ class NativeCliAdapter:
         raise NotImplementedError
 
 
-def _line_observer(
-    activity_sink: Callable[[AgentActivity], None] | None,
-    translate_event: Callable[[Mapping[str, Any]], AgentActivity | None] | None,
-) -> Callable[[str], None] | None:
-    if activity_sink is None or translate_event is None:
-        return None
+class _JsonlActivityObserver:
+    """Translate complete JSONL records from bounded process fragments."""
 
-    thinking = AgentActivity(AgentActivityKind.THINKING)
+    def __init__(
+        self,
+        activity_sink: Callable[[AgentActivity], None],
+        translate_event: Callable[[Mapping[str, Any]], AgentActivity | None],
+    ) -> None:
+        self._activity_sink = activity_sink
+        self._translate_event = translate_event
+        self._pending = ""
+        self._thinking = AgentActivity(AgentActivityKind.THINKING)
 
-    def observe(line: str) -> None:
-        activity = thinking
+    def __call__(self, fragment: str) -> None:
+        self._pending += fragment
+        while "\n" in self._pending:
+            record, _, self._pending = self._pending.partition("\n")
+            self._observe_record(record)
+
+    def finish(self) -> None:
+        """Observe a final record when the stream omits its trailing newline."""
+        if not self._pending:
+            return
+        record = self._pending
+        self._pending = ""
+        self._observe_record(record)
+
+    def _observe_record(self, record: str) -> None:
+        activity = self._thinking
         try:
-            event = json.loads(line)
+            event = json.loads(record)
             if isinstance(event, Mapping):
-                activity = translate_event(event) or thinking
+                activity = self._translate_event(event) or self._thinking
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         except Exception:
             # Provider translation is observational and cannot affect a run.
             pass
-        _emit_activity(activity_sink, activity)
+        _emit_activity(self._activity_sink, activity)
 
-    return observe
+
+def _line_observer(
+    activity_sink: Callable[[AgentActivity], None] | None,
+    translate_event: Callable[[Mapping[str, Any]], AgentActivity | None] | None,
+) -> _JsonlActivityObserver | None:
+    if activity_sink is None or translate_event is None:
+        return None
+    return _JsonlActivityObserver(activity_sink, translate_event)
 
 
 def _emit_activity(

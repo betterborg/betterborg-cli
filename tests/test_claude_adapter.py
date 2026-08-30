@@ -165,6 +165,50 @@ def test_native_tool_events_emit_neutral_activity_without_changing_logs(
     ]
 
 
+def test_fragmented_large_tool_event_emits_activity_without_changing_log(
+    tmp_path: Path,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = _stream(
+        _tool_event(
+            "Write",
+            {
+                "file_path": "large-output.txt",
+                "content": "x" * (64 * 1024),
+            },
+        ),
+        _envelope({"status": "completed", "version": "fragmented"}),
+    )
+    process_chunk_size = 64 * 1024
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        log_path.write_text(transcript, encoding="utf-8")
+        assert on_line is not None
+        for offset in range(0, len(transcript), process_chunk_size):
+            on_line(transcript[offset : offset + process_chunk_size])
+        return 0
+
+    spec = claude_spec(tmp_path, activity_sink=activities.append)
+    result = ClaudeAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "fragmented"}
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        AgentActivity(AgentActivityKind.WRITING, "large-output.txt"),
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
 def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
     tmp_path: Path,
 ) -> None:
