@@ -1,8 +1,13 @@
 """Tests for the public CLI bootstrap."""
 
+import io
+import os
+import signal
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
@@ -12,6 +17,7 @@ from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
@@ -71,6 +77,146 @@ def test_help_lists_bootstrap_commands(cli_runner: CliRunner) -> None:
     assert "init" in result.output
     assert "trust" in result.output
     assert "version" in result.output
+
+
+@pytest.mark.parametrize(
+    ("terminal_method", "terminal_state"),
+    [("complete", StageState.COMPLETED), ("stop", StageState.STOPPED)],
+)
+def test_main_sigint_acknowledges_without_terminalizing_active_work(
+    monkeypatch: MonkeyPatch,
+    terminal_method: str,
+    terminal_state: StageState,
+) -> None:
+    stream = io.StringIO()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "RunProgress",
+        lambda **kwargs: RunProgress(stream=stream, **kwargs),
+    )
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        observed["run"] = run
+        run.progress.declare(StageSpec("work", "Work"))
+        run.progress.start("work")
+        observed["before_interrupt"] = stream.getvalue()
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except KeyboardInterrupt as error:
+            deadline = time.monotonic() + 1
+            while not run.progress.cancelling and time.monotonic() < deadline:
+                time.sleep(0.001)
+            observed["cancelled"] = run.cancellation.is_set()
+            observed["acknowledged_state"] = run.progress.stages["work"].state
+            observed["acknowledgement"] = stream.getvalue()
+            getattr(run.progress, terminal_method)("work", "reconciled")
+            observed["terminal_state"] = run.progress.stages["work"].state
+            run.progress.close()
+            raise click.ClickException("workflow interruption reconciled") from error
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="borg")
+
+    assert exit_code == 130
+    assert isinstance(observed["run"], cli_module.CliRunContext)
+    assert observed["cancelled"] is True
+    assert observed["acknowledged_state"] is StageState.RUNNING
+    assert observed["acknowledgement"] == (
+        f"{observed['before_interrupt']}stopping...\n"
+    )
+    assert observed["terminal_state"] is terminal_state
+    assert "workflow interruption reconciled" not in stream.getvalue()
+    assert "Error:" not in stream.getvalue()
+
+
+def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    stream = io.StringIO()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "RunProgress",
+        lambda **kwargs: RunProgress(stream=stream, **kwargs),
+    )
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        interruption: KeyboardInterrupt | None = None
+        run.progress.declare(StageSpec("work", "Work"))
+        run.progress.start("work")
+        with run.progress.suspend():
+            observed["before_interrupt"] = stream.getvalue()
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except KeyboardInterrupt as error:
+                interruption = error
+                deadline = time.monotonic() + 1
+                while not run.progress.cancelling and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                observed["cancelled"] = run.cancellation.is_set()
+                observed["acknowledged_state"] = run.progress.stages["work"].state
+                observed["suspended_output"] = stream.getvalue()
+                run.progress.stop("work", "reconciled")
+                observed["terminal_state"] = run.progress.stages["work"].state
+                observed["terminal_output"] = stream.getvalue()
+        run.progress.close()
+        assert interruption is not None
+        raise click.ClickException(
+            "workflow interruption reconciled"
+        ) from interruption
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="borg")
+
+    assert exit_code == 130
+    assert observed["cancelled"] is True
+    assert observed["acknowledged_state"] is StageState.RUNNING
+    assert observed["terminal_state"] is StageState.STOPPED
+    assert observed["suspended_output"] == observed["before_interrupt"]
+    assert observed["terminal_output"] == observed["before_interrupt"]
+    assert stream.getvalue().startswith(
+        f"{observed['before_interrupt']}stopping...\n"
+    )
+    assert "stopped" in stream.getvalue()
+
+
+def test_main_preserves_click_usage_error_formatting(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    exit_code = cli_module.main(["version", "unexpected"], prog_name="borg")
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "Usage: borg version [OPTIONS]" in captured.err
+    assert "Error: Got unexpected extra argument (unexpected)" in captured.err
+
+
+def test_main_preserves_click_exception_formatting(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    @click.command()
+    def command() -> None:
+        raise click.ClickException("ordinary failure")
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="borg")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Error: ordinary failure\n"
 
 
 def test_create_help_registers_required_positional_name(

@@ -157,6 +157,22 @@ def test_python_distributions_contain_release_assets(
         assert "PKG-INFO" in members
 
 
+def test_wheel_console_entry_uses_root_run_lifecycle(
+    built_distributions: BuiltDistributions,
+) -> None:
+    with zipfile.ZipFile(built_distributions.wheel) as archive:
+        entry_points = next(
+            name
+            for name in archive.namelist()
+            if name.endswith(".dist-info/entry_points.txt")
+        )
+
+        assert (
+            "borg = betterborg_cli.cli:main"
+            in archive.read(entry_points).decode("utf-8")
+        )
+
+
 def test_wheel_declares_python_compatible_rich_dependency(
     built_distributions: BuiltDistributions,
 ) -> None:
