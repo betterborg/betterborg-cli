@@ -117,15 +117,15 @@ class MultiprocessUrlRequest:
                     "cancelled", "URL request was cancelled"
                 ) from error
 
-            context = multiprocessing.get_context("spawn")
-            receiver, sender = context.Pipe(duplex=False)
-            process = context.Process(
-                target=_url_request_worker,
-                args=(self.spec, sender),
-                name="betterborg-url-request",
-                daemon=False,
-            )
             try:
+                context = multiprocessing.get_context("spawn")
+                receiver, sender = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_url_request_worker,
+                    args=(self.spec, sender),
+                    name="betterborg-url-request",
+                    daemon=False,
+                )
                 process.start()
             except BaseException:
                 if window is not None:
@@ -144,7 +144,7 @@ class MultiprocessUrlRequest:
                 try:
                     registration = window.register(
                         lambda: _terminate_process(process),
-                        lambda: _kill_process(process),
+                        lambda: _force_process(process),
                         force_target=force_target,
                     )
                 except CancellationDeliveryError as error:
@@ -183,7 +183,7 @@ class MultiprocessUrlRequest:
                         force_target = ForceTarget(process.pid)
                     window.publish_cleaned_resource(
                         lambda: _terminate_process(process),
-                        lambda: _kill_process(process),
+                        lambda: _force_process(process),
                         force_target=force_target,
                     )
                 process.close()
@@ -310,6 +310,14 @@ def _kill_process(process: BaseProcess) -> None:
     with contextlib.suppress(ProcessLookupError, OSError, ValueError):
         if process.is_alive():
             process.kill()
+
+
+def _force_process(process: BaseProcess) -> None:
+    """Kill and reap a request child before force delivery is complete."""
+    _kill_process(process)
+    process.join(CancellationToken.DEFAULT_GRACE_SECONDS)
+    if process.is_alive():
+        raise TimeoutError(f"URL request worker {process.pid} could not be joined")
 
 
 def _cleanup_process(

@@ -18,8 +18,10 @@ from test_adapter_harness import (
     BlockingTcpServer,
     FakeApiTransport,
     LocalHttpServer,
+    LocalTlsServer,
 )
 
+import betterborg_cli.agent_runtime.api_http as api_http
 from betterborg_cli.agent_runtime import (
     AgentStatus,
     AgentUsage,
@@ -35,6 +37,49 @@ from betterborg_cli.agent_runtime import (
 @pytest.fixture(params=API_ADAPTER_HARNESSES, ids=lambda harness: harness.provider)
 def harness(request: pytest.FixtureRequest) -> ApiAdapterHarness:
     return request.param
+
+
+@pytest.mark.parametrize("failure_point", ["pipe", "process"])
+def test_url_request_settles_window_when_prestart_setup_fails(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections = []
+
+    class StubConnection:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FailingContext:
+        def Pipe(self, *, duplex: bool):
+            assert duplex is False
+            if failure_point == "pipe":
+                raise OSError("injected pipe failure")
+            receiver = StubConnection()
+            sender = StubConnection()
+            connections.extend((receiver, sender))
+            return receiver, sender
+
+        def Process(self, **_kwargs):
+            raise OSError("injected process failure")
+
+    monkeypatch.setattr(
+        api_http.multiprocessing,
+        "get_context",
+        lambda method: FailingContext(),
+    )
+    cancel = CancellationToken()
+
+    with pytest.raises(OSError, match=f"injected {failure_point} failure"):
+        MultiprocessUrlRequest(
+            UrlRequestSpec("http://127.0.0.1/", "GET", {}, None),
+            cancel,
+        ).run()
+
+    assert cancel.active_windows == ()
+    assert all(connection.closed for connection in connections)
 
 
 def test_multiprocess_url_request_preserves_http_behavior() -> None:
@@ -97,6 +142,36 @@ def test_multiprocess_url_request_uses_default_proxy_opener(
 
     assert response.body == b"proxied"
     assert len(proxy.requests) == 1
+
+
+def test_multiprocess_url_request_preserves_default_tls_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+
+    with LocalTlsServer(
+        tmp_path,
+        lambda _request: (200, {}, b"trusted"),
+    ) as server:
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        with pytest.raises(UrlTransportError) as untrusted:
+            MultiprocessUrlRequest(
+                UrlRequestSpec(server.url(), "GET", {}, None),
+                CancellationToken(),
+            ).run()
+
+        monkeypatch.setenv("SSL_CERT_FILE", str(server.certificate_path))
+        trusted = MultiprocessUrlRequest(
+            UrlRequestSpec(server.url(), "GET", {}, None),
+            CancellationToken(),
+        ).run()
+
+    assert untrusted.value.kind == "network"
+    assert "CERTIFICATE_VERIFY_FAILED" in untrusted.value.message
+    assert trusted.status_code == 200
+    assert trusted.body == b"trusted"
 
 
 @pytest.mark.parametrize("phase", ["headers", "body", "proxy", "tls"])
@@ -163,6 +238,104 @@ def test_multiprocess_url_request_cancels_blocked_network_phase(
     assert time.monotonic() - before < 1.5
     assert captured.value.kind == "cancelled"
     assert cancel.active_windows == ()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")
+def test_url_request_cancels_blocked_dns_before_socket_within_deadline(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    process = real_process_harness.launch_blocked_url_wrapper(
+        "http://127.0.0.1:9/",
+        name="url-blocked-dns",
+    )
+    real_process_harness.wait_for_marker("url-blocked-dns.dns-gate")
+    child_pid = int(
+        real_process_harness.wait_for_marker("url-blocked-dns.request.pid")
+    )
+
+    started = time.monotonic()
+    real_process_harness.signal(process, signal.SIGINT)
+
+    assert real_process_harness.wait_for_exit(
+        process,
+        timeout=CancellationToken.DEFAULT_GRACE_SECONDS,
+    ) == 130
+    joined_at = float(
+        real_process_harness.wait_for_marker("url-blocked-dns.request-joined")
+    )
+    assert joined_at - started <= CancellationToken.DEFAULT_GRACE_SECONDS
+    assert (
+        real_process_harness.wait_for_marker("url-blocked-dns.active-windows")
+        == "0"
+    )
+    real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")
+def test_url_request_force_kills_and_joins_resistant_child(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    process = real_process_harness.launch_blocked_url_wrapper(
+        "http://127.0.0.1:9/",
+        name="url-resistant-dns",
+        resistant=True,
+    )
+    real_process_harness.wait_for_marker("url-resistant-dns.dns-gate")
+    child_pid = int(
+        real_process_harness.wait_for_marker("url-resistant-dns.request.pid")
+    )
+
+    real_process_harness.signal(process, signal.SIGINT)
+    cancelled_at = float(
+        real_process_harness.wait_for_marker("url-resistant-dns.cancelled")
+    )
+    real_process_harness.signal(process, signal.SIGINT)
+
+    assert real_process_harness.wait_for_exit(process, timeout=1) == 130
+    killed_at = float(
+        real_process_harness.wait_for_marker("url-resistant-dns.kill")
+    )
+    joined_at = float(
+        real_process_harness.wait_for_marker("url-resistant-dns.force-joined")
+    )
+    assert killed_at >= cancelled_at
+    assert joined_at >= killed_at
+    real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")
+def test_url_request_joins_resistant_child_by_production_deadline(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    process = real_process_harness.launch_blocked_url_wrapper(
+        "http://127.0.0.1:9/",
+        name="url-deadline-dns",
+        resistant=True,
+    )
+    real_process_harness.wait_for_marker("url-deadline-dns.dns-gate")
+    child_pid = int(
+        real_process_harness.wait_for_marker("url-deadline-dns.request.pid")
+    )
+
+    real_process_harness.signal(process, signal.SIGINT)
+    cancelled_at = float(
+        real_process_harness.wait_for_marker("url-deadline-dns.cancelled")
+    )
+
+    assert real_process_harness.wait_for_exit(process, timeout=1.5) == 130
+    killed_at = float(
+        real_process_harness.wait_for_marker("url-deadline-dns.kill")
+    )
+    joined_at = float(
+        real_process_harness.wait_for_marker("url-deadline-dns.request-joined")
+    )
+    assert killed_at - cancelled_at <= CancellationToken.DEFAULT_GRACE_SECONDS + 0.1
+    assert joined_at - cancelled_at <= CancellationToken.DEFAULT_GRACE_SECONDS + 0.1
+    assert (
+        real_process_harness.wait_for_marker("url-deadline-dns.active-windows")
+        == "0"
+    )
+    real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")

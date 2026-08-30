@@ -5,12 +5,20 @@ from __future__ import annotations
 import contextlib
 import json
 import socket
+import ssl
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from betterborg_cli.agent_runtime import (
     AgentAdapter,
@@ -51,6 +59,7 @@ class LocalHttpServer:
     requests: list[HttpRequestRecord] = field(default_factory=list)
     body_started: threading.Event | None = None
     body_release: threading.Event | None = None
+    tls_context: ssl.SSLContext | None = field(default=None, repr=False)
     _server: ThreadingHTTPServer = field(init=False, repr=False)
     _thread: threading.Thread = field(init=False, repr=False)
 
@@ -95,6 +104,11 @@ class LocalHttpServer:
                 return None
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if self.tls_context is not None:
+            self._server.socket = self.tls_context.wrap_socket(
+                self._server.socket,
+                server_side=True,
+            )
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             name="betterborg-test-http",
@@ -110,7 +124,75 @@ class LocalHttpServer:
 
     def url(self, path: str = "/") -> str:
         host, port = self._server.server_address
-        return f"http://{host}:{port}{path}"
+        scheme = "https" if self.tls_context is not None else "http"
+        return f"{scheme}://{host}:{port}{path}"
+
+
+@dataclass
+class LocalTlsServer:
+    """Local HTTPS endpoint with an explicit self-signed trust anchor."""
+
+    root: Path
+    responder: HttpResponder
+    certificate_path: Path = field(init=False)
+    _server: LocalHttpServer = field(init=False, repr=False)
+
+    def __enter__(self) -> LocalTlsServer:
+        self.certificate_path = self.root / "localhost-ca.pem"
+        private_key_path = self.root / "localhost-key.pem"
+        _write_localhost_certificate(self.certificate_path, private_key_path)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.certificate_path, private_key_path)
+        self._server = LocalHttpServer(self.responder, tls_context=context)
+        self._server.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._server.__exit__(*exc_info)
+
+    @property
+    def requests(self) -> list[HttpRequestRecord]:
+        return self._server.requests
+
+    def url(self, path: str = "/") -> str:
+        return self._server.url(path)
+
+
+def _write_localhost_certificate(certificate_path: Path, key_path: Path) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ip_address("127.0.0.1")),
+                ]
+            ),
+            critical=False,
+        )
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None),
+            critical=True,
+        )
+        .sign(private_key, hashes.SHA256())
+    )
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
 
 
 @dataclass

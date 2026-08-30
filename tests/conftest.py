@@ -6,13 +6,16 @@ import contextlib
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -20,6 +23,10 @@ from click.testing import CliRunner
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
+from betterborg_cli.agent_runtime.api_http import (
+    UrlRequestSpec,
+    _url_request_worker,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter
 from betterborg_cli.planning import (
     approved_plan_digest,
@@ -81,6 +88,31 @@ class RecordingProgress:
         self, stage_key: str, child_key: str, activity: AgentActivity
     ) -> None:
         self.child_activities.append((stage_key, child_key, activity))
+
+
+def blocked_dns_url_request_worker(
+    spec: UrlRequestSpec,
+    sender: Connection,
+) -> None:
+    """Block a real urllib worker in DNS before socket creation."""
+    root = Path(os.environ["BETTERBORG_TEST_REQUEST_ROOT"])
+    name = os.environ["BETTERBORG_TEST_REQUEST_NAME"]
+    if os.environ.get("BETTERBORG_TEST_REQUEST_RESISTANT") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    original_getaddrinfo = socket.getaddrinfo
+
+    def gated_getaddrinfo(*args: Any, **kwargs: Any) -> Any:
+        (root / f"{name}.request.pid").write_text(str(os.getpid()))
+        (root / f"{name}.dns-gate").write_text("blocked")
+        while not (root / f"release-{name}").exists():
+            time.sleep(0.01)
+        return original_getaddrinfo(*args, **kwargs)
+
+    socket.getaddrinfo = gated_getaddrinfo
+    try:
+        _url_request_worker(spec, sender)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
 
 
 @dataclass
@@ -259,6 +291,120 @@ if __name__ == "__main__":
         mode = "fail" if fail_registration else "signal"
         return self.launch_python(
             source,
+            str(self.root),
+            name,
+            mode,
+            url,
+            name=f"{name}-wrapper",
+        )
+
+    def launch_blocked_url_wrapper(
+        self,
+        url: str,
+        *,
+        name: str,
+        resistant: bool = False,
+    ) -> subprocess.Popen[str]:
+        """Run urllib behind a DNS gate in a production RunControl wrapper."""
+        source = r'''
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+tests_root = sys.argv[1]
+root = Path(sys.argv[2])
+name = sys.argv[3]
+resistant = sys.argv[4] == "resistant"
+url = sys.argv[5]
+sys.path.insert(0, tests_root)
+
+import betterborg_cli.agent_runtime.api_http as api_http
+from betterborg_cli.agent_runtime import (
+    CancellationToken,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+)
+from betterborg_cli.run_control import RunControl
+from conftest import blocked_dns_url_request_worker
+
+os.environ["BETTERBORG_TEST_REQUEST_ROOT"] = str(root)
+os.environ["BETTERBORG_TEST_REQUEST_NAME"] = name
+os.environ["BETTERBORG_TEST_REQUEST_RESISTANT"] = "1" if resistant else "0"
+api_http._url_request_worker = blocked_dns_url_request_worker
+original_kill = api_http._kill_process
+original_force = api_http._force_process
+original_cleanup = api_http._cleanup_process
+
+
+def marked_kill(process):
+    marker = root / f"{name}.kill"
+    if not marker.exists():
+        marker.write_text(str(time.monotonic()))
+    original_kill(process)
+
+
+def record_join():
+    marker = root / f"{name}.request-joined"
+    if not marker.exists():
+        marker.write_text(str(time.monotonic()))
+
+
+def marked_force(process):
+    original_force(process)
+    record_join()
+    (root / f"{name}.force-joined").write_text(str(time.monotonic()))
+
+
+def marked_cleanup(process, *, terminate, deadline):
+    original_cleanup(process, terminate=terminate, deadline=deadline)
+    record_join()
+    (root / f"{name}.cleanup-joined").write_text(str(time.monotonic()))
+
+
+api_http._kill_process = marked_kill
+api_http._force_process = marked_force
+api_http._cleanup_process = marked_cleanup
+
+
+class Progress:
+    def begin_cancellation(self):
+        (root / f"{name}.cancelled").write_text(str(time.monotonic()))
+        return True
+
+
+def main() -> None:
+    cancel = CancellationToken()
+    request = MultiprocessUrlRequest(
+        UrlRequestSpec(url, "GET", {}, None),
+        cancel,
+    )
+    try:
+        control = RunControl(cancel, progress=Progress())
+        with control:
+            with control.protected():
+                request.run()
+    except KeyboardInterrupt:
+        (root / f"{name}.active-windows").write_text(
+            str(len(cancel.active_windows))
+        )
+        raise SystemExit(130) from None
+    except BaseException as error:
+        (root / f"{name}.error").write_text(
+            f"{type(error).__name__}: {error}"
+        )
+        raise SystemExit(74) from None
+
+
+if __name__ == "__main__":
+    main()
+'''
+        mode = "resistant" if resistant else "normal"
+        return self.launch_python(
+            source,
+            str(Path(__file__).parent),
             str(self.root),
             name,
             mode,
