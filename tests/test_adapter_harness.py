@@ -242,6 +242,12 @@ class BlockingTcpServer:
         return f"https://{host}:{port}/"
 
 
+def native_event_stream(*events: str | Mapping[str, Any]) -> str:
+    """Serialize native provider events as a JSONL stream."""
+    return "\n".join(
+        event if isinstance(event, str) else json.dumps(event) for event in events
+    )
+
 def write_native_output(
     log_path: Path,
     text: str,
