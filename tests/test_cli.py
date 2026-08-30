@@ -650,6 +650,39 @@ def test_explicit_trust_command_records_current_workspace(
     assert store.is_trusted(WorkspaceIdentity.discover(RepoPaths.discover(git_repo)))
 
 
+def test_trust_command_forwards_root_cancellation_token(
+    cli_runner: CliRunner,
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    cancel = cli_module.CancellationToken()
+    run = cli_module.CliRunContext(cancel, RunProgress())
+    observed: list[tuple[str, object]] = []
+    original_discover = RepoPaths.discover.__func__
+
+    def discover(cls, start=None, *, cancel=None, command_runner=None):
+        observed.append(("paths", cancel))
+        if command_runner is None:
+            return original_discover(cls, start or git_repo)
+        return original_discover(
+            cls,
+            start or git_repo,
+            command_runner=command_runner,
+        )
+
+    def trust(_paths: RepoPaths, **kwargs) -> None:
+        observed.append(("trust", kwargs["cancel"]))
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(discover))
+    monkeypatch.setattr(cli_module, "require_workspace_trust", trust)
+
+    result = cli_runner.invoke(cli, ["trust", "--yes"], obj=run)
+
+    assert result.exit_code == 0, result.output
+    assert observed == [("paths", cancel), ("trust", cancel)]
+
+
 def test_untrusted_noninteractive_command_rejects_before_callback(
     cli_runner: CliRunner,
     git_repo: Path,

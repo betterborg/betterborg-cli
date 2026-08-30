@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
+
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 
 _WINDOWS_RESERVED_BASENAMES = {
     "aux",
@@ -30,7 +34,13 @@ def is_windows_reserved_filename(name: str) -> bool:
     return name.casefold().split(".", 1)[0] in _WINDOWS_RESERVED_BASENAMES
 
 
-def require_git_trackable(path: Path, *, root: Path) -> None:
+def require_git_trackable(
+    path: Path,
+    *,
+    root: Path,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+) -> None:
     """Require ``path`` to resolve within ``root`` and be visible to Git."""
     resolved_root = root.resolve(strict=True)
     candidate = path if path.is_absolute() else resolved_root / path
@@ -40,7 +50,7 @@ def require_git_trackable(path: Path, *, root: Path) -> None:
         raise RepositoryPathError(f"repository path escapes root: {path}") from error
 
     relative_text = relative.as_posix()
-    result = subprocess.run(
+    result = command_runner(
         [
             "git",
             "-C",
@@ -51,6 +61,7 @@ def require_git_trackable(path: Path, *, root: Path) -> None:
             relative_text,
         ],
         check=False,
+        cancel=cancel,
     )
     if result.returncode == 0:
         raise RepositoryGitVisibilityError(

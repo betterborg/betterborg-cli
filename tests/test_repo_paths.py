@@ -1,8 +1,11 @@
 """Filesystem contracts for repository-local BetterBorg data."""
 
 import subprocess
+import threading
 from pathlib import Path
+from typing import Any
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.repo_paths import (
     MANAGED_IGNORE_BEGIN,
     MANAGED_IGNORE_END,
@@ -26,6 +29,64 @@ def test_discover_uses_nearest_git_root(git_repo: Path) -> None:
     assert paths.improvement_prds_dir == (
         nested_repo / ".borg" / "prds" / "improvements"
     )
+
+
+def test_discover_forwards_cancellation_to_the_registered_runner(
+    git_repo: Path,
+) -> None:
+    cancel = CancellationToken()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, f"{git_repo}\n", "")
+
+    paths = RepoPaths.discover(
+        git_repo,
+        cancel=cancel,
+        command_runner=runner,
+    )
+
+    assert paths.root == git_repo
+    assert calls == [
+        (
+            ["git", "-C", str(git_repo), "rev-parse", "--show-toplevel"],
+            {"check": True, "cancel": cancel},
+        )
+    ]
+
+
+def test_discover_cancellation_reaps_the_git_process_tree(
+    git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.05)
+    errors: list[BaseException] = []
+
+    def runner(_command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return run_captured(
+            real_process_harness.resistant_argv("repo-root"),
+            cancel=kwargs["cancel"],
+            check=kwargs["check"],
+        )
+
+    def discover() -> None:
+        try:
+            RepoPaths.discover(git_repo, cancel=cancel, command_runner=runner)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=discover)
+    worker.start()
+    real_process_harness.wait_for_marker("repo-root.parent.pid")
+    real_process_harness.wait_for_marker("repo-root.child.pid")
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    real_process_harness.assert_tree_absent("repo-root")
 
 
 def test_managed_ignore_keeps_documents_trackable_and_ignores_state(

@@ -249,7 +249,10 @@ def _trusted_workspace_callback(function):
     @wraps(function)
     def guarded(*args, explicit_trust: bool = False, **kwargs):
         try:
-            paths = RepoPaths.discover()
+            context = click.get_current_context().find_root()
+            run = context.obj
+            cancel = run.cancellation if isinstance(run, CliRunContext) else None
+            paths = RepoPaths.discover(cancel=cancel)
             interactive = _stdin_is_interactive() and not kwargs.get(
                 "json_output", False
             )
@@ -258,6 +261,7 @@ def _trusted_workspace_callback(function):
                 explicit=explicit_trust,
                 interactive=interactive,
                 confirm=lambda prompt: click.confirm(prompt, default=False),
+                cancel=cancel,
             )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             raise click.ClickException(str(error)) from error

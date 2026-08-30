@@ -7,8 +7,9 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from inspect import Parameter, signature
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from betterborg_cli.agent_runtime.anthropic import AnthropicAdapter
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole, is_read_only_tool_set
@@ -23,13 +24,12 @@ from betterborg_cli.agent_runtime.base import (
 from betterborg_cli.agent_runtime.claude import ClaudeAdapter
 from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.openai import OpenAIAdapter
-from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.repository_config import AgentChoice, RepositoryConfig
-from betterborg_cli.workspace_trust import (
-    TrustStore,
-    WorkspaceIdentity,
-    require_workspace_trust,
-)
+
+if TYPE_CHECKING:
+    from betterborg_cli.repo_paths import RepoPaths
+    from betterborg_cli.workspace_trust import TrustStore
 
 _NATIVE_ADAPTERS = ("claude", "codex")
 _API_ADAPTERS = ("anthropic", "openai")
@@ -51,6 +51,12 @@ _SETUP_GUIDANCE = (
     "Install and log in to the 'claude' or 'codex' CLI, or set "
     "ANTHROPIC_API_KEY or OPENAI_API_KEY for API use."
 )
+
+
+def _default_trust_requirement() -> Callable[..., Any]:
+    from betterborg_cli.workspace_trust import require_workspace_trust
+
+    return require_workspace_trust
 
 
 class AgentSelectionError(RuntimeError):
@@ -97,7 +103,7 @@ class SelectedAgent:
     trust_explicit: bool = False
     trust_confirm: Callable[[str], bool] | None = field(default=None, repr=False)
     trust_requirement: Callable[..., Any] = field(
-        default=require_workspace_trust,
+        default_factory=_default_trust_requirement,
         repr=False,
     )
 
@@ -122,14 +128,11 @@ class SelectedAgent:
         if cancel is not None and cancel.is_set():
             return self.adapter.run(resolved_spec, cancel=cancel)
 
-        run_paths = self._bound_run_paths(resolved_spec.cwd)
+        run_paths = self._bound_run_paths(resolved_spec.cwd, cancel)
         if self.capabilities.host_capable:
-            self.trust_requirement(
+            self._require_trust(
                 run_paths,
-                store=self.trust_store,
-                explicit=self.trust_explicit,
-                interactive=self.interactive,
-                confirm=self.trust_confirm,
+                cancel,
             )
             if isinstance(self.adapter, AnthropicAdapter | OpenAIAdapter):
                 self.adapter.workspace_trusted = True
@@ -177,12 +180,9 @@ class SelectedAgent:
                     f"Host-capable adapter {self.name!r} may only run in a "
                     "bounded workspace under a read-only tool set"
                 )
-            self.trust_requirement(
+            self._require_trust(
                 self.paths,
-                store=self.trust_store,
-                explicit=self.trust_explicit,
-                interactive=self.interactive,
-                confirm=self.trust_confirm,
+                cancel,
             )
         return self.adapter.run(self._resolve_spec(spec), cancel=cancel)
 
@@ -198,12 +198,25 @@ class SelectedAgent:
             ),
         )
 
-    def _bound_run_paths(self, cwd: Path) -> RepoPaths:
+    def _bound_run_paths(
+        self,
+        cwd: Path,
+        cancel: CancellationToken | None,
+    ) -> RepoPaths:
         """Resolve a run cwd that belongs to the selected repository."""
+        from betterborg_cli.repo_paths import RepoPaths
+        from betterborg_cli.workspace_trust import WorkspaceIdentity
+
         try:
-            run_paths = RepoPaths.discover(cwd)
-            selected_identity = WorkspaceIdentity.discover(self.paths)
-            run_identity = WorkspaceIdentity.discover(run_paths)
+            run_paths = RepoPaths.discover(cwd, cancel=cancel)
+            selected_identity = WorkspaceIdentity.discover(
+                self.paths,
+                cancel=cancel,
+            )
+            run_identity = WorkspaceIdentity.discover(
+                run_paths,
+                cancel=cancel,
+            )
         except ValueError as error:
             raise AgentSelectionError(
                 f"Agent run cwd is not a usable Git workspace: {cwd}"
@@ -220,6 +233,34 @@ class SelectedAgent:
                 f"{run_paths.root} (selected {self.paths.root})"
             )
         return run_paths
+
+    def _require_trust(
+        self,
+        paths: RepoPaths,
+        cancel: CancellationToken | None,
+    ) -> None:
+        """Call injected trust checks with supported cancellation keywords."""
+        kwargs: dict[str, Any] = {
+            "store": self.trust_store,
+            "explicit": self.trust_explicit,
+            "interactive": self.interactive,
+            "confirm": self.trust_confirm,
+        }
+        parameters = signature(self.trust_requirement).parameters.values()
+        accepts_arbitrary_keywords = any(
+            parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters
+        )
+        supported_keywords = {
+            parameter.name
+            for parameter in parameters
+            if parameter.kind
+            in {Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY}
+        }
+        if accepts_arbitrary_keywords or "cancel" in supported_keywords:
+            kwargs["cancel"] = cancel
+        if accepts_arbitrary_keywords or "command_runner" in supported_keywords:
+            kwargs["command_runner"] = run_captured
+        self.trust_requirement(paths, **kwargs)
 
 
 def select_agent(
@@ -311,7 +352,7 @@ def select_agent(
         trust_store=trust_store,
         trust_explicit=trust_explicit,
         trust_confirm=trust_confirm,
-        trust_requirement=trust_requirement or require_workspace_trust,
+        trust_requirement=trust_requirement or _default_trust_requirement(),
     )
 
 
