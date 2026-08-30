@@ -46,10 +46,15 @@ test("package metadata exposes the public scoped borg command", () => {
 test("packed package includes the license and attribution notice", () => {
   const packageRoot = path.resolve(__dirname, "..");
   const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  // Node refuses to execFileSync a Windows .cmd shim without a shell.
   const output = childProcess.execFileSync(
     npmCommand,
     ["pack", "--dry-run", "--json", "."],
-    { cwd: packageRoot, encoding: "utf8" },
+    {
+      cwd: packageRoot,
+      encoding: "utf8",
+      shell: process.platform === "win32",
+    },
   );
   const [{ files }] = JSON.parse(output);
   const packedPaths = new Set(files.map((file) => file.path));
