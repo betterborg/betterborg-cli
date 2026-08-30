@@ -13,14 +13,21 @@ import pytest
 
 import betterborg_cli.planning.worktree as worktree_module
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
+from betterborg_cli.agent_runtime.mock import MockAdapter
 from betterborg_cli.planning import (
+    ArchitectLoop,
     PlanningWorktreeError,
+    ProjectManagerLoop,
+    SupervisorLoop,
+    TechLeadLoop,
     materialize_planning_worktree,
 )
+from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import (
     build_machine_report,
     render_markdown_report,
 )
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
     PlanChangeRequest,
@@ -408,6 +415,184 @@ def test_cancellation_reaps_each_planning_worktree_git_process(
     real_process_harness.assert_tree_absent(f"planning-{blocked_operation}")
 
 
+@pytest.mark.parametrize(
+    "role",
+    ["architect", "project-manager", "tech-lead", "supervisor"],
+)
+def test_cancellation_reaps_planning_constructor_repository_discovery(
+    committed_git_repo: Path,
+    persist_planning_context,
+    real_process_harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    database = committed_git_repo.parent / f"planning-{role}-discovery.db"
+    constructor_cancel = CancellationToken()
+    errors: list[BaseException] = []
+    adapter = MockAdapter(name="openai")
+    marker = f"planning-{role}-discovery"
+    original_discover = RepoPaths.discover
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo,
+            store,
+            f"{role}-discovery",
+        )
+
+        def blocked_discover(
+            start: Path | None = None,
+            *,
+            cancel: CancellationToken | None = None,
+            command_runner: Any = run_captured,
+        ) -> RepoPaths:
+            del command_runner
+            assert cancel is constructor_cancel
+
+            def runner(
+                _command: list[str], **kwargs: Any
+            ) -> subprocess.CompletedProcess[str]:
+                assert kwargs["cancel"] is cancel
+                return run_captured(
+                    real_process_harness.resistant_argv(marker),
+                    check=kwargs["check"],
+                    cancel=kwargs["cancel"],
+                )
+
+            return original_discover(
+                start,
+                cancel=cancel,
+                command_runner=runner,
+            )
+
+        monkeypatch.setattr(RepoPaths, "discover", blocked_discover)
+
+        def construct() -> None:
+            try:
+                _construct_planning_role(
+                    role,
+                    repository,
+                    borg,
+                    store,
+                    adapter,
+                    constructor_cancel,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=construct)
+        worker.start()
+        real_process_harness.wait_for_marker(f"{marker}.parent.pid")
+        real_process_harness.wait_for_marker(f"{marker}.child.pid")
+        constructor_cancel.cancel()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert adapter.calls == []
+    real_process_harness.assert_tree_absent(marker)
+
+
+def test_cancelled_completed_creation_is_removed(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    database = committed_git_repo.parent / "planning-creation-race.db"
+    cancel = CancellationToken()
+    destination: Path | None = None
+    worktrees_before = _git(committed_git_repo, "worktree", "list", "--porcelain")
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal destination
+        result = run_captured(command, **kwargs)
+        if command[3:5] != ["worktree", "add"]:
+            return result
+        destination = Path(command[-2])
+        assert result.returncode == 0
+        cancel.cancel()
+        return subprocess.CompletedProcess(
+            result.args,
+            -1,
+            result.stdout,
+            result.stderr,
+        )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "creation-race"
+        )
+        with pytest.raises(
+            PlanningWorktreeError,
+            match="unable to materialize planning worktree",
+        ):
+            with materialize_planning_worktree(
+                repository,
+                borg,
+                store,
+                cancel=cancel,
+                command_runner=runner,
+            ):
+                pytest.fail("cancelled worktree creation reached the caller")
+
+    assert destination is not None
+    assert not destination.exists()
+    assert (
+        _git(committed_git_repo, "worktree", "list", "--porcelain")
+        == worktrees_before
+    )
+
+
+def test_cancelled_completed_removal_is_not_retried(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    database = committed_git_repo.parent / "planning-removal-race.db"
+    cancel = CancellationToken()
+    removal_calls: list[dict[str, Any]] = []
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        result = run_captured(command, **kwargs)
+        if command[3:5] != ["worktree", "remove"]:
+            return result
+        removal_calls.append(dict(kwargs))
+        assert result.returncode == 0
+        cancel.cancel()
+        return subprocess.CompletedProcess(
+            result.args,
+            -1,
+            result.stdout,
+            result.stderr,
+        )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "removal-race"
+        )
+        with materialize_planning_worktree(
+            repository,
+            borg,
+            store,
+            cancel=cancel,
+            command_runner=runner,
+        ) as worktree:
+            assert worktree.is_dir()
+
+    assert not worktree.exists()
+    assert removal_calls == [
+        {
+            "check": True,
+            "cancel": cancel,
+            "terminate_on_cancel": True,
+            "deadline": None,
+        }
+    ]
+
+
 def test_already_cancelled_removal_uses_shared_deadline_and_registered_force(
     committed_git_repo: Path,
     persist_planning_context,
@@ -542,6 +727,60 @@ def _git(root: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
     ).stdout
+
+
+def _construct_planning_role(
+    role: str,
+    repository: Repository,
+    borg: Borg,
+    store: SqliteStore,
+    adapter: MockAdapter,
+    cancel: CancellationToken,
+) -> object:
+    shared = {
+        "model": "planning-model",
+        "cancel": cancel,
+    }
+    io = InteractiveIO(
+        prompt=lambda _message: None,
+        confirm=lambda _message, _default: False,
+        write=lambda _message: None,
+    )
+    if role == "architect":
+        return ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=io,
+            **shared,
+        )
+    if role == "project-manager":
+        return ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            **shared,
+        )
+    if role == "tech-lead":
+        return TechLeadLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=io,
+            **shared,
+        )
+    if role == "supervisor":
+        return SupervisorLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            **shared,
+        )
+    raise AssertionError(f"unknown planning role {role}")
 
 
 def _json(path: Path):

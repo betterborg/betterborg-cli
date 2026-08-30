@@ -175,13 +175,15 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
     publication_cancel = CancellationToken()
     errors: list[BaseException] = []
     checkpoints: list[str] = []
+    commands: list[tuple[str, ...]] = []
 
     def blocked_visibility(path: Path, *, root: Path, cancel=None) -> None:
         assert cancel is publication_cancel
 
         def runner(
-            _command: list[str], **kwargs: Any
+            command: list[str], **kwargs: Any
         ) -> subprocess.CompletedProcess[str]:
+            commands.append(tuple(command))
             return run_captured(
                 real_process_harness.resistant_argv("publication-visibility"),
                 check=kwargs["check"],
@@ -239,6 +241,9 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
         persisted = store.get_task_generation(generation.id)
     assert persisted is not None
     assert persisted.status is TaskGenerationStatus.PREPARING
+    assert [command[3:5] for command in commands] == [
+        ("check-ignore", "--quiet")
+    ]
     real_process_harness.assert_tree_absent("publication-visibility")
 
 

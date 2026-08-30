@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -131,7 +132,7 @@ def materialize_planning_worktree(
         active_error = error
         raise
     finally:
-        if created:
+        if created or os.path.lexists(destination):
             try:
                 _remove_worktree(
                     paths.root,
@@ -509,6 +510,10 @@ def _remove_worktree(
         except subprocess.CalledProcessError:
             if not cancel.is_set():
                 raise
+            # Cancellation can be observed after Git has completed removal.
+            # In that race the owned worktree is already safely absent.
+            if not os.path.lexists(destination):
+                return
 
     _run_git(
         repository_root,

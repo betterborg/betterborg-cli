@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import threading
 from pathlib import Path
+from typing import Any
 
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
+from betterborg_cli import workflow_service as workflow_service_module
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
@@ -18,6 +23,10 @@ from betterborg_cli.planning import (
     build_plan_element_catalog,
 )
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repository_files import (
+    RepositoryGitVisibilityError,
+    require_git_trackable,
+)
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -100,6 +109,91 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
         "summary": message,
         "findings": findings,
     }
+
+
+def test_approved_plan_trackability_uses_run_token(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    real_process_harness: Any,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "approval-trackability",
+        plan,
+    )
+    approval_cancel = CancellationToken()
+    errors: list[BaseException] = []
+    commands: list[tuple[str, ...]] = []
+
+    def blocked_trackability(
+        path: Path,
+        *,
+        root: Path,
+        cancel: CancellationToken | None = None,
+    ) -> None:
+        assert cancel is approval_cancel
+
+        def runner(
+            command: list[str], **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(tuple(command))
+            assert kwargs["cancel"] is cancel
+            return run_captured(
+                real_process_harness.resistant_argv("approval-trackability"),
+                check=kwargs["check"],
+                cancel=kwargs["cancel"],
+            )
+
+        require_git_trackable(
+            path,
+            root=root,
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    monkeypatch.setattr(
+        workflow_service_module,
+        "require_git_trackable",
+        blocked_trackability,
+    )
+
+    def approve() -> None:
+        try:
+            with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+                borg = store.get_borg_by_name(repository.id, "approval-trackability")
+                assert borg is not None
+                workflow_service_module.bind_plan_approval(
+                    paths,
+                    store,
+                    borg,
+                    cancel=approval_cancel,
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=approve)
+    worker.start()
+    real_process_harness.wait_for_marker("approval-trackability.parent.pid")
+    real_process_harness.wait_for_marker("approval-trackability.child.pid")
+    approval_cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RepositoryGitVisibilityError)
+    assert [command[3:5] for command in commands] == [
+        ("check-ignore", "--quiet")
+    ]
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "approval-trackability")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert store.list_plan_approvals(borg.id) == []
+    real_process_harness.assert_tree_absent("approval-trackability")
 
 
 def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
