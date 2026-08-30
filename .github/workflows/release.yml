@@ -190,6 +190,8 @@ jobs:
       attest: false
     permissions:
       contents: read
+      id-token: write
+      attestations: write
 
   reconcile-github-release:
     name: Digest-gate and publish GitHub Release
