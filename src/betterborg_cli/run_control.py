@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import select
 import selectors
 import signal
 import stat
@@ -95,6 +96,7 @@ class RunControl:
         self._force_delivery_started = False
         self._exit_invoked = False
         self._force_notice_written = False
+        self._force_notice_attempted = False
 
         self._cancel_dispatched = threading.Event()
         self._force_dispatched = threading.Event()
@@ -409,6 +411,10 @@ class RunControl:
         if self._force_descriptor >= 0:
             self._force_notice_written = self._write_force_notice_signal_safe()
             return
+        if self._force_stream_descriptor >= 0:
+            self._force_notice_written = self._write_force_notice_if_ready()
+            self._force_notice_attempted = True
+            return
         try:
             self._force_stream.write(_FORCE_NOTICE.decode("ascii"))
             self._force_stream.flush()
@@ -420,10 +426,46 @@ class RunControl:
         """Return whether notification is complete or safely best-effort.
 
         A prepared nonblocking descriptor lets the handler attempt notification
-        without waiting, even when the destination is already full. Without one,
-        the dispatcher must confirm the ordinary stream write before exit.
+        without waiting, even when the destination is already full. On platforms
+        that cannot independently reopen the descriptor, the dispatcher instead
+        performs a zero-time readiness attempt. Descriptor-less streams must
+        confirm the ordinary stream write before exit.
         """
-        return self._force_notice_written or self._force_descriptor >= 0
+        return (
+            self._force_notice_written
+            or self._force_descriptor >= 0
+            or self._force_notice_attempted
+        )
+
+    def _write_force_notice_if_ready(self) -> bool:
+        """Attempt descriptor output without waiting for write capacity.
+
+        BSD ``/dev/fd`` descriptors share file status flags with the original,
+        so they cannot provide the independently nonblocking handle available
+        through Linux ``/proc``. A zero-time readiness check is the portable
+        fallback and restores the caller's descriptor mode after the attempt.
+        The notice is smaller than ``PIPE_BUF``, so a write-ready pipe accepts it
+        atomically; a temporary nonblocking guard also closes a concurrent-writer
+        race between the readiness check and the write.
+        """
+        descriptor = self._force_stream_descriptor
+        try:
+            _readable, writable, _exceptional = select.select(
+                [], [descriptor], [], 0
+            )
+            if not writable:
+                return False
+            was_blocking = os.get_blocking(descriptor)
+            if was_blocking:
+                os.set_blocking(descriptor, False)
+            try:
+                os.write(descriptor, _FORCE_NOTICE)
+            finally:
+                if was_blocking:
+                    os.set_blocking(descriptor, True)
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _open_nonblocking_force_descriptor(self) -> int:
         """Open an independently nonblocking descriptor for handler output."""

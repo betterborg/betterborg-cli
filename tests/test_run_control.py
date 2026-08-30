@@ -329,17 +329,54 @@ def test_second_sigint_defers_exit_until_force_notice_is_written() -> None:
     control.close()
 
 
+def test_deferred_descriptor_fallback_writes_notice_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    force_stream = os.fdopen(write_fd, "w", closefd=False)
+    exits: list[int] = []
+    control = RunControl(force_stream=force_stream, exit_function=exits.append)
+    monkeypatch.setattr(control, "_open_nonblocking_force_descriptor", lambda: -1)
+    control.install()
+    section = control.protected()
+    section.__enter__()
+
+    try:
+        _press_sigint()
+        assert control.wait_for_cancellation(1)
+        _press_sigint()
+
+        deadline = time.monotonic() + 1
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert exits == [INTERRUPTED_EXIT_CODE]
+        assert os.read(read_fd, 4096) == b"Force stopping...\n"
+        assert os.get_blocking(write_fd)
+    finally:
+        with pytest.raises(KeyboardInterrupt):
+            section.__exit__(None, None, None)
+        control.close()
+        force_stream.close()
+        os.close(write_fd)
+        os.close(read_fd)
+
+
 @pytest.mark.skipif(
     not hasattr(signal, "setitimer"), reason="POSIX interval timer required"
 )
-def test_second_sigint_does_not_block_on_full_force_stream_pipe() -> None:
+def test_second_sigint_does_not_block_on_full_force_stream_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     read_fd, write_fd = os.pipe()
     force_stream = os.fdopen(write_fd, "w", closefd=False)
     exits: list[int] = []
     control = RunControl(
         force_stream=force_stream,
         exit_function=exits.append,
-    ).install()
+    )
+    monkeypatch.setattr(control, "_open_nonblocking_force_descriptor", lambda: -1)
+    control.install()
+    assert control._force_descriptor == -1
     section = control.protected()
     section.__enter__()
     previous_alarm_handler = signal.getsignal(signal.SIGALRM)
@@ -368,7 +405,11 @@ def test_second_sigint_does_not_block_on_full_force_stream_pipe() -> None:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
         assert os.get_blocking(write_fd)
+        deadline = time.monotonic() + 1
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert exits == [INTERRUPTED_EXIT_CODE]
+        assert control.dispatcher_error is None
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_alarm_handler)
