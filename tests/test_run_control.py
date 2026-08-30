@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import signal
+import socket
 import threading
 import time
 from pathlib import Path
@@ -496,10 +497,12 @@ def test_second_sigint_does_not_block_on_full_force_stream_pipe(
 
 
 def test_install_and_close_restore_handler_and_wakeup_fd() -> None:
-    read_fd, write_fd = os.pipe()
-    os.set_blocking(write_fd, False)
+    read_socket, write_socket = socket.socketpair()
+    write_socket.setblocking(False)
     previous_handler = signal.getsignal(signal.SIGINT)
-    previous_wakeup = signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+    previous_wakeup = signal.set_wakeup_fd(
+        write_socket.fileno(), warn_on_full_buffer=False
+    )
     control = RunControl(exit_function=lambda _code: None)
     try:
         control.install()
@@ -507,12 +510,36 @@ def test_install_and_close_restore_handler_and_wakeup_fd() -> None:
         control.close()
         assert signal.getsignal(signal.SIGINT) == previous_handler
         restored_wakeup = signal.set_wakeup_fd(-1)
-        assert restored_wakeup == write_fd
+        assert restored_wakeup == write_socket.fileno()
     finally:
         signal.signal(signal.SIGINT, previous_handler)
         signal.set_wakeup_fd(previous_wakeup)
-        os.close(read_fd)
-        os.close(write_fd)
+        read_socket.close()
+        write_socket.close()
+
+
+def test_dispatcher_startup_failure_releases_cancellation_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenSelector:
+        def register(self, _fileobj: object, _events: int) -> None:
+            raise OSError(10038, "not a socket")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "betterborg_cli.run_control.selectors.DefaultSelector",
+        BrokenSelector,
+    )
+    control = RunControl(exit_function=lambda _code: None).install()
+    try:
+        assert control._dispatcher_stopped.wait(1)
+        assert control.wait_for_cancellation(0)
+        assert isinstance(control.dispatcher_error, OSError)
+        assert str(control.dispatcher_error) == "[Errno 10038] not a socket"
+    finally:
+        control.close()
 
 
 def test_real_process_harness_deadline_diagnostic_and_cleanup(

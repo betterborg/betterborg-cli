@@ -2,7 +2,9 @@
 
 import io
 import os
+import selectors
 import signal
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -15,6 +17,7 @@ from pytest import MonkeyPatch
 
 from betterborg_cli import __version__
 from betterborg_cli import cli as cli_module
+from betterborg_cli import run_control as run_control_module
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.prd_session import InteractiveIO
@@ -250,6 +253,48 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
         "stopping...",
         "summary: 0 completed, 0 failed, 0 stopped — 0 retained",
     ]
+
+
+def test_main_dispatches_sigint_with_socket_only_selector(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    selector_factory = run_control_module.selectors.DefaultSelector
+    dispatcher_ready = threading.Event()
+
+    class SocketOnlySelector:
+        def __init__(self) -> None:
+            self._selector = selector_factory()
+
+        def register(
+            self, fileobj: object, events: int
+        ) -> selectors.SelectorKey:
+            if not isinstance(fileobj, socket.socket):
+                raise OSError(10038, "not a socket")
+            key = self._selector.register(fileobj, events)
+            dispatcher_ready.set()
+            return key
+
+        def select(
+            self, timeout: float | None = None
+        ) -> list[tuple[selectors.SelectorKey, int]]:
+            return self._selector.select(timeout)
+
+        def close(self) -> None:
+            self._selector.close()
+
+    @click.command()
+    def command() -> None:
+        assert dispatcher_ready.wait(1)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(
+        run_control_module.selectors,
+        "DefaultSelector",
+        SocketOnlySelector,
+    )
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    assert cli_module.main([], prog_name="borg") == 130
 
 
 def test_main_preserves_click_usage_error_formatting(
