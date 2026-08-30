@@ -661,8 +661,8 @@ class RunProgress:
     def _refresh_transient(self, *, force_plain: bool = False) -> None:
         if not self._enabled or self._suspension_depth:
             return
-        lines = self._active_lines()
         if self._interactive:
+            lines = self._live_lines()
             if not lines:
                 self._stop_live()
                 return
@@ -681,6 +681,7 @@ class RunProgress:
                 self._live.update(renderable, refresh=True)
             return
 
+        lines = self._active_lines()
         if not lines:
             self._next_heartbeat_at = None
             return
@@ -694,6 +695,23 @@ class RunProgress:
                 self._write_plain(line)
             self._next_heartbeat_at = now + self._heartbeat_interval
 
+    def _live_lines(self) -> list[str]:
+        lines: list[str] = []
+        for stage in self._stages.values():
+            if stage.state is not StageState.RUNNING:
+                continue
+            lines.append(self._format_running_line(stage))
+            child_state = self.child_render_state(stage.key)
+            lines.extend(
+                self._format_child_live_line(child, parent_label=stage.label)
+                for child in child_state.children
+            )
+            if child_state.earlier_attempt_count:
+                count = child_state.earlier_attempt_count
+                noun = "attempt" if count == 1 else "attempts"
+                lines.append(f"{stage.label}: … {count} earlier {noun}")
+        return self._bound_live_lines(lines)
+
     def _active_lines(self) -> list[str]:
         lines: list[str] = []
         for stage in self._stages.values():
@@ -704,10 +722,23 @@ class RunProgress:
                 for child in stage._children.values()
                 if child.state is StageState.RUNNING
             )
+        return lines
+
+    @staticmethod
+    def _bound_live_lines(lines: list[str]) -> list[str]:
         if len(lines) <= _MAX_LIVE_ROWS:
             return lines
         hidden = len(lines) - (_MAX_LIVE_ROWS - 1)
         return [*lines[: _MAX_LIVE_ROWS - 1], f"… {hidden} more running"]
+
+    def _format_child_live_line(
+        self, child: ChildRecord, *, parent_label: str
+    ) -> str:
+        if child.state is StageState.RUNNING:
+            return self._format_running_line(child, parent_label=parent_label)
+        if child.state is StageState.PENDING:
+            return f"pending {parent_label}: {child.label}"
+        return _format_terminal_line(child, parent_label=parent_label)
 
     def _format_running_line(
         self,

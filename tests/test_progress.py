@@ -405,7 +405,7 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
     ("environment", "interactive"),
     [({}, True), ({"NO_COLOR": "1"}, True), ({"TERM": "dumb"}, False)],
 )
-def test_nested_suspension_flushes_retained_lines_once_in_every_terminal_mode(
+def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
     monkeypatch: pytest.MonkeyPatch,
     environment: dict[str, str],
     interactive: bool,
@@ -415,20 +415,108 @@ def test_nested_suspension_flushes_retained_lines_once_in_every_terminal_mode(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     stream = TTYStringIO()
+    clock = FakeClock()
     progress = RunProgress(
-        [StageSpec("one", "One"), StageSpec("two", "Two")], stream=stream
+        [
+            StageSpec("active", "Active"),
+            StageSpec("one", "One"),
+            StageSpec("two", "Two"),
+            StageSpec("cached-one", "Cached one"),
+            StageSpec("cached-two", "Cached two"),
+        ],
+        stream=stream,
+        clock=clock,
+        width=120,
+        heartbeat_interval=5,
     )
+    progress.start("active")
+    progress.start("one")
+    progress.start("two")
+    release_one = threading.Event()
+    release_two = threading.Event()
+    first_done = threading.Event()
+
+    def finish_one() -> None:
+        release_one.wait()
+        progress.complete("one", "first")
+        first_done.set()
+
+    def finish_two() -> None:
+        release_two.wait()
+        progress.fail("two", "second")
 
     with progress.suspend():
-        progress.seed_completed("one", "cached", 1)
+        stream.seek(0)
+        stream.truncate()
+        progress.seed_completed("cached-one", "reused", 3)
+        clock.advance(10)
+        progress.refresh()
         with progress.suspend():
-            progress.seed_failed("two", "failure")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(finish_one), executor.submit(finish_two)]
+                release_one.set()
+                assert first_done.wait(timeout=2)
+                release_two.set()
+                for future in futures:
+                    future.result(timeout=2)
+            progress.seed_failed("cached-two", "cached failure")
             assert stream.getvalue() == ""
         assert stream.getvalue() == ""
 
-    output = _terminal_text(stream.getvalue()) if interactive else stream.getvalue()
-    assert output.count("completed One — cached (1.0s) [retained]") == 1
-    assert output.count("failed Two — failure (—) [retained]") == 1
+    permanent_lines = [
+        "completed Cached one — reused (3.0s) [retained]",
+        "completed One — first (10.0s)",
+        "failed Two — second (10.0s)",
+        "failed Cached two — cached failure (—) [retained]",
+    ]
+    resumed = _terminal_text(stream.getvalue()) if interactive else stream.getvalue()
+    assert all(resumed.count(line) == 1 for line in permanent_lines)
+    assert [resumed.index(line) for line in permanent_lines] == sorted(
+        resumed.index(line) for line in permanent_lines
+    )
+
+    clock.advance(4)
+    progress.refresh()
+    if not interactive:
+        assert stream.getvalue() == resumed
+        clock.advance(1)
+        progress.refresh()
+        assert stream.getvalue().splitlines()[-1] == "running Active (15.0s)"
+    else:
+        refreshed = _terminal_text(stream.getvalue())
+        assert all(refreshed.count(line) == 1 for line in permanent_lines)
+
+    progress.complete("active", "third")
+
+
+def test_rich_live_output_uses_bounded_dynamic_child_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = TTYStringIO()
+    progress = RunProgress(
+        [StageSpec("plan", "Plan")],
+        stream=stream,
+        width=120,
+        attempt_history_limit=2,
+    )
+    for number in range(1, 4):
+        key = f"attempt-{number}"
+        progress.declare_child("plan", ChildSpec(key, f"Attempt {number}"))
+        progress.seed_child_completed("plan", key, "retry")
+    progress.declare_child("plan", ChildSpec("attempt-4", "Attempt 4"))
+    stream.seek(0)
+    stream.truncate()
+
+    progress.start("plan")
+    output = _terminal_text(stream.getvalue())
+
+    assert "completed Plan: Attempt 1" not in output
+    assert "completed Plan: Attempt 2" not in output
+    assert "completed Plan: Attempt 3 — retry (—) [retained]" in output
+    assert "pending Plan: Attempt 4" in output
+    assert "Plan: … 2 earlier attempts" in output
 
 
 def test_rich_live_output_is_bounded_for_many_running_stages(
