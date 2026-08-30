@@ -22,6 +22,29 @@ launch environment your host uses:
 borg plugins install --all
 ```
 
+## Standalone binary
+
+Install the latest release binary for Darwin or Linux without a Python
+toolchain:
+
+```console
+curl --proto '=https' --tlsv1.2 -fsSL https://install.betterborg.ai | sh
+```
+
+`install.betterborg.ai` serves the installer from the latest GitHub Release.
+The canonical release URL works the same way:
+
+```console
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/betterborg/betterborg-cli/releases/latest/download/install.sh \
+  | sh
+```
+
+The installer selects ARM64 or x86_64 from the release manifest, verifies the
+binary's SHA-256 digest and exact version before atomically replacing
+`~/.local/bin/borg`, and only then runs `borg plugins install --all`. It prints
+PATH guidance when `~/.local/bin` is not already visible.
+
 ## Ephemeral wrappers
 
 Use either public package wrapper without a persistent install:
@@ -101,6 +124,4 @@ version with an explicit pin while maintainers fix forward with a new release.
 
 ## Not yet available
 
-The standalone binary installer, its vanity URL `install.betterborg.ai`, and a
-Homebrew formula are planned and not published. Use the PyPI package or the npm
-launcher above.
+A Homebrew formula is planned and not published.

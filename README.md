@@ -18,6 +18,15 @@ BetterBorg is an AI engineering team for substantial software projects, not a ch
     pip install betterborg
     ```
 
+    Or install the standalone release binary for Darwin or Linux, which needs
+    no Python toolchain. It selects ARM64 or x86_64 from the release manifest,
+    verifies the SHA-256 digest and exact version before replacing
+    `~/.local/bin/borg`, and then runs step 2 for you:
+
+    ```bash
+    curl --proto '=https' --tlsv1.2 -fsSL https://install.betterborg.ai | sh
+    ```
+
 2. Activate the agent-host integrations:
 
     ```bash
