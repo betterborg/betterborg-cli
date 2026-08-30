@@ -6,6 +6,7 @@ import contextlib
 import os
 import selectors
 import signal
+import stat
 import sys
 import threading
 import time
@@ -66,9 +67,10 @@ class RunControl:
         self._clock = clock
         self._force_stream = force_stream if force_stream is not None else sys.stderr
         try:
-            self._force_descriptor = self._force_stream.fileno()
+            self._force_stream_descriptor = self._force_stream.fileno()
         except (AttributeError, OSError):
-            self._force_descriptor = -1
+            self._force_stream_descriptor = -1
+        self._force_descriptor = -1
         self._exit_function = exit_function
 
         self._read_fd = -1
@@ -129,6 +131,7 @@ class RunControl:
         os.set_blocking(write_fd, False)
         self._read_fd = read_fd
         self._write_fd = write_fd
+        self._force_descriptor = self._open_nonblocking_force_descriptor()
         try:
             self._previous_handler = signal.getsignal(signal.SIGINT)
             self._previous_wakeup_fd = signal.set_wakeup_fd(
@@ -143,8 +146,11 @@ class RunControl:
                     signal.signal(signal.SIGINT, self._previous_handler)
             os.close(read_fd)
             os.close(write_fd)
+            if self._force_descriptor >= 0:
+                os.close(self._force_descriptor)
             self._read_fd = -1
             self._write_fd = -1
+            self._force_descriptor = -1
             raise
 
         self._installed = True
@@ -170,12 +176,17 @@ class RunControl:
         dispatcher = self._dispatcher
         if dispatcher is not None and dispatcher is not threading.current_thread():
             dispatcher.join(timeout=1.0)
-        for descriptor in (self._read_fd, self._write_fd):
+        for descriptor in (
+            self._read_fd,
+            self._write_fd,
+            self._force_descriptor,
+        ):
             if descriptor >= 0:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
         self._read_fd = -1
         self._write_fd = -1
+        self._force_descriptor = -1
 
     def __enter__(self) -> RunControl:
         return self.install()
@@ -392,12 +403,38 @@ class RunControl:
         return True
 
     def _write_force_notice_deferred(self) -> None:
+        if self._force_descriptor >= 0:
+            self._force_notice_written = self._write_force_notice_signal_safe()
+            return
         try:
             self._force_stream.write(_FORCE_NOTICE.decode("ascii"))
             self._force_stream.flush()
             self._force_notice_written = True
         except (AttributeError, OSError, ValueError):
             pass
+
+    def _open_nonblocking_force_descriptor(self) -> int:
+        """Open an independently nonblocking descriptor for handler output."""
+        descriptor = self._force_stream_descriptor
+        if descriptor < 0:
+            return -1
+        try:
+            mode = os.fstat(descriptor).st_mode
+        except OSError:
+            return -1
+        if not (stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)):
+            return -1
+
+        # ``dup`` would share O_NONBLOCK with the caller's descriptor. Reopening
+        # the Linux descriptor path creates an independent open file description,
+        # so the signal handler cannot block and the caller retains its mode.
+        flags = os.O_WRONLY | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOCTTY", 0)
+        try:
+            return os.open(f"/proc/self/fd/{descriptor}", flags)
+        except OSError:
+            return -1
 
     def _wake_dispatcher(self, payload: bytes) -> None:
         if self._write_fd < 0:

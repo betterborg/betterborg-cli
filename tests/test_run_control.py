@@ -305,6 +305,57 @@ def test_failed_force_delivery_prevents_exit() -> None:
     control.close()
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "setitimer"), reason="POSIX interval timer required"
+)
+def test_second_sigint_does_not_block_on_full_force_stream_pipe() -> None:
+    read_fd, write_fd = os.pipe()
+    force_stream = os.fdopen(write_fd, "w", closefd=False)
+    exits: list[int] = []
+    control = RunControl(
+        force_stream=force_stream,
+        exit_function=exits.append,
+    ).install()
+    section = control.protected()
+    section.__enter__()
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+    try:
+        os.set_blocking(write_fd, False)
+        while True:
+            try:
+                os.write(write_fd, b"x" * 4096)
+            except BlockingIOError:
+                break
+        os.set_blocking(write_fd, True)
+        assert os.get_blocking(write_fd)
+
+        _press_sigint()
+        assert control.wait_for_cancellation(1)
+
+        def fail_if_handler_blocks(_signum: int, _frame: object) -> None:
+            raise TimeoutError("SIGINT handler blocked on the force stream")
+
+        signal.signal(signal.SIGALRM, fail_if_handler_blocks)
+        signal.setitimer(signal.ITIMER_REAL, 0.2)
+        try:
+            _press_sigint()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+        assert os.get_blocking(write_fd)
+        assert exits == [INTERRUPTED_EXIT_CODE]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
+        with pytest.raises(KeyboardInterrupt):
+            section.__exit__(None, None, None)
+        control.close()
+        force_stream.close()
+        os.close(write_fd)
+        os.close(read_fd)
+
+
 def test_install_and_close_restore_handler_and_wakeup_fd() -> None:
     read_fd, write_fd = os.pipe()
     os.set_blocking(write_fd, False)
