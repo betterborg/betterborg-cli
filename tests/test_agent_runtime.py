@@ -18,6 +18,7 @@ from betterborg_cli.agent_runtime import (
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationDeliveryError,
     CancellationRegistrationWindow,
     CancellationState,
     CancellationToken,
@@ -346,8 +347,13 @@ def test_late_cancel_callback_failure_propagates() -> None:
     def fail_cancel() -> None:
         raise RuntimeError("cancel delivery failed")
 
-    with pytest.raises(RuntimeError, match="cancel delivery failed"):
+    with pytest.raises(
+        CancellationDeliveryError, match="cancel delivery failed"
+    ) as raised:
         cancel.register(fail_cancel)
+
+    assert raised.value.errors == (raised.value.__cause__,)
+    assert raised.value.registration.unregister()
 
 
 def test_late_forced_registration_attempts_force_after_cancel_failure() -> None:
@@ -358,7 +364,9 @@ def test_late_forced_registration_attempts_force_after_cancel_failure() -> None:
     def fail_cancel() -> None:
         raise RuntimeError("cancel delivery failed")
 
-    with pytest.raises(RuntimeError, match="cancel delivery failed"):
+    with pytest.raises(
+        CancellationDeliveryError, match="cancel delivery failed"
+    ) as raised:
         cancel.register(
             fail_cancel,
             force_delivered.set,
@@ -366,6 +374,9 @@ def test_late_forced_registration_attempts_force_after_cancel_failure() -> None:
         )
 
     assert force_delivered.is_set()
+    assert cancel.force_targets == (ForceTarget("late-worker"),)
+    assert raised.value.registration.unregister()
+    assert cancel.force_targets == ()
 
 
 def test_force_callback_failure_propagates_and_remains_failed() -> None:
@@ -398,7 +409,9 @@ def test_failed_force_delivery_keeps_registration_window_active() -> None:
     def fail_force() -> None:
         raise RuntimeError("created resource was not forced")
 
-    with pytest.raises(RuntimeError, match="created resource was not forced"):
+    with pytest.raises(
+        CancellationDeliveryError, match="created resource was not forced"
+    ) as raised:
         window.register(
             lambda: None,
             fail_force,
@@ -408,6 +421,37 @@ def test_failed_force_delivery_keeps_registration_window_active() -> None:
     assert not window.is_settled
     assert cancel.active_windows == (window,)
     assert cancel.force_targets == (ForceTarget("created-worker"),)
+
+    assert raised.value.registration.unregister()
+    assert window.is_settled
+    assert cancel.active_windows == ()
+    assert cancel.force_targets == ()
+
+
+def test_failed_late_cancel_settles_window_after_successful_force() -> None:
+    cancel = CancellationToken()
+    window = cancel.registration_window()
+    cancel.force()
+    force_delivered = threading.Event()
+
+    def fail_cancel() -> None:
+        raise RuntimeError("cancel delivery failed")
+
+    with pytest.raises(
+        CancellationDeliveryError, match="cancel delivery failed"
+    ) as raised:
+        window.register(
+            fail_cancel,
+            force_delivered.set,
+            force_target=ForceTarget("created-worker"),
+        )
+
+    assert force_delivered.is_set()
+    assert window.is_settled
+    assert cancel.active_windows == ()
+    assert cancel.force_targets == (ForceTarget("created-worker"),)
+    assert raised.value.registration.unregister()
+    assert cancel.force_targets == ()
 
 
 def test_registration_window_retains_created_resource_until_late_force() -> None:
@@ -516,6 +560,48 @@ def test_cancellation_token_unregister_before_cancel_prevents_delivery() -> None
     cancel.cancel()
 
     assert delivered == []
+
+
+def test_unregister_waits_for_claimed_force_delivery() -> None:
+    cancel = CancellationToken()
+    force_entered = threading.Event()
+    release_force = threading.Event()
+    unregister_returned = threading.Event()
+    target = ForceTarget("worker")
+
+    def on_force() -> None:
+        force_entered.set()
+        release_force.wait()
+
+    registration = cancel.register(
+        lambda: None,
+        on_force,
+        force_target=target,
+    )
+    force_thread = threading.Thread(target=cancel.force)
+    force_thread.start()
+    assert force_entered.wait(1)
+
+    unregister_result: list[bool] = []
+
+    def unregister() -> None:
+        unregister_result.append(registration.unregister())
+        unregister_returned.set()
+
+    unregister_thread = threading.Thread(target=unregister)
+    unregister_thread.start()
+    try:
+        assert not unregister_returned.wait(0.05)
+        assert cancel.force_targets == (target,)
+    finally:
+        release_force.set()
+    force_thread.join(timeout=1)
+    unregister_thread.join(timeout=1)
+
+    assert not force_thread.is_alive()
+    assert not unregister_thread.is_alive()
+    assert unregister_result == [True]
+    assert cancel.force_targets == ()
 
 
 def test_cleanup_registration_skips_cancel_but_remains_force_deliverable() -> None:

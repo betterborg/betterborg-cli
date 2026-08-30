@@ -67,9 +67,11 @@ class _CancellationEntry:
     on_force: Callable[[], None] | None
     terminate_on_cancel: bool
     force_target: ForceTarget | None
+    window_id: int | None = None
     cancel_claimed: bool = False
     force_claimed: bool = False
     cancel_started: threading.Event = field(default_factory=threading.Event)
+    cancel_finished: threading.Event = field(default_factory=threading.Event)
     force_finished: threading.Event = field(default_factory=threading.Event)
     force_error: Exception | None = None
 
@@ -96,6 +98,22 @@ class CancellationRegistration:
     def unregister(self) -> bool:
         """Remove the registration after cleanup, returning whether it was active."""
         return self._token._unregister(self._registration_id)
+
+
+class CancellationDeliveryError(RuntimeError):
+    """Late callback failure that retains the registration cleanup handle."""
+
+    def __init__(
+        self,
+        registration: CancellationRegistration,
+        errors: tuple[Exception, ...],
+    ) -> None:
+        if not errors:
+            raise ValueError("at least one delivery error is required")
+        detail = str(errors[0]) if len(errors) == 1 else f"{len(errors)} errors"
+        super().__init__(f"late cancellation delivery failed: {detail}")
+        self.registration = registration
+        self.errors = errors
 
 
 class CancellationRegistrationWindow:
@@ -300,8 +318,31 @@ class CancellationToken:
         return self._force_event.wait(timeout)
 
     def _unregister(self, registration_id: int) -> bool:
-        with self._lock:
-            return self._registrations.pop(registration_id, None) is not None
+        while True:
+            with self._lock:
+                entry = self._registrations.get(registration_id)
+                if entry is None:
+                    return False
+                pending_deliveries = [
+                    finished
+                    for claimed, finished in (
+                        (entry.cancel_claimed, entry.cancel_finished),
+                        (entry.force_claimed, entry.force_finished),
+                    )
+                    if claimed and not finished.is_set()
+                ]
+                if not pending_deliveries:
+                    self._registrations.pop(registration_id)
+                    if entry.window_id is not None:
+                        window_entry = self._registration_windows.pop(
+                            entry.window_id, None
+                        )
+                        if window_entry is not None:
+                            window_entry.window._settled.set()
+                    return True
+
+            for finished in pending_deliveries:
+                finished.wait()
 
     def _register(
         self,
@@ -339,6 +380,7 @@ class CancellationToken:
                 on_force=on_force,
                 terminate_on_cancel=terminate_on_cancel,
                 force_target=force_target,
+                window_id=window_id,
             )
             self._registrations[registration_id] = entry
             cancel_callback = self._claim_cancel(entry)
@@ -362,12 +404,24 @@ class CancellationToken:
                 callback()
             except Exception as error:
                 callback_errors.append(error)
-        if len(callback_errors) == 1:
-            raise callback_errors[0]
-        if callback_errors:
-            raise ExceptionGroup("late cancellation callbacks failed", callback_errors)
         if window_id is not None and not window_settled:
-            self._settle_published_window(window_id, entry)
+            try:
+                self._settle_published_window(window_id, entry)
+            except Exception as error:
+                if all(
+                    error is not callback_error
+                    for callback_error in callback_errors
+                ):
+                    callback_errors.append(error)
+        if callback_errors:
+            delivery_error = CancellationDeliveryError(
+                registration, tuple(callback_errors)
+            )
+            if len(callback_errors) == 1:
+                raise delivery_error from callback_errors[0]
+            raise delivery_error from ExceptionGroup(
+                "late cancellation callbacks failed", callback_errors
+            )
         return registration
 
     def _settle_no_resource(self, window_id: int) -> None:
@@ -418,8 +472,11 @@ class CancellationToken:
         entry.cancel_claimed = True
 
         def deliver_cancel() -> None:
-            entry.cancel_started.set()
-            entry.on_cancel()
+            try:
+                entry.cancel_started.set()
+                entry.on_cancel()
+            finally:
+                entry.cancel_finished.set()
 
         return deliver_cancel
 
