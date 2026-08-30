@@ -1,7 +1,9 @@
 """Tests for the public CLI bootstrap."""
 
 import io
+import multiprocessing
 import os
+import runpy
 import selectors
 import signal
 import socket
@@ -81,6 +83,48 @@ def test_help_lists_bootstrap_commands(cli_runner: CliRunner) -> None:
     assert "init" in result.output
     assert "trust" in result.output
     assert "version" in result.output
+
+
+def test_main_enables_multiprocessing_before_click_dispatch(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    @click.command()
+    def command() -> None:
+        events.append("click")
+
+    monkeypatch.setattr(
+        cli_module.multiprocessing,
+        "freeze_support",
+        lambda: events.append("freeze-support"),
+    )
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    assert cli_module.main([], prog_name="borg") == 0
+    assert events == ["freeze-support", "click"]
+
+
+def test_executable_module_enables_multiprocessing_before_cli_dispatch(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        multiprocessing,
+        "freeze_support",
+        lambda: events.append("freeze-support"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "main",
+        lambda: events.append("click") or 23,
+    )
+
+    with pytest.raises(SystemExit, match="23"):
+        runpy.run_module("betterborg_cli", run_name="__main__")
+
+    assert events == ["freeze-support", "click"]
 
 
 @pytest.mark.parametrize(

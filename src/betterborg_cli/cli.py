@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import multiprocessing
 import os
 import re
 import shlex
@@ -124,6 +125,7 @@ def main(
 ) -> int:
     """Run the root Click command under one interruption-aware lifecycle."""
 
+    multiprocessing.freeze_support()
     arguments = list(args) if args is not None else None
     requested_arguments = arguments if arguments is not None else sys.argv[1:]
     machine_readable = "--json" in requested_arguments

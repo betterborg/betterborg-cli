@@ -80,10 +80,12 @@ class BuiltDistributions:
 def _run(
     *command: str | os.PathLike[str],
     cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(part) for part in command],
         cwd=cwd,
+        env=env,
         check=True,
         capture_output=True,
         text=True,
@@ -208,7 +210,31 @@ def test_clean_install_exposes_borg_and_matching_metadata(
     borg = scripts / ("borg.exe" if os.name == "nt" else "borg")
     _run(python, "-m", "pip", "install", artifact)
 
-    completed = _run(borg, "version")
+    startup_hook = tmp_path / "startup-hook"
+    startup_hook.mkdir()
+    freeze_marker = tmp_path / "freeze-support"
+    startup_hook.joinpath("sitecustomize.py").write_text(
+        """import multiprocessing
+import os
+from pathlib import Path
+
+original_freeze_support = multiprocessing.freeze_support
+
+
+def freeze_support():
+    Path(os.environ["BETTERBORG_FREEZE_MARKER"]).write_text("called")
+    original_freeze_support()
+
+
+multiprocessing.freeze_support = freeze_support
+""",
+        encoding="utf-8",
+    )
+    environment_variables = os.environ.copy()
+    environment_variables["PYTHONPATH"] = str(startup_hook)
+    environment_variables["BETTERBORG_FREEZE_MARKER"] = str(freeze_marker)
+
+    completed = _run(borg, "version", env=environment_variables)
     metadata = _run(
         python,
         "-c",
@@ -221,6 +247,7 @@ def test_clean_install_exposes_borg_and_matching_metadata(
     )
 
     assert completed.stdout.strip() == f"borg {__version__}"
+    assert freeze_marker.read_text(encoding="utf-8") == "called"
     assert metadata.stdout.strip() == __version__
     assert Version(rich_metadata.stdout.strip()).major == 15
 
@@ -247,6 +274,24 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
     binary = output / ("borg.exe" if os.name == "nt" else "borg")
 
     assert _run(binary, "version").stdout.strip() == f"borg {__version__}"
+    worker = subprocess.run(
+        [
+            str(binary),
+            # PyInstaller's frozen interpreter flags precede helper commands.
+            "-B",
+            "-S",
+            "-I",
+            "-c",
+            "from multiprocessing.resource_tracker import main;main(0)",
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert worker.returncode == 0
+    assert worker.stdout == ""
+    assert worker.stderr == ""
     from PyInstaller.archive.readers import CArchiveReader
 
     bundled = set(CArchiveReader(str(binary)).toc)
