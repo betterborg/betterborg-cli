@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import betterborg_cli.planning.worktree as worktree_module
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.planning import (
     PlanningWorktreeError,
     materialize_planning_worktree,
@@ -230,14 +234,16 @@ def test_surfaces_worktree_removal_failure(
     database = committed_git_repo.parent / f"{committed_git_repo.name}-cleanup.db"
     original_run_git = worktree_module._run_git
 
-    def fail_worktree_removal(root: Path, *arguments: str) -> None:
+    def fail_worktree_removal(
+        root: Path, *arguments: str, **kwargs: Any
+    ) -> None:
         if arguments[:2] == ("worktree", "remove"):
             raise subprocess.CalledProcessError(
                 1,
                 ["git", *arguments],
                 stderr="simulated cleanup failure",
             )
-        original_run_git(root, *arguments)
+        original_run_git(root, *arguments, **kwargs)
 
     materialized_path: Path | None = None
     with SqliteStore.open(database) as store:
@@ -278,10 +284,12 @@ def test_preserves_caller_error_when_worktree_removal_also_fails(
     database = committed_git_repo.parent / f"{committed_git_repo.name}-body-error.db"
     original_run_git = worktree_module._run_git
 
-    def fail_worktree_removal(root: Path, *arguments: str) -> None:
+    def fail_worktree_removal(
+        root: Path, *arguments: str, **kwargs: Any
+    ) -> None:
         if arguments[:2] == ("worktree", "remove"):
             raise subprocess.CalledProcessError(1, ["git", *arguments])
-        original_run_git(root, *arguments)
+        original_run_git(root, *arguments, **kwargs)
 
     materialized_path: Path | None = None
     caller_error = OSError("architect validation failed")
@@ -315,6 +323,216 @@ def test_preserves_caller_error_when_worktree_removal_also_fails(
                     "--force",
                     str(materialized_path),
                 )
+
+
+@pytest.mark.parametrize(
+    ("blocked_operation", "dirty_document"),
+    [
+        ("status", True),
+        ("revision", False),
+        ("creation", False),
+    ],
+)
+def test_cancellation_reaps_each_planning_worktree_git_process(
+    committed_git_repo: Path,
+    persist_planning_context,
+    real_process_harness: Any,
+    blocked_operation: str,
+    dirty_document: bool,
+) -> None:
+    database = committed_git_repo.parent / f"planning-{blocked_operation}.db"
+    cancel = CancellationToken()
+    errors: list[BaseException] = []
+    document = Path(".borg/notes/cancel.md")
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo,
+            store,
+            f"cancel-{blocked_operation}",
+        )
+    if dirty_document:
+        (committed_git_repo / document).parent.mkdir(parents=True)
+        (committed_git_repo / document).write_text("cancel me\n", encoding="utf-8")
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = command[3:]
+        target_prefix = {
+            "status": ["status", "--porcelain"],
+            "revision": ["rev-parse", "--verify"],
+            "creation": ["worktree", "add"],
+        }[blocked_operation]
+        is_target = arguments[:2] == target_prefix
+        if is_target:
+            return run_captured(
+                real_process_harness.resistant_argv(
+                    f"planning-{blocked_operation}"
+                ),
+                check=kwargs["check"],
+                cancel=kwargs["cancel"],
+            )
+        return run_captured(command, **kwargs)
+
+    def materialize() -> None:
+        try:
+            with SqliteStore.open(database) as store:
+                with materialize_planning_worktree(
+                    repository,
+                    borg,
+                    store,
+                    dirty_borg_documents=[document] if dirty_document else (),
+                    cancel=cancel,
+                    command_runner=runner,
+                ):
+                    pytest.fail("cancelled Git operation exposed a worktree")
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=materialize)
+    worker.start()
+    real_process_harness.wait_for_marker(
+        f"planning-{blocked_operation}.parent.pid"
+    )
+    real_process_harness.wait_for_marker(
+        f"planning-{blocked_operation}.child.pid"
+    )
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(
+        errors[0], PlanningWorktreeError | subprocess.CalledProcessError
+    )
+    real_process_harness.assert_tree_absent(f"planning-{blocked_operation}")
+
+
+def test_already_cancelled_removal_uses_shared_deadline_and_registered_force(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    database = committed_git_repo.parent / "planning-cancelled-removal.db"
+    cancel = CancellationToken(grace_seconds=0.5)
+    removal_calls: list[dict[str, Any]] = []
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if command[3:5] == ["worktree", "remove"]:
+            removal_calls.append(dict(kwargs))
+        return run_captured(command, **kwargs)
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "cancelled-removal"
+        )
+        with materialize_planning_worktree(
+            repository,
+            borg,
+            store,
+            cancel=cancel,
+            command_runner=runner,
+        ) as worktree:
+            assert worktree.is_dir()
+            cancel.cancel()
+            shared_deadline = cancel.force_deadline
+
+        assert not worktree.exists()
+
+    assert shared_deadline is not None
+    assert removal_calls == [
+        {
+            "check": True,
+            "cancel": cancel,
+            "terminate_on_cancel": False,
+            "deadline": shared_deadline,
+        }
+    ]
+
+
+def test_cancelled_removal_reaps_resistant_tree_by_shared_deadline(
+    committed_git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.25)
+    cancel.cancel()
+    shared_deadline = cancel.force_deadline
+    calls: list[dict[str, Any]] = []
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        assert command[3:5] == ["worktree", "remove"]
+        calls.append(dict(kwargs))
+        return run_captured(
+            real_process_harness.resistant_argv("planning-removal"),
+            **kwargs,
+        )
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.CalledProcessError):
+        worktree_module._remove_worktree(
+            committed_git_repo,
+            committed_git_repo.parent / "simulated-planning-worktree",
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    assert time.monotonic() - started < 1.5
+    assert calls == [
+        {
+            "check": True,
+            "cancel": cancel,
+            "terminate_on_cancel": False,
+            "deadline": shared_deadline,
+        }
+    ]
+    real_process_harness.assert_tree_absent("planning-removal")
+
+
+def test_records_token_aware_planning_git_command_inventory(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    database = committed_git_repo.parent / "planning-command-inventory.db"
+    cancel = CancellationToken()
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+    document = Path(".borg/notes/inventory.md")
+
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((tuple(command), dict(kwargs)))
+        return run_captured(command, **kwargs)
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "command-inventory"
+        )
+        (committed_git_repo / document).parent.mkdir(parents=True)
+        (committed_git_repo / document).write_text(
+            "inventory\n", encoding="utf-8"
+        )
+        with materialize_planning_worktree(
+            repository,
+            borg,
+            store,
+            dirty_borg_documents=[document],
+            cancel=cancel,
+            command_runner=runner,
+        ):
+            pass
+
+    operations = [command[3:5] for command, _kwargs in calls]
+    assert operations == [
+        ("rev-parse", "--show-toplevel"),
+        ("status", "--porcelain"),
+        ("rev-parse", "--verify"),
+        ("worktree", "add"),
+        ("worktree", "remove"),
+    ]
+    assert all(kwargs["cancel"] is cancel for _command, kwargs in calls)
 
 
 def _git(root: Path, *arguments: str) -> str:

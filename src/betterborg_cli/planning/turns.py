@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
@@ -23,6 +23,7 @@ from betterborg_cli.agent_runtime.structured import (
 )
 from betterborg_cli.planning.plan_contracts import validate_plan
 from betterborg_cli.planning.worktree import materialize_planning_worktree
+from betterborg_cli.progress import AgentActivity
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -33,6 +34,16 @@ from betterborg_cli.store import (
 )
 
 ErrorFactory = Callable[[str], Exception]
+
+
+class PlanningProgress(Protocol):
+    """Provider-neutral activity operations used by a planning turn."""
+
+    def activity(self, stage_key: str, activity: AgentActivity) -> object: ...
+
+    def child_activity(
+        self, stage_key: str, child_key: str, activity: AgentActivity
+    ) -> object: ...
 
 
 class DurablePlanningTurns:
@@ -51,6 +62,9 @@ class DurablePlanningTurns:
         error_factory: ErrorFactory,
         cancelled_error_factory: ErrorFactory,
         cancel: CancellationToken | None = None,
+        progress: PlanningProgress | None = None,
+        stage_key: str | None = None,
+        child_key: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
@@ -60,6 +74,10 @@ class DurablePlanningTurns:
             raise ValueError(
                 "Borg must already belong to the supplied repository and store"
             )
+        if progress is None and (stage_key is not None or child_key is not None):
+            raise ValueError("planning progress keys require a progress reporter")
+        if progress is not None and stage_key is None:
+            raise ValueError("planning progress requires a stage key")
         self.repository = repository
         self.borg_id = borg.id
         self.store = store
@@ -70,6 +88,9 @@ class DurablePlanningTurns:
         self.error_factory = error_factory
         self.cancelled_error_factory = cancelled_error_factory
         self.cancel = cancel
+        self.progress = progress
+        self.stage_key = stage_key
+        self.child_key = child_key
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
 
@@ -141,6 +162,9 @@ class DurablePlanningTurns:
                         allowed_tools=READ_ONLY_API_TOOLS,
                         log_path=result_path.with_suffix(".log"),
                         result_path=result_path,
+                        activity_sink=(
+                            self._record_activity if self.progress is not None else None
+                        ),
                     ),
                     cancel=self.cancel,
                 )
@@ -240,6 +264,14 @@ class DurablePlanningTurns:
         """Validate a plan against the exact repository snapshot agents inspect."""
         with self.materialized_worktree() as worktree:
             validate_plan(plan, worktree)
+
+    def _record_activity(self, activity: AgentActivity) -> None:
+        if self.progress is None or self.stage_key is None:
+            return
+        if self.child_key is None:
+            self.progress.activity(self.stage_key, activity)
+            return
+        self.progress.child_activity(self.stage_key, self.child_key, activity)
 
     def _start_attempt(
         self,
