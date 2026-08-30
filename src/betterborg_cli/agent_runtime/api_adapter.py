@@ -19,6 +19,7 @@ from betterborg_cli.agent_runtime.base import (
     CancellationDeliveryError,
     CancellationRegistration,
     CancellationToken,
+    ForceTarget,
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.retry import run_with_transient_retry
@@ -197,7 +198,13 @@ class ApiRunContext:
                 request = factory(cancel)
                 if cancel is not None:
                     try:
-                        registration = cancel.register(request.abort)
+                        registration = cancel.register(
+                            request.abort,
+                            request.force,
+                            force_target=ForceTarget(
+                                ("api-request", id(request))
+                            ),
+                        )
                     except CancellationDeliveryError as error:
                         registration = error.registration
                         raise

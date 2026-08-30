@@ -694,6 +694,39 @@ def test_cancellation_interrupts_blocked_transport(
     assert transport.requests[0].abort_calls >= 1
 
 
+def test_forced_cancellation_reaches_owned_request_handle(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    started = threading.Event()
+    cancel = CancellationToken()
+
+    def block_request(request_cancel: CancellationToken | None):
+        assert request_cancel is cancel
+        started.set()
+        assert request_cancel.wait_for_force(1)
+        return harness.response([])
+
+    transport = FakeApiTransport([block_request])
+
+    def force_when_started() -> None:
+        assert started.wait(1)
+        cancel.force()
+
+    force_worker = threading.Thread(target=force_when_started)
+    force_worker.start()
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        transport=transport,
+    ).run(harness.spec(tmp_path), cancel=cancel)
+    force_worker.join()
+
+    assert result.status == AgentStatus.CANCELLED
+    assert transport.requests[0].abort_calls >= 1
+    assert transport.requests[0].force_calls == 1
+    assert cancel.force_targets == ()
+
+
 def test_cancellation_terminates_in_flight_command(
     tmp_path: Path,
     harness: ApiAdapterHarness,
