@@ -110,7 +110,7 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
         observed["before_interrupt"] = stream.getvalue()
         try:
             os.kill(os.getpid(), signal.SIGINT)
-        except KeyboardInterrupt as error:
+        except KeyboardInterrupt:
             deadline = time.monotonic() + 1
             while not run.progress.cancelling and time.monotonic() < deadline:
                 time.sleep(0.001)
@@ -119,8 +119,6 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
             observed["acknowledgement"] = stream.getvalue()
             getattr(run.progress, terminal_method)("work", "reconciled")
             observed["terminal_state"] = run.progress.stages["work"].state
-            run.progress.close()
-            raise click.ClickException("workflow interruption reconciled") from error
 
     monkeypatch.setattr(cli_module, "cli", command)
 
@@ -134,7 +132,9 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
         f"{observed['before_interrupt']}stopping...\n"
     )
     assert observed["terminal_state"] is terminal_state
-    assert "workflow interruption reconciled" not in stream.getvalue()
+    run = observed["run"]
+    assert isinstance(run, cli_module.CliRunContext)
+    assert run.progress.closed
     assert "Error:" not in stream.getvalue()
 
 

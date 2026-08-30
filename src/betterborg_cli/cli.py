@@ -154,6 +154,8 @@ def main(
             if error.errno != errno.EPIPE:
                 raise
             return 1
+        if control.interruption_requested:
+            return _interrupted_exit_code(control, run.progress)
         return result if isinstance(result, int) else 0
     finally:
         control.close()
