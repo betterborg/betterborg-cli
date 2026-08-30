@@ -21,6 +21,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TextIO
 
+from rich.cells import cell_len, chop_cells
 from rich.console import Console, Group
 from rich.live import Live
 from rich.text import Text
@@ -797,7 +798,7 @@ class RunProgress:
     def _write_permanent(self, line: str) -> None:
         line = self._truncate(line)
         if self._interactive:
-            self._output_console().print(Text(line, no_wrap=True))
+            self._output_console().print(Text(line), soft_wrap=True)
         else:
             self._write_plain(line)
 
@@ -806,9 +807,11 @@ class RunProgress:
         self._stream.flush()
 
     def _truncate(self, line: str) -> str:
-        if self._width is None or len(line) <= self._width:
+        if self._width is None or cell_len(line) <= self._width:
             return line
-        return line[: max(self._width - 1, 0)] + "…"
+        if self._width == 1:
+            return "…"
+        return chop_cells(line, self._width - 1)[0] + "…"
 
 
 def _format_terminal_line(

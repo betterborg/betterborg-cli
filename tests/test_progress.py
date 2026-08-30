@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import pytest
+from rich.cells import cell_len
 
 from betterborg_cli.progress import (
     AgentActivity,
@@ -437,6 +438,40 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
     expected = "completed Stage — cached (2.5s) [retained]"
     assert plain.getvalue().strip() == expected
     assert _terminal_text(rich.getvalue()).strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("label", "width", "expected"),
+    [
+        ("A" * 100, None, None),
+        ("界" * 10, 12, "completed …"),
+    ],
+)
+def test_long_permanent_lines_remain_one_canonical_terminal_line(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    width: int | None,
+    expected: str | None,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    plain = StringIO()
+    rich = TTYStringIO()
+
+    for stream in (plain, rich):
+        progress = RunProgress(
+            [StageSpec("stage", label)], stream=stream, width=width
+        )
+        progress.seed_completed("stage", "cached", 2.5)
+
+    plain_lines = plain.getvalue().splitlines()
+    rich_lines = _terminal_text(rich.getvalue()).splitlines()
+    assert rich_lines == plain_lines
+    assert len(rich_lines) == 1
+    if expected is not None:
+        assert rich_lines == [expected]
+    if width is not None:
+        assert cell_len(rich_lines[0]) <= width
 
 
 @pytest.mark.parametrize(
