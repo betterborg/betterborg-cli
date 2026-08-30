@@ -155,6 +155,36 @@ child.wait()
         fail_registration: bool = False,
     ) -> subprocess.Popen[str]:
         """Run ``run_streamed`` behind a post-creation registration gate."""
+        return self._launch_registration_wrapper(
+            command,
+            name=name,
+            runner="streamed",
+            fail_registration=fail_registration,
+        )
+
+    def launch_captured_registration_wrapper(
+        self,
+        command: tuple[str, ...],
+        *,
+        name: str,
+        fail_registration: bool = False,
+    ) -> subprocess.Popen[str]:
+        """Run ``run_captured`` behind a post-creation registration gate."""
+        return self._launch_registration_wrapper(
+            command,
+            name=name,
+            runner="captured",
+            fail_registration=fail_registration,
+        )
+
+    def _launch_registration_wrapper(
+        self,
+        command: tuple[str, ...],
+        *,
+        name: str,
+        runner: str,
+        fail_registration: bool,
+    ) -> subprocess.Popen[str]:
         source = r'''
 from __future__ import annotations
 
@@ -165,6 +195,7 @@ from pathlib import Path
 from betterborg_cli.agent_runtime import (
     CancellationRegistrationWindow,
     CancellationToken,
+    run_captured,
     run_streamed,
 )
 from betterborg_cli.run_control import RunControl
@@ -172,7 +203,8 @@ from betterborg_cli.run_control import RunControl
 root = Path(sys.argv[1])
 name = sys.argv[2]
 fail_registration = sys.argv[3] == "fail"
-command = sys.argv[4:]
+runner = sys.argv[4]
+command = sys.argv[5:]
 cancel = CancellationToken()
 original_register = CancellationRegistrationWindow.register
 
@@ -193,12 +225,20 @@ class Progress:
 
 try:
     if fail_registration:
-        run_streamed(command, root, "", root / f"{name}.log", cancel)
+        if runner == "streamed":
+            run_streamed(command, root, "", root / f"{name}.log", cancel)
+        else:
+            run_captured(command, cwd=root, input="", cancel=cancel)
     else:
         control = RunControl(cancel, progress=Progress())
         with control:
             with control.protected():
-                run_streamed(command, root, "", root / f"{name}.log", cancel)
+                if runner == "streamed":
+                    run_streamed(
+                        command, root, "", root / f"{name}.log", cancel
+                    )
+                else:
+                    run_captured(command, cwd=root, input="", cancel=cancel)
 except KeyboardInterrupt:
     raise SystemExit(130) from None
 except RuntimeError as error:
@@ -214,6 +254,7 @@ except RuntimeError as error:
             str(self.root),
             name,
             mode,
+            runner,
             *command,
             name=f"{name}-wrapper",
         )

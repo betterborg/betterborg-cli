@@ -16,9 +16,225 @@ from conftest import RealProcessHarness
 from betterborg_cli.agent_runtime import (
     CancellationRegistrationWindow,
     CancellationToken,
+    run_captured,
     run_streamed,
 )
 from betterborg_cli.agent_runtime.process import terminate_process
+
+
+def test_run_captured_preserves_cwd_input_environment_and_output(
+    tmp_path: Path,
+) -> None:
+    environment = dict(os.environ)
+    environment["BETTERBORG_CAPTURED_VALUE"] = "environment-value"
+    script = (
+        "import os, pathlib, sys; "
+        "data=sys.stdin.read(); "
+        "print(pathlib.Path.cwd().name); "
+        "print(os.environ['BETTERBORG_CAPTURED_VALUE']); "
+        "print(data); "
+        "print('captured-error', file=sys.stderr)"
+    )
+
+    result = run_captured(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        input="captured-input",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == (
+        f"{tmp_path.name}\nenvironment-value\ncaptured-input\n"
+    )
+    assert result.stderr == "captured-error\n"
+
+
+def test_run_captured_uses_argv_without_shell_interpretation(
+    tmp_path: Path,
+) -> None:
+    result = run_captured(
+        [sys.executable, "-c", "import sys; print(sys.argv[1])", "$(touch nope)"],
+        cwd=tmp_path,
+    )
+
+    assert result.stdout.strip() == "$(touch nope)"
+    assert not (tmp_path / "nope").exists()
+
+
+def test_run_captured_preserves_failure_and_check_behavior(tmp_path: Path) -> None:
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; print('out'); print('err', file=sys.stderr); raise SystemExit(9)",
+    ]
+
+    result = run_captured(command, cwd=tmp_path)
+
+    assert result.returncode == 9
+    assert result.stdout == "out\n"
+    assert result.stderr == "err\n"
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        run_captured(command, cwd=tmp_path, check=True)
+    assert raised.value.returncode == 9
+    assert raised.value.stdout == "out\n"
+    assert raised.value.stderr == "err\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_captured_timeout_reaps_process_tree(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        run_captured(
+            real_process_harness.resistant_argv("captured-timeout"),
+            cwd=real_process_harness.root,
+            timeout=0.25,
+        )
+
+    assert raised.value.timeout == 0.25
+    real_process_harness.assert_tree_absent("captured-timeout")
+
+
+def test_run_captured_already_cancelled_does_not_spawn(tmp_path: Path) -> None:
+    cancel = CancellationToken()
+    cancel.cancel()
+    marker = tmp_path / "spawned"
+
+    result = run_captured(
+        [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ],
+        cwd=tmp_path,
+        cancel=cancel,
+    )
+
+    assert result.returncode == -1
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_captured_cancellation_reaps_process_tree(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.1)
+    results: list[subprocess.CompletedProcess[str]] = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_captured(
+                real_process_harness.resistant_argv("captured-cancel"),
+                cwd=real_process_harness.root,
+                cancel=cancel,
+            )
+        )
+    )
+    thread.start()
+    real_process_harness.wait_for_marker("captured-cancel.parent.pid")
+    real_process_harness.wait_for_marker("captured-cancel.child.pid")
+
+    cancel.cancel()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert [result.returncode for result in results] == [-1]
+    real_process_harness.assert_tree_absent("captured-cancel")
+
+
+def test_run_captured_cleanup_mode_can_finish_after_cancellation(
+    tmp_path: Path,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.5)
+    cancel.cancel()
+
+    result = run_captured(
+        [sys.executable, "-c", "print('cleanup-complete')"],
+        cwd=tmp_path,
+        cancel=cancel,
+        terminate_on_cancel=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "cleanup-complete\n"
+
+
+def test_run_captured_cleanup_mode_requires_an_absolute_deadline(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="absolute deadline"):
+        run_captured(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            cancel=CancellationToken(),
+            terminate_on_cancel=False,
+        )
+
+
+def test_run_captured_cleanup_deadline_cannot_exceed_token_deadline(
+    tmp_path: Path,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.5)
+    cancel.cancel()
+    assert cancel.force_deadline is not None
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        run_captured(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            cancel=cancel,
+            terminate_on_cancel=False,
+            deadline=cancel.force_deadline + 0.1,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_captured_cleanup_mode_remains_force_terminable(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    cancel = CancellationToken()
+    results: list[subprocess.CompletedProcess[str]] = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            run_captured(
+                real_process_harness.resistant_argv("captured-force"),
+                cwd=real_process_harness.root,
+                cancel=cancel,
+                terminate_on_cancel=False,
+                deadline=time.monotonic() + 2,
+            )
+        )
+    )
+    thread.start()
+    real_process_harness.wait_for_marker("captured-force.parent.pid")
+    real_process_harness.wait_for_marker("captured-force.child.pid")
+
+    cancel.force()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert [result.returncode for result in results] == [-1]
+    real_process_harness.assert_tree_absent("captured-force")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_captured_cleanup_mode_expires_at_token_deadline(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.25)
+    cancel.cancel()
+
+    result = run_captured(
+        real_process_harness.resistant_argv("captured-deadline"),
+        cwd=real_process_harness.root,
+        cancel=cancel,
+        terminate_on_cancel=False,
+    )
+
+    assert result.returncode == -1
+    real_process_harness.assert_tree_absent("captured-deadline")
 
 
 def test_run_streamed_persists_exact_observed_text_and_passes_stdin(
@@ -238,6 +454,28 @@ def test_sigint_during_registration_reaches_late_process_and_exits_130(
     real_process_harness.assert_tree_absent("late-signal")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")
+def test_run_captured_sigint_during_registration_reaps_late_process(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    process = real_process_harness.launch_captured_registration_wrapper(
+        real_process_harness.resistant_argv("captured-late-signal"),
+        name="captured-late-signal",
+    )
+    real_process_harness.wait_for_marker(
+        "captured-late-signal.registration-gate"
+    )
+    real_process_harness.wait_for_marker("captured-late-signal.parent.pid")
+    real_process_harness.wait_for_marker("captured-late-signal.child.pid")
+
+    real_process_harness.signal(process, signal.SIGINT)
+    real_process_harness.wait_for_marker("captured-late-signal.cancelled")
+    real_process_harness.release("release-captured-late-signal")
+
+    assert real_process_harness.wait_for_exit(process) == 130
+    real_process_harness.assert_tree_absent("captured-late-signal")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
 def test_registration_exception_directly_cleans_created_process(
     real_process_harness: RealProcessHarness,
@@ -263,6 +501,43 @@ def test_registration_exception_directly_cleans_created_process(
         == "0"
     )
     real_process_harness.assert_tree_absent("registration-error")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_run_captured_registration_exception_cleans_created_process(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    process = real_process_harness.launch_captured_registration_wrapper(
+        real_process_harness.resistant_argv("captured-registration-error"),
+        name="captured-registration-error",
+        fail_registration=True,
+    )
+    real_process_harness.wait_for_marker(
+        "captured-registration-error.registration-gate"
+    )
+    real_process_harness.wait_for_marker(
+        "captured-registration-error.parent.pid"
+    )
+    real_process_harness.wait_for_marker(
+        "captured-registration-error.child.pid"
+    )
+
+    real_process_harness.release("release-captured-registration-error")
+
+    assert real_process_harness.wait_for_exit(process) == 73
+    assert (
+        real_process_harness.wait_for_marker(
+            "captured-registration-error.error"
+        )
+        == "injected registration failure"
+    )
+    assert (
+        real_process_harness.wait_for_marker(
+            "captured-registration-error.active-windows"
+        )
+        == "0"
+    )
+    real_process_harness.assert_tree_absent("captured-registration-error")
 
 
 def test_run_streamed_already_cancelled_creates_empty_log(tmp_path: Path) -> None:

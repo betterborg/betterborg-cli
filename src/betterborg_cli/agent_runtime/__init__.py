@@ -48,7 +48,11 @@ from betterborg_cli.agent_runtime.openai import (
     OpenAITransport,
     UrllibOpenAITransport,
 )
-from betterborg_cli.agent_runtime.process import ProcessRunner, run_streamed
+from betterborg_cli.agent_runtime.process import (
+    ProcessRunner,
+    run_captured,
+    run_streamed,
+)
 from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
@@ -127,6 +131,7 @@ __all__ = [
     "extract_structured_result",
     "extract_structured_result_file",
     "retry_outcome_to_result",
+    "run_captured",
     "run_streamed",
     "run_with_transient_retry",
     "require_read_only_agent",
