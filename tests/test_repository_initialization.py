@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
+from betterborg_cli import repository_files as repository_files_module
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
-from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
+from betterborg_cli.repository_service import (
+    RepositoryInitializationError,
+    RepositoryService,
+)
 from betterborg_cli.store import (
     Borg,
     PrdSession,
+    Repository,
     RepositoryAnalysis,
     RepositoryPackage,
     SqliteStore,
@@ -175,6 +183,109 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
         assert repository_count == 1
+
+
+@pytest.mark.parametrize("interrupt_after_claim", [False, True])
+def test_initial_config_interruption_leaves_no_file_or_complete_parseable_config(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    interrupt_after_claim: bool,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    repository = Repository(root=paths.root)
+    config_path = paths.tracked_dir / CONFIG_FILENAME
+    original_link = os.link
+
+    def interrupt(source: Path, destination: Path) -> None:
+        if interrupt_after_claim:
+            original_link(source, destination)
+        raise KeyboardInterrupt("config publication interrupted")
+
+    monkeypatch.setattr(repository_files_module.os, "link", interrupt)
+
+    with SqliteStore.open(paths.state_dir / "atomic-config.sqlite3") as store:
+        service = RepositoryService(paths, store, lambda _config: MockAdapter())
+        with pytest.raises(KeyboardInterrupt, match="config publication interrupted"):
+            service._write_initial_config(repository)
+
+    if interrupt_after_claim:
+        config = load_repository_config(paths)
+        assert config.repository_id == repository.id
+        assert config_path.read_text(encoding="utf-8").endswith("\n")
+    else:
+        assert not config_path.exists()
+    assert list(paths.tracked_dir.glob(".config.toml.*.tmp")) == []
+
+
+def test_initial_config_create_race_preserves_the_winning_repository_identity(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    losing_repository = Repository(root=paths.root)
+    winning_repository = Repository(root=paths.root)
+    config_path = paths.tracked_dir / CONFIG_FILENAME
+    winning_body = (
+        "version = 1\n\n"
+        "[repository]\n"
+        f'id = "{winning_repository.id}"\n'
+        'default_branch = "winning-branch"\n'
+    )
+    unrelated_temporary = paths.tracked_dir / ".config.toml.concurrent.tmp"
+    original_link = os.link
+
+    def publish_winner_then_lose(source: Path, destination: Path) -> None:
+        unrelated_temporary.write_text(
+            "owned by another initializer\n",
+            encoding="utf-8",
+        )
+        winner_temporary = paths.tracked_dir / ".config.toml.winner.tmp"
+        winner_temporary.write_text(winning_body, encoding="utf-8")
+        original_link(winner_temporary, destination)
+        winner_temporary.unlink()
+        original_link(source, destination)
+
+    monkeypatch.setattr(
+        repository_files_module.os,
+        "link",
+        publish_winner_then_lose,
+    )
+
+    with SqliteStore.open(paths.state_dir / "config-race.sqlite3") as store:
+        service = RepositoryService(paths, store, lambda _config: MockAdapter())
+        service._write_initial_config(losing_repository)
+        first_repository, first_config = service._ensure_repository()
+        second_repository, second_config = service._ensure_repository()
+
+        assert first_repository.id == winning_repository.id
+        assert second_repository.id == winning_repository.id
+        assert first_config.repository_id == winning_repository.id
+        assert second_config.repository_id == winning_repository.id
+        assert store.get_repository(winning_repository.id) == first_repository
+
+    assert config_path.read_text(encoding="utf-8") == winning_body
+    assert unrelated_temporary.read_text(encoding="utf-8") == (
+        "owned by another initializer\n"
+    )
+    assert list(paths.tracked_dir.glob(".config.toml.*.tmp")) == [
+        unrelated_temporary
+    ]
+
+
+def test_initial_config_rejects_a_tracked_directory_outside_the_repository(
+    committed_git_repo: Path,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    outside = committed_git_repo.parent / f"{committed_git_repo.name}-outside"
+    outside.mkdir()
+    paths.tracked_dir.symlink_to(outside, target_is_directory=True)
+
+    with SqliteStore.open(outside / "containment.sqlite3") as store:
+        service = RepositoryService(paths, store, lambda _config: MockAdapter())
+        with pytest.raises(RepositoryInitializationError, match="escapes repository"):
+            service._write_initial_config(Repository(root=paths.root))
+
+    assert not outside.joinpath(CONFIG_FILENAME).exists()
 
 
 def test_json_init_never_prompts_and_emits_exact_create_commands(

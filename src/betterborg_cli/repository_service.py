@@ -226,16 +226,6 @@ class RepositoryService:
         return repository, config
 
     def _write_initial_config(self, repository: Repository) -> None:
-        tracked_dir = self.paths.tracked_dir
-        if not tracked_dir.resolve().is_relative_to(self.paths.root):
-            raise RepositoryInitializationError(
-                f"tracked Borg directory escapes repository: {tracked_dir}"
-            )
-        tracked_dir.mkdir(parents=True, exist_ok=True)
-        if not tracked_dir.resolve(strict=True).is_relative_to(self.paths.root):
-            raise RepositoryInitializationError(
-                f"tracked Borg directory escapes repository: {tracked_dir}"
-            )
         default_branch = _default_branch(self.paths.root)
         body = (
             f"version = {CONFIG_VERSION}\n\n"
@@ -244,13 +234,17 @@ class RepositoryService:
             f"default_branch = {json.dumps(default_branch, ensure_ascii=False)}\n"
         )
         try:
-            with (tracked_dir / CONFIG_FILENAME).open(
-                "x", encoding="utf-8", errors="strict", newline="\n"
-            ) as config_file:
-                config_file.write(body)
+            publish_repository_text(
+                self.paths.tracked_dir / CONFIG_FILENAME,
+                body,
+                root=self.paths.root,
+                overwrite=False,
+            )
         except FileExistsError:
             # Another initializer won the creation race; its identity is canonical.
             return
+        except RepositoryPathError as error:
+            raise RepositoryInitializationError(str(error)) from error
 
     def _is_initialized(self, repository: Repository) -> bool:
         return any(
