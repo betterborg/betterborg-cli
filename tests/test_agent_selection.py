@@ -281,6 +281,56 @@ def test_contained_selected_agent_forwards_token_to_compatible_trust(
     assert observed == [cancel]
 
 
+def test_contained_agent_cancellation_reaps_trust_probe_before_adapter(
+    git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.05)
+    errors: list[BaseException] = []
+
+    def trust(_paths: RepoPaths, **kwargs: Any) -> None:
+        assert kwargs["cancel"] is cancel
+        result = kwargs["command_runner"](
+            real_process_harness.resistant_argv("contained-trust"),
+            cancel=kwargs["cancel"],
+        )
+        if result.returncode != 0:
+            raise ValueError("contained trust discovery cancelled")
+
+    adapter = MockAdapter(
+        capabilities=replace(MockAdapter().capabilities, host_capable=True)
+    ).queue(MockResponse(payload={"status": "completed", "version": "1"}))
+    selected = SelectedAgent(
+        role=ApiAgentRole.CODING,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+        trust_requirement=trust,
+    )
+
+    def invoke() -> None:
+        try:
+            selected.run_contained(
+                _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS),
+                cancel=cancel,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    real_process_harness.wait_for_marker("contained-trust.parent.pid")
+    real_process_harness.wait_for_marker("contained-trust.child.pid")
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert str(errors[0]) == "contained trust discovery cancelled"
+    assert adapter.calls == []
+    real_process_harness.assert_tree_absent("contained-trust")
+
+
 @pytest.mark.parametrize(
     "blocked_probe",
     ["run-root", "selected-identity", "run-identity", "trust"],
