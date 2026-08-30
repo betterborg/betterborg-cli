@@ -99,7 +99,14 @@ jobs:
             --env ARTIFACT \
             "$MANYLINUX_IMAGE" \
             bash -euxo pipefail -c '
-              /opt/python/cp313-cp313/bin/python -m venv /tmp/betterborg-build
+              # The manylinux CPython is static, and PyInstaller requires a
+              # shared libpython. A python-build-standalone interpreter has
+              # one and targets the same glibc 2.17 floor.
+              /opt/python/cp313-cp313/bin/pip install --no-cache-dir uv
+              export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+              /opt/python/cp313-cp313/bin/uv python install 3.13
+              interpreter=$(/opt/python/cp313-cp313/bin/uv python find 3.13)
+              "$interpreter" -m venv /tmp/betterborg-build
               /tmp/betterborg-build/bin/pip download \
                 --only-binary=:all: \
                 --destination-directory /tmp/betterborg-wheels \
