@@ -31,7 +31,7 @@ Repository = "https://github.com/betterborg/betterborg-cli"
 Issues = "https://github.com/betterborg/betterborg-cli/issues"
 
 [project.scripts]
-borg = "betterborg_cli.cli:cli"
+borg = "betterborg_cli.cli:main"
 
 [dependency-groups]
 binary = [

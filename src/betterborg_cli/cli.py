@@ -1,5 +1,8 @@
 """Command-line entry point for BetterBorg."""
 
+from __future__ import annotations
+
+import errno
 import json
 import os
 import re
@@ -7,6 +10,9 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -15,7 +21,7 @@ from uuid import UUID
 import click
 
 from betterborg_cli import __version__
-from betterborg_cli.agent_runtime import BillingMode
+from betterborg_cli.agent_runtime import BillingMode, CancellationToken
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
 from betterborg_cli.execution_estimate import (
@@ -66,10 +72,12 @@ from betterborg_cli.plugins import (
     PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
+from betterborg_cli.progress import ProgressError, RunProgress
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
+from betterborg_cli.run_control import INTERRUPTED_EXIT_CODE, RunControl
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -93,9 +101,91 @@ from betterborg_cli.workspace_trust import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class CliRunContext:
+    """Cancellation and reporting state shared by one root command invocation."""
+
+    cancellation: CancellationToken
+    progress: RunProgress
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-def cli() -> None:
+@click.pass_context
+def cli(context: click.Context) -> None:
     """Work with BetterBorg from the command line."""
+
+    if context.obj is None:
+        context.obj = CliRunContext(CancellationToken(), RunProgress())
+
+
+def main(
+    args: Sequence[str] | None = None,
+    prog_name: str | None = None,
+) -> int:
+    """Run the root Click command under one interruption-aware lifecycle."""
+
+    arguments = list(args) if args is not None else None
+    requested_arguments = arguments if arguments is not None else sys.argv[1:]
+    machine_readable = "--json" in requested_arguments
+    run = CliRunContext(
+        CancellationToken(),
+        RunProgress(machine_readable=machine_readable),
+    )
+    control = RunControl(run.cancellation, progress=run.progress).install()
+    try:
+        try:
+            result = cli.main(
+                args=arguments,
+                prog_name=prog_name,
+                standalone_mode=False,
+                obj=run,
+            )
+        except click.ClickException as error:
+            if _caused_by_interruption(error):
+                return _interrupted_exit_code(control, run.progress)
+            error.show()
+            return error.exit_code
+        except click.Abort as error:
+            if _caused_by_interruption(error):
+                return _interrupted_exit_code(control, run.progress)
+            click.echo("Aborted!", err=True)
+            return 1
+        except OSError as error:
+            if error.errno != errno.EPIPE:
+                raise
+            return 1
+        if control.interruption_requested:
+            return _interrupted_exit_code(control, run.progress)
+        return result if isinstance(result, int) else 0
+    finally:
+        control.close()
+
+
+def _caused_by_interruption(error: BaseException) -> bool:
+    """Return whether Click directly wrapped an unsuppressed interrupt."""
+
+    cause = error.__cause__
+    if cause is None and not error.__suppress_context__:
+        cause = error.__context__
+    return isinstance(cause, KeyboardInterrupt)
+
+
+def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
+    """Map interruption only after strict progress reconciliation succeeds."""
+
+    if control.interruption_requested:
+        control.wait_for_cancellation()
+        if dispatch_error := control.dispatcher_error:
+            click.ClickException(
+                f"cancellation dispatch failed: {dispatch_error}"
+            ).show()
+            return 1
+    try:
+        progress.close()
+    except ProgressError as error:
+        click.ClickException(str(error)).show()
+        return 1
+    return INTERRUPTED_EXIT_CODE
 
 
 @cli.command()
