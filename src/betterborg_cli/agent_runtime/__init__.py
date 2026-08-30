@@ -66,6 +66,7 @@ from betterborg_cli.agent_runtime.structured import (
     extract_structured_result_file,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 __all__ = [
     "DEFAULT_TRANSIENT_BACKOFF_SECONDS",
@@ -74,6 +75,8 @@ __all__ = [
     "ANTHROPIC_API_VERSION",
     "OPENAI_API_URL",
     "AgentAdapter",
+    "AgentActivity",
+    "AgentActivityKind",
     "AgentArtifact",
     "AgentCapabilities",
     "AgentResult",

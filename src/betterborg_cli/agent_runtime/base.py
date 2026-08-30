@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+from betterborg_cli.progress import AgentActivity
 
 
 class AgentStatus(StrEnum):
@@ -90,6 +92,7 @@ class AgentRunSpec:
     effort: str | None = None
     billing_mode: BillingMode = BillingMode.API
     resume_token: str | None = None
+    activity_sink: Callable[[AgentActivity], None] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cwd", Path(self.cwd))

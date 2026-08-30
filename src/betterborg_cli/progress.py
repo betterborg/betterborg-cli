@@ -37,6 +37,16 @@ class StageState(StrEnum):
     STOPPED = "stopped"
 
 
+class AgentActivityKind(StrEnum):
+    """Provider-neutral kinds of agent work shown by the reporter."""
+
+    THINKING = "thinking"
+    READING = "reading"
+    SEARCHING = "searching"
+    COMMAND = "command"
+    WRITING = "writing"
+
+
 TERMINAL_STATES = frozenset(
     {StageState.COMPLETED, StageState.FAILED, StageState.STOPPED}
 )
@@ -75,11 +85,13 @@ class StageSpec:
 class AgentActivity:
     """The current kind of agent work and an optional detail string."""
 
-    kind: str
+    kind: AgentActivityKind
     detail: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.kind, "activity kind")
+        object.__setattr__(self, "kind", AgentActivityKind(self.kind))
+        if self.detail is not None and not isinstance(self.detail, str):
+            raise TypeError("activity detail must be a string or None")
 
 
 @dataclass(slots=True)
@@ -97,6 +109,7 @@ class ChildRecord:
     finished_at: float | None = None
     duration_seconds: float | None = None
     retained: bool = False
+    _activity_is_latest: bool = field(default=False, repr=False)
 
 
 @dataclass(slots=True)
@@ -113,6 +126,7 @@ class StageRecord:
     finished_at: float | None = None
     duration_seconds: float | None = None
     retained: bool = False
+    _activity_is_latest: bool = field(default=False, repr=False)
     _children: dict[str, ChildRecord] = field(default_factory=dict, repr=False)
 
     @property
@@ -245,18 +259,18 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_running(record, f"stage {stage_key!r}")
             record.detail = detail
+            record._activity_is_latest = False
             self._refresh_transient()
             return record
 
-    def activity(
-        self, stage_key: str, activity: AgentActivity | str, detail: str | None = None
-    ) -> StageRecord:
+    def activity(self, stage_key: str, activity: AgentActivity) -> StageRecord:
         """Replace a running parent's current agent activity."""
 
         with self._lock:
             record = self._stage(stage_key)
             self._require_running(record, f"stage {stage_key!r}")
-            record.activity = _coerce_activity(activity, detail)
+            record.activity = _require_activity(activity)
+            record._activity_is_latest = True
             self._refresh_transient()
             return record
 
@@ -333,6 +347,7 @@ class RunProgress:
             _parent, child = self._child(stage_key, child_key)
             self._require_running(child, f"child {child_key!r}")
             child.detail = detail
+            child._activity_is_latest = False
             self._refresh_transient()
             return child
 
@@ -340,15 +355,15 @@ class RunProgress:
         self,
         stage_key: str,
         child_key: str,
-        activity: AgentActivity | str,
-        detail: str | None = None,
+        activity: AgentActivity,
     ) -> ChildRecord:
         """Replace a running child's current agent activity."""
 
         with self._lock:
             _parent, child = self._child(stage_key, child_key)
             self._require_running(child, f"child {child_key!r}")
-            child.activity = _coerce_activity(activity, detail)
+            child.activity = _require_activity(activity)
+            child._activity_is_latest = True
             self._refresh_transient()
             return child
 
@@ -759,10 +774,12 @@ class RunProgress:
             label = f"{parent_label}: {label}"
         elapsed = self._elapsed(record)
         line = f"running {label} ({0.0 if elapsed is None else elapsed:.1f}s)"
-        if record.activity is not None:
+        if record._activity_is_latest and record.activity is not None:
             activity = record.activity.kind
             if record.activity.detail:
-                activity += f": {record.activity.detail}"
+                detail = record.activity.detail.replace("\r\n", " ")
+                detail = detail.replace("\r", " ").replace("\n", " ")
+                activity += f": {detail}"
             line += f" — {activity}"
         elif record.detail:
             line += f" — {record.detail}"
@@ -850,14 +867,10 @@ def _is_interactive(stream: TextIO) -> bool:
         return False
 
 
-def _coerce_activity(
-    activity: AgentActivity | str, detail: str | None
-) -> AgentActivity:
-    if isinstance(activity, AgentActivity):
-        if detail is not None:
-            raise ValueError("detail cannot accompany an AgentActivity")
-        return activity
-    return AgentActivity(activity, detail)
+def _require_activity(activity: AgentActivity) -> AgentActivity:
+    if not isinstance(activity, AgentActivity):
+        raise TypeError("activity must be an AgentActivity")
+    return activity
 
 
 def _validate_duration(duration_seconds: float | None) -> float | None:
@@ -876,6 +889,7 @@ def _require_text(value: str, name: str) -> None:
 
 __all__ = [
     "AgentActivity",
+    "AgentActivityKind",
     "ChildRecord",
     "ChildRenderState",
     "ChildSpec",

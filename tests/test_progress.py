@@ -6,12 +6,14 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
+from typing import Any
 
 import pytest
 from rich.cells import cell_len
 
 from betterborg_cli.progress import (
     AgentActivity,
+    AgentActivityKind,
     ChildSpec,
     ProgressError,
     RunProgress,
@@ -112,15 +114,21 @@ def test_fresh_parent_and_child_have_independent_frozen_timing() -> None:
     clock.advance(3)
     progress.update("plan", "checking")
     progress.update_child("plan", "prompt", "writing")
-    progress.activity("plan", AgentActivity("review", "contracts"))
-    progress.child_activity("plan", "prompt", "agent", "drafting")
 
     assert progress.elapsed("plan") == 5
     assert progress.child_elapsed("plan", "prompt") == 3
     assert parent.detail == "checking"
     assert child.detail == "writing"
-    assert parent.activity == AgentActivity("review", "contracts")
-    assert child.activity == AgentActivity("agent", "drafting")
+
+    parent_activity = AgentActivity(AgentActivityKind.SEARCHING, "contracts")
+    child_activity = AgentActivity(AgentActivityKind.WRITING, "drafting")
+    progress.activity("plan", parent_activity)
+    progress.child_activity("plan", "prompt", child_activity)
+
+    assert parent.detail == "checking"
+    assert child.detail == "writing"
+    assert parent.activity == parent_activity
+    assert child.activity == child_activity
 
     progress.complete_child("plan", "prompt", "accepted")
     clock.advance(4)
@@ -148,7 +156,7 @@ def test_parent_seeding_rejects_invalid_or_touched_records() -> None:
         progress.seed_completed("stage", "bad", -0.1)
 
     progress.start("stage")
-    progress.activity("stage", AgentActivity("agent"))
+    progress.activity("stage", AgentActivity(AgentActivityKind.THINKING))
     with pytest.raises(ProgressError, match="must be pending"):
         progress.seed_completed("stage", "retained")
 
@@ -693,4 +701,182 @@ def test_concurrent_permanent_lines_follow_lock_transition_order() -> None:
     assert stream.getvalue().splitlines() == [
         "completed One — first (0.0s)",
         "failed Two — second (0.0s)",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "detail", "truncated"),
+    [
+        (AgentActivityKind.THINKING, None, False),
+        (
+            AgentActivityKind.READING,
+            "src/betterborg_cli/a/deeply/nested/provider_adapter.py",
+            True,
+        ),
+        (
+            AgentActivityKind.SEARCHING,
+            "every occurrence of the long-lived\nexecution attempt identifier",
+            True,
+        ),
+        (AgentActivityKind.COMMAND, "pytest tests/test_progress.py", False),
+        (AgentActivityKind.WRITING, "src/betterborg_cli/progress.py", False),
+    ],
+)
+def test_parent_and_child_neutral_activity_render_as_one_capped_line(
+    kind: AgentActivityKind,
+    detail: str | None,
+    truncated: bool,
+) -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    width = 72
+    progress = RunProgress(
+        [StageSpec("stage", "Parent", (ChildSpec("child", "Child"),))],
+        stream=stream,
+        clock=clock,
+        width=width,
+        heartbeat_interval=1,
+    )
+    progress.start("stage")
+    progress.start_child("stage", "child")
+    stream.seek(0)
+    stream.truncate()
+
+    activity = AgentActivity(kind, detail)
+    progress.activity("stage", activity)
+    progress.child_activity("stage", "child", activity)
+    clock.advance(1)
+    progress.refresh()
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith(f"running Parent (1.0s) — {kind.value}")
+    assert lines[1].startswith(f"running Parent: Child (1.0s) — {kind.value}")
+    assert all(cell_len(line) <= width for line in lines)
+    if truncated:
+        assert all(line.endswith("…") for line in lines)
+
+
+def test_latest_detail_or_activity_replaces_the_rendered_parent_and_child_state(
+) -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage", (ChildSpec("child", "Child"),))],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=1,
+    )
+    parent = progress.start("stage")
+    child = progress.start_child("stage", "child")
+    stream.seek(0)
+    stream.truncate()
+
+    progress.activity(
+        "stage", AgentActivity(AgentActivityKind.READING, "old-parent.py")
+    )
+    progress.child_activity(
+        "stage",
+        "child",
+        AgentActivity(AgentActivityKind.SEARCHING, "old child detail"),
+    )
+    progress.update("stage", "new parent detail")
+    progress.update_child("stage", "child", "new child detail")
+    clock.advance(1)
+    progress.refresh()
+
+    assert parent.detail == "new parent detail"
+    assert parent.activity == AgentActivity(
+        AgentActivityKind.READING, "old-parent.py"
+    )
+    assert child.detail == "new child detail"
+    assert child.activity == AgentActivity(
+        AgentActivityKind.SEARCHING, "old child detail"
+    )
+    detail_lines = stream.getvalue().splitlines()
+    assert detail_lines[-2].endswith("— new parent detail")
+    assert detail_lines[-1].endswith("— new child detail")
+
+    progress.activity("stage", AgentActivity(AgentActivityKind.THINKING))
+    progress.child_activity(
+        "stage", "child", AgentActivity(AgentActivityKind.WRITING, "answer.json")
+    )
+
+    clock.advance(1)
+    progress.refresh()
+
+    assert parent.detail == "new parent detail"
+    assert parent.activity == AgentActivity(AgentActivityKind.THINKING)
+    assert child.detail == "new child detail"
+    assert child.activity == AgentActivity(
+        AgentActivityKind.WRITING, "answer.json"
+    )
+    activity_lines = stream.getvalue().splitlines()
+    assert activity_lines[-2].endswith("— thinking")
+    assert activity_lines[-1].endswith("— writing: answer.json")
+
+
+def test_activity_api_rejects_values_outside_the_neutral_contract() -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        AgentActivity("unknown")
+
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=StringIO(),
+    )
+    progress.start("stage")
+    with pytest.raises(TypeError, match="AgentActivity"):
+        progress.activity("stage", "thinking")
+
+
+def test_concurrent_parent_and_child_activity_updates_are_isolated() -> None:
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage", (ChildSpec("child", "Child"),))],
+        stream=StringIO(),
+        clock=clock,
+    )
+    parent = progress.start("stage")
+    child = progress.start_child("stage", "child")
+    clock.advance(4)
+    parent_activity = AgentActivity(AgentActivityKind.COMMAND, "make test")
+    child_activity = AgentActivity(AgentActivityKind.WRITING, "result.json")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(progress.activity, "stage", parent_activity),
+            executor.submit(
+                progress.child_activity,
+                "stage",
+                "child",
+                child_activity,
+            ),
+        ]
+        for future in futures:
+            future.result(timeout=2)
+
+    assert parent.activity == parent_activity
+    assert child.activity == child_activity
+    assert parent.started_at == 0
+    assert child.started_at == 0
+    assert progress.elapsed("stage") == 4
+    assert progress.child_elapsed("stage", "child") == 4
+
+
+def test_recording_progress_records_only_neutral_parent_and_child_values(
+    recording_progress: Any,
+) -> None:
+    parent_activity = AgentActivity(AgentActivityKind.READING, "README.md")
+    child_activity = AgentActivity(AgentActivityKind.COMMAND, "make lint")
+
+    recording_progress.update("plan", "preparing")
+    recording_progress.activity("plan", parent_activity)
+    recording_progress.update_child("plan", "prompt", "drafting")
+    recording_progress.child_activity("plan", "prompt", child_activity)
+
+    assert recording_progress.updates == [("plan", "preparing")]
+    assert recording_progress.activities == [("plan", parent_activity)]
+    assert recording_progress.child_updates == [("plan", "prompt", "drafting")]
+    assert recording_progress.child_activities == [
+        ("plan", "prompt", child_activity)
     ]

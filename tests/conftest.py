@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +22,7 @@ from betterborg_cli.planning import (
     task_markdown_digest,
 )
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import AgentActivity
 from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -49,10 +50,44 @@ class TaskGenerationFixture:
     task: TaskRecord
 
 
+@dataclass
+class RecordingProgress:
+    """Record provider-neutral parent and child progress updates for tests."""
+
+    updates: list[tuple[str, str | None]] = field(default_factory=list)
+    activities: list[tuple[str, AgentActivity]] = field(default_factory=list)
+    child_updates: list[tuple[str, str, str | None]] = field(default_factory=list)
+    child_activities: list[tuple[str, str, AgentActivity]] = field(
+        default_factory=list
+    )
+
+    def update(self, stage_key: str, detail: str | None) -> None:
+        self.updates.append((stage_key, detail))
+
+    def activity(self, stage_key: str, activity: AgentActivity) -> None:
+        self.activities.append((stage_key, activity))
+
+    def update_child(
+        self, stage_key: str, child_key: str, detail: str | None
+    ) -> None:
+        self.child_updates.append((stage_key, child_key, detail))
+
+    def child_activity(
+        self, stage_key: str, child_key: str, activity: AgentActivity
+    ) -> None:
+        self.child_activities.append((stage_key, child_key, activity))
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """Return Click's isolated command-line test runner."""
     return CliRunner()
+
+
+@pytest.fixture
+def recording_progress() -> RecordingProgress:
+    """Return a progress recorder that understands only shared activity types."""
+    return RecordingProgress()
 
 
 @pytest.fixture

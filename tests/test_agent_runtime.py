@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from betterborg_cli.agent_runtime import (
+    AgentActivity,
+    AgentActivityKind,
     AgentArtifact,
     AgentRunSpec,
     AgentStatus,
@@ -45,6 +47,21 @@ def _spec(tmp_path: Path, **changes) -> AgentRunSpec:
     }
     values.update(changes)
     return AgentRunSpec(**values)
+
+
+def test_agent_run_spec_activity_sink_is_optional_and_provider_neutral(
+    tmp_path: Path,
+) -> None:
+    assert _spec(tmp_path).activity_sink is None
+    received: list[AgentActivity] = []
+    spec = _spec(tmp_path, activity_sink=received.append)
+    activity = AgentActivity(AgentActivityKind.SEARCHING, "AgentRunSpec")
+
+    assert spec.activity_sink is not None
+    spec.activity_sink(activity)
+
+    assert received == [activity]
+    assert activity.kind is AgentActivityKind.SEARCHING
 
 
 def test_mock_completed_run_preserves_metadata_and_writes_result(
