@@ -11,9 +11,12 @@ import tarfile
 import venv
 import zipfile
 from dataclasses import dataclass
+from email.parser import Parser
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 from betterborg_cli import __version__
 
@@ -154,6 +157,27 @@ def test_python_distributions_contain_release_assets(
         assert "PKG-INFO" in members
 
 
+def test_wheel_declares_python_compatible_rich_dependency(
+    built_distributions: BuiltDistributions,
+) -> None:
+    with zipfile.ZipFile(built_distributions.wheel) as archive:
+        metadata_name = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        metadata = Parser().parsestr(
+            archive.read(metadata_name).decode("utf-8"), headersonly=True
+        )
+
+    requirements = [
+        Requirement(value) for value in metadata.get_all("Requires-Dist", [])
+    ]
+    rich = next(
+        requirement for requirement in requirements if requirement.name == "rich"
+    )
+    assert Version("15.0.0") in rich.specifier
+    assert Version("16.0.0") not in rich.specifier
+
+
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
 def test_clean_install_exposes_borg_and_matching_metadata(
     tmp_path: Path,
@@ -174,9 +198,15 @@ def test_clean_install_exposes_borg_and_matching_metadata(
         "-c",
         "from importlib.metadata import version; print(version('betterborg'))",
     )
+    rich_metadata = _run(
+        python,
+        "-c",
+        "from importlib.metadata import version; import rich; print(version('rich'))",
+    )
 
     assert completed.stdout.strip() == f"borg {__version__}"
     assert metadata.stdout.strip() == __version__
+    assert Version(rich_metadata.stdout.strip()).major == 15
 
 
 def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> None:

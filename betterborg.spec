@@ -10,7 +10,9 @@ analysis = Analysis(
     pathex=["src"],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    # The shared reporter is not wired to a workflow until later progress-control
+    # tasks, but it and Rich must already be viable in this first shipping change.
+    hiddenimports=["betterborg_cli.progress"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

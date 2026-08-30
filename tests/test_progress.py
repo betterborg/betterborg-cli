@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import pytest
@@ -29,6 +32,17 @@ class FakeClock:
         self.now += seconds
 
 
+class TTYStringIO(StringIO):
+    """An in-memory stream that exercises Rich's interactive renderer."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _terminal_text(value: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
+
+
 @pytest.mark.parametrize(
     ("method_name", "state", "result", "duration", "rendered_duration"),
     [
@@ -38,7 +52,7 @@ class FakeClock:
             StageState.COMPLETED,
             "cached",
             None,
-            "duration unknown",
+            "—",
         ),
         ("seed_failed", StageState.FAILED, "durable error", 4.0, "4.0s"),
         (
@@ -46,7 +60,7 @@ class FakeClock:
             StageState.FAILED,
             "durable error",
             None,
-            "duration unknown",
+            "—",
         ),
     ],
 )
@@ -67,6 +81,7 @@ def test_retained_parent_seeding_preserves_authoritative_outcome(
 
     record = getattr(progress, method_name)("analysis", result, duration)
     clock.advance(100)
+    progress.refresh()
 
     assert record.state is state
     assert record.result == result
@@ -243,7 +258,10 @@ def test_cancellation_is_nonterminal_until_authoritative_reconciliation(
     assert progress.begin_cancellation() is False
     assert progress.cancelling is True
     assert record.state is StageState.RUNNING
-    assert stream.getvalue().splitlines() == ["stopping..."]
+    assert stream.getvalue().splitlines() == [
+        "running Work (0.0s)",
+        "stopping...",
+    ]
     with pytest.raises(ProgressError, match="after cancellation"):
         progress.declare(StageSpec("late", "Late"))
     with pytest.raises(ProgressError, match="after cancellation"):
@@ -292,7 +310,7 @@ def test_nested_suspension_queues_one_time_lines_in_transition_order() -> None:
         assert stream.getvalue() == ""
     assert stream.getvalue().splitlines() == [
         "completed One — cached (1.0s) [retained]",
-        "failed Two — cached failure (duration unknown) [retained]",
+        "failed Two — cached failure (—) [retained]",
         "stopping...",
     ]
 
@@ -304,5 +322,214 @@ def test_machine_readable_progress_emits_no_output() -> None:
     )
     progress.seed_completed("stage", "cached")
     progress.begin_cancellation()
+    progress.close()
 
     assert stream.getvalue() == ""
+
+
+def test_plain_heartbeats_cover_only_fresh_running_work() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("fresh", "Fresh"), StageSpec("retained", "Retained")],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+
+    progress.start("fresh")
+    progress.seed_completed("retained", "cached", 9)
+    clock.advance(4)
+    progress.refresh()
+    clock.advance(1)
+    progress.refresh()
+    progress.complete("fresh", "built")
+
+    assert stream.getvalue().splitlines() == [
+        "running Fresh (0.0s)",
+        "completed Retained — cached (9.0s) [retained]",
+        "running Fresh (5.0s)",
+        "completed Fresh — built (5.0s)",
+    ]
+
+
+def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("fresh", "Fresh"), StageSpec("retained", "Retained")],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+    progress.start("fresh")
+    stream.seek(0)
+    stream.truncate()
+
+    with progress.suspend():
+        clock.advance(10)
+        progress.refresh()
+        progress.seed_failed("retained", "cached failure")
+        assert stream.getvalue() == ""
+
+    assert stream.getvalue().splitlines() == [
+        "failed Retained — cached failure (—) [retained]"
+    ]
+    clock.advance(4)
+    progress.refresh()
+    assert len(stream.getvalue().splitlines()) == 1
+    clock.advance(1)
+    progress.refresh()
+    assert stream.getvalue().splitlines()[-1] == "running Fresh (15.0s)"
+
+
+def test_permanent_lines_match_in_plain_and_rich_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TERM", raising=False)
+    plain = StringIO()
+    rich = TTYStringIO()
+
+    for stream in (plain, rich):
+        progress = RunProgress(
+            [StageSpec("stage", "Stage")], stream=stream, width=120
+        )
+        progress.seed_completed("stage", "cached", 2.5)
+
+    expected = "completed Stage — cached (2.5s) [retained]"
+    assert plain.getvalue().strip() == expected
+    assert _terminal_text(rich.getvalue()).strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("environment", "interactive"),
+    [({}, True), ({"NO_COLOR": "1"}, True), ({"TERM": "dumb"}, False)],
+)
+def test_nested_suspension_flushes_retained_lines_once_in_every_terminal_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    interactive: bool,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    stream = TTYStringIO()
+    progress = RunProgress(
+        [StageSpec("one", "One"), StageSpec("two", "Two")], stream=stream
+    )
+
+    with progress.suspend():
+        progress.seed_completed("one", "cached", 1)
+        with progress.suspend():
+            progress.seed_failed("two", "failure")
+            assert stream.getvalue() == ""
+        assert stream.getvalue() == ""
+
+    output = _terminal_text(stream.getvalue()) if interactive else stream.getvalue()
+    assert output.count("completed One — cached (1.0s) [retained]") == 1
+    assert output.count("failed Two — failure (—) [retained]") == 1
+
+
+def test_rich_live_output_is_bounded_for_many_running_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TERM", raising=False)
+    stream = TTYStringIO()
+    progress = RunProgress(
+        [StageSpec(f"stage-{number}", f"Stage {number}") for number in range(12)],
+        stream=stream,
+        width=120,
+    )
+
+    with progress.suspend():
+        for number in range(12):
+            progress.start(f"stage-{number}")
+    initial_frame = _terminal_text(stream.getvalue())
+
+    assert all(f"running Stage {number}" in initial_frame for number in range(7))
+    assert "running Stage 7" not in initial_frame
+    assert "… 5 more running" in initial_frame
+
+
+def test_width_truncation_and_run_summary_are_canonical() -> None:
+    stream = StringIO()
+    progress = RunProgress(
+        [StageSpec("cached", "A very long retained stage")],
+        stream=stream,
+        width=24,
+    )
+    progress.seed_completed("cached", "a long durable result", 1)
+    progress.close()
+
+    lines = stream.getvalue().splitlines()
+    assert all(len(line) <= 24 for line in lines)
+    assert all(line.endswith("…") for line in lines)
+
+    summary_stream = StringIO()
+    summary = RunProgress(
+        [StageSpec("done", "Done"), StageSpec("failed", "Failed")],
+        stream=summary_stream,
+    )
+    summary.seed_completed("done", "cached")
+    summary.seed_failed("failed", "cached failure")
+    summary.close()
+    assert summary_stream.getvalue().splitlines()[-1] == (
+        "summary: 1 completed, 1 failed, 0 stopped — 2 retained"
+    )
+
+
+def test_disabled_mode_suppresses_transient_permanent_and_summary_output() -> None:
+    stream = TTYStringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        clock=clock,
+        enabled=False,
+        heartbeat_interval=1,
+    )
+
+    progress.start("stage")
+    clock.advance(2)
+    progress.refresh()
+    progress.complete("stage", "done")
+    progress.close()
+
+    assert stream.getvalue() == ""
+
+
+def test_concurrent_permanent_lines_follow_lock_transition_order() -> None:
+    stream = StringIO()
+    progress = RunProgress(
+        [StageSpec("one", "One"), StageSpec("two", "Two")], stream=stream
+    )
+    progress.start("one")
+    progress.start("two")
+    stream.seek(0)
+    stream.truncate()
+    release_one = threading.Event()
+    release_two = threading.Event()
+    first_done = threading.Event()
+
+    def finish_one() -> None:
+        release_one.wait()
+        progress.complete("one", "first")
+        first_done.set()
+
+    def finish_two() -> None:
+        release_two.wait()
+        progress.fail("two", "second")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(finish_one), executor.submit(finish_two)]
+        release_one.set()
+        assert first_done.wait(timeout=2)
+        release_two.set()
+        for future in futures:
+            future.result(timeout=2)
+
+    assert stream.getvalue().splitlines() == [
+        "completed One — first (0.0s)",
+        "failed Two — second (0.0s)",
+    ]

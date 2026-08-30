@@ -1,13 +1,15 @@
-"""Authoritative lifecycle state for command progress reporting.
+"""Authoritative lifecycle and shared rendering for command progress.
 
-Rendering is deliberately kept behind the small ``_emit_terminal`` boundary in
-this module.  Workflow code owns durable outcomes and must explicitly reconcile
-every started record before closing the reporter.
+Workflow code owns durable outcomes and must explicitly reconcile every started
+record before closing the reporter.  This module owns the corresponding
+human-readable account so interactive and plain invocations use the same
+permanent lines.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import sys
 import threading
 import time
@@ -18,6 +20,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TextIO
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.text import Text
 
 
 class StageState(StrEnum):
@@ -129,6 +135,8 @@ class ProgressError(ValueError):
 
 Clock = Callable[[], float]
 
+_MAX_LIVE_ROWS = 8
+
 
 class RunProgress:
     """Own parent and child progress state for one command invocation."""
@@ -143,16 +151,24 @@ class RunProgress:
         enabled: bool = True,
         machine_readable: bool = False,
         attempt_history_limit: int = 2,
+        heartbeat_interval: float = 30.0,
     ) -> None:
         if width is not None and width <= 0:
             raise ValueError("width must be positive")
         if attempt_history_limit < 1:
             raise ValueError("attempt_history_limit must be at least one")
+        if heartbeat_interval <= 0 or not math.isfinite(heartbeat_interval):
+            raise ValueError("heartbeat_interval must be a finite positive value")
         self._stream = sys.stderr if stream is None else stream
         self._clock = clock
         self._width = width
         self._enabled = enabled and not machine_readable
         self._attempt_history_limit = attempt_history_limit
+        self._heartbeat_interval = float(heartbeat_interval)
+        self._interactive = self._enabled and _is_interactive(self._stream)
+        self._console: Console | None = None
+        self._live: Live | None = None
+        self._next_heartbeat_at: float | None = None
         self._stages: dict[str, StageRecord] = {}
         self._cancelling = False
         self._closed = False
@@ -218,6 +234,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_new_work_allowed()
             self._start_record(record, f"stage {stage_key!r}")
+            self._refresh_transient(force_plain=True)
             return record
 
     def update(self, stage_key: str, detail: str | None) -> StageRecord:
@@ -227,6 +244,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_running(record, f"stage {stage_key!r}")
             record.detail = detail
+            self._refresh_transient()
             return record
 
     def activity(
@@ -238,6 +256,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_running(record, f"stage {stage_key!r}")
             record.activity = _coerce_activity(activity, detail)
+            self._refresh_transient()
             return record
 
     def seed_completed(
@@ -301,6 +320,7 @@ class RunProgress:
             self._require_new_work_allowed()
             self._require_running(parent, f"stage {stage_key!r}")
             self._start_record(child, f"child {child_key!r}")
+            self._refresh_transient(force_plain=True)
             return child
 
     def update_child(
@@ -312,6 +332,7 @@ class RunProgress:
             _parent, child = self._child(stage_key, child_key)
             self._require_running(child, f"child {child_key!r}")
             child.detail = detail
+            self._refresh_transient()
             return child
 
     def child_activity(
@@ -327,6 +348,7 @@ class RunProgress:
             _parent, child = self._child(stage_key, child_key)
             self._require_running(child, f"child {child_key!r}")
             child.activity = _coerce_activity(activity, detail)
+            self._refresh_transient()
             return child
 
     def seed_child_completed(
@@ -407,6 +429,13 @@ class RunProgress:
                 earlier_attempt_count=len(attempts) - len(visible_attempts),
             )
 
+    def refresh(self) -> None:
+        """Refresh live elapsed time or emit a due plain-mode heartbeat."""
+
+        with self._lock:
+            self._require_open()
+            self._refresh_transient()
+
     def begin_cancellation(self) -> bool:
         """Acknowledge cancellation once without changing any record state."""
 
@@ -416,6 +445,7 @@ class RunProgress:
                 return False
             self._cancelling = True
             self._emit("stopping...")
+            self._refresh_transient()
             return True
 
     @contextmanager
@@ -424,6 +454,8 @@ class RunProgress:
 
         with self._lock:
             self._require_open()
+            if self._suspension_depth == 0:
+                self._stop_live()
             self._suspension_depth += 1
         try:
             yield self
@@ -433,7 +465,9 @@ class RunProgress:
                 if self._suspension_depth == 0:
                     queued, self._queued_lines = self._queued_lines, []
                     for line in queued:
-                        self._write(line)
+                        self._write_permanent(line)
+                    self._reset_heartbeat()
+                    self._refresh_transient()
 
     def close(self) -> None:
         """Close only after every started parent and child is terminal."""
@@ -459,6 +493,8 @@ class RunProgress:
                 )
             if self._suspension_depth:
                 raise ProgressError("cannot close progress while output is suspended")
+            self._stop_live()
+            self._emit(_format_summary_line(self._stages.values()))
             self._closed = True
 
     def _seed_stage(
@@ -489,6 +525,7 @@ class RunProgress:
             self._require_terminal_children(record)
             self._finish_record(record, state, result)
             self._emit_terminal(record)
+            self._refresh_transient()
             return record
 
     def _finish_child(
@@ -505,6 +542,7 @@ class RunProgress:
             self._require_running(child, f"child {child_key!r}")
             self._finish_record(child, state, result)
             self._emit_terminal(child, parent_label=parent.label)
+            self._refresh_transient()
             return child
 
     def _stage(self, stage_key: str) -> StageRecord:
@@ -616,13 +654,123 @@ class RunProgress:
         if self._suspension_depth:
             self._queued_lines.append(line)
             return
-        self._write(line)
+        if self._interactive:
+            self._refresh_transient()
+        self._write_permanent(line)
 
-    def _write(self, line: str) -> None:
-        if self._width is not None and len(line) > self._width:
-            line = line[: max(self._width - 1, 0)] + "…"
-        self._stream.write(line + "\n")
+    def _refresh_transient(self, *, force_plain: bool = False) -> None:
+        if not self._enabled or self._suspension_depth:
+            return
+        lines = self._active_lines()
+        if self._interactive:
+            if not lines:
+                self._stop_live()
+                return
+            renderable = Group(
+                *(Text(self._truncate(line), no_wrap=True) for line in lines)
+            )
+            if self._live is None:
+                self._live = Live(
+                    renderable,
+                    console=self._output_console(),
+                    auto_refresh=False,
+                    transient=True,
+                )
+                self._live.start(refresh=True)
+            else:
+                self._live.update(renderable, refresh=True)
+            return
+
+        if not lines:
+            self._next_heartbeat_at = None
+            return
+        now = self._clock()
+        if force_plain or self._next_heartbeat_at is None:
+            for line in lines:
+                self._write_plain(line)
+            self._next_heartbeat_at = now + self._heartbeat_interval
+        elif now >= self._next_heartbeat_at:
+            for line in lines:
+                self._write_plain(line)
+            self._next_heartbeat_at = now + self._heartbeat_interval
+
+    def _active_lines(self) -> list[str]:
+        lines: list[str] = []
+        for stage in self._stages.values():
+            if stage.state is StageState.RUNNING:
+                lines.append(self._format_running_line(stage))
+            lines.extend(
+                self._format_running_line(child, parent_label=stage.label)
+                for child in stage._children.values()
+                if child.state is StageState.RUNNING
+            )
+        if len(lines) <= _MAX_LIVE_ROWS:
+            return lines
+        hidden = len(lines) - (_MAX_LIVE_ROWS - 1)
+        return [*lines[: _MAX_LIVE_ROWS - 1], f"… {hidden} more running"]
+
+    def _format_running_line(
+        self,
+        record: StageRecord | ChildRecord,
+        *,
+        parent_label: str | None = None,
+    ) -> str:
+        label = record.label
+        if parent_label is not None:
+            label = f"{parent_label}: {label}"
+        elapsed = self._elapsed(record)
+        line = f"running {label} ({0.0 if elapsed is None else elapsed:.1f}s)"
+        if record.activity is not None:
+            activity = record.activity.kind
+            if record.activity.detail:
+                activity += f": {record.activity.detail}"
+            line += f" — {activity}"
+        elif record.detail:
+            line += f" — {record.detail}"
+        if self._cancelling:
+            line += " [stopping]"
+        return line
+
+    def _reset_heartbeat(self) -> None:
+        self._next_heartbeat_at = (
+            self._clock() + self._heartbeat_interval
+            if self._active_lines()
+            else None
+        )
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def _output_console(self) -> Console:
+        if self._console is None:
+            options: dict[str, object] = {
+                "file": self._stream,
+                "force_terminal": True,
+                "highlight": False,
+                "no_color": "NO_COLOR" in os.environ,
+            }
+            if self._width is not None:
+                options["width"] = self._width
+            self._console = Console(**options)
+        return self._console
+
+    def _write_permanent(self, line: str) -> None:
+        line = self._truncate(line)
+        if self._interactive:
+            self._output_console().print(Text(line, no_wrap=True))
+        else:
+            self._write_plain(line)
+
+    def _write_plain(self, line: str) -> None:
+        self._stream.write(self._truncate(line) + "\n")
         self._stream.flush()
+
+    def _truncate(self, line: str) -> str:
+        if self._width is None or len(line) <= self._width:
+            return line
+        return line[: max(self._width - 1, 0)] + "…"
 
 
 def _format_terminal_line(
@@ -632,13 +780,33 @@ def _format_terminal_line(
     if parent_label is not None:
         label = f"{parent_label}: {label}"
     duration = (
-        "duration unknown"
+        "—"
         if record.duration_seconds is None
         else f"{record.duration_seconds:.1f}s"
     )
     result = "" if record.result is None else f" — {record.result}"
     retained = " [retained]" if record.retained else ""
     return f"{record.state.value} {label}{result} ({duration}){retained}"
+
+
+def _format_summary_line(records: Iterable[StageRecord]) -> str:
+    records = tuple(records)
+    counts = Counter(record.state for record in records)
+    retained = sum(record.retained for record in records)
+    return (
+        f"summary: {counts[StageState.COMPLETED]} completed, "
+        f"{counts[StageState.FAILED]} failed, "
+        f"{counts[StageState.STOPPED]} stopped — {retained} retained"
+    )
+
+
+def _is_interactive(stream: TextIO) -> bool:
+    if os.environ.get("TERM", "").casefold() == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
 
 
 def _coerce_activity(
