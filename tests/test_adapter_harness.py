@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,6 +27,137 @@ Response = Mapping[str, Any]
 QueuedResponse = Response | Exception | Callable[[CancellationToken | None], Response]
 Provider = Literal["anthropic", "openai"]
 RunProvider = Literal["anthropic", "openai", "claude", "codex"]
+
+
+@dataclass(frozen=True, slots=True)
+class HttpRequestRecord:
+    method: str
+    path: str
+    headers: Mapping[str, str]
+    body: bytes
+
+
+HttpResponder = Callable[
+    [HttpRequestRecord],
+    tuple[int, Mapping[str, str], bytes],
+]
+
+
+@dataclass
+class LocalHttpServer:
+    """Threaded local HTTP endpoint for spawned urllib contract tests."""
+
+    responder: HttpResponder
+    requests: list[HttpRequestRecord] = field(default_factory=list)
+    body_started: threading.Event | None = None
+    body_release: threading.Event | None = None
+    _server: ThreadingHTTPServer = field(init=False, repr=False)
+    _thread: threading.Thread = field(init=False, repr=False)
+
+    def __enter__(self) -> LocalHttpServer:
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                self._respond()
+
+            def do_POST(self) -> None:
+                self._respond()
+
+            def _respond(self) -> None:
+                length = int(self.headers.get("content-length", "0"))
+                record = HttpRequestRecord(
+                    self.command,
+                    self.path,
+                    dict(self.headers.items()),
+                    self.rfile.read(length),
+                )
+                fixture.requests.append(record)
+                status, headers, body = fixture.responder(record)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    if fixture.body_started is not None and body:
+                        self.wfile.write(body[:1])
+                        self.wfile.flush()
+                        fixture.body_started.set()
+                        if fixture.body_release is not None:
+                            fixture.body_release.wait()
+                        body = body[1:]
+                    self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return None
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="betterborg-test-http",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join()
+
+    def url(self, path: str = "/") -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}{path}"
+
+
+@dataclass
+class BlockingTcpServer:
+    """Accept one connection and hold it for TLS-handshake cancellation."""
+
+    connected: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    _socket: socket.socket = field(init=False, repr=False)
+    _thread: threading.Thread = field(init=False, repr=False)
+
+    def __enter__(self) -> BlockingTcpServer:
+        self._socket = socket.socket()
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen()
+        self._socket.settimeout(0.1)
+
+        def accept() -> None:
+            while not self.release.is_set():
+                try:
+                    connection, _address = self._socket.accept()
+                except TimeoutError:
+                    continue
+                break
+            else:
+                return
+            with connection:
+                self.connected.set()
+                self.release.wait()
+
+        self._thread = threading.Thread(
+            target=accept,
+            name="betterborg-test-tcp",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release.set()
+        self._socket.close()
+        self._thread.join()
+
+    @property
+    def url(self) -> str:
+        host, port = self._socket.getsockname()
+        return f"https://{host}:{port}/"
 
 
 @dataclass

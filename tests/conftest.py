@@ -177,6 +177,95 @@ child.wait()
             fail_registration=fail_registration,
         )
 
+    def launch_url_registration_wrapper(
+        self,
+        url: str,
+        *,
+        name: str,
+        fail_registration: bool = False,
+    ) -> subprocess.Popen[str]:
+        """Run a URL request behind a post-start registration gate."""
+        source = r'''
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+from betterborg_cli.agent_runtime import (
+    CancellationRegistrationWindow,
+    CancellationToken,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+)
+from betterborg_cli.run_control import RunControl
+
+
+def main() -> None:
+    root = Path(sys.argv[1])
+    name = sys.argv[2]
+    fail_registration = sys.argv[3] == "fail"
+    url = sys.argv[4]
+    cancel = CancellationToken()
+    original_register = CancellationRegistrationWindow.register
+
+    def gated_register(self, *args, **kwargs):
+        target = kwargs["force_target"]
+        (root / f"{name}.request.pid").write_text(str(target.identity))
+        (root / f"{name}.registration-gate").write_text("blocked")
+        while not (root / f"release-{name}").exists():
+            time.sleep(0.01)
+        if fail_registration:
+            raise RuntimeError("injected registration failure")
+        return original_register(self, *args, **kwargs)
+
+    CancellationRegistrationWindow.register = gated_register
+
+    class Progress:
+        def begin_cancellation(self):
+            (root / f"{name}.cancelled").write_text("cancelled")
+            return True
+
+    try:
+        request = MultiprocessUrlRequest(
+            UrlRequestSpec(
+                url,
+                "GET",
+                {"authorization": "Bearer request-private-value"},
+                None,
+            ),
+            cancel,
+        )
+        if fail_registration:
+            request.run()
+        else:
+            control = RunControl(cancel, progress=Progress())
+            with control:
+                with control.protected():
+                    request.run()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except RuntimeError as error:
+        (root / f"{name}.error").write_text(str(error))
+        (root / f"{name}.active-windows").write_text(
+            str(len(cancel.active_windows))
+        )
+        raise SystemExit(73) from None
+
+
+if __name__ == "__main__":
+    main()
+'''
+        mode = "fail" if fail_registration else "signal"
+        return self.launch_python(
+            source,
+            str(self.root),
+            name,
+            mode,
+            url,
+            name=f"{name}-wrapper",
+        )
+
     def _launch_registration_wrapper(
         self,
         command: tuple[str, ...],
@@ -325,6 +414,19 @@ except RuntimeError as error:
             time.sleep(0.01)
         surviving = [pid for pid in pids if self._pid_exists(pid)]
         raise AssertionError(f"process tree {name!r} survived: {surviving}")
+
+    def assert_pid_absent(
+        self, pid: int, *, timeout: float | None = None
+    ) -> None:
+        """Assert one marked process identity is absent before a deadline."""
+        deadline = time.monotonic() + (
+            self.deadline_seconds if timeout is None else timeout
+        )
+        while time.monotonic() < deadline:
+            if not self._pid_exists(pid):
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"process {pid} survived")
 
     def cleanup(self) -> None:
         """Kill all tracked wrappers and every marked resistant process group."""

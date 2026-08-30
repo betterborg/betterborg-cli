@@ -8,6 +8,12 @@ from betterborg_cli.agent_runtime.anthropic import (
     AnthropicTransport,
     UrllibAnthropicTransport,
 )
+from betterborg_cli.agent_runtime.api_http import (
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    UrlResponse,
+    UrlTransportError,
+)
 from betterborg_cli.agent_runtime.api_tools import (
     READ_ONLY_API_TOOLS,
     ApiAgentRole,
@@ -112,6 +118,7 @@ __all__ = [
     "ForceTarget",
     "MockAdapter",
     "MockResponse",
+    "MultiprocessUrlRequest",
     "OpenAIAdapter",
     "OpenAIApiError",
     "OpenAITransport",
@@ -125,6 +132,9 @@ __all__ = [
     "ToolGrantError",
     "UrllibAnthropicTransport",
     "UrllibOpenAITransport",
+    "UrlRequestSpec",
+    "UrlResponse",
+    "UrlTransportError",
     "api_tool_definition",
     "combine_agent_usage",
     "extract_json",

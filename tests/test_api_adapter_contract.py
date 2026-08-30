@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
+from conftest import RealProcessHarness
 from test_adapter_harness import (
     API_ADAPTER_HARNESSES,
     ApiAdapterHarness,
+    BlockingTcpServer,
     FakeApiTransport,
+    LocalHttpServer,
 )
 
 from betterborg_cli.agent_runtime import (
@@ -21,12 +26,216 @@ from betterborg_cli.agent_runtime import (
     ApiAgentRole,
     BillingMode,
     CancellationToken,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    UrlTransportError,
 )
 
 
 @pytest.fixture(params=API_ADAPTER_HARNESSES, ids=lambda harness: harness.provider)
 def harness(request: pytest.FixtureRequest) -> ApiAdapterHarness:
     return request.param
+
+
+def test_multiprocess_url_request_preserves_http_behavior() -> None:
+    def respond(request):
+        if request.path == "/redirect":
+            return 302, {"location": "/final"}, b""
+        if request.path == "/error":
+            return 429, {"content-type": "application/json"}, b'{"retry":true}'
+        if request.path == "/final":
+            return 200, {}, b"redirected"
+        assert request.method == "POST"
+        headers = {name.casefold(): value for name, value in request.headers.items()}
+        assert headers["x-contract"] == "preserved"
+        assert request.body == b"request-body"
+        return 201, {"content-type": "application/octet-stream"}, b"response-body"
+
+    with LocalHttpServer(respond) as server:
+        response = MultiprocessUrlRequest(
+            UrlRequestSpec(
+                server.url("/request"),
+                "POST",
+                {"x-contract": "preserved"},
+                b"request-body",
+            ),
+            CancellationToken(),
+        ).run()
+        redirected = MultiprocessUrlRequest(
+            UrlRequestSpec(server.url("/redirect"), "GET", {}, None),
+            CancellationToken(),
+        ).run()
+        error = MultiprocessUrlRequest(
+            UrlRequestSpec(server.url("/error"), "GET", {}, None),
+            CancellationToken(),
+        ).run()
+
+    assert response.status_code == 201
+    assert response.reason == "Created"
+    assert response.body == b"response-body"
+    assert redirected.status_code == 200
+    assert redirected.body == b"redirected"
+    assert error.status_code == 429
+    assert error.body == b'{"retry":true}'
+
+
+def test_multiprocess_url_request_uses_default_proxy_opener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def respond(request):
+        assert request.path == "http://api.invalid/provider"
+        return 200, {}, b"proxied"
+
+    with LocalHttpServer(respond) as proxy:
+        monkeypatch.setenv("http_proxy", proxy.url())
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        response = MultiprocessUrlRequest(
+            UrlRequestSpec("http://api.invalid/provider", "GET", {}, None),
+            CancellationToken(),
+        ).run()
+
+    assert response.body == b"proxied"
+    assert len(proxy.requests) == 1
+
+
+@pytest.mark.parametrize("phase", ["headers", "body", "proxy", "tls"])
+def test_multiprocess_url_request_cancels_blocked_network_phase(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    cancel = CancellationToken()
+
+    def respond(_request):
+        started.set()
+        if phase != "body":
+            release.wait()
+        return 200, {}, b"too late"
+
+    if phase == "tls":
+        server_context = BlockingTcpServer()
+    elif phase == "body":
+        server_context = LocalHttpServer(
+            respond,
+            body_started=threading.Event(),
+            body_release=release,
+        )
+    else:
+        server_context = LocalHttpServer(respond)
+    with server_context as server:
+        if phase == "tls":
+            url = server.url
+            marker = server.connected
+        elif phase == "proxy":
+            monkeypatch.setenv("http_proxy", server.url())
+            monkeypatch.delenv("no_proxy", raising=False)
+            monkeypatch.delenv("NO_PROXY", raising=False)
+            url = "http://api.invalid/blocked"
+            marker = started
+        elif phase == "body":
+            url = server.url("/blocked")
+            assert server.body_started is not None
+            marker = server.body_started
+        else:
+            url = server.url("/blocked")
+            marker = started
+
+        def cancel_when_blocked() -> None:
+            assert marker.wait(2)
+            cancel.cancel()
+
+        canceller = threading.Thread(target=cancel_when_blocked)
+        canceller.start()
+        before = time.monotonic()
+        try:
+            with pytest.raises(UrlTransportError, match="cancelled") as captured:
+                MultiprocessUrlRequest(
+                    UrlRequestSpec(url, "GET", {}, None), cancel
+                ).run()
+        finally:
+            release.set()
+            if phase == "tls":
+                server.release.set()
+            canceller.join()
+
+    assert time.monotonic() - before < 1.5
+    assert captured.value.kind == "cancelled"
+    assert cancel.active_windows == ()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals required")
+def test_url_request_sigint_during_registration_joins_exact_child(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    release_response = threading.Event()
+
+    def respond(_request):
+        release_response.wait()
+        return 200, {}, b"too late"
+
+    with LocalHttpServer(respond) as server:
+        process = real_process_harness.launch_url_registration_wrapper(
+            server.url("/blocked"),
+            name="url-late-signal",
+        )
+        real_process_harness.wait_for_marker("url-late-signal.registration-gate")
+        child_pid = int(
+            real_process_harness.wait_for_marker("url-late-signal.request.pid")
+        )
+        command_line_path = Path("/proc") / str(child_pid) / "cmdline"
+        if command_line_path.exists():
+            assert b"request-private-value" not in command_line_path.read_bytes()
+
+        real_process_harness.signal(process, signal.SIGINT)
+        real_process_harness.wait_for_marker("url-late-signal.cancelled")
+        real_process_harness.release("release-url-late-signal")
+
+        assert real_process_harness.wait_for_exit(process) == 130
+        real_process_harness.assert_pid_absent(child_pid, timeout=1)
+        release_response.set()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process cleanup required")
+def test_url_request_registration_failure_joins_exact_child(
+    real_process_harness: RealProcessHarness,
+) -> None:
+    release_response = threading.Event()
+
+    def respond(_request):
+        release_response.wait()
+        return 200, {}, b"too late"
+
+    with LocalHttpServer(respond) as server:
+        process = real_process_harness.launch_url_registration_wrapper(
+            server.url("/blocked"),
+            name="url-registration-error",
+            fail_registration=True,
+        )
+        real_process_harness.wait_for_marker(
+            "url-registration-error.registration-gate"
+        )
+        child_pid = int(
+            real_process_harness.wait_for_marker(
+                "url-registration-error.request.pid"
+            )
+        )
+        real_process_harness.release("release-url-registration-error")
+
+        assert real_process_harness.wait_for_exit(process) == 73
+        assert (
+            real_process_harness.wait_for_marker("url-registration-error.error")
+            == "injected registration failure"
+        )
+        assert (
+            real_process_harness.wait_for_marker(
+                "url-registration-error.active-windows"
+            )
+            == "0"
+        )
+        real_process_harness.assert_pid_absent(child_pid, timeout=1)
+        release_response.set()
 
 
 def test_structured_result_persists_usage_and_metadata(
