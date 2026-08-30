@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from betterborg_cli.agent_runtime.api_tools import ApiToolError, api_patch_paths
 from betterborg_cli.agent_runtime.base import (
     AgentResult,
     AgentRunSpec,
@@ -27,6 +29,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,24 @@ class ApiRunContext:
         with self.spec.log_path.open("a", encoding="utf-8") as log:
             log.write(json.dumps(self.redactor.value(event), sort_keys=True) + "\n")
 
+    def emit_activity(self, activity: AgentActivity | None) -> None:
+        """Emit one credential-safe observational activity when configured."""
+        sink = self.spec.activity_sink
+        if sink is None or activity is None:
+            return
+        detail = activity.detail
+        if detail is not None:
+            detail = self.redactor.text(detail)
+        try:
+            sink(AgentActivity(activity.kind, detail))
+        except Exception:
+            # Rendering and reporting callbacks are observational only.
+            return
+
+    def emit_tool_activity(self, name: str, arguments: Mapping[str, Any]) -> None:
+        """Translate and emit one provider-neutral contained-tool activity."""
+        self.emit_activity(_tool_activity(name, arguments))
+
     def record_response(self, response: Mapping[str, Any], usage: AgentUsage) -> None:
         """Record provider-parsed response accounting and model metadata."""
         self.usage.append(usage)
@@ -191,6 +212,8 @@ class ApiRunContext:
             state = attempt
             if cancel is not None and cancel.is_set():
                 return -1
+
+            self.emit_activity(AgentActivity(AgentActivityKind.THINKING))
 
             request: AbortableApiRequest | None = None
             registration: CancellationRegistration | None = None
@@ -262,3 +285,43 @@ class ApiRunContext:
             error = state.error if state is not None else None
             return self.result(AgentStatus.FAILED, error=str(error))
         return state.response
+
+
+def _tool_activity(
+    name: str,
+    arguments: Mapping[str, Any],
+) -> AgentActivity | None:
+    if name == "read_file":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return AgentActivity(AgentActivityKind.READING, path)
+        return None
+    if name == "search_text":
+        query = arguments.get("query")
+        if isinstance(query, str) and query:
+            return AgentActivity(AgentActivityKind.SEARCHING, query)
+        return None
+    if name == "list_files":
+        path = arguments.get("path", ".")
+        if isinstance(path, str):
+            return AgentActivity(AgentActivityKind.SEARCHING, path or ".")
+        return None
+    if name == "run_command":
+        argv = arguments.get("argv")
+        if (
+            isinstance(argv, list)
+            and argv
+            and all(isinstance(item, str) for item in argv)
+        ):
+            return AgentActivity(AgentActivityKind.COMMAND, shlex.join(argv))
+        return None
+    if name == "apply_patch":
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            return None
+        try:
+            paths = api_patch_paths(patch)
+        except (ApiToolError, TypeError, ValueError):
+            return None
+        return AgentActivity(AgentActivityKind.WRITING, ", ".join(paths))
+    return None

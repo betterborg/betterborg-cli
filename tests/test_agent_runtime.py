@@ -99,6 +99,24 @@ def test_mock_completed_run_preserves_metadata_and_writes_result(
     assert adapter.calls[0].model == "test-model"
 
 
+def test_mock_response_emits_scripted_provider_neutral_activity(
+    tmp_path: Path,
+) -> None:
+    activities = (
+        AgentActivity(AgentActivityKind.THINKING),
+        AgentActivity(AgentActivityKind.READING, "pyproject.toml"),
+    )
+    received: list[AgentActivity] = []
+    adapter = MockAdapter().queue(
+        MockResponse(payload={"status": "completed"}, activities=activities)
+    )
+
+    result = adapter.run(_spec(tmp_path, activity_sink=received.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert received == list(activities)
+
+
 def test_mock_failed_run_preserves_failure_details(tmp_path: Path) -> None:
     adapter = MockAdapter().queue(MockResponse(exit_code=17, error="provider failed"))
 

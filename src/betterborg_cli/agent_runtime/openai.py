@@ -341,6 +341,7 @@ class OpenAIAdapter:
             for call in calls:
                 if cancel is not None and cancel.is_set():
                     return runtime.cancelled()
+                _emit_tool_activity(call, allowed, runtime)
                 try:
                     function_output = _execute_tool_call(
                         call,
@@ -361,6 +362,27 @@ class OpenAIAdapter:
             AgentStatus.FAILED,
             error=f"OpenAI exceeded the {self.max_turns}-turn limit",
         )
+
+
+def _emit_tool_activity(
+    call: Mapping[str, Any],
+    allowed: frozenset[str],
+    runtime: ApiRunContext,
+) -> None:
+    call_id = call.get("call_id")
+    name = call.get("name")
+    if (
+        not isinstance(call_id, str)
+        or not call_id
+        or not isinstance(name, str)
+        or name not in allowed
+    ):
+        return
+    try:
+        arguments = _tool_arguments(call)
+    except OpenAIApiError:
+        return
+    runtime.emit_tool_activity(name, arguments)
 
 
 def _create_response(

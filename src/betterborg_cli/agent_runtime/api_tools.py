@@ -163,6 +163,11 @@ def api_tool_definition(name: str) -> ApiToolDefinition:
         raise ValueError(f"unknown API tool: {name}") from error
 
 
+def api_patch_paths(patch: str) -> tuple[str, ...]:
+    """Return the affected relative paths from a valid contained API patch."""
+    return tuple(action.relative_path for action in _parse_patch(patch))
+
+
 def select_api_tool_names(
     tools: ContainedApiTools, requested: Sequence[str]
 ) -> frozenset[str]:

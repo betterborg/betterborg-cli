@@ -335,6 +335,7 @@ class AnthropicAdapter:
             for block in tool_uses:
                 if cancel is not None and cancel.is_set():
                     return runtime.cancelled()
+                _emit_tool_activity(block, allowed, runtime)
                 try:
                     tool_result = _execute_tool_use(
                         block,
@@ -354,6 +355,24 @@ class AnthropicAdapter:
             AgentStatus.FAILED,
             error=f"Anthropic exceeded the {self.max_turns}-turn limit",
         )
+
+
+def _emit_tool_activity(
+    block: Mapping[str, Any],
+    allowed: frozenset[str],
+    runtime: ApiRunContext,
+) -> None:
+    tool_id = block.get("id")
+    name = block.get("name")
+    arguments = block.get("input")
+    if (
+        isinstance(tool_id, str)
+        and tool_id
+        and isinstance(name, str)
+        and name in allowed
+        and isinstance(arguments, Mapping)
+    ):
+        runtime.emit_tool_activity(name, arguments)
 
 
 def _tool_definition(name: str) -> dict[str, Any]:

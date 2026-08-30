@@ -24,6 +24,8 @@ from test_adapter_harness import (
 
 import betterborg_cli.agent_runtime.api_http as api_http
 from betterborg_cli.agent_runtime import (
+    AgentActivity,
+    AgentActivityKind,
     AgentStatus,
     AgentUsage,
     ApiAgentRole,
@@ -35,6 +37,44 @@ from betterborg_cli.agent_runtime import (
     UrlRequestSpec,
     UrlResponse,
     UrlTransportError,
+)
+
+_API_TOOL_ACTIVITY_CASES = (
+    (
+        "read_file",
+        {"path": "version.txt"},
+        AgentActivity(AgentActivityKind.READING, "version.txt"),
+    ),
+    (
+        "search_text",
+        {"query": "activity needle"},
+        AgentActivity(AgentActivityKind.SEARCHING, "activity needle"),
+    ),
+    (
+        "list_files",
+        {},
+        AgentActivity(AgentActivityKind.SEARCHING, "."),
+    ),
+    (
+        "run_command",
+        {"argv": [sys.executable, "-c", "raise SystemExit(0)"]},
+        AgentActivity(
+            AgentActivityKind.COMMAND,
+            f"{sys.executable} -c 'raise SystemExit(0)'",
+        ),
+    ),
+    (
+        "apply_patch",
+        {
+            "patch": (
+                "*** Begin Patch\n"
+                "*** Add File: activity.txt\n"
+                "+translated\n"
+                "*** End Patch"
+            )
+        },
+        AgentActivity(AgentActivityKind.WRITING, "activity.txt"),
+    ),
 )
 
 
@@ -470,6 +510,167 @@ def test_structured_result_persists_usage_and_metadata(
         num_turns=1,
     )
     assert json.loads(result.result_path.read_text(encoding="utf-8")) == result.payload
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected"),
+    _API_TOOL_ACTIVITY_CASES,
+    ids=("read", "search", "list", "command", "patch"),
+)
+def test_contained_tools_emit_equal_provider_neutral_activity(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    tool_name: str,
+    arguments: dict[str, object],
+    expected: AgentActivity,
+) -> None:
+    (tmp_path / "version.txt").write_text(
+        "activity needle\n", encoding="utf-8"
+    )
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [harness.tool_call(tool_name, arguments, call_id="activity")],
+                response_id="activity_response",
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "activity"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.CODING,
+        transport=transport,
+        workspace_trusted=True,
+    ).run(harness.spec(tmp_path, activity_sink=activities.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        expected,
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
+def test_submit_result_emits_no_tool_activity(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "silent"},
+                        call_id="submit",
+                    )
+                ]
+            )
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        transport=transport,
+    ).run(harness.spec(tmp_path, activity_sink=activities.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert activities == [AgentActivity(AgentActivityKind.THINKING)]
+
+
+@pytest.mark.parametrize("call_kind", ["malformed", "disallowed"])
+def test_rejected_calls_emit_no_provider_payload_activity(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+    call_kind: str,
+) -> None:
+    provider_payload = "provider-payload-must-stay-hidden"
+    if call_kind == "disallowed":
+        call = harness.tool_call(provider_payload, {}, call_id="rejected")
+    else:
+        call = harness.tool_call("read_file", {}, call_id="rejected")
+        if harness.provider == "anthropic":
+            call["input"] = provider_payload
+        else:
+            call["arguments"] = provider_payload
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response([call], response_id="rejected_response"),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "safe"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        transport=transport,
+    ).run(harness.spec(tmp_path, activity_sink=activities.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert activities == [AgentActivity(AgentActivityKind.THINKING)] * 2
+    assert provider_payload not in repr(activities)
+
+
+def test_api_tool_activity_detail_is_credential_redacted(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    credential = harness.credential
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "read_file",
+                        {"path": credential},
+                        call_id="credential-path",
+                    )
+                ],
+                response_id="credential_response",
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "redacted"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        api_key=credential,
+        transport=transport,
+    ).run(harness.spec(tmp_path, activity_sink=activities.append))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        AgentActivity(AgentActivityKind.READING, "[REDACTED]"),
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
 
 
 def test_standard_transport_rejects_malformed_response_body(
