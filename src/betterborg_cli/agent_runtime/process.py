@@ -16,6 +16,7 @@ from typing import Protocol
 from betterborg_cli.agent_runtime.base import (
     CancellationDeliveryError,
     CancellationRegistration,
+    CancellationRegistrationRejected,
     CancellationToken,
     ForceTarget,
 )
@@ -73,7 +74,12 @@ def run_streamed(
     cancelled = False
 
     with log_path.open("w", encoding="utf-8", newline="") as log_file:
-        window = cancel.registration_window() if cancel is not None else None
+        try:
+            window = (
+                cancel.registration_window() if cancel is not None else None
+            )
+        except CancellationRegistrationRejected:
+            return -1
         try:
             try:
                 process = subprocess.Popen(

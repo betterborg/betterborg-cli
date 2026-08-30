@@ -125,6 +125,10 @@ class CancellationDeliveryError(RuntimeError):
         self.errors = errors
 
 
+class CancellationRegistrationRejected(RuntimeError):
+    """A creation window rejected because forced cancellation already began."""
+
+
 class CancellationRegistrationWindow:
     """Pre-creation entry retained until resource creation is resolved."""
 
@@ -264,7 +268,9 @@ class CancellationToken:
                     self._state is CancellationState.FORCED
                     or self._force_requested_signal
                 ):
-                    raise RuntimeError("cannot open a registration window after force")
+                    raise CancellationRegistrationRejected(
+                        "cannot open a registration window after force"
+                    )
                 window_id = self._next_window_id
                 self._next_window_id += 1
                 window = CancellationRegistrationWindow(self, window_id)

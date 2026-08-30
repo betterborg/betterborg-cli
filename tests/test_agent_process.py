@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 from conftest import RealProcessHarness
 
-from betterborg_cli.agent_runtime import CancellationToken, run_streamed
+from betterborg_cli.agent_runtime import (
+    CancellationRegistrationWindow,
+    CancellationToken,
+    run_streamed,
+)
 from betterborg_cli.agent_runtime.process import terminate_process
 
 
@@ -276,6 +280,35 @@ def test_run_streamed_already_cancelled_creates_empty_log(tmp_path: Path) -> Non
 
     assert exit_code == -1
     assert log_path.read_text(encoding="utf-8") == ""
+
+
+def test_run_streamed_force_before_registration_returns_cancelled(
+    tmp_path: Path,
+) -> None:
+    class ForceBeforeRegistrationToken(CancellationToken):
+        def registration_window(self) -> CancellationRegistrationWindow:
+            self.force()
+            return super().registration_window()
+
+    cancel = ForceBeforeRegistrationToken()
+    marker = tmp_path / "spawned"
+    log_path = tmp_path / "forced-before-registration.log"
+
+    exit_code = run_streamed(
+        [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ],
+        tmp_path,
+        "",
+        log_path,
+        cancel,
+    )
+
+    assert exit_code == -1
+    assert log_path.read_text(encoding="utf-8") == ""
+    assert not marker.exists()
 
 
 def test_run_streamed_rejects_shell_command_string(tmp_path: Path) -> None:
