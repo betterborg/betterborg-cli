@@ -14,10 +14,15 @@ Only a BetterBorg release maintainer who is authorized as both a PyPI project
 owner and a required reviewer of the GitHub `pypi` environment may approve a
 release. Configure that environment with required reviewers, prevent
 self-review and administrator bypass, and limit deployment branches to
-`main`. Store one environment secret named `OPENAI_API_KEY`; do not add
-`ANTHROPIC_API_KEY` or a PyPI password/token. The provider credential is used
-only by the post-publication fixture smoke. PyPI authentication uses OIDC and
-has no long-lived registry secret.
+`main`. It holds no secrets: PyPI authentication uses OIDC and has no
+long-lived registry secret.
+
+Configure a third environment named `smoke`, restricted to `main` with
+administrator bypass prevented and no required reviewers. It holds one secret
+named `OPENAI_API_KEY`; do not add `ANTHROPIC_API_KEY` or a PyPI
+password/token. That credential is used only by the post-publication fixture
+smoke, which runs after every registry is already immutable, so it gates
+nothing that could be rolled back and does not need an approval.
 
 For the first release, a PyPI owner must create the `betterborg` project with a
 pending trusted publisher (or add the publisher to the existing project) with
@@ -96,8 +101,8 @@ different commit under the reviewed tag's version.
    compares the preserved npm tarball's SHA-512 integrity with
    `@betterborg/cli@VERSION`. It publishes only a missing version with npm OIDC,
    skips an exact match, and rejects a mismatch as immutable.
-7. Only after all three public sources match, approve the protected `pypi`
-   environment for the final smoke. One provider credential runs fresh,
+7. After all three public sources match, the final smoke runs unattended in
+   the `smoke` environment. One provider credential runs fresh,
    isolated trusted initialization fixtures through the versioned GitHub curl
    installer, `uvx --from betterborg==VERSION`, and
    `npx @betterborg/cli@VERSION`. Each fixture scans stdout, stderr, paths,
