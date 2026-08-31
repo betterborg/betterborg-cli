@@ -1001,6 +1001,12 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
     for progress in progress_instances:
         progress.start("execute")
         progress.start_child("execute", child_key)
+    service_stream = StringIO()
+    service_progress = RunProgress(
+        stream=service_stream,
+        clock=ProgressClock(),
+        heartbeat_interval=1,
+    )
     received: list[AgentActivity] = []
 
     def report(task_id: UUID, activity: AgentActivity) -> None:
@@ -1048,6 +1054,7 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
             activity=report,
+            progress=service_progress,
         ).run(
             borg.id,
             generation.id,
@@ -1066,6 +1073,7 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             ),
             plain_stream.getvalue(),
             live_stream.getvalue(),
+            repr(service_progress.records[child_key]),
             repr(events),
         )
         for surface in surfaces:
@@ -1073,6 +1081,9 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             assert escaped not in surface
             assert encoded not in surface
             assert "[REDACTED]" in surface
+        assert token not in service_stream.getvalue()
+        assert escaped not in service_stream.getvalue()
+        assert encoded not in service_stream.getvalue()
         assert [activity.detail for activity in received] == [
             "local [REDACTED] [REDACTED] [REDACTED]",
             "agent [REDACTED] [REDACTED] [REDACTED]",
@@ -3107,6 +3118,7 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
     cancel = CancellationToken()
     second_started = threading.Event()
     invocations: list[str] = []
+    first_progress = RunProgress(stream=StringIO(), enabled=False)
 
     @dataclass
     class CancellingRuntime:
@@ -3133,6 +3145,7 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             worktree_manager=_Worktrees(calls),
             compose_manager=_Compose(calls),
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=first_progress,
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
             running = executor.submit(
@@ -3151,8 +3164,11 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
         assert store.get_task_runtime(records[1].id).status is (
             TaskRuntimeStatus.PENDING
         )
+        assert first_progress.stages[str(records[0].id)].state.value == "completed"
+        assert first_progress.stages[str(records[1].id)].state.value == "stopped"
 
         resumed_ids: list[str] = []
+        resumed_progress = RunProgress(stream=StringIO(), enabled=False)
 
         @dataclass
         class ResumeRuntime:
@@ -3172,10 +3188,18 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             ResumeRuntime(plan),
             worktree_manager=_Worktrees(calls),
             compose_manager=_Compose(calls),
+            progress=resumed_progress,
         ).run(borg.id, generation.id, {})
 
         assert resumed.status is ExecutionRunStatus.COMPLETED
         assert resumed_ids == [str(records[1].id)]
         assert len(invocations) == 2
+        retained = resumed_progress.stages[str(records[0].id)]
+        resumed_stage = resumed_progress.stages[str(records[1].id)]
+        assert retained.state.value == resumed_stage.state.value == "completed"
+        assert retained.retained is True
+        assert retained.started_at is None
+        assert resumed_stage.retained is False
+        assert resumed_stage.started_at is not None
     finally:
         store.close()

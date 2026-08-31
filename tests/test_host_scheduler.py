@@ -7,18 +7,27 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 
 import pytest
 
-from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime import AgentStatus, BillingMode, CancellationToken
 from betterborg_cli.host_execution import (
+    ActivitySink,
     HostSchedulerConfig,
     HostTaskScheduler,
     ScheduledTaskContext,
+    TaskActivitySink,
 )
-from betterborg_cli.progress import AgentActivity, AgentActivityKind
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageState,
+)
 from betterborg_cli.store import (
+    AgentAttempt,
     Borg,
     ExecutionOwnershipError,
     ExecutionRunStatus,
@@ -253,19 +262,23 @@ def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> 
     def report(task_id, activity: AgentActivity) -> None:  # noqa: ANN001
         reported.append((task_id, activity))
 
+    task_reporter: TaskActivitySink = report
+
     with SqliteStore.open(database) as store:
 
         def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
-            assert context.activity is context.agent_activity_sink
+            assert context.activity is context.activity_sink
+            assert context.activity_sink is context.agent_activity_sink
             assert context.activity is not None
-            context.activity(
+            activity_sink: ActivitySink = context.activity
+            activity_sink(
                 AgentActivity(AgentActivityKind.COMMAND, "bound activity")
             )
             assert "report" not in repr(context)
             context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
             return TaskRuntimeStatus.DONE
 
-        result = HostTaskScheduler(store, behavior, activity=report).run(
+        result = HostTaskScheduler(store, behavior, activity=task_reporter).run(
             borg.id, generation.id
         )
 
@@ -276,6 +289,139 @@ def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> 
             AgentActivity(AgentActivityKind.COMMAND, "bound activity"),
         )
     ]
+
+
+def test_scheduler_seeds_durable_rerun_before_claiming_pending_work(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("done", "failed", "blocked", "pending"),
+        dependencies=(),
+    )
+    clock = FakeClock()
+    cancel = CancellationToken()
+    durations = {"done": 1.5, "failed": 2.5, "blocked": 3.5}
+
+    with SqliteStore.open(database) as store:
+
+        def establish_durable_rows(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            task_ref = next(
+                ref
+                for ref, record in records.items()
+                if record.id == context.claim.task_id
+            )
+            assert task_ref != "pending"
+            attempt = AgentAttempt(
+                run_id=context.claim.run_id,
+                claim_id=context.claim.id,
+                task_id=context.claim.task_id,
+                phase="coding",
+                attempt_number=1,
+                adapter="test",
+                model="test-model",
+                billing_mode=BillingMode.SUBSCRIPTION,
+                status=AgentStatus.COMPLETED,
+                log_path=f"artifacts/{task_ref}.log",
+                duration_seconds=durations[task_ref],
+                started_at=clock(),
+                finished_at=clock(),
+            )
+            store.append_agent_attempt(
+                attempt,
+                context.owner_token,
+                context.claim.claim_token,
+                now=clock(),
+            )
+            status = {
+                "done": TaskRuntimeStatus.DONE,
+                "failed": TaskRuntimeStatus.FAILED,
+                "blocked": TaskRuntimeStatus.BLOCKED,
+            }[task_ref]
+            reason = {
+                "done": None,
+                "failed": "durable failure",
+                "blocked": "durable block",
+            }[task_ref]
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                status,
+                state_reason=reason,
+            )
+            if task_ref == "blocked":
+                cancel.cancel()
+            return status
+
+        first = HostTaskScheduler(
+            store,
+            establish_durable_rows,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            clock=clock,
+        ).run(borg.id, generation.id, cancel=cancel)
+        assert first.status is ExecutionRunStatus.CANCELLED
+        assert (first.done, first.failed, first.blocked, first.pending) == (1, 1, 1, 1)
+
+        progress = RunProgress(stream=StringIO(), enabled=False)
+        claimed: list[str] = []
+
+        def resume_pending(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            retained = [
+                progress.stages[str(records[ref].id)]
+                for ref in ("done", "failed", "blocked")
+            ]
+            assert [stage.state for stage in retained] == [
+                StageState.COMPLETED,
+                StageState.FAILED,
+                StageState.FAILED,
+            ]
+            assert [stage.duration_seconds for stage in retained] == [1.5, 2.5, 3.5]
+            claimed.append(str(context.claim.task_id))
+            assert context.stage_key == str(records["pending"].id)
+            assert progress.stages[context.stage_key].state is StageState.RUNNING
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return TaskRuntimeStatus.DONE
+
+        rerun = HostTaskScheduler(
+            store,
+            resume_pending,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            clock=clock,
+            progress=progress,
+        ).run(borg.id, generation.id)
+
+        ordered_keys = [str(records[ref].id) for ref in records]
+        assert list(progress.stages) == ordered_keys
+        done, failed, blocked, pending = (
+            progress.stages[str(records[ref].id)]
+            for ref in ("done", "failed", "blocked", "pending")
+        )
+        assert (done.state, done.result, done.duration_seconds, done.started_at) == (
+            StageState.COMPLETED,
+            "done",
+            1.5,
+            None,
+        )
+        assert (
+            failed.state,
+            failed.result,
+            failed.duration_seconds,
+            failed.started_at,
+        ) == (StageState.FAILED, "failed: durable failure", 2.5, None)
+        assert (
+            blocked.state,
+            blocked.result,
+            blocked.duration_seconds,
+            blocked.started_at,
+        ) == (StageState.FAILED, "blocked: durable block", 3.5, None)
+        assert pending.state is StageState.COMPLETED
+        assert pending.result == "done"
+        assert pending.started_at is not None
+        assert claimed == [str(records["pending"].id)]
+        rerun_claims = store.list_task_claims(rerun.operation_id)
+        assert [claim.task_id for claim in rerun_claims] == [records["pending"].id]
+        assert (rerun.done, rerun.failed, rerun.blocked, rerun.pending) == (2, 1, 1, 0)
 
 
 def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
@@ -290,6 +436,7 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
     cancel = CancellationToken()
     consumer_started = threading.Event()
     first_invocations: list[str] = []
+    progress = RunProgress(stream=StringIO(), enabled=False)
 
     with SqliteStore.open(database) as store:
 
@@ -312,6 +459,7 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
             cancelling_behavior,
             config=HostSchedulerConfig(jobs=1, poll_interval_seconds=0.005),
             clock=clock,
+            progress=progress,
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
             running = executor.submit(
@@ -328,6 +476,18 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
         )
         assert store.get_task_runtime(records["consumer"].id).status is (
             TaskRuntimeStatus.PENDING
+        )
+        foundation_stage = progress.stages[str(records["foundation"].id)]
+        consumer_stage = progress.stages[str(records["consumer"].id)]
+        assert foundation_stage.state is StageState.COMPLETED
+        assert consumer_stage.state is StageState.STOPPED
+        assert consumer_stage.result == "execution cancelled"
+        assert progress.cancelling is True
+        cancelled_claims = store.list_task_claims(cancelled.operation_id)
+        assert all(claim.released_at is not None for claim in cancelled_claims)
+        assert any(
+            event.kind == "run.interrupted"
+            for event in store.list_execution_events(cancelled.operation_id)
         )
 
         resumed_invocations: list[str] = []

@@ -42,7 +42,7 @@ from betterborg_cli.host_execution.scheduler import (
     TaskActivitySink,
 )
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
-from betterborg_cli.progress import AgentActivity
+from betterborg_cli.progress import AgentActivity, RunProgress, StageState
 from betterborg_cli.store import ExecutionRunStatus, SqliteStore, TaskRuntimeStatus
 
 
@@ -56,19 +56,28 @@ class _ExecutionActivityBinding:
 
     mask_values: tuple[str, ...] = field(repr=False)
     reporter: TaskActivitySink | None = field(repr=False)
+    progress: RunProgress | None = field(default=None, repr=False)
 
     def emit(self, task_id: UUID, activity: AgentActivity) -> None:
         """Publish a freshly redacted activity without affecting execution."""
-        if self.reporter is None:
-            return
         detail = activity.detail
         if detail is not None:
             detail = redact_secrets(detail, self.mask_values)
+        redacted = AgentActivity(activity.kind, detail)
         try:
-            self.reporter(task_id, AgentActivity(activity.kind, detail))
+            if self.reporter is not None:
+                self.reporter(task_id, redacted)
         except Exception:
             # Activity reporters are observational and cannot change execution.
-            return
+            pass
+        try:
+            if self.progress is not None:
+                stage = self.progress.stages.get(str(task_id))
+                if stage is not None and stage.state is StageState.RUNNING:
+                    self.progress.activity(stage.key, redacted)
+        except Exception:
+            # The generic progress reporter is observational too.
+            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +432,7 @@ class HostExecutionService:
         scheduler_config: HostSchedulerConfig | None = None,
         clock=None,
         activity: TaskActivitySink | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self._store = store
         self._preflight = preflight
@@ -432,6 +442,7 @@ class HostExecutionService:
         self._scheduler_config = scheduler_config
         self._clock = clock
         self._activity = activity
+        self._progress = progress
 
     def run(
         self,
@@ -477,9 +488,14 @@ class HostExecutionService:
             activity = _ExecutionActivityBinding(
                 declared_secret_mask_values(validated, secrets),
                 self._activity,
+                self._progress,
             )
             runtime = self._runtime.with_secret_values(secrets)
-            task_activity = activity.emit if self._activity is not None else None
+            task_activity = (
+                activity.emit
+                if self._activity is not None or self._progress is not None
+                else None
+            )
             if isinstance(runtime, HostTaskRuntime):
                 runtime = runtime.with_task_activity(task_activity)
             owner_token = acquisition.owner_token
@@ -566,9 +582,11 @@ class HostExecutionService:
             config=self._scheduler_config,
             activity=(
                 activity.emit
-                if activity is not None and self._activity is not None
+                if activity is not None
+                and (self._activity is not None or self._progress is not None)
                 else None
             ),
+            progress=self._progress,
             **({"clock": self._clock} if self._clock is not None else {}),
         )
 

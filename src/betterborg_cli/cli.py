@@ -1316,6 +1316,7 @@ def _invoke_host_execution(
         worktree_manager=worktrees,
         compose_manager=compose,
         scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
+        progress=progress,
     )
     secrets = {
         name: os.environ[name]

@@ -11,7 +11,7 @@ from typing import Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime import CancellationToken
-from betterborg_cli.progress import AgentActivity
+from betterborg_cli.progress import AgentActivity, RunProgress, StageSpec, StageState
 from betterborg_cli.store import (
     ExecutionOwnershipError,
     ExecutionRunAcquisition,
@@ -72,6 +72,19 @@ class ScheduledTaskContext:
     cancel: CancellationToken
     clock: Callable[[], datetime] = field(repr=False)
     activity: ActivitySink | None = field(default=None, repr=False, compare=False)
+    _transitioned: Callable[[TaskRuntime], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def stage_key(self) -> str:
+        """Return this task's stable key in the shared progress renderer."""
+        return str(self.claim.task_id)
+
+    @property
+    def activity_sink(self) -> ActivitySink | None:
+        """Return the task-bound, execution-redacting activity sink."""
+        return self.activity
 
     @property
     def agent_activity_sink(self) -> ActivitySink | None:
@@ -93,7 +106,7 @@ class ScheduledTaskContext:
         **changes: object,
     ) -> TaskRuntime:
         """Persist one claim-owned phase transition for injected behavior."""
-        return self.store.transition_task_runtime(
+        runtime = self.store.transition_task_runtime(
             self.claim.run_id,
             self.owner_token,
             self.claim.id,
@@ -103,6 +116,9 @@ class ScheduledTaskContext:
             now=self.clock(),
             **changes,
         )
+        if self._transitioned is not None:
+            self._transitioned(runtime)
+        return runtime
 
 
 class HostTaskBehavior(Protocol):
@@ -143,12 +159,14 @@ class HostTaskScheduler:
         config: HostSchedulerConfig | None = None,
         clock: Callable[[], datetime] = _utcnow,
         activity: TaskActivitySink | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self._store = store
         self._behavior = behavior
         self._config = config or HostSchedulerConfig()
         self._clock = clock
         self._activity = activity
+        self._progress = progress
 
     def run(
         self,
@@ -187,6 +205,8 @@ class HostTaskScheduler:
         if owner_token is None:  # Defensive narrowing of the acquisition contract.
             raise RuntimeError("acquired execution run has no owner token")
 
+        self._seed_progress(acquisition.run_id, generation_id)
+
         active: dict[Future[TaskRuntimeStatus | None], TaskClaim] = {}
         next_heartbeat = started_at + self._config.heartbeat_interval
         with ThreadPoolExecutor(
@@ -197,6 +217,8 @@ class HostTaskScheduler:
                 while True:
                     now = self._clock()
                     if token.is_set():
+                        if self._progress is not None:
+                            self._progress.begin_cancellation()
                         self._drain_cancelled(
                             active,
                             acquisition.run_id,
@@ -209,6 +231,7 @@ class HostTaskScheduler:
                             reason="execution cancelled",
                             now=self._clock(),
                         )
+                        self._reconcile_interrupted_progress(generation_id)
                         return self._result(
                             acquisition.run_id, generation_id, acquired=True
                         )
@@ -233,6 +256,7 @@ class HostTaskScheduler:
                         )
                         if claim is None:
                             break
+                        self._start_progress(claim)
                         context = ScheduledTaskContext(
                             store=self._store,
                             claim=claim,
@@ -240,10 +264,11 @@ class HostTaskScheduler:
                             cancel=token,
                             clock=self._clock,
                             activity=(
-                                partial(self._activity, claim.task_id)
+                                partial(self._report_activity, claim.task_id)
                                 if self._activity is not None
                                 else None
                             ),
+                            _transitioned=self._transition_progress,
                         )
                         active[executor.submit(self._behavior, context)] = claim
 
@@ -262,7 +287,93 @@ class HostTaskScheduler:
             except ExecutionOwnershipError:
                 token.cancel()
                 self._drain(active)
+                self._reconcile_interrupted_progress(generation_id)
                 raise
+
+    def _seed_progress(self, run_id: UUID, generation_id: UUID) -> None:
+        """Declare tasks and seed only authoritative terminal projections."""
+        if self._progress is None or self._progress.cancelling:
+            return
+        records = self._store.list_task_records(generation_id)
+        runtimes = {
+            runtime.task_id: runtime
+            for runtime in self._store.list_task_runtimes(generation_id)
+        }
+        run = self._store.get_execution_run(run_id)
+        if run is None:
+            raise KeyError(f"execution run {run_id} not found")
+        rows = {
+            row.task_id: row
+            for row in self._store.list_task_runtime(run.borg_id)
+            if row.generation_id == generation_id
+        }
+        for record in records:
+            stage_key = str(record.id)
+            if stage_key not in self._progress.stages:
+                self._progress.declare(StageSpec(stage_key, record.title))
+            stage = self._progress.stages[stage_key]
+            if stage.state is not StageState.PENDING:
+                continue
+            runtime = runtimes[record.id]
+            row = rows.get(record.id)
+            duration = row.duration_seconds if row is not None else None
+            result = self._progress_result(runtime)
+            if runtime.status is TaskRuntimeStatus.DONE:
+                self._progress.seed_completed(stage_key, result, duration)
+            elif runtime.status in {
+                TaskRuntimeStatus.FAILED,
+                TaskRuntimeStatus.BLOCKED,
+            }:
+                self._progress.seed_failed(stage_key, result, duration)
+
+    def _start_progress(self, claim: TaskClaim) -> None:
+        """Start a task timer only after its durable claim was accepted."""
+        if self._progress is None:
+            return
+        stage = self._progress.stages.get(str(claim.task_id))
+        if stage is not None and stage.state is StageState.PENDING:
+            self._progress.start(stage.key)
+            self._progress.update(stage.key, claim.resume_phase)
+
+    def _transition_progress(self, runtime: TaskRuntime) -> None:
+        """Reflect one already-accepted durable task transition."""
+        if self._progress is None:
+            return
+        stage = self._progress.stages.get(str(runtime.task_id))
+        if stage is None or stage.state is not StageState.RUNNING:
+            return
+        result = self._progress_result(runtime)
+        if runtime.status is TaskRuntimeStatus.DONE:
+            self._progress.complete(stage.key, result)
+        elif runtime.status in {TaskRuntimeStatus.FAILED, TaskRuntimeStatus.BLOCKED}:
+            self._progress.fail(stage.key, result)
+        else:
+            self._progress.update(stage.key, runtime.status.value)
+
+    def _report_activity(self, task_id: UUID, activity: AgentActivity) -> None:
+        """Forward already-redacted activity to configured task observers."""
+        if self._activity is not None:
+            self._activity(task_id, activity)
+
+    def _reconcile_interrupted_progress(self, generation_id: UUID) -> None:
+        """Close started display rows from post-interruption durable state."""
+        if self._progress is None:
+            return
+        for runtime in self._store.list_task_runtimes(generation_id):
+            stage = self._progress.stages.get(str(runtime.task_id))
+            if stage is None or stage.state is not StageState.RUNNING:
+                continue
+            if runtime.status in _TERMINAL_TASK_STATUSES:
+                self._transition_progress(runtime)
+            else:
+                self._progress.stop(stage.key, "execution cancelled")
+
+    @staticmethod
+    def _progress_result(runtime: TaskRuntime) -> str:
+        result = runtime.status.value
+        if runtime.state_reason:
+            result += f": {runtime.state_reason}"
+        return result
 
     def _settle_completed(
         self,
@@ -286,6 +397,7 @@ class HostTaskScheduler:
                             "task behavior returned a status different from its "
                             "durable outcome"
                         )
+                    self._transition_progress(runtime)
                     continue
                 terminal_status = outcome or TaskRuntimeStatus.FAILED
                 reason = (
@@ -300,7 +412,7 @@ class HostTaskScheduler:
                 terminal_status = TaskRuntimeStatus.FAILED
                 reason = f"task behavior failed: {error}"
             try:
-                self._store.transition_task_runtime(
+                runtime = self._store.transition_task_runtime(
                     claim.run_id,
                     owner_token,
                     claim.id,
@@ -310,6 +422,7 @@ class HostTaskScheduler:
                     state_reason=reason,
                     now=self._clock(),
                 )
+                self._transition_progress(runtime)
             except ExecutionOwnershipError:
                 # Cancellation or lease loss already reconciled the durable claim.
                 pass
@@ -364,6 +477,8 @@ class HostTaskScheduler:
             status=status,
             now=self._clock(),
         )
+        for runtime in runtimes:
+            self._transition_progress(runtime)
         return self._result(run_id, generation_id, acquired=True)
 
     def _result(
