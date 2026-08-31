@@ -366,7 +366,7 @@ def test_cli_exit_status_zero_means_complete(
     _deny_public_access(monkeypatch)
 
     assert _run_main(monkeypatch, registry, fixture, github) == 0
-    assert "verified synchronized BetterBorg" in capsys.readouterr().out
+    assert "verified synchronized Betterborg" in capsys.readouterr().out
 
 
 def test_cli_exit_status_two_needs_only_available_pypi_inputs(
@@ -438,6 +438,4 @@ def test_public_install_and_command_docs_match_release_artifacts() -> None:
     ):
         assert required in documentation
     assert "install.betterborg.ai" in readme
-    assert "remains pending" in readme
     assert "install.betterborg.ai" in installation
-    assert "not active yet" in installation

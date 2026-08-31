@@ -76,7 +76,9 @@ def _commands_for_installation(
         env=environment,
     )
     if completed.returncode != 0:
-        protected_smoke.fail("exact-version curl installer download failed")
+        protected_smoke.fail_with_output(
+            "exact-version curl installer download failed", captures[-1], credential
+        )
     install_environment = dict(environment)
     install_environment["BETTERBORG_VERSION"] = version
     completed = protected_smoke.run_command(
@@ -90,7 +92,9 @@ def _commands_for_installation(
         env=install_environment,
     )
     if completed.returncode != 0:
-        protected_smoke.fail("checksum-verifying curl installation failed")
+        protected_smoke.fail_with_output(
+            "checksum-verifying curl installation failed", captures[-1], credential
+        )
     return [str(fixture / "home/.local/bin/borg")], environment
 
 
@@ -115,6 +119,10 @@ def verify_installations(
 
     for method in ("curl", "uvx", "npx"):
         fixture = root / method
+        fixture.mkdir()
+        # Machine state sits beside the repository, never within it: the CLI
+        # refuses to record workspace trust inside the workspace it trusts.
+        repository = fixture / "repo"
         captures: list[protected_smoke.CommandCapture] = []
         environment = dict(base_environment)
         environment.update(
@@ -127,7 +135,7 @@ def verify_installations(
             }
         )
         protected_smoke.initialize_git_fixture(
-            fixture, environment, captures, credential, runner
+            repository, environment, captures, credential, runner
         )
         prefix, command_environment = _commands_for_installation(
             method, version, fixture, environment, captures, credential, runner
@@ -136,7 +144,8 @@ def verify_installations(
             prefix,
             method=method,
             version=version,
-            fixture=fixture,
+            repository=repository,
+            scan_root=fixture,
             environment=command_environment,
             captures=captures,
             credential=credential,
@@ -165,7 +174,7 @@ def main() -> int:
     except PublicInstallationError as error:
         print(f"public installation verification failed: {error}", file=sys.stderr)
         return 1
-    print(f"verified curl, uvx, and npx for BetterBorg {arguments.version}")
+    print(f"verified curl, uvx, and npx for Betterborg {arguments.version}")
     return 0
 
 

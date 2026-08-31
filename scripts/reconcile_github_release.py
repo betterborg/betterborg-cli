@@ -1,4 +1,4 @@
-"""Digest-gate and reconcile an immutable BetterBorg GitHub Release."""
+"""Digest-gate and reconcile an immutable Betterborg GitHub Release."""
 
 from __future__ import annotations
 
@@ -195,7 +195,7 @@ def reconcile(
                 "--verify-tag",
                 "--draft",
                 "--title",
-                f"BetterBorg {version}",
+                f"Betterborg {version}",
             ]
         )
     for filename in plan.upload:

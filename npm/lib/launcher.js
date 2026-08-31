@@ -373,7 +373,7 @@ function launch(resolved, arguments_, overrides = {}) {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error(`could not start BetterBorg CLI: ${error.message}`));
+      reject(new Error(`could not start Betterborg CLI: ${error.message}`));
     });
     child.once("close", (code, signal) => {
       if (settled) return;

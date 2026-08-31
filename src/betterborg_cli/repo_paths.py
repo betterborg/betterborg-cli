@@ -1,4 +1,4 @@
-"""Filesystem locations owned by BetterBorg inside a Git repository."""
+"""Filesystem locations owned by Betterborg inside a Git repository."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.repository_files import publish_repository_text
 
-MANAGED_IGNORE_BEGIN = "# >>> BetterBorg managed ignores >>>"
-MANAGED_IGNORE_END = "# <<< BetterBorg managed ignores <<<"
+MANAGED_IGNORE_BEGIN = "# >>> Betterborg managed ignores >>>"
+MANAGED_IGNORE_END = "# <<< Betterborg managed ignores <<<"
 MANAGED_IGNORE_RULE = ".borg/state/"
 
 
@@ -100,7 +100,7 @@ class RepoPaths:
 
 
 def ensure_managed_gitignore(paths: RepoPaths) -> None:
-    """Write one canonical BetterBorg block while preserving other ignore rules."""
+    """Write one canonical Betterborg block while preserving other ignore rules."""
     try:
         existing = paths.gitignore.read_text(encoding="utf-8")
     except FileNotFoundError:

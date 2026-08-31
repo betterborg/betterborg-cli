@@ -1,28 +1,28 @@
 {
   "name": "borg",
-  "version": "0.2.0",
-  "description": "Plan and execute repository work with BetterBorg",
+  "version": "0.1.0",
+  "description": "Plan and execute repository work with Betterborg",
   "author": {
-    "name": "BetterBorg",
+    "name": "Betterborg",
     "url": "https://github.com/betterborg"
   },
   "homepage": "https://github.com/betterborg/betterborg-cli",
   "repository": "https://github.com/betterborg/betterborg-cli",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "keywords": ["planning", "orchestration", "repositories"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "BetterBorg",
+    "displayName": "Betterborg",
     "shortDescription": "Plan and execute substantial repository work.",
-    "longDescription": "Create durable PRDs and reviewed plans, then supervise repository execution with BetterBorg.",
-    "developerName": "BetterBorg",
+    "longDescription": "Create durable PRDs and reviewed plans, then supervise repository execution with Betterborg.",
+    "developerName": "Betterborg",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
     "websiteURL": "https://github.com/betterborg/betterborg-cli",
     "defaultPrompt": [
-      "Turn this repository goal into a reviewed BetterBorg plan.",
-      "Show my approved BetterBorg tasks and next actions."
+      "Turn this repository goal into a reviewed Betterborg plan.",
+      "Show my approved Betterborg tasks and next actions."
     ]
   }
 }

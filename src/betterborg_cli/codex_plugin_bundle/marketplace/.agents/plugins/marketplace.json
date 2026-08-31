@@ -1,12 +1,12 @@
 {
   "name": "betterborg",
   "interface": {
-    "displayName": "BetterBorg"
+    "displayName": "Betterborg"
   },
   "plugins": [
     {
       "name": "borg",
-      "version": "0.2.0",
+      "version": "0.1.0",
       "source": {
         "source": "local",
         "path": "./plugins/borg"

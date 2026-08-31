@@ -40,7 +40,7 @@ from betterborg_cli.store import (
 
 PRD_SESSION_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "BetterBorg PRD interview turn",
+    "title": "Betterborg PRD interview turn",
     "type": "object",
     "additionalProperties": False,
     "required": ["questions", "prd_markdown"],

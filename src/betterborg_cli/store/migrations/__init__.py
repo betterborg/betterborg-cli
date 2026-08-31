@@ -1,1 +1,1 @@
-"""SQL migrations bundled with the BetterBorg CLI."""
+"""SQL migrations bundled with the Betterborg CLI."""

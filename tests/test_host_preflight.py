@@ -615,7 +615,7 @@ def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     assert "runtime.version" in result.reason
     assert "host executable is required: example-runtime" in result.reason
     assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
-    assert "BetterBorg will not install runtimes" in result.reason
+    assert "Betterborg will not install runtimes" in result.reason
     assert "pyproject.toml" in result.reason
 
 

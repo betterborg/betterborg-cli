@@ -85,7 +85,7 @@ def _seed_executable_generation(
                 manifest={
                     "plan": {
                         "title": f"Deliver {name}",
-                        "summary": "Ship the completed BetterBorg project.",
+                        "summary": "Ship the completed Betterborg project.",
                         "phases": [
                             {
                                 "name": "01-delivery",

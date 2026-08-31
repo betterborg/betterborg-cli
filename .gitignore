@@ -8,6 +8,6 @@ __pycache__/
 build/
 dist/
 
-# >>> BetterBorg managed ignores >>>
+# >>> Betterborg managed ignores >>>
 .borg/state/
-# <<< BetterBorg managed ignores <<<
+# <<< Betterborg managed ignores <<<

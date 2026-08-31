@@ -255,7 +255,7 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
 }
 ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "BetterBorg bounded repository analysis",
+    "title": "Betterborg bounded repository analysis",
     "type": "object",
     "additionalProperties": False,
     "required": [

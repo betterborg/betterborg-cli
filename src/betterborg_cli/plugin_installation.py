@@ -23,7 +23,7 @@ class PluginCommandError(RuntimeError):
 
 
 class PluginCollisionError(RuntimeError):
-    """An existing marketplace or bundle is not owned by BetterBorg."""
+    """An existing marketplace or bundle is not owned by Betterborg."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +132,7 @@ def marketplace_entry(
 
 
 def owned_marketplace_source(entry: dict[str, Any], expected: Path) -> bool:
-    """Return whether a host entry points at BetterBorg's stable bundle path."""
+    """Return whether a host entry points at Betterborg's stable bundle path."""
 
     candidates: list[str] = []
     source = entry.get("source")
@@ -166,7 +166,7 @@ def owned_marketplace_source(entry: dict[str, Any], expected: Path) -> bool:
 
 
 def bundle_digest(source: Any) -> str:
-    """Hash all bundle files except BetterBorg's ownership marker."""
+    """Hash all bundle files except Betterborg's ownership marker."""
 
     digest = hashlib.sha256()
     for relative, body in _bundle_files(source):
@@ -202,7 +202,7 @@ def materialize_bundle(
         if ownership_before is None:
             raise PluginCollisionError(
                 f"{host_name} bundle path {destination} already exists without "
-                "BetterBorg ownership metadata; it was left untouched."
+                "Betterborg ownership metadata; it was left untouched."
             )
         materialized_digest = bundle_digest(destination)
         previous_version = ownership_before.get("version")
@@ -287,7 +287,7 @@ def materialize_bundle(
 
 
 def ownership(path: Path) -> dict[str, Any] | None:
-    """Read valid BetterBorg ownership metadata from a materialized bundle."""
+    """Read valid Betterborg ownership metadata from a materialized bundle."""
 
     marker = path / _OWNER_FILE
     try:

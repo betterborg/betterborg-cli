@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "betterborg"
 dynamic = ["version"]
-description = "The open source BetterBorg command-line interface"
+description = "The open source Betterborg command-line interface"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
+license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "BetterBorg" }]
+authors = [{ name = "Betterborg" }]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Environment :: Console",

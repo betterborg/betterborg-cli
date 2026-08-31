@@ -1,8 +1,8 @@
 {
   "name": "@betterborg/cli",
-  "version": "0.2.0",
-  "description": "Installer and launcher for the BetterBorg CLI",
-  "license": "Apache-2.0",
+  "version": "0.1.0",
+  "description": "Installer and launcher for the Betterborg CLI",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/betterborg/betterborg-cli.git",
@@ -17,6 +17,7 @@
   "files": [
     "LICENSE",
     "NOTICE",
+    "README.md",
     "bin",
     "lib"
   ],

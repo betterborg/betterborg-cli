@@ -96,7 +96,7 @@ def execution_preflight_fixture(tmp_path: Path):
         repository = tmp_path / f"repository-{uuid4().hex}"
         repository.mkdir()
         _git(repository, "init", "--quiet", "--initial-branch=main")
-        _git(repository, "config", "user.name", "BetterBorg Tests")
+        _git(repository, "config", "user.name", "Betterborg Tests")
         _git(repository, "config", "user.email", "tests@betterborg.dev")
         (repository / "README.md").write_text("# Fixture\n", encoding="utf-8")
         (repository / "package.lock").write_text("lock-v1\n", encoding="utf-8")

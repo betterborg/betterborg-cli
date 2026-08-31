@@ -10,14 +10,19 @@ disabled.
 
 ## One-time protected setup
 
-Only a BetterBorg release maintainer who is authorized as both a PyPI project
+Only a Betterborg release maintainer who is authorized as both a PyPI project
 owner and a required reviewer of the GitHub `pypi` environment may approve a
 release. Configure that environment with required reviewers, prevent
 self-review and administrator bypass, and limit deployment branches to
-`main`. Store one environment secret named `OPENAI_API_KEY`; do not add
-`ANTHROPIC_API_KEY` or a PyPI password/token. The provider credential is used
-only by the post-publication fixture smoke. PyPI authentication uses OIDC and
-has no long-lived registry secret.
+`main`. It holds no secrets: PyPI authentication uses OIDC and has no
+long-lived registry secret.
+
+Configure a third environment named `smoke`, restricted to `main` with
+administrator bypass prevented and no required reviewers. It holds one secret
+named `OPENAI_API_KEY`; do not add `ANTHROPIC_API_KEY` or a PyPI
+password/token. That credential is used only by the post-publication fixture
+smoke, which runs after every registry is already immutable, so it gates
+nothing that could be rolled back and does not need an approval.
 
 For the first release, a PyPI owner must create the `betterborg` project with a
 pending trusted publisher (or add the publisher to the existing project) with
@@ -43,22 +48,18 @@ an `NPM_TOKEN`.
 
 If `@betterborg/cli` does not exist yet, an npm owner must complete a separate,
 reviewed lower-version package-claim checkpoint before configuring its trusted
-publisher. Do not claim it with the phase-10 version or the synchronized final
-version, and do not dispatch this workflow until the trusted publisher is
-active. Restrict token-based publishing after OIDC succeeds.
+publisher. Do not claim it with the reviewed release version, and do not
+dispatch this workflow until the trusted publisher is active. Restrict
+token-based publishing after OIDC succeeds.
 
 ## Select the reviewed release
 
 Update `betterborg_cli.__version__`, `npm/package.json`, both bundled plugin
 manifests, and both marketplace entries in one reviewed change. Run
-`python scripts/check_versions.py --tag vVERSION --greater-than 0.1.0`,
-`make lint`, `make test`, and `make build`, then create the reviewed `vVERSION`
-tag on that exact commit. The final version must remain greater than the
-phase-10 version; the phase-10 tag is never a publication target.
-Phase-10 version `0.1.0` is immutable: never overwrite, reuse, move, or retag
-it. Every synchronized final release must use one newly reviewed version
-strictly greater than `0.1.0`, and that final version becomes equally
-immutable as soon as any registry accepts it.
+`python scripts/check_versions.py --tag vVERSION`, `make lint`, `make test`,
+and `make build`, then create the reviewed `vVERSION` tag on that exact commit.
+A release version becomes immutable as soon as any registry accepts it: never
+overwrite, reuse, move, or retag one.
 Verify that the tag is annotated or signed according to the project's release
 policy, that its version matches the source and artifact names, and that the
 tagged commit is the current tip of `main`.
@@ -70,7 +71,7 @@ different commit under the reviewed tag's version.
 
 ## Run or resume the merged workflow
 
-1. After `.github/workflows/release.yml` is merged, open **Release BetterBorg** in
+1. After `.github/workflows/release.yml` is merged, open **Release Betterborg** in
    GitHub Actions, choose **Run workflow**, select `main`, enter the exact
    reviewed version, leave `publish` disabled, and require every dry-run job to
    pass. The run builds the wheel, sdist, npm tarball, four binaries, manifest,
@@ -100,8 +101,8 @@ different commit under the reviewed tag's version.
    compares the preserved npm tarball's SHA-512 integrity with
    `@betterborg/cli@VERSION`. It publishes only a missing version with npm OIDC,
    skips an exact match, and rejects a mismatch as immutable.
-7. Only after all three public sources match, approve the protected `pypi`
-   environment for the final smoke. One provider credential runs fresh,
+7. After all three public sources match, the final smoke runs unattended in
+   the `smoke` environment. One provider credential runs fresh,
    isolated trusted initialization fixtures through the versioned GitHub curl
    installer, `uvx --from betterborg==VERSION`, and
    `npx @betterborg/cli@VERSION`. Each fixture scans stdout, stderr, paths,
@@ -203,7 +204,7 @@ and cannot create a GitHub Release.
 ## Authorize and verify the binary publication
 
 The binary publication is authorized only through the reviewed workflow run.
-Two authorized BetterBorg release maintainers must participate: a dispatching
+Two authorized Betterborg release maintainers must participate: a dispatching
 operator who is allowed to run Actions on `betterborg/betterborg-cli`, and a
 different required reviewer for the protected `pypi` environment. Prevent
 self-review remains enabled, so the dispatching operator must not approve
@@ -217,7 +218,7 @@ grant repository contents read and attestations read, but no write permission.
 Do not use an administrator bypass or a personal token with release-write
 scope for verification.
 
-To start the binary path, the dispatching operator runs **Release BetterBorg**
+To start the binary path, the dispatching operator runs **Release Betterborg**
 for that exact reviewed version with `publish` enabled. The different required
 reviewer independently checks the run SHA, tag, version, inputs, and trusted
 publisher identity, then approves the protected environment. To resume an
@@ -303,7 +304,7 @@ supply `ANTHROPIC_API_KEY`, a PyPI password, a PyPI token, or an npm token.
 Each curl, uvx, and npx init child receives exactly one provider variable,
 `OPENAI_API_KEY`, and puts HOME, cache, data, and state inside its own
 disposable fixture. The verification captures stdout and stderr and recursively
-scans each fixture, including Git and BetterBorg state, for raw, URL-encoded,
+scans each fixture, including Git and Betterborg state, for raw, URL-encoded,
 standard-base64, and URL-safe-base64 forms of the credential. GitHub log
 masking is defense in depth; it is not the redaction assertion.
 

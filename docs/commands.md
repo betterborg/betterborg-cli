@@ -1,4 +1,4 @@
-# BetterBorg command bootstrap
+# Betterborg command bootstrap
 
 `borg --help` is the authoritative command index. These are the commands needed
 to get a new checkout ready without hiding trust or provider decisions.
@@ -38,8 +38,10 @@ borg plugins install --host claude
 borg plugins install --host codex
 ```
 
-The persistent installer runs `--all` after binary verification. Re-run it
-after installing or logging in to a host. Open Claude Code sessions require
+The standalone binary installer runs `--all` after verification; after a pip
+or uv install, run it yourself. Re-run it after installing or logging in to a
+host. Activation requires a persistent install and is refused under the `npx`
+and `uvx` wrappers. Open Claude Code sessions require
 `/reload-plugins` after installation or upgrade; start a new Codex session when
 the installer requests it.
 

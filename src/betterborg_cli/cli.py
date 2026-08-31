@@ -1,4 +1,4 @@
-"""Command-line entry point for BetterBorg."""
+"""Command-line entry point for Betterborg."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ class CliRunContext:
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.pass_context
 def cli(context: click.Context) -> None:
-    """Work with BetterBorg from the command line."""
+    """Work with Betterborg from the command line."""
 
     if context.obj is None:
         context.obj = CliRunContext(
@@ -212,13 +212,13 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
 
 @cli.command()
 def version() -> None:
-    """Print the installed BetterBorg CLI version."""
+    """Print the installed Betterborg CLI version."""
     click.echo(f"borg {__version__}")
 
 
 @cli.command(name="mcp")
 def run_mcp_server() -> None:
-    """Expose BetterBorg workflows over MCP stdio."""
+    """Expose Betterborg workflows over MCP stdio."""
     from betterborg_cli.mcp_server import run_stdio_server
 
     run_stdio_server()
@@ -226,7 +226,7 @@ def run_mcp_server() -> None:
 
 @cli.group()
 def plugins() -> None:
-    """Install BetterBorg integrations for supported agent hosts."""
+    """Install Betterborg integrations for supported agent hosts."""
 
 
 @plugins.command(name="install")
@@ -242,7 +242,7 @@ def plugins() -> None:
     help="Install only the selected host integration.",
 )
 def install_plugins(all_hosts: bool, host: str | None) -> None:
-    """Install BetterBorg plugins after verifying the persistent CLI."""
+    """Install Betterborg plugins after verifying the persistent CLI."""
     if all_hosts and host is not None:
         raise click.UsageError("--all and --host cannot be used together")
     selected = SUPPORTED_PLUGIN_HOSTS if host is None else (host.casefold(),)

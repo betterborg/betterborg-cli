@@ -50,9 +50,9 @@ from betterborg_cli.store import (
 MERGE_RESULT_SCHEMA: dict[str, Any] = CODING_RESULT_SCHEMA
 
 _MERGE_IDENTITY = {
-    "GIT_AUTHOR_NAME": "BetterBorg",
+    "GIT_AUTHOR_NAME": "Betterborg",
     "GIT_AUTHOR_EMAIL": "betterborg@example.invalid",
-    "GIT_COMMITTER_NAME": "BetterBorg",
+    "GIT_COMMITTER_NAME": "Betterborg",
     "GIT_COMMITTER_EMAIL": "betterborg@example.invalid",
 }
 _MERGE_STARTED_EVENT = "merge.started"

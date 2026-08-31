@@ -24,7 +24,7 @@ EFFORT_COST = {"S": 1.0, "M": 2.0, "L": 3.0}
 
 RECOMMENDATION_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "BetterBorg repository recommendation",
+    "title": "Betterborg repository recommendation",
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -58,7 +58,7 @@ RECOMMENDATION_SCHEMA: dict[str, Any] = {
 
 RECOMMENDATION_THEME_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "BetterBorg recommendation theme",
+    "title": "Betterborg recommendation theme",
     "type": "object",
     "additionalProperties": False,
     "required": [

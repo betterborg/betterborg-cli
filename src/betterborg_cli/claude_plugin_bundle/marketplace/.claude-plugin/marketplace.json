@@ -1,14 +1,14 @@
 {
   "name": "betterborg",
   "owner": {
-    "name": "BetterBorg"
+    "name": "Betterborg"
   },
   "plugins": [
     {
       "name": "borg",
-      "version": "0.2.0",
+      "version": "0.1.0",
       "source": "./plugins/borg",
-      "description": "Plan and execute repository work with BetterBorg"
+      "description": "Plan and execute repository work with Betterborg"
     }
   ]
 }

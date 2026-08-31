@@ -31,6 +31,14 @@ function executable(directory, name, content = "") {
   return pathname;
 }
 
+// Windows has no POSIX permission bits; chmod there only toggles read-only.
+function assertExecutableMode(pathname) {
+  if (process.platform === "win32") {
+    return;
+  }
+  assert.equal(fs.statSync(pathname).mode & 0o777, 0o755);
+}
+
 test("package metadata exposes the public scoped borg command", () => {
   assert.equal(metadata.name, "@betterborg/cli");
   assert.equal(metadata.bin.borg, "bin/borg.js");
@@ -43,17 +51,28 @@ test("package metadata exposes the public scoped borg command", () => {
   assert.match(metadata.version, /^\d+\.\d+\.\d+$/);
 });
 
-test("packed package includes the license and attribution notice", () => {
+test("packed package includes the readme, license, and attribution notice", () => {
   const packageRoot = path.resolve(__dirname, "..");
   const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  // Node refuses to execFileSync a Windows .cmd shim without a shell.
   const output = childProcess.execFileSync(
     npmCommand,
     ["pack", "--dry-run", "--json", "."],
-    { cwd: packageRoot, encoding: "utf8" },
+    {
+      cwd: packageRoot,
+      encoding: "utf8",
+      shell: process.platform === "win32",
+    },
   );
   const [{ files }] = JSON.parse(output);
   const packedPaths = new Set(files.map((file) => file.path));
 
+  // A tarball without a readme publishes "ERROR: No README data found!".
+  assert.equal(packedPaths.has("README.md"), true);
+  assert.match(
+    fs.readFileSync(path.join(packageRoot, "README.md"), "utf8"),
+    /@betterborg\/cli/,
+  );
   assert.equal(packedPaths.has("LICENSE"), true);
   assert.equal(packedPaths.has("NOTICE"), true);
   assert.equal(
@@ -285,7 +304,7 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
     "borg-darwin-arm64",
     "borg-darwin-arm64.sha256",
   ]);
-  assert.equal(fs.statSync(resolved.command).mode & 0o777, 0o755);
+  assertExecutableMode(resolved.command);
 
   fs.chmodSync(resolved.command, 0o600);
   const reused = await resolveCli("1.2.3", {
@@ -298,7 +317,7 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
     platform: "darwin",
   });
   assert.equal(reused.command, resolved.command);
-  assert.equal(fs.statSync(reused.command).mode & 0o777, 0o755);
+  assertExecutableMode(reused.command);
 });
 
 test(

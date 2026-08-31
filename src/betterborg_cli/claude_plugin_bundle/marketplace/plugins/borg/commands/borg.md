@@ -1,9 +1,9 @@
 ---
-description: Plan or execute repository work with BetterBorg
+description: Plan or execute repository work with Betterborg
 argument-hint: <goal or Borg name>
 ---
 
-Use the BetterBorg MCP tools and the `borg:orchestrate` skill to handle this
+Use the Betterborg MCP tools and the `borg:orchestrate` skill to handle this
 request: $ARGUMENTS
 
 Keep the user in control of every elicited approval. Follow each tool result's

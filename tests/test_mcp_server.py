@@ -1,4 +1,4 @@
-"""Protocol contracts for BetterBorg's typed MCP workflow surface."""
+"""Protocol contracts for Betterborg's typed MCP workflow surface."""
 
 from __future__ import annotations
 

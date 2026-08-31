@@ -15,7 +15,7 @@ from typing import Generic, TypeVar
 PERSISTENT_INSTALL_COMMAND = "uv tool install betterborg"
 
 _SETUP_GUIDANCE = (
-    "Install a persistent BetterBorg CLI with "
+    "Install a persistent Betterborg CLI with "
     f"`{PERSISTENT_INSTALL_COMMAND}`, ensure its bin directory is on the host "
     "launch PATH, and confirm `borg version` succeeds. A `borg` supplied by "
     "`uvx` is disposable and cannot back a persistent MCP plugin."
@@ -118,7 +118,7 @@ def preflight_plugin_activation(
         )
     if not version.startswith("borg "):
         return _setup_required(
-            "`borg version` did not identify the BetterBorg CLI."
+            "`borg version` did not identify the Betterborg CLI."
         )
 
     return PluginActivationPreflight(

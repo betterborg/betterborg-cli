@@ -530,7 +530,7 @@ def _concrete_host_fixture(
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
     _git(repository_root, "init", "--quiet", "--initial-branch=main")
-    _git(repository_root, "config", "user.name", "BetterBorg Tests")
+    _git(repository_root, "config", "user.name", "Betterborg Tests")
     _git(repository_root, "config", "user.email", "tests@betterborg.dev")
     (repository_root / "README.md").write_text("# Fixture\n", encoding="utf-8")
     (repository_root / "compose.yml").write_text(

@@ -1,4 +1,4 @@
-"""Allow-listed Git execution for BetterBorg-owned host operations."""
+"""Allow-listed Git execution for Betterborg-owned host operations."""
 
 from __future__ import annotations
 

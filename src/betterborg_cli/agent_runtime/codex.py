@@ -81,7 +81,7 @@ class _PromptSchemaFallback(ValueError):
 
 @dataclass(slots=True)
 class CodexAdapter(NativeCliAdapter):
-    """Run Codex non-interactively for a BetterBorg role."""
+    """Run Codex non-interactively for a Betterborg role."""
 
     role: ApiAgentRole | str
     binary: str = "codex"

@@ -1,4 +1,4 @@
-"""Verify a published BetterBorg binary GitHub Release without mutating it."""
+"""Verify a published Betterborg binary GitHub Release without mutating it."""
 
 from __future__ import annotations
 

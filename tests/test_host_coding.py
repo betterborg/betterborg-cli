@@ -144,7 +144,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
     repository_root = tmp_path / "repository"
     repository_root.mkdir()
     _git(repository_root, "init", "--quiet", "--initial-branch=main")
-    _git(repository_root, "config", "user.name", "BetterBorg Tests")
+    _git(repository_root, "config", "user.name", "Betterborg Tests")
     _git(repository_root, "config", "user.email", "tests@betterborg.dev")
     (repository_root / "README.md").write_text("# Fixture\n", encoding="utf-8")
     ensure_managed_gitignore(RepoPaths.discover(repository_root))
