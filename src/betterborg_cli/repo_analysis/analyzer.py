@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from betterborg_cli.agent_runtime.base import (
     AgentStatus,
     CancellationToken,
 )
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.agent_runtime.selection import (
     AgentSelectionError,
     SelectedAgent,
@@ -24,6 +25,7 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_analysis.discovery import (
     DiscoveryLimits,
     DiscoveryManifest,
@@ -367,6 +369,9 @@ def run_analyzer(
     workspace_dir: Path | None = None,
     config: AnalyzerConfig | None = None,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
+    stage_key: str = "discover",
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
 ) -> RepositoryAnalysis:
     """Run, validate, normalize, and append one successful analysis."""
     stored_repository = store.get_repository(repository.id)
@@ -375,33 +380,56 @@ def run_analyzer(
 
     artifact_dir = Path(artifact_dir).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    head_sha = _git_head(repository.root)
     resolved_config = config or AnalyzerConfig()
     if resolved_config.effort is not None and agent.name == "anthropic":
         raise AnalyzerError("Anthropic does not support an effort override")
 
-    if workspace_dir is None:
-        with tempfile.TemporaryDirectory(prefix="betterborg-analysis-") as temporary:
-            return _run_in_workspace(
-                repository,
-                store,
-                agent,
-                artifact_dir=artifact_dir,
-                workspace_dir=Path(temporary),
-                head_sha=head_sha,
-                config=resolved_config,
-                cancel=cancel,
-            )
-    return _run_in_workspace(
-        repository,
-        store,
-        agent,
-        artifact_dir=artifact_dir,
-        workspace_dir=Path(workspace_dir),
-        head_sha=head_sha,
-        config=resolved_config,
-        cancel=cancel,
-    )
+    if progress is not None:
+        progress.start(stage_key)
+    try:
+        head_sha = _git_head(
+            repository.root,
+            cancel=cancel,
+            command_runner=command_runner,
+        )
+        if workspace_dir is None:
+            with tempfile.TemporaryDirectory(
+                prefix="betterborg-analysis-"
+            ) as temporary:
+                return _run_in_workspace(
+                    repository,
+                    store,
+                    agent,
+                    artifact_dir=artifact_dir,
+                    workspace_dir=Path(temporary),
+                    head_sha=head_sha,
+                    config=resolved_config,
+                    cancel=cancel,
+                    progress=progress,
+                    discovery_stage_key=stage_key,
+                )
+        return _run_in_workspace(
+            repository,
+            store,
+            agent,
+            artifact_dir=artifact_dir,
+            workspace_dir=Path(workspace_dir),
+            head_sha=head_sha,
+            config=resolved_config,
+            cancel=cancel,
+            progress=progress,
+            discovery_stage_key=stage_key,
+        )
+    except BaseException as error:
+        if (
+            progress is not None
+            and progress.stages[stage_key].state is StageState.RUNNING
+        ):
+            if _is_interruption(error, cancel):
+                progress.stop(stage_key, "interrupted")
+            else:
+                progress.fail(stage_key, str(error))
+        raise
 
 
 def _run_in_workspace(
@@ -414,43 +442,76 @@ def _run_in_workspace(
     head_sha: str,
     config: AnalyzerConfig,
     cancel: CancellationToken | None,
+    progress: RunProgress | None,
+    discovery_stage_key: str,
 ) -> RepositoryAnalysis:
     manifest = build_discovery_workspace(
         repository.root,
         workspace_dir,
         limits=config.limits,
+        cancel=cancel,
     )
-    require_read_only_agent(agent, role="analyzer", error_factory=AnalyzerError)
-    run_id = uuid4()
-    spec = AgentRunSpec(
-        system_prompt=_SYSTEM_PROMPT,
-        user_prompt=_USER_PROMPT,
-        schema=ANALYZER_OUTPUT_SCHEMA,
-        cwd=workspace_dir.resolve(),
-        model=resolve_analysis_model(agent, config.model),
-        effort=config.effort,
-        allowed_tools=READ_ONLY_API_TOOLS,
-        log_path=artifact_dir / f"{run_id}.log",
-        result_path=artifact_dir / f"{run_id}.json",
-    )
-    result = (
-        agent.run_contained(spec, cancel=cancel)
-        if isinstance(agent, SelectedAgent)
-        else agent.run(spec, cancel=cancel)
-    )
-    if result.status is not AgentStatus.COMPLETED or result.payload is None:
-        raise AnalyzerError(result.error or f"analyzer returned {result.status.value}")
+    if progress is not None:
+        progress.complete(
+            discovery_stage_key,
+            f"{len(manifest.files)} evidence files",
+        )
+        progress.start("analyze")
+    try:
+        require_read_only_agent(agent, role="analyzer", error_factory=AnalyzerError)
+        run_id = uuid4()
+        spec = AgentRunSpec(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=_USER_PROMPT,
+            schema=ANALYZER_OUTPUT_SCHEMA,
+            cwd=workspace_dir.resolve(),
+            model=resolve_analysis_model(agent, config.model),
+            effort=config.effort,
+            allowed_tools=READ_ONLY_API_TOOLS,
+            log_path=artifact_dir / f"{run_id}.log",
+            result_path=artifact_dir / f"{run_id}.json",
+            activity_sink=(
+                (lambda activity: progress.activity("analyze", activity))
+                if progress is not None
+                else None
+            ),
+        )
+        result = (
+            agent.run_contained(spec, cancel=cancel)
+            if isinstance(agent, SelectedAgent)
+            else agent.run(spec, cancel=cancel)
+        )
+        if (
+            result.status is AgentStatus.CANCELLED
+            and cancel is not None
+            and cancel.is_set()
+        ):
+            raise KeyboardInterrupt
+        if result.status is not AgentStatus.COMPLETED or result.payload is None:
+            raise AnalyzerError(
+                result.error or f"analyzer returned {result.status.value}"
+            )
 
-    # Adapters validate their output; repeat validation at the persistence edge.
-    validate_structured_result(result.payload, ANALYZER_OUTPUT_SCHEMA)
-    return _persist_payload(
-        repository,
-        store,
-        result.payload,
-        manifest=manifest,
-        head_sha=head_sha,
-        analysis_id=run_id,
-    )
+        # Adapters validate their output; repeat validation at the persistence edge.
+        validate_structured_result(result.payload, ANALYZER_OUTPUT_SCHEMA)
+        analysis = _persist_payload(
+            repository,
+            store,
+            result.payload,
+            manifest=manifest,
+            head_sha=head_sha,
+            analysis_id=run_id,
+        )
+    except BaseException as error:
+        if progress is not None:
+            if _is_interruption(error, cancel):
+                progress.stop("analyze", "interrupted")
+            else:
+                progress.fail("analyze", str(error))
+        raise
+    if progress is not None:
+        progress.complete("analyze", f"score {analysis.overall_score:.2f}/5")
+    return analysis
 
 
 def _persist_payload(
@@ -684,14 +745,33 @@ def resolve_analysis_model(
         ) from error
 
 
-def _git_head(repository_root: Path) -> str:
+def _git_head(
+    repository_root: Path,
+    *,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+) -> str:
+    command = ["git", "-C", str(repository_root), "rev-parse", "HEAD"]
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+        result = command_runner(
+            command,
             check=True,
-            capture_output=True,
-            text=True,
+            cancel=cancel,
         )
     except subprocess.CalledProcessError as error:
         raise AnalyzerError("repository does not have a readable Git HEAD") from error
-    return result.stdout.strip()
+    if result.returncode == -1 and cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
+    head = result.stdout.strip()
+    if result.returncode != 0 or not head:
+        raise AnalyzerError("repository does not have a readable Git HEAD")
+    return head
+
+
+def _is_interruption(
+    error: BaseException,
+    cancel: CancellationToken | None,
+) -> bool:
+    return isinstance(error, KeyboardInterrupt) or (
+        cancel is not None and cancel.is_set()
+    )

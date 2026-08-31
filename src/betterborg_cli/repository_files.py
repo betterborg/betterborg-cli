@@ -101,16 +101,18 @@ def publish_repository_text(
     file or symlink already occupies it. ``overwrite=True`` atomically replaces
     the destination without following a destination symlink.
     """
-    parent = path.parent
-    if not parent.resolve().is_relative_to(root):
+    resolved_root = root.resolve(strict=True)
+    candidate = path if path.is_absolute() else resolved_root / path
+    parent = candidate.parent
+    if not parent.resolve().is_relative_to(resolved_root):
         raise RepositoryPathError(f"output directory escapes repository: {parent}")
     parent.mkdir(parents=True, exist_ok=True)
     resolved_parent = parent.resolve(strict=True)
-    if not resolved_parent.is_relative_to(root):
+    if not resolved_parent.is_relative_to(resolved_root):
         raise RepositoryPathError(f"output directory escapes repository: {parent}")
 
-    destination = resolved_parent / path.name
-    temporary = resolved_parent / f".{path.name}.{uuid4().hex}.tmp"
+    destination = resolved_parent / candidate.name
+    temporary = resolved_parent / f".{candidate.name}.{uuid4().hex}.tmp"
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as output:
             output.write(body)

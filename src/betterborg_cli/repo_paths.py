@@ -9,6 +9,7 @@ from pathlib import Path
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.repository_files import publish_repository_text
 
 MANAGED_IGNORE_BEGIN = "# >>> BetterBorg managed ignores >>>"
 MANAGED_IGNORE_END = "# <<< BetterBorg managed ignores <<<"
@@ -131,4 +132,9 @@ def ensure_managed_gitignore(paths: RepoPaths) -> None:
     if retained:
         retained.append("")
     retained.extend([MANAGED_IGNORE_BEGIN, MANAGED_IGNORE_RULE, MANAGED_IGNORE_END])
-    paths.gitignore.write_text("\n".join(retained) + "\n", encoding="utf-8")
+    publish_repository_text(
+        paths.gitignore,
+        "\n".join(retained) + "\n",
+        root=paths.root,
+        overwrite=True,
+    )

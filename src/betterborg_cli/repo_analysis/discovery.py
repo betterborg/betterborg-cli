@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from betterborg_cli.agent_runtime.base import CancellationToken
+
 Clock = Callable[[], float]
 
 
@@ -261,8 +263,10 @@ def build_discovery_workspace(
     deadline_seconds: float | None = None,
     deadline_monotonic: float | None = None,
     clock: Clock = time.monotonic,
+    cancel: CancellationToken | None = None,
 ) -> DiscoveryManifest:
     """Copy bounded, allowlisted evidence into a sanitized workspace."""
+    _cancellation_checkpoint(cancel)
     repo = Path(repo_root).resolve()
     if not repo.is_dir():
         raise ValueError(f"repository root is not a directory: {repo}")
@@ -275,6 +279,7 @@ def build_discovery_workspace(
     )
     workspace = Path(workspace_dir).resolve()
     _prepare_workspace(repo, workspace)
+    _cancellation_checkpoint(cancel)
 
     deadline = (
         deadline_monotonic
@@ -286,11 +291,13 @@ def build_discovery_workspace(
         workspace=workspace,
         deadline=deadline,
         clock=clock,
+        cancel=cancel,
     )
 
     copied_files: list[DiscoveryFile] = []
     total_copied = 0
     for candidate in sorted(candidates, key=_candidate_sort_key):
+        _cancellation_checkpoint(cancel)
         if _deadline_expired(clock, deadline):
             deadline_exceeded = True
             omitted.append(
@@ -330,6 +337,7 @@ def build_discovery_workspace(
         workspace_rel = _workspace_file_path(candidate.rel_path)
         output_path = workspace / workspace_rel
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        _cancellation_checkpoint(cancel)
         data, read_error = _read_candidate(candidate, copied)
         if read_error is not None:
             omitted.append(
@@ -341,6 +349,7 @@ def build_discovery_workspace(
                 )
             )
             continue
+        _cancellation_checkpoint(cancel)
         output_path.write_bytes(data)
         copied_bytes = len(data)
         total_copied += copied_bytes
@@ -365,6 +374,7 @@ def build_discovery_workspace(
             )
         )
 
+    _cancellation_checkpoint(cancel)
     manifest = DiscoveryManifest(
         repo_name=repo.name,
         files=copied_files,
@@ -424,12 +434,14 @@ def _collect_candidates(
     workspace: Path,
     deadline: float,
     clock: Clock,
+    cancel: CancellationToken | None,
 ) -> tuple[list[_Candidate], list[DiscoveryOmission], bool]:
     candidates: list[_Candidate] = []
     omitted: list[DiscoveryOmission] = []
     deadline_exceeded = False
 
     for current_root_raw, dirnames, filenames in os.walk(repo, topdown=True):
+        _cancellation_checkpoint(cancel)
         current_root = Path(current_root_raw)
         if _deadline_expired(clock, deadline):
             deadline_exceeded = True
@@ -443,6 +455,7 @@ def _collect_candidates(
 
         kept_dirs: list[str] = []
         for dirname in sorted(dirnames):
+            _cancellation_checkpoint(cancel)
             path = current_root / dirname
             rel = _relative_posix(repo, path)
             if path.is_symlink():
@@ -456,6 +469,7 @@ def _collect_candidates(
         dirnames[:] = kept_dirs
 
         for filename in sorted(filenames):
+            _cancellation_checkpoint(cancel)
             if _deadline_expired(clock, deadline):
                 deadline_exceeded = True
                 omitted.append(
@@ -629,3 +643,8 @@ def _relative_posix(root: Path, path: Path) -> str:
 
 def _deadline_expired(clock: Clock, deadline: float) -> bool:
     return clock() >= deadline
+
+
+def _cancellation_checkpoint(cancel: CancellationToken | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt

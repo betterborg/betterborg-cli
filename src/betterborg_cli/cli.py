@@ -243,6 +243,13 @@ def _stdin_is_interactive() -> bool:
     return click.get_text_stream("stdin").isatty()
 
 
+def _repository_progress(machine_readable: bool) -> RunProgress | None:
+    if machine_readable:
+        return None
+    run = click.get_current_context().find_root().obj
+    return run.progress if isinstance(run, CliRunContext) else None
+
+
 def _trusted_workspace_callback(function):
     """Gate a callback before it can load repository-controlled context."""
 
@@ -322,6 +329,7 @@ def initialize_repository(
                     interactive=interactive,
                 ),
                 cancel=cancel,
+                progress=_repository_progress(json_output),
             )
             result = service.initialize()
 
@@ -410,6 +418,7 @@ def analyze_repository(
                     interactive=interactive,
                 ),
                 cancel=cancel,
+                progress=_repository_progress(json_output),
             ).analyze()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error

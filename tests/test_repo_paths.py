@@ -1,5 +1,6 @@
 """Filesystem contracts for repository-local BetterBorg data."""
 
+import os
 import subprocess
 import sys
 import threading
@@ -7,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pytest import MonkeyPatch
 
+from betterborg_cli import repository_files as repository_files_module
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.repo_paths import (
     MANAGED_IGNORE_BEGIN,
@@ -176,3 +179,38 @@ def test_managed_ignore_update_is_idempotent_and_preserves_existing_rules(
     assert first_update.count(MANAGED_IGNORE_BEGIN) == 1
     assert first_update.count(MANAGED_IGNORE_END) == 1
     assert first_update.count(".borg/state/\n") == 1
+
+
+@pytest.mark.parametrize("interrupt_after_replacement", [False, True])
+def test_managed_ignore_interruption_preserves_prior_or_complete_canonical_bytes(
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    interrupt_after_replacement: bool,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    prior = "dist/\n*.log\n"
+    canonical = (
+        "dist/\n*.log\n\n"
+        f"{MANAGED_IGNORE_BEGIN}\n"
+        ".borg/state/\n"
+        f"{MANAGED_IGNORE_END}\n"
+    )
+    paths.gitignore.write_text(prior, encoding="utf-8")
+    original_replace = os.replace
+
+    def interrupt(source: Path, destination: Path) -> None:
+        if interrupt_after_replacement:
+            original_replace(source, destination)
+        raise KeyboardInterrupt("managed ignore publication interrupted")
+
+    monkeypatch.setattr(repository_files_module.os, "replace", interrupt)
+
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="managed ignore publication interrupted",
+    ):
+        ensure_managed_gitignore(paths)
+
+    expected = canonical if interrupt_after_replacement else prior
+    assert paths.gitignore.read_text(encoding="utf-8") == expected
+    assert list(git_repo.glob(".gitignore.*.tmp")) == []
