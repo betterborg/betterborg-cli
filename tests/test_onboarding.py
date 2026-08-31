@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.onboarding import OnboardingDispatcher, create_commands
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageSpec
 from betterborg_cli.repo_analysis import ImprovementPrd
 from betterborg_cli.store import Borg, Repository, SqliteStore
 
@@ -20,6 +23,19 @@ class RecordingCreator:
     def create(self, name: str, source: Path | None = None):
         self.calls.append((name, source))
         return self.calls[-1]
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TTYStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def _io(answers: Iterator[str | None], output: list[str]) -> InteractiveIO:
@@ -183,6 +199,80 @@ def test_cancellation_does_not_dispatch_or_mutate(onboarding_context) -> None:
             connection.execute("SELECT COUNT(*) FROM prd_sessions").fetchone()[0]
             == 0
         )
+
+
+def test_token_cancellation_during_menu_starts_no_selected_door(
+    onboarding_context,
+) -> None:
+    repository, store = onboarding_context
+    cancel = CancellationToken()
+    creator = RecordingCreator()
+
+    def cancel_while_choosing(_message: str) -> str:
+        cancel.cancel()
+        return "1"
+
+    result = OnboardingDispatcher(
+        repository,
+        store,
+        InteractiveIO(
+            prompt=cancel_while_choosing,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        creator,
+        _documents(repository.root),
+        cancel=cancel,
+    ).run()
+
+    assert result is None
+    assert creator.calls == []
+
+
+@pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
+def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
+    onboarding_context,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    repository, store = onboarding_context
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    stream = TTYStringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("active", "Active work")],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+    progress.start("active")
+    snapshots: list[tuple[str, str]] = []
+
+    def wait_at_prompt(_message: str) -> str:
+        before = stream.getvalue()
+        clock.now += 10
+        progress.refresh()
+        snapshots.append((before, stream.getvalue()))
+        return "q"
+
+    result = OnboardingDispatcher(
+        repository,
+        store,
+        InteractiveIO(
+            prompt=wait_at_prompt,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        RecordingCreator(),
+        _documents(repository.root),
+        progress=progress,
+    ).run()
+
+    assert result is None
+    assert snapshots and all(before == after for before, after in snapshots)
 
 
 def test_machine_handoff_commands_are_exact_and_mutation_free(

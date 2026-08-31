@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -250,9 +250,15 @@ def _stdin_is_interactive() -> bool:
 
 def _repository_progress(machine_readable: bool) -> RunProgress | None:
     if machine_readable:
-        return None
+        return RunProgress(enabled=False)
     run = click.get_current_context().find_root().obj
     return run.progress if isinstance(run, CliRunContext) else None
+
+
+def _suspend_progress(
+    progress: RunProgress | None,
+) -> AbstractContextManager[object]:
+    return progress.suspend() if progress is not None else nullcontext()
 
 
 def _trusted_workspace_callback(function):
@@ -320,6 +326,7 @@ def initialize_repository(
     """Register and analyze the current Git repository."""
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
+    progress = _repository_progress(json_output)
     try:
         if not database.resolve().is_relative_to(paths.root):
             raise ValueError(f"repository state path escapes repository: {database}")
@@ -334,13 +341,18 @@ def initialize_repository(
                     interactive=interactive,
                 ),
                 cancel=cancel,
-                progress=_repository_progress(json_output),
+                progress=progress,
             )
             result = service.initialize()
 
             if result.initialized and interactive:
-                _write_initialized(result)
+                if cancel is not None and cancel.is_set():
+                    return
+                with _suspend_progress(progress):
+                    _write_initialized(result)
                 config = load_repository_config(paths)
+                if cancel is not None and cancel.is_set():
+                    return
                 io = _interactive_io()
                 creator = CreateService(
                     result.repository,
@@ -354,6 +366,7 @@ def initialize_repository(
                     io=io,
                     editor=_edit_markdown,
                     cancel=cancel,
+                    progress=progress,
                 )
                 OnboardingDispatcher(
                     result.repository,
@@ -361,30 +374,37 @@ def initialize_repository(
                     io,
                     creator,
                     result.improvement_prds,
+                    cancel=cancel,
+                    progress=progress,
                 ).run()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
+    if cancel is not None and cancel.is_set():
+        return
     commands = create_commands(paths.root, result.improvement_prds)
-    if json_output:
-        click.echo(
-            json.dumps(
-                {
-                    "repository_id": str(result.repository.id),
-                    "initialized": result.initialized,
-                    "score": result.analysis.overall_score,
-                    "create_commands": [shlex.join(command) for command in commands],
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+    with _suspend_progress(progress):
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "repository_id": str(result.repository.id),
+                        "initialized": result.initialized,
+                        "score": result.analysis.overall_score,
+                        "create_commands": [
+                            shlex.join(command) for command in commands
+                        ],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             )
-        )
-    elif not result.initialized:
-        click.echo(f"Repository already initialized: {result.repository.id}")
-    elif not interactive:
-        _write_initialized(result)
-        for command in commands:
-            click.echo(shlex.join(command))
+        elif not result.initialized:
+            click.echo(f"Repository already initialized: {result.repository.id}")
+        elif not interactive:
+            _write_initialized(result)
+            for command in commands:
+                click.echo(shlex.join(command))
 
 
 @cli.command(name="analyze")
@@ -409,6 +429,7 @@ def analyze_repository(
     """Re-analyze an initialized Git repository and refresh its outputs."""
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
+    progress = _repository_progress(json_output)
     try:
         if not database.resolve().is_relative_to(paths.root):
             raise ValueError(f"repository state path escapes repository: {database}")
@@ -423,7 +444,7 @@ def analyze_repository(
                     interactive=interactive,
                 ),
                 cancel=cancel,
-                progress=_repository_progress(json_output),
+                progress=progress,
             ).analyze()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
@@ -431,27 +452,28 @@ def analyze_repository(
     analysis = result.analysis
     previous_score = result.previous_analysis.overall_score
     score_delta = analysis.overall_score - previous_score
-    if json_output:
-        click.echo(
-            json.dumps(
-                {
-                    "analysis_id": str(analysis.id),
-                    "repository_id": str(result.repository.id),
-                    "score": analysis.overall_score,
-                    "previous_score": previous_score,
-                    "delta": score_delta,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+    with _suspend_progress(progress):
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "analysis_id": str(analysis.id),
+                        "repository_id": str(result.repository.id),
+                        "score": analysis.overall_score,
+                        "previous_score": previous_score,
+                        "delta": score_delta,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             )
-        )
-    else:
-        click.echo(
-            f"Analyzed repository {result.repository.id}: "
-            f"score {analysis.overall_score:.2f}/5 "
-            f"(previous {previous_score:.2f}/5, "
-            f"delta {score_delta:+.2f})."
-        )
+        else:
+            click.echo(
+                f"Analyzed repository {result.repository.id}: "
+                f"score {analysis.overall_score:.2f}/5 "
+                f"(previous {previous_score:.2f}/5, "
+                f"delta {score_delta:+.2f})."
+            )
 
 
 @cli.command(name="create")
@@ -482,6 +504,7 @@ def create_borg(
         raise click.ClickException(str(error)) from error
     if not _stdin_is_interactive():
         raise click.ClickException("borg create requires an interactive terminal")
+    progress = _repository_progress(False)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -501,17 +524,21 @@ def create_borg(
                 io=io,
                 editor=_edit_markdown,
                 cancel=cancel,
+                progress=progress,
             ).create(name, source)
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
-    if result.confirmed:
-        click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
-        click.echo(f"borg plan start {result.borg.name}")
-    elif result.questions:
-        click.echo("Borg PRD needs more input before it can be created.")
-    else:
-        click.echo("Borg draft saved without a confirmed PRD.")
+    if cancel is not None and cancel.is_set():
+        return
+    with _suspend_progress(progress):
+        if result.confirmed:
+            click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
+            click.echo(f"borg plan start {result.borg.name}")
+        elif result.questions:
+            click.echo("Borg PRD needs more input before it can be created.")
+        else:
+            click.echo("Borg draft saved without a confirmed PRD.")
 
 
 @cli.group()
