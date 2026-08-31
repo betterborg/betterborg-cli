@@ -78,13 +78,21 @@ shown; permanent outcome lines still record every stage.
 
 When stderr is redirected or is otherwise noninteractive, the same progress is
 plain, newline-delimited text with no cursor control or color. A line is written
-when work starts, and active work is repeated every 30 seconds as a heartbeat:
+when work starts. After a running stage crosses the 30-second heartbeat
+interval, the next progress refresh can repeat its active row. Activity and
+stage changes cause refreshes; the optional `execute` push and pull-request
+stages also refresh periodically while their commands run. A periodic push
+heartbeat can look like this:
 
 ```text
-running Analyze repository (0.0s)
-running Analyze repository (30.0s) — reading: pyproject.toml
-completed Analyze repository — score 4.20/5 (35.2s)
+running Push project branch (0.0s)
+running Push project branch (30.0s)
+completed Push project branch — Pushed project/example to origin. (35.2s)
 ```
+
+Heartbeats are refresh-driven rather than a timer guarantee for every stage. A
+silent agent or provider wait may therefore go longer than 30 seconds without
+another line.
 
 Interactive questions, confirmations, editor sessions, and ordinary command
 results temporarily suspend the live display. Progress lines produced during
@@ -123,9 +131,10 @@ Pressing Ctrl+C a second time is the safety valve that requests this force path
 immediately instead of waiting for the deadline. A forced exit may occur before
 the normal closing summary, but its process exit status is still 130.
 
-Cancellation does not roll back durable work that already completed. On the
-next invocation, reused stage outcomes are marked `[retained]`; this is reuse of
-a safe persisted checkpoint, not continuation of an in-flight process:
+Cancellation does not roll back durable work that already completed. When a
+later invocation can reuse a stage outcome, that outcome is marked
+`[retained]`; this is reuse of a safe persisted checkpoint, not continuation of
+an in-flight process:
 
 ```text
 completed Analyze repository — score 4.20/5 (—) [retained]
@@ -133,6 +142,11 @@ completed Analyze repository — score 4.20/5 (—) [retained]
 
 What is retained depends on the command:
 
+- `borg create` stores the Borg name, its PRD session, and each completed
+  conversation turn as soon as the session begins. If interrupted, it does not
+  publish a confirmed PRD. The current CLI cannot resume that session and
+  rejects another `borg create` using the same name; retrying creation requires
+  a different Borg name.
 - `borg init` reuses a completed repository analysis and any completed role
   prompts, then generates only missing initialization outputs.
 - `borg plan start`, `borg plan change`, and `borg plan approve` reuse completed
@@ -143,6 +157,6 @@ What is retained depends on the command:
   state.
 
 Unfinished agent requests, HTTP requests, and local processes are never
-resumable in place. Re-run the command named by the interruption message; it
-starts a new invocation and uses only the command-specific durable state listed
-above.
+resumable in place. Except for the `borg create` name restriction above, re-run
+the command you invoked. It starts a new invocation and uses only the
+command-specific durable state listed above.

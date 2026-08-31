@@ -115,13 +115,13 @@ tracked file. See the [command guide](docs/commands.md) for the bootstrap and
 initialization command shapes.
 
 Agent-backed terminal commands show stage and activity progress on stderr;
-redirected logs receive plain 30-second heartbeats, while successful `--json`
-stdout remains JSON-only. Ctrl+C cancels active work and exits 130 after
-cleanup; press it again to request the force-stop safety valve immediately.
-Completed durable checkpoints are retained for a later invocation, but
-unfinished work is not resumable in place. See [progress output and
-interruption](docs/commands.md#progress-output) for examples and the
-command-specific retention rules.
+redirected logs use newline-delimited progress with refresh-driven heartbeats,
+while successful `--json` stdout remains JSON-only. Ctrl+C cancels active work
+and exits 130 after cleanup; press it again to request the force-stop safety
+valve immediately. Completed durable checkpoints are retained where the
+command supports reuse, but unfinished work is not resumable in place. See
+[progress output and interruption](docs/commands.md#progress-output) for
+examples and the command-specific retention and retry rules.
 
 Provider API agents use contained file tools that reject absolute paths,
 traversal, and symlinks escaping the run directory. Analysis and planning
