@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import shlex
+import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -15,6 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.host_execution import HostPreflightBlock
 from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
@@ -23,6 +27,7 @@ from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_service import RepositoryService
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     BorgState,
     ExecutionEvent,
@@ -446,6 +451,117 @@ server = FastMCP(
 )
 
 
+_MISSING = object()
+
+
+class _WorkerResult:
+    """Thread-safe outcome and completion fence for one MCP worker."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.completed = threading.Event()
+        self._lock = threading.Lock()
+        self._result: object = _MISSING
+        self._exception: BaseException | None = None
+
+    def run(self, function: Callable[[], Any]) -> Any:
+        """Run and publish one outcome before signalling worker completion."""
+        try:
+            result = function()
+        except BaseException as error:
+            with self._lock:
+                self._exception = error
+            raise
+        else:
+            with self._lock:
+                self._result = result
+            return result
+        finally:
+            self.completed.set()
+
+    def acknowledge(self) -> object:
+        """Read the completed worker outcome, re-raising its stored exception."""
+        if not self.completed.is_set():
+            raise RuntimeError("MCP worker has not completed")
+        with self._lock:
+            exception = self._exception
+            result = self._result
+        if exception is not None:
+            raise exception
+        if result is _MISSING:
+            raise RuntimeError("MCP worker completed without an outcome")
+        return result
+
+
+async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
+    """Run synchronous MCP work under cooperative cancellation and force cleanup."""
+    control = RunControl()
+    outcome = _WorkerResult()
+    invocation_finished = anyio.Event()
+
+    def run() -> Any:
+        outcome.started.set()
+        return outcome.run(lambda: function(*args, cancel=control.cancellation))
+
+    async def invoke() -> None:
+        try:
+            await anyio.to_thread.run_sync(run, abandon_on_cancel=True)
+        except BaseException:
+            # The result fence owns the synchronous exception. Cancellation of
+            # this adapter task abandons only its wait, never the worker.
+            pass
+        finally:
+            invocation_finished.set()
+
+    try:
+        # Guarantee that the AnyIO worker has started before exposing it to an
+        # already-pending request cancellation. This also preserves
+        # ``from_thread.run()`` support for MCP elicitation in the worker.
+        with anyio.CancelScope(shield=True) as startup:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(invoke)
+                await anyio.to_thread.run_sync(outcome.started.wait)
+                startup.shield = False
+                await invocation_finished.wait()
+                if not outcome.completed.is_set():
+                    # The adapter wait was abandoned by request cancellation;
+                    # surface that pending cancellation to the cleanup branch.
+                    await anyio.lowlevel.checkpoint()
+                    raise RuntimeError("MCP worker wait ended before completion")
+    except anyio.get_cancelled_exc_class():
+        # The request task owns protocol cancellation while the synchronous
+        # worker owns provider, subprocess, and durable-state cleanup. Shield
+        # that cleanup so the request cannot disappear before its worker does.
+        with anyio.CancelScope(shield=True):
+            control.cancellation.cancel()
+            deadline = control.cancellation.force_deadline
+            timeout = (
+                max(0.0, deadline - time.monotonic())
+                if deadline is not None
+                else 0.0
+            )
+            completed = await anyio.to_thread.run_sync(
+                outcome.completed.wait,
+                timeout,
+            )
+            if not completed:
+                try:
+                    await anyio.to_thread.run_sync(control.cancellation.force)
+                except BaseException:
+                    # A force callback failure must not replace protocol
+                    # cancellation or bypass the synchronous worker fence.
+                    pass
+                await anyio.to_thread.run_sync(outcome.completed.wait)
+            try:
+                outcome.acknowledge()
+            except BaseException:
+                # Protocol cancellation remains the request outcome. Reading
+                # the worker outcome is still required before re-raising it.
+                pass
+        raise
+    return outcome.acknowledge()
+
+
 def _progress_phase(
     event: ExecutionEvent,
     attempt_phases: dict[UUID, str],
@@ -653,8 +769,13 @@ class McpInteractiveIO(InteractiveIO):
         self._rendered.append(message)
 
 
-def _paths(*, trusted: bool, io: InteractiveIO | None = None) -> RepoPaths:
-    paths = RepoPaths.discover()
+def _paths(
+    *,
+    trusted: bool,
+    io: InteractiveIO | None = None,
+    cancel: CancellationToken | None = None,
+) -> RepoPaths:
+    paths = RepoPaths.discover(cancel=cancel)
     if trusted:
         require_workspace_trust(
             paths,
@@ -665,6 +786,7 @@ def _paths(*, trusted: bool, io: InteractiveIO | None = None) -> RepoPaths:
                 if io is not None
                 else None
             ),
+            cancel=cancel,
         )
     return paths
 
@@ -713,8 +835,12 @@ def _theme_actions(paths: RepoPaths, result: Any) -> tuple[CreateNextAction, ...
     )
 
 
-def _initialize(io: McpInteractiveIO) -> InitializeResult:
-    paths = _paths(trusted=True, io=io)
+def _initialize(
+    io: McpInteractiveIO,
+    *,
+    cancel: CancellationToken | None = None,
+) -> InitializeResult:
+    paths = _paths(trusted=True, io=io, cancel=cancel)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         result = RepositoryService(
             paths,
@@ -722,6 +848,7 @@ def _initialize(io: McpInteractiveIO) -> InitializeResult:
             lambda config: select_agent(
                 config, ApiAgentRole.ANALYSIS, paths, interactive=False
             ),
+            cancel=cancel,
         ).initialize()
         onboarding = None
         if result.initialized:
@@ -734,6 +861,7 @@ def _initialize(io: McpInteractiveIO) -> InitializeResult:
                 ),
                 io=io,
                 interactive=True,
+                cancel=cancel,
             )
             onboarding = OnboardingDispatcher(
                 result.repository,
@@ -741,6 +869,7 @@ def _initialize(io: McpInteractiveIO) -> InitializeResult:
                 io,
                 creator,
                 result.improvement_prds,
+                cancel=cancel,
             ).run()
 
     artifacts: list[AnalysisArtifact | PrdArtifact] = list(
@@ -782,11 +911,15 @@ async def initialize(ctx: Context) -> InitializeResult:
             status="setup_required",
             data=SetupRequiredData(cli_command=_cli_command("init")),
         )
-    return await anyio.to_thread.run_sync(_initialize, McpInteractiveIO(ctx))
+    return await _run_cancellable(_initialize, McpInteractiveIO(ctx))
 
 
-def _analyze(io: McpInteractiveIO) -> AnalyzeResult:
-    paths = _paths(trusted=True, io=io)
+def _analyze(
+    io: McpInteractiveIO,
+    *,
+    cancel: CancellationToken | None = None,
+) -> AnalyzeResult:
+    paths = _paths(trusted=True, io=io, cancel=cancel)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         result = RepositoryService(
             paths,
@@ -794,6 +927,7 @@ def _analyze(io: McpInteractiveIO) -> AnalyzeResult:
             lambda config: select_agent(
                 config, ApiAgentRole.ANALYSIS, paths, interactive=False
             ),
+            cancel=cancel,
         ).analyze()
     return AnalyzeResult(
         status="completed",
@@ -817,11 +951,17 @@ async def analyze(ctx: Context) -> AnalyzeResult:
             status="setup_required",
             data=SetupRequiredData(cli_command=_cli_command("analyze")),
         )
-    return await anyio.to_thread.run_sync(_analyze, McpInteractiveIO(ctx))
+    return await _run_cancellable(_analyze, McpInteractiveIO(ctx))
 
 
-def _create(name: str, source: str | None, io: McpInteractiveIO) -> CreateResult:
-    paths = _paths(trusted=True, io=io)
+def _create(
+    name: str,
+    source: str | None,
+    io: McpInteractiveIO,
+    *,
+    cancel: CancellationToken | None = None,
+) -> CreateResult:
+    paths = _paths(trusted=True, io=io, cancel=cancel)
     config = load_repository_config(paths)
     source_path = Path(source) if source is not None else None
     if source_path is not None and not source_path.is_absolute():
@@ -838,6 +978,7 @@ def _create(name: str, source: str | None, io: McpInteractiveIO) -> CreateResult
             ),
             io=io,
             interactive=True,
+            cancel=cancel,
         ).create(name, source_path)
 
     if result.confirmed:
@@ -883,7 +1024,7 @@ async def create(
             status="setup_required",
             data=SetupRequiredData(cli_command=_cli_command(*arguments)),
         )
-    return await anyio.to_thread.run_sync(
+    return await _run_cancellable(
         _create,
         name,
         source,
@@ -940,7 +1081,12 @@ def _plan_actions(
     return ()
 
 
-def _approve_plan(paths: RepoPaths, name: str) -> tuple[Any, Any, Path, Any]:
+def _approve_plan(
+    paths: RepoPaths,
+    name: str,
+    *,
+    cancel: CancellationToken | None = None,
+) -> tuple[Any, Any, Path, Any]:
     config = load_repository_config(paths)
     result = approve_plan_workflow(
         paths,
@@ -949,6 +1095,7 @@ def _approve_plan(paths: RepoPaths, name: str) -> tuple[Any, Any, Path, Any]:
         planning_agent=lambda: select_agent(
             config, ApiAgentRole.PLANNING, paths, interactive=False
         ),
+        cancel=cancel,
     )
     return result.borg, result.approval, result.plan_path, result.publication
 
@@ -958,10 +1105,12 @@ def _plan(
     action: Literal["start", "show", "change", "approve"],
     note: str | None,
     io: McpInteractiveIO | None,
+    *,
+    cancel: CancellationToken | None = None,
 ) -> PlanResult:
     from betterborg_cli import cli as cli_module
 
-    paths = _paths(trusted=action != "show", io=io)
+    paths = _paths(trusted=action != "show", io=io, cancel=cancel)
     if action == "approve":
         assert io is not None
         borg, _questions = _planning_state(paths, name)
@@ -978,7 +1127,11 @@ def _plan(
                 next_actions=_plan_actions(name, borg.state),
                 data=PlanShowData(borg=name, plan=plan_document),
             )
-        borg, approval, plan_path, publication = _approve_plan(paths, name)
+        borg, approval, plan_path, publication = _approve_plan(
+            paths,
+            name,
+            cancel=cancel,
+        )
         artifacts = [
             ApprovedPlanArtifact(
                 kind="approved_plan",
@@ -1024,6 +1177,7 @@ def _plan(
             name,
             change_note=note.strip() if action == "change" and note else None,
             io=io,
+            cancel=cancel,
         )
         questions: list[dict[str, Any]] = []
     except click.ClickException as error:
@@ -1062,7 +1216,7 @@ async def plan(
 ) -> PlanResult:
     """Start, inspect, change, or approve a plan; approval decomposes tasks."""
     if action == "show":
-        return await anyio.to_thread.run_sync(_plan, name, action, note, None)
+        return await _run_cancellable(_plan, name, action, note, None)
 
     arguments = ["plan", action, name]
     if action == "change" and note is not None:
@@ -1073,7 +1227,7 @@ async def plan(
             next_actions=(),
             data=SetupRequiredData(cli_command=_cli_command(*arguments)),
         )
-    return await anyio.to_thread.run_sync(
+    return await _run_cancellable(
         _plan,
         name,
         action,
@@ -1138,10 +1292,15 @@ def task_list(name: str) -> TaskListResult:
     )
 
 
-def _execute(name: str, io: McpInteractiveIO) -> ExecuteResult:
+def _execute(
+    name: str,
+    io: McpInteractiveIO,
+    *,
+    cancel: CancellationToken | None = None,
+) -> ExecuteResult:
     from betterborg_cli import cli as cli_module
 
-    paths = _paths(trusted=True, io=io)
+    paths = _paths(trusted=True, io=io, cancel=cancel)
     config = load_repository_config(paths)
 
     def decide(estimate: dict[str, Any]) -> ExecutionDecisionRequest | None:
@@ -1159,6 +1318,7 @@ def _execute(name: str, io: McpInteractiveIO) -> ExecuteResult:
         name,
         decide=decide,
         invoke_host=cli_module._invoke_host_execution,
+        cancel=cancel,
     )
     publication = workflow.publication
     generation = publication.generation
@@ -1229,7 +1389,7 @@ async def execute(name: str, ctx: Context) -> ExecuteResult:
             status="setup_required",
             data=SetupRequiredData(cli_command=_cli_command("execute", name)),
         )
-    return await anyio.to_thread.run_sync(_execute, name, McpInteractiveIO(ctx))
+    return await _run_cancellable(_execute, name, McpInteractiveIO(ctx))
 
 
 def run_stdio_server() -> None:

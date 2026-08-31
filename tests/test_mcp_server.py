@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import select
 import subprocess
 import sys
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,16 +16,26 @@ from uuid import UUID, uuid4
 
 import anyio
 import pytest
+from conftest import blocked_dns_url_request_worker
 from mcp import types as mcp_types
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli import mcp_server
-from betterborg_cli.agent_runtime import AgentStatus, AgentUsage, BillingMode
+from betterborg_cli.agent_runtime import (
+    AgentStatus,
+    AgentUsage,
+    BillingMode,
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    api_http,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
 from betterborg_cli.host_execution.scheduler import HostSchedulerResult
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
+from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     AgentAttempt,
@@ -116,6 +129,326 @@ def _structured(result) -> dict:
     assert result.isError is False
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_run_cancellable_forces_and_waits_for_worker_completion() -> None:
+    started = threading.Event()
+    worker_completed = threading.Event()
+    order: list[str] = []
+    cancellation_requested: list[float] = []
+
+    def workflow(*, cancel):
+        order.append("token-received")
+        started.set()
+        try:
+            assert cancel.wait(timeout=2)
+            order.append("cancelled")
+            assert cancel.force_deadline is not None
+            assert cancel.wait_for_force(timeout=2)
+            order.append("forced")
+        finally:
+            order.append("worker-finally")
+            worker_completed.set()
+        if not cancel.is_set():
+            order.append("forbidden-post-cancel-mutation")
+        return "late-result"
+
+    async def cancel_when_started(scope: anyio.CancelScope) -> None:
+        await anyio.to_thread.run_sync(started.wait)
+        cancellation_requested.append(time.monotonic())
+        scope.cancel()
+
+    async def run() -> None:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel_when_started, scope)
+                await mcp_server._run_cancellable(workflow)
+        order.append("request-returned")
+
+    anyio.run(run)
+
+    assert worker_completed.is_set()
+    assert time.monotonic() - cancellation_requested[0] >= 0.9
+    assert order == [
+        "token-received",
+        "cancelled",
+        "forced",
+        "worker-finally",
+        "request-returned",
+    ]
+
+
+def test_run_cancellable_preserves_success_and_failure_results() -> None:
+    def succeed(value: str, *, cancel) -> str:
+        assert cancel.is_set() is False
+        return value
+
+    def fail(*, cancel) -> None:
+        assert cancel.is_set() is False
+        raise ValueError("worker failed")
+
+    assert anyio.run(mcp_server._run_cancellable, succeed, "compatible") == (
+        "compatible"
+    )
+    with pytest.raises(ValueError, match="worker failed"):
+        anyio.run(mcp_server._run_cancellable, fail)
+
+
+def test_run_cancellable_starts_worker_under_pending_cancellation() -> None:
+    worker_finished = threading.Event()
+
+    def workflow(*, cancel) -> None:
+        try:
+            cancel.wait(timeout=2)
+        finally:
+            worker_finished.set()
+
+    async def run() -> None:
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await mcp_server._run_cancellable(workflow)
+
+    anyio.run(run)
+
+    assert worker_finished.is_set()
+
+
+def test_run_cancellable_reaps_resistant_local_descendants_before_return(
+    real_process_harness,
+) -> None:
+    process_name = "mcp-local-command"
+    worker_finished = threading.Event()
+
+    def workflow(*, cancel) -> None:
+        try:
+            run_captured(
+                real_process_harness.resistant_argv(process_name),
+                cwd=real_process_harness.root,
+                input="",
+                cancel=cancel,
+            )
+        finally:
+            worker_finished.set()
+
+    async def cancel_after_descendant(scope: anyio.CancelScope) -> None:
+        await anyio.to_thread.run_sync(
+            real_process_harness.wait_for_marker,
+            f"{process_name}.child.pid",
+        )
+        scope.cancel()
+
+    async def run() -> None:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel_after_descendant, scope)
+                await mcp_server._run_cancellable(workflow)
+
+    anyio.run(run)
+
+    assert worker_finished.is_set()
+    real_process_harness.assert_tree_absent(process_name, timeout=0.1)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process cleanup required")
+def test_run_cancellable_joins_blocked_provider_process_before_return(
+    real_process_harness,
+    monkeypatch,
+) -> None:
+    request_name = "mcp-provider-request"
+    root = real_process_harness.root
+    original_cleanup = api_http._cleanup_process
+
+    def marked_cleanup(process, *, terminate, deadline):
+        original_cleanup(process, terminate=terminate, deadline=deadline)
+        marker = root / f"{request_name}.request-joined"
+        if not marker.exists():
+            marker.write_text(str(time.monotonic()), encoding="utf-8")
+
+    monkeypatch.setenv("BETTERBORG_TEST_REQUEST_ROOT", str(root))
+    monkeypatch.setenv("BETTERBORG_TEST_REQUEST_NAME", request_name)
+    monkeypatch.setenv("BETTERBORG_TEST_REQUEST_RESISTANT", "1")
+    monkeypatch.setattr(api_http, "_url_request_worker", blocked_dns_url_request_worker)
+    monkeypatch.setattr(api_http, "_cleanup_process", marked_cleanup)
+
+    def workflow(*, cancel) -> None:
+        try:
+            MultiprocessUrlRequest(
+                UrlRequestSpec("http://127.0.0.1:9/", "GET", {}, None),
+                cancel,
+            ).run()
+        finally:
+            (root / f"{request_name}.worker-finished").write_text(
+                str(time.monotonic()),
+                encoding="utf-8",
+            )
+
+    async def cancel_at_dns_gate(scope: anyio.CancelScope) -> None:
+        await anyio.to_thread.run_sync(
+            real_process_harness.wait_for_marker,
+            f"{request_name}.dns-gate",
+        )
+        scope.cancel()
+
+    request_returned: list[float] = []
+
+    async def run() -> None:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel_at_dns_gate, scope)
+                await mcp_server._run_cancellable(workflow)
+        request_returned.append(time.monotonic())
+
+    anyio.run(run)
+
+    child_pid = int(
+        real_process_harness.wait_for_marker(f"{request_name}.request.pid")
+    )
+    joined_at = float(
+        real_process_harness.wait_for_marker(f"{request_name}.request-joined")
+    )
+    worker_finished_at = float(
+        real_process_harness.wait_for_marker(f"{request_name}.worker-finished")
+    )
+    assert joined_at <= worker_finished_at <= request_returned[0]
+    real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
+
+
+def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
+    monkeypatch,
+) -> None:
+    worker_finished = threading.Event()
+    received_tokens = []
+
+    def blocked_create(_name, _source, io, *, cancel):
+        received_tokens.append(cancel)
+        try:
+            io.prompt("Wait for an answer")
+        finally:
+            worker_finished.set()
+        raise AssertionError("cancelled elicitation fabricated a tool result")
+
+    monkeypatch.setattr(mcp_server, "_create", blocked_create)
+
+    async def run() -> tuple[bool, bool]:
+        elicitation_started = anyio.Event()
+        elicitation_unwound = anyio.Event()
+
+        async def elicit(_context, _params):
+            elicitation_started.set()
+            try:
+                await anyio.sleep_forever()
+            finally:
+                elicitation_unwound.set()
+
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+            elicitation_callback=elicit,
+        ) as session:
+            call_scope = anyio.CancelScope()
+
+            async def call() -> None:
+                with call_scope:
+                    await session.call_tool("create", {"name": "cancel-me"})
+
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(call)
+                await elicitation_started.wait()
+                call_scope.cancel()
+
+        return elicitation_unwound.is_set(), worker_finished.is_set()
+
+    elicitation_unwound, worker_unwound = anyio.run(run)
+
+    assert elicitation_unwound is True
+    assert worker_unwound is True
+    assert len(received_tokens) == 1
+    assert received_tokens[0].is_set() is True
+
+
+def test_cancelled_execute_is_durable_before_request_returns(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch,
+) -> None:
+    paths, borg, current, _publication = _published_runtime(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+    )
+    host_started = threading.Event()
+    host_finished = threading.Event()
+
+    def invoke(
+        _paths,
+        store,
+        _config,
+        _repository_id,
+        _borg_id,
+        _generation_id,
+        *,
+        cancel,
+        progress,
+    ):
+        assert progress is None
+        operation = store.list_execution_runs(borg.id)[0]
+        host_started.set()
+        try:
+            assert cancel.wait(timeout=2)
+            store.interrupt_execution_run(
+                operation.id,
+                operation.owner_token,
+                reason="MCP request cancelled",
+            )
+        finally:
+            host_finished.set()
+        raise KeyboardInterrupt
+
+    io = InteractiveIO(
+        prompt=lambda _message: None,
+        confirm=lambda _message, _default: True,
+        write=lambda _message: None,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
+    )
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
+
+    async def cancel_after_host_starts(scope: anyio.CancelScope) -> None:
+        await anyio.to_thread.run_sync(host_started.wait)
+        scope.cancel()
+
+    async def run() -> None:
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel_after_host_starts, scope)
+                await mcp_server._run_cancellable(
+                    mcp_server._execute,
+                    borg.name,
+                    io,
+                )
+
+    anyio.run(run)
+
+    assert host_finished.is_set()
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        operation = store.list_execution_runs(borg.id)[0]
+        runtime = store.get_task_runtime(current.task.id)
+        claim = store.list_task_claims(operation.id)[0]
+        event_ids = [event.id for event in store.list_execution_events(operation.id)]
+        assert operation.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
+        assert claim.released_at is not None
+
+    time.sleep(0.05)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert [
+            event.id for event in store.list_execution_events(operation.id)
+        ] == event_ids
 
 
 def test_empty_elicitation_capability_supports_legacy_form_mode() -> None:
@@ -351,7 +684,11 @@ def test_progress_resources_reconnect_and_resume_durable_execution_events(
         planning_cli_repository,
         approved_task_generation,
     )
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted, io=None: paths)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
+    )
 
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         operation = store.list_execution_runs(borg.id)[0]
@@ -487,8 +824,9 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
     calls: list[str] = []
 
     class FakeRepositoryService:
-        def __init__(self, service_paths, _store, _factory) -> None:
+        def __init__(self, service_paths, _store, _factory, *, cancel) -> None:
             assert service_paths == paths
+            assert cancel is not None
 
         def initialize(self):
             calls.append("init")
@@ -522,7 +860,11 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
                 ),
             )
 
-    monkeypatch.setattr(mcp_server, "_paths", lambda *, trusted, io=None: paths)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
+    )
     monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
 
     initialized = _structured(_call_tool("init"))
@@ -573,10 +915,12 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
             *,
             io,
             interactive: bool,
+            cancel,
         ) -> None:
             assert repository.id == borg.repository_id
             assert io is not None
             assert interactive is True
+            assert cancel is not None
 
         def create(self, name, source):
             create_calls.append((name, source))
@@ -590,7 +934,9 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
 
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
@@ -641,7 +987,7 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     monkeypatch.setattr(
         mcp_server,
         "_paths",
-        lambda *, trusted, io=None: paths,
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
 
@@ -697,7 +1043,9 @@ def test_plan_change_validates_note_and_preserves_service_history(
         adapter.queue(MockResponse(payload=payload))
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
 
@@ -790,7 +1138,9 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     )
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(
         mcp_server,
@@ -870,7 +1220,9 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
 
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
 
@@ -925,7 +1277,8 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         borg.id,
         current.generation.id,
     )
-    assert invoked_kwargs == {"cancel": None, "progress": None}
+    assert invoked_kwargs["cancel"] is not None
+    assert invoked_kwargs["progress"] is None
     assert executed["status"] == "completed"
     assert executed["data"]["operation_id"] == str(operation_id)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -1016,8 +1369,9 @@ def test_workspace_trust_confirmation_uses_elicitation(
     analysis = SimpleNamespace(id=uuid4(), overall_score=4.0)
 
     class FakeRepositoryService:
-        def __init__(self, service_paths, _store, _factory) -> None:
+        def __init__(self, service_paths, _store, _factory, *, cancel) -> None:
             assert service_paths == paths
+            assert cancel is not None
 
         def initialize(self):
             return SimpleNamespace(
@@ -1063,8 +1417,9 @@ def test_init_elicits_onboarding_door_theme_and_name(
     created = Borg(repository_id=repository.id, name="repair-ci")
 
     class FakeRepositoryService:
-        def __init__(self, service_paths, _store, _factory) -> None:
+        def __init__(self, service_paths, _store, _factory, *, cancel) -> None:
             assert service_paths == paths
+            assert cancel is not None
 
         def initialize(self):
             return SimpleNamespace(
@@ -1077,9 +1432,19 @@ def test_init_elicits_onboarding_door_theme_and_name(
             )
 
     class FakeCreateService:
-        def __init__(self, _repository, _store, _agent, *, io, interactive):
+        def __init__(
+            self,
+            _repository,
+            _store,
+            _agent,
+            *,
+            io,
+            interactive,
+            cancel,
+        ):
             assert io is not None
             assert interactive is True
+            assert cancel is not None
 
         def create(self, name, source):
             assert (name, source) == ("repair-ci", theme.path)
@@ -1093,7 +1458,9 @@ def test_init_elicits_onboarding_door_theme_and_name(
 
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
     monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
@@ -1145,7 +1512,9 @@ def test_create_elicits_prd_question_and_final_confirmation(
     )
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
-        mcp_server, "_paths", lambda *, trusted, io=None: paths
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: adapter)
     requests: list = []
