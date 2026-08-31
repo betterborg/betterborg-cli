@@ -498,6 +498,11 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
     control = RunControl()
     outcome = _WorkerResult()
     invocation_finished = anyio.Event()
+    # MCP work must remain startable when unrelated calls occupy AnyIO's default
+    # pool. The bridge is separate because it waits while the worker holds its
+    # own token, and reuses one token sequentially for startup, cleanup, and force.
+    worker_limiter = anyio.CapacityLimiter(1)
+    bridge_limiter = anyio.CapacityLimiter(1)
 
     def run() -> Any:
         outcome.started.set()
@@ -505,7 +510,11 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
 
     async def invoke() -> None:
         try:
-            await anyio.to_thread.run_sync(run, abandon_on_cancel=True)
+            await anyio.to_thread.run_sync(
+                run,
+                abandon_on_cancel=True,
+                limiter=worker_limiter,
+            )
         except BaseException:
             # The result fence owns the synchronous exception. Cancellation of
             # this adapter task abandons only its wait, never the worker.
@@ -520,7 +529,10 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
         with anyio.CancelScope(shield=True) as startup:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(invoke)
-                await anyio.to_thread.run_sync(outcome.started.wait)
+                await anyio.to_thread.run_sync(
+                    outcome.started.wait,
+                    limiter=bridge_limiter,
+                )
                 startup.shield = False
                 await invocation_finished.wait()
                 if not outcome.completed.is_set():
@@ -543,15 +555,22 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
             completed = await anyio.to_thread.run_sync(
                 outcome.completed.wait,
                 timeout,
+                limiter=bridge_limiter,
             )
             if not completed:
                 try:
-                    await anyio.to_thread.run_sync(control.cancellation.force)
+                    await anyio.to_thread.run_sync(
+                        control.cancellation.force,
+                        limiter=bridge_limiter,
+                    )
                 except BaseException:
                     # A force callback failure must not replace protocol
                     # cancellation or bypass the synchronous worker fence.
                     pass
-                await anyio.to_thread.run_sync(outcome.completed.wait)
+                await anyio.to_thread.run_sync(
+                    outcome.completed.wait,
+                    limiter=bridge_limiter,
+                )
             try:
                 outcome.acknowledge()
             except BaseException:

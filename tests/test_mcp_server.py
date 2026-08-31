@@ -224,6 +224,69 @@ def test_run_cancellable_starts_worker_under_pending_cancellation() -> None:
     assert worker_finished.is_set()
 
 
+def test_run_cancellable_ignores_exhausted_default_thread_limiter() -> None:
+    default_worker_started = threading.Event()
+    release_default_worker = threading.Event()
+    workflow_started = threading.Event()
+    workflow_finished = threading.Event()
+    rescue_started = threading.Event()
+    request_finished_before_rescue: list[bool] = []
+
+    def occupy_default_worker() -> None:
+        default_worker_started.set()
+        assert release_default_worker.wait(timeout=4)
+
+    def workflow(*, cancel) -> None:
+        workflow_started.set()
+        try:
+            assert cancel.wait(timeout=2)
+            assert cancel.wait_for_force(timeout=2)
+        finally:
+            workflow_finished.set()
+
+    async def wait_for_event(event: threading.Event) -> None:
+        while not event.is_set():
+            await anyio.sleep(0.01)
+
+    async def rescue_default_limiter(limiter, original_tokens: int) -> None:
+        await anyio.sleep(1.5)
+        rescue_started.set()
+        limiter.total_tokens = original_tokens
+
+    async def cancel_when_started(scope: anyio.CancelScope) -> None:
+        await wait_for_event(workflow_started)
+        scope.cancel()
+
+    async def run() -> None:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        original_tokens = limiter.total_tokens
+        limiter.total_tokens = 1
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(anyio.to_thread.run_sync, occupy_default_worker)
+                await wait_for_event(default_worker_started)
+                tasks.start_soon(
+                    rescue_default_limiter,
+                    limiter,
+                    original_tokens,
+                )
+                try:
+                    with anyio.CancelScope() as scope:
+                        async with anyio.create_task_group() as cancellation_tasks:
+                            cancellation_tasks.start_soon(cancel_when_started, scope)
+                            await mcp_server._run_cancellable(workflow)
+                    request_finished_before_rescue.append(not rescue_started.is_set())
+                finally:
+                    release_default_worker.set()
+        finally:
+            limiter.total_tokens = original_tokens
+
+    anyio.run(run)
+
+    assert workflow_finished.is_set()
+    assert request_finished_before_rescue == [True]
+
+
 def test_run_cancellable_reaps_resistant_local_descendants_before_return(
     real_process_harness,
 ) -> None:
