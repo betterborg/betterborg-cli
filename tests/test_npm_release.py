@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from release_test_support import load_script
 
 reconcile_npm_release = load_script("reconcile_npm_release")

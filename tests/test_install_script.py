@@ -9,7 +9,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from release_test_support import REPOSITORY_ROOT, release_artifacts
 
 INSTALLER = REPOSITORY_ROOT / "scripts/install.sh"
