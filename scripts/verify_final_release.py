@@ -211,7 +211,10 @@ class _FixtureRunner:
     def __call__(
         self, command: list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[bytes]:
-        fixture = Path(str(kwargs["cwd"]))
+        directory = Path(str(kwargs["cwd"]))
+        # Repository commands run inside the fixture; installation commands run
+        # beside it, so that machine state never lands within the repository.
+        fixture = directory.parent if directory.name == "repo" else directory
         method = fixture.name
         if method not in self.git_indexes:
             return subprocess.CompletedProcess(command, 1, b"", b"unknown fixture")

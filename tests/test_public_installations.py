@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from release_test_support import load_script
 
+from betterborg_cli.workspace_trust import TrustStore
 from scripts import protected_smoke
 
 verify_public_installations = load_script("verify_public_installations")
@@ -68,18 +69,36 @@ def test_three_fresh_fixtures_isolate_trust_provider_and_machine_state(
 
     init_calls = [call for call in calls if call[0][-3:] == ["init", "--yes", "--json"]]
     assert len(init_calls) == 3
-    assert {cwd.name for _command, cwd, _environment in init_calls} == {
+    assert {cwd.parent.name for _command, cwd, _environment in init_calls} == {
         "curl",
         "uvx",
         "npx",
     }
-    for command, cwd, environment in calls:
+    assert {cwd.name for _command, cwd, _environment in init_calls} == {"repo"}
+    for command, _cwd, environment in calls:
         if command[-3:] == ["init", "--yes", "--json"]:
             assert environment["OPENAI_API_KEY"] == CREDENTIAL
         else:
             assert "OPENAI_API_KEY" not in environment
         assert "ANTHROPIC_API_KEY" not in environment
-        assert Path(environment["XDG_STATE_HOME"]).is_relative_to(cwd)
+
+    machine_state_variables = (
+        "HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    )
+    for _command, repository, environment in init_calls:
+        for variable in machine_state_variables:
+            machine_state = Path(environment[variable])
+            # Isolated per method, yet outside the repository being initialized.
+            assert machine_state.is_relative_to(repository.parent)
+            assert not machine_state.is_relative_to(repository)
+        # Ask the CLI's own store where trust would land. It refuses to record
+        # trust for a repository from within that repository, so a fixture that
+        # nests them fails before it ever reaches a provider.
+        monkeypatch.setenv("XDG_STATE_HOME", environment["XDG_STATE_HOME"])
+        assert not TrustStore.default_path().is_relative_to(repository)
     assert not any(
         {"publish", "upload"} & set(command)
         for command, _cwd, _environment in calls

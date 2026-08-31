@@ -54,6 +54,37 @@ def credential_markers(credential: str) -> tuple[bytes, ...]:
     return tuple(candidate for candidate in candidates if candidate)
 
 
+def redact(content: bytes, credential: str) -> str:
+    """Return decoded output with every credential representation removed."""
+    for marker in credential_markers(credential):
+        content = content.replace(marker, b"[REDACTED]")
+    return content.decode("utf-8", errors="replace").strip()
+
+
+def fail_with_output(
+    message: str, capture: CommandCapture, credential: str
+) -> NoReturn:
+    """Fail a protected smoke, reporting one command's scrubbed output.
+
+    Every capture has already passed ``assert_no_credential_leak`` before a
+    caller can reach this point, so the credential provably does not appear in
+    it; redacting again here is defence in depth. An opaque smoke failure is
+    undiagnosable from a CI log, which costs more than this discloses.
+    """
+    details = [
+        f"{stream}: {text}"
+        for stream, text in (
+            ("stdout", redact(capture.stdout, credential)),
+            ("stderr", redact(capture.stderr, credential)),
+        )
+        if text
+    ]
+    if not details:
+        fail(message)
+    joined = "\n".join(details)
+    fail(f"{message}\n{joined}")
+
+
 def assert_no_credential_leak(
     credential: str,
     captures: list[CommandCapture],
@@ -129,15 +160,21 @@ def protected_environment() -> tuple[str, dict[str, str]]:
 
 
 def initialize_git_fixture(
-    fixture: Path,
+    repository: Path,
     environment: dict[str, str],
     captures: list[CommandCapture],
     credential: str,
     runner: Runner,
 ) -> None:
-    """Create the common fresh trusted repository used by release smokes."""
-    fixture.mkdir()
-    (fixture / "README.md").write_text(
+    """Create the common fresh repository used by release smokes.
+
+    The repository is a directory of its own so that a smoke's machine state —
+    home, caches, and the workspace trust store — can sit beside it rather than
+    inside it. The CLI refuses to record trust for a repository within that
+    repository, so a fixture that nests them cannot be initialized at all.
+    """
+    repository.mkdir(parents=True)
+    (repository / "README.md").write_text(
         "# BetterBorg release fixture\n", encoding="utf-8"
     )
     commands = (
@@ -155,12 +192,14 @@ def initialize_git_fixture(
             label=label,
             captures=captures,
             credential=credential,
-            roots=(fixture,),
-            cwd=fixture,
+            roots=(repository,),
+            cwd=repository,
             env=environment,
         )
         if completed.returncode != 0:
-            fail(f"fixture setup failed: {label}")
+            fail_with_output(
+                f"fixture setup failed: {label}", captures[-1], credential
+            )
 
 
 def verify_cli_initialization(
@@ -168,7 +207,8 @@ def verify_cli_initialization(
     *,
     method: str,
     version: str,
-    fixture: Path,
+    repository: Path,
+    scan_root: Path,
     environment: dict[str, str],
     captures: list[CommandCapture],
     credential: str,
@@ -176,7 +216,12 @@ def verify_cli_initialization(
     attempts: int,
     retry_delay: float,
 ) -> None:
-    """Check one exact CLI version and initialize one fresh provider fixture."""
+    """Check one exact CLI version and initialize one fresh provider fixture.
+
+    The CLI runs inside ``repository``; ``scan_root`` is the wider fixture tree
+    the credential scan walks, so machine state written outside the repository
+    is still checked for leaks.
+    """
     expected_version_output = f"borg {version}".encode()
     for attempt in range(1, attempts + 1):
         completed = run_command(
@@ -185,8 +230,8 @@ def verify_cli_initialization(
             label=f"{method} exact-version check attempt {attempt}",
             captures=captures,
             credential=credential,
-            roots=(fixture,),
-            cwd=fixture,
+            roots=(scan_root,),
+            cwd=repository,
             env=environment,
         )
         if (
@@ -197,7 +242,11 @@ def verify_cli_initialization(
         if attempt != attempts:
             time.sleep(retry_delay)
     else:
-        fail(f"exact-version {method} check did not observe BetterBorg {version}")
+        fail_with_output(
+            f"exact-version {method} check did not observe BetterBorg {version}",
+            captures[-1],
+            credential,
+        )
 
     init_environment = dict(environment)
     init_environment[PROVIDER_VARIABLE] = credential
@@ -207,15 +256,25 @@ def verify_cli_initialization(
         label=f"{method} trusted provider initialization",
         captures=captures,
         credential=credential,
-        roots=(fixture,),
-        cwd=fixture,
+        roots=(scan_root,),
+        cwd=repository,
         env=init_environment,
     )
     if initialized.returncode != 0:
-        fail(f"{method} provider initialization failed")
+        fail_with_output(
+            f"{method} provider initialization failed", captures[-1], credential
+        )
     try:
         payload = json.loads(initialized.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        fail(f"{method} provider initialization did not emit valid JSON")
+        fail_with_output(
+            f"{method} provider initialization did not emit valid JSON",
+            captures[-1],
+            credential,
+        )
     if not isinstance(payload, dict) or payload.get("initialized") is not True:
-        fail(f"{method} provider initialization was not fresh")
+        fail_with_output(
+            f"{method} provider initialization was not fresh",
+            captures[-1],
+            credential,
+        )

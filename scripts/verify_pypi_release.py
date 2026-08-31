@@ -202,19 +202,23 @@ def verify_release(
 
     credential, safe_environment = protected_smoke.protected_environment()
     captures: list[protected_smoke.CommandCapture] = []
+    # Machine state sits beside the repository, never within it: the CLI
+    # refuses to record workspace trust inside the workspace it trusts.
+    repository = fixture_root / "repo"
     protected_smoke.initialize_git_fixture(
-        fixture_root, safe_environment, captures, credential, subprocess.run
+        repository, safe_environment, captures, credential, subprocess.run
     )
 
     child_environment = dict(safe_environment)
-    child_environment["XDG_STATE_HOME"] = str(fixture_root / ".release-state")
+    child_environment["XDG_STATE_HOME"] = str(fixture_root / "state")
     child_environment["NO_COLOR"] = "1"
 
     protected_smoke.verify_cli_initialization(
         _uvx_command(version),
         method="uvx",
         version=version,
-        fixture=fixture_root,
+        repository=repository,
+        scan_root=fixture_root,
         environment=child_environment,
         captures=captures,
         credential=credential,
