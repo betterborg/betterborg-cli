@@ -333,7 +333,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     result = cli_runner.invoke(cli, ["init", "--yes", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {
+    expected = {
         "create_commands": [
             "borg create theme-ci --prd "
             ".borg/prds/improvements/theme-ci.md"
@@ -342,6 +342,10 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
         "repository_id": str(load_repository_config(paths).repository_id),
         "score": 3.0,
     }
+    assert json.loads(result.output) == expected
+    assert result.output == json.dumps(
+        expected, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     assert selected_interactivity == [False]
     assert paths.improvement_prds_dir.joinpath("theme-ci.md").is_file()
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -529,13 +533,17 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload == {
+    expected = {
         "analysis_id": payload["analysis_id"],
         "delta": -1.0,
         "previous_score": 3.0,
         "repository_id": str(load_repository_config(paths).repository_id),
         "score": 2.0,
     }
+    assert payload == expected
+    assert result.output == json.dumps(
+        expected, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     assert selected_interactivity == [False, False]
 
 

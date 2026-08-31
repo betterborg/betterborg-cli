@@ -11,10 +11,12 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import pytest
 from click.testing import CliRunner
+from progress_test_support import FakeClock, TTYStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import __version__
@@ -299,6 +301,74 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     ]
 
 
+def test_json_init_reconciles_cancellation_on_run_control_reporter(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    stream = io.StringIO()
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class StubRepositoryService:
+        def __init__(
+            self,
+            paths: RepoPaths,
+            _store: SqliteStore,
+            _agent_factory,
+            *,
+            cancel: cli_module.CancellationToken,
+            progress: RunProgress,
+        ) -> None:
+            assert reporters == [progress]
+            self.paths = paths
+            self.cancel = cancel
+            self.progress = progress
+
+        def initialize(self):
+            self.progress.declare(StageSpec("work", "Structured work"))
+            self.progress.start("work")
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except KeyboardInterrupt:
+                deadline = time.monotonic() + 1
+                while not self.progress.cancelling and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                assert self.cancel.is_set()
+                self.progress.stop("work", "reconciled")
+            return SimpleNamespace(
+                repository=Repository(root=self.paths.root),
+                initialized=False,
+                improvement_prds=(),
+                analysis=SimpleNamespace(overall_score=3.0),
+            )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+
+    exit_code = cli_module.main(
+        ["init", "--yes", "--json"],
+        prog_name="borg",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert len(reporters) == 1
+    assert reporters[0].stages["work"].state is StageState.STOPPED
+    assert reporters[0].closed
+    assert stream.getvalue() == ""
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_main_dispatches_sigint_with_socket_only_selector(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -371,18 +441,165 @@ def test_main_preserves_click_exception_formatting(
     assert captured.err == "Error: ordinary failure\n"
 
 
-def test_main_surfaces_reconciliation_failure_after_interrupt(
+@pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
+def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+
+    stream = TTYStringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+    run = cli_module.CliRunContext(cli_module.CancellationToken(), progress)
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": ["Who needs this first?"],
+                "prd_markdown": None,
+            }
+        )
+    ).queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# CLI draft\n\nReady for review.",
+            }
+        ),
+    )
+    snapshots: list[tuple[str, str, str]] = []
+
+    def cross_heartbeat(boundary: str) -> None:
+        before = stream.getvalue()
+        clock.now += 10
+        progress.refresh()
+        snapshots.append((boundary, before, stream.getvalue()))
+
+    class StubRepositoryService:
+        def __init__(
+            self,
+            paths: RepoPaths,
+            store: SqliteStore,
+            _agent_factory,
+            *,
+            cancel=None,
+            progress: RunProgress | None = None,
+        ) -> None:
+            assert cancel is run.cancellation
+            assert progress is run.progress
+            self.paths = paths
+            self.store = store
+            self.progress = progress
+
+        def initialize(self):
+            repository = Repository(root=self.paths.root)
+            self.store.add_repository(repository)
+            self.paths.tracked_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.tracked_dir.joinpath("config.toml").write_text(
+                "version = 1\n\n"
+                "[repository]\n"
+                f'id = "{repository.id}"\n'
+                'default_branch = "main"\n',
+                encoding="utf-8",
+            )
+            assert self.progress is not None
+            self.progress.declare(StageSpec("active", "Active work"))
+            self.progress.start("active")
+            return SimpleNamespace(
+                repository=repository,
+                analysis=SimpleNamespace(overall_score=3.0),
+                initialized=True,
+                improvement_prds=(),
+            )
+
+    original_echo = click.echo
+    original_prompt = click.prompt
+    original_confirm = click.confirm
+
+    def echo(message=None, *args, **kwargs):
+        cross_heartbeat(f"output:{message}")
+        return original_echo(message, *args, **kwargs)
+
+    def prompt(*args, **kwargs):
+        cross_heartbeat("prompt")
+        return original_prompt(*args, **kwargs)
+
+    def confirm(*args, **kwargs):
+        cross_heartbeat("confirmation")
+        return original_confirm(*args, **kwargs)
+
+    def edit(_body: str) -> str:
+        cross_heartbeat("editor")
+        return "# Edited CLI draft\n\nApproved requirements."
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    monkeypatch.setattr(cli_module.click, "prompt", prompt)
+    monkeypatch.setattr(cli_module.click, "confirm", confirm)
+    monkeypatch.setattr(cli_module, "_edit_markdown", edit)
+
+    result = cli_runner.invoke(
+        cli,
+        ["init", "--yes"],
+        input="3\ncli-suspended\nMaintainers\ny\ny\n",
+        obj=run,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert any(
+        boundary.startswith("output:Initialized repository")
+        for boundary, *_ in snapshots
+    )
+    assert any(boundary == "prompt" for boundary, *_ in snapshots)
+    assert any(boundary == "confirmation" for boundary, *_ in snapshots)
+    assert any(boundary == "editor" for boundary, *_ in snapshots)
+    assert snapshots and all(before == after for _, before, after in snapshots)
+    assert committed_git_repo.joinpath(
+        ".borg/prds/cli-suspended.md"
+    ).read_text(encoding="utf-8") == (
+        "# Edited CLI draft\n\nApproved requirements.\n"
+    )
+
+
+def test_main_surfaces_reconciliation_failure_after_sigint(
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
+    observed: dict[str, cli_module.CliRunContext] = {}
+
     @click.command()
-    def command() -> None:
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        observed["run"] = run
+        run.progress.declare(StageSpec("work", "Work"))
+        run.progress.start("work")
         try:
             try:
-                raise KeyboardInterrupt
+                os.kill(os.getpid(), signal.SIGINT)
             except KeyboardInterrupt as interruption:
+                deadline = time.monotonic() + 1
+                while not run.progress.cancelling and time.monotonic() < deadline:
+                    time.sleep(0.001)
                 raise RuntimeError("durability reconciliation failed") from interruption
         except RuntimeError as failure:
+            run.progress.fail("work", str(failure))
             raise click.ClickException(
                 "could not reconcile interruption"
             ) from failure
@@ -393,8 +610,13 @@ def test_main_surfaces_reconciliation_failure_after_interrupt(
 
     captured = capsys.readouterr()
     assert exit_code == 1
+    run = observed["run"]
+    assert run.cancellation.is_set()
+    assert run.progress.cancelling
+    assert run.progress.stages["work"].state is StageState.FAILED
     assert captured.out == ""
-    assert captured.err == "Error: could not reconcile interruption\n"
+    assert "failed Work — durability reconciliation failed" in captured.err
+    assert captured.err.endswith("Error: could not reconcile interruption\n")
 
 
 @pytest.mark.parametrize("wrapper", [click.ClickException, click.Abort])
@@ -618,6 +840,88 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
             store.get_borg_by_name(repository.id, "wait-for-approval") is not None
         )
         assert store.list_operations(repository.id) == []
+
+
+@pytest.mark.parametrize(
+    ("confirmation_number", "name"),
+    [(1, "interrupt-editor-review"), (2, "interrupt-final-approval")],
+    ids=["editor-confirmation", "final-confirmation"],
+)
+def test_main_sigint_during_prd_confirmation_stops_without_publishing(
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    confirmation_number: int,
+    name: str,
+) -> None:
+    repository, paths = initialized_cli_repository
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# Interrupted draft\n\nNever publish this.",
+            }
+        )
+    )
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=io.StringIO(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    prompts = 0
+
+    def interrupt_at_confirmation(_prompt: str) -> str:
+        nonlocal prompts
+        prompts += 1
+        if prompts == confirmation_number:
+            os.kill(os.getpid(), signal.SIGINT)
+        return "n"
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(click.termui, "visible_prompt_func", interrupt_at_confirmation)
+    monkeypatch.setattr(
+        cli_module,
+        "_edit_markdown",
+        lambda _body: pytest.fail("interrupted work must not launch the editor"),
+    )
+
+    exit_code = cli_module.main(
+        ["create", name, "--yes"],
+        prog_name="borg",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert prompts == confirmation_number
+    assert len(reporters) == 1
+    assert reporters[0].stages["requirements"].state is StageState.STOPPED
+    assert reporters[0].stages["requirements"].result == "interrupted"
+    assert reporters[0].closed
+    assert captured.err == ""
+    assert "Error:" not in captured.out
+    assert "Aborted!" not in captured.out
+    assert "borg plan start" not in captured.out
+    assert "draft saved" not in captured.out
+    assert not paths.tracked_dir.joinpath("prds", f"{name}.md").exists()
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, name)
+        assert borg is not None
+        session = store.get_prd_session_for_borg(borg.id)
+        assert session is not None
+        assert [turn.role for turn in store.list_prd_turns(session.id)] == [
+            "user",
+            "assistant",
+        ]
 
 
 def test_version_does_not_initialize_repository(

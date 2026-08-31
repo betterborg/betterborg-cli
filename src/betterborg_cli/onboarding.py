@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Protocol
 
@@ -15,6 +16,7 @@ from betterborg_cli.prd_session import (
     PrdSessionResult,
     validate_borg_name,
 )
+from betterborg_cli.progress import RunProgress
 from betterborg_cli.repo_analysis import ImprovementPrd
 from betterborg_cli.repo_analysis.text_rendering import terminal_text
 from betterborg_cli.store import Repository, SqliteStore
@@ -40,6 +42,7 @@ class CreateService:
         editor: Editor | None = None,
         interactive: bool = True,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self._session = PrdSession(
             repository,
@@ -49,6 +52,7 @@ class CreateService:
             editor=editor,
             interactive=interactive,
             cancel=cancel,
+            progress=progress,
         )
 
     def create(
@@ -78,23 +82,31 @@ class OnboardingDispatcher:
         io: InteractiveIO,
         creator: BorgCreator,
         improvement_prds: Sequence[ImprovementPrd],
+        *,
+        cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self.repository = repository
         self.store = store
         self.io = io
         self.creator = creator
         self.improvement_prds = tuple(improvement_prds)
+        self.cancel = cancel
+        self.progress = progress
 
     def run(self) -> PrdSessionResult | None:
         """Choose a door and dispatch it, or return ``None`` on cancellation."""
-        self.io.write("What would you like to do next?")
-        for index, door in enumerate(self._DOORS, start=1):
-            self.io.write(f"  {index}. {door}")
+        if self._cancelled():
+            return None
+        with self._suspend_output():
+            self.io.write("What would you like to do next?")
+            for index, door in enumerate(self._DOORS, start=1):
+                self.io.write(f"  {index}. {door}")
 
-        door = self._choose(
-            "Choose a door (1-3, or q to cancel)",
-            count=len(self._DOORS),
-        )
+            door = self._choose(
+                "Choose a door (1-3, or q to cancel)",
+                count=len(self._DOORS),
+            )
         if door is None:
             return None
         if door == 1:
@@ -104,50 +116,68 @@ class OnboardingDispatcher:
         return self._brainstorm()
 
     def _fix_the_repo(self) -> PrdSessionResult | None:
-        if not self.improvement_prds:
-            self.io.write("No repository improvement themes were generated.")
+        if self._cancelled():
             return None
-        self.io.write("Ranked repository improvement themes:")
-        for index, document in enumerate(self.improvement_prds, start=1):
-            self.io.write(
-                f"  {index}. {terminal_text(document.title)} — predicted impact "
-                f"+{document.predicted_impact:g}; effort {document.effort}"
+        if not self.improvement_prds:
+            with self._suspend_output():
+                self.io.write("No repository improvement themes were generated.")
+            return None
+        with self._suspend_output():
+            self.io.write("Ranked repository improvement themes:")
+            for index, document in enumerate(self.improvement_prds, start=1):
+                self.io.write(
+                    f"  {index}. {terminal_text(document.title)} — predicted impact "
+                    f"+{document.predicted_impact:g}; effort {document.effort}"
+                )
+            selection = self._choose(
+                f"Choose a theme [1] (1-{len(self.improvement_prds)}, or q to cancel)",
+                count=len(self.improvement_prds),
+                default=1,
             )
-        selection = self._choose(
-            f"Choose a theme [1] (1-{len(self.improvement_prds)}, or q to cancel)",
-            count=len(self.improvement_prds),
-            default=1,
-        )
         if selection is None:
             return None
         document = self.improvement_prds[selection - 1]
-        name = self._prompt_name(document.suggested_borg_name)
-        if name is None:
+        with self._suspend_output():
+            name = self._prompt_name(document.suggested_borg_name)
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name, document.path)
 
     def _improve_prd(self) -> PrdSessionResult | None:
-        answer = self.io.prompt("Local Markdown PRD path (or q to cancel)")
+        if self._cancelled():
+            return None
+        with self._suspend_output():
+            answer = self.io.prompt("Local Markdown PRD path (or q to cancel)")
+        if self._cancelled():
+            return None
         if answer is None or answer.casefold() == "q":
             return None
         source = Path(answer)
         if not source.is_absolute():
             source = self.repository.root / source
-        name = self._prompt_name(source.stem)
-        if name is None:
+        with self._suspend_output():
+            name = self._prompt_name(source.stem)
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name, source)
 
     def _brainstorm(self) -> PrdSessionResult | None:
-        name = self._prompt_name()
-        if name is None:
+        if self._cancelled():
+            return None
+        with self._suspend_output():
+            name = self._prompt_name()
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name)
 
     def _prompt_name(self, suggested: str | None = None) -> str | None:
         while True:
+            if self._cancelled():
+                return None
             suffix = f" [{suggested}]" if suggested else ""
             answer = self.io.prompt(f"Borg name{suffix} (or q to cancel)")
+            if self._cancelled():
+                return None
             if answer is None or answer.casefold() == "q":
                 return None
             name = suggested if not answer and suggested is not None else answer
@@ -175,7 +205,11 @@ class OnboardingDispatcher:
         default: int | None = None,
     ) -> int | None:
         while True:
+            if self._cancelled():
+                return None
             answer = self.io.prompt(message)
+            if self._cancelled():
+                return None
             if answer is None or answer.casefold() == "q":
                 return None
             if not answer and default is not None:
@@ -187,6 +221,16 @@ class OnboardingDispatcher:
             if 1 <= selection <= count:
                 return selection
             self.io.write(f"Choose a number from 1 to {count}, or q to cancel.")
+
+    def _cancelled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
+
+    def _suspend_output(self) -> AbstractContextManager[object]:
+        return (
+            self.progress.suspend()
+            if self.progress is not None
+            else nullcontext()
+        )
 
 
 def create_commands(
