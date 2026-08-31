@@ -352,10 +352,10 @@ published release is partial, it is also immutable and requires a new version.
 After publication, verify a downloaded binary before use:
 
 ```console
-sha256sum --check borg-OPERATING_SYSTEM-ARCHITECTURE.sha256
-gh attestation verify borg-OPERATING_SYSTEM-ARCHITECTURE \
+sha256sum --check betterborg-OPERATING_SYSTEM-ARCHITECTURE.sha256
+gh attestation verify betterborg-OPERATING_SYSTEM-ARCHITECTURE \
   --repo betterborg/betterborg-cli
-./borg-OPERATING_SYSTEM-ARCHITECTURE version
+./betterborg-OPERATING_SYSTEM-ARCHITECTURE version
 ```
 
 On Darwin, use `shasum -a 256 -c` in place of `sha256sum --check`. The version

@@ -47,7 +47,7 @@ On each run, in order:
 
 1. **An installed `betterborg` on `PATH`**, if `betterborg version` reports this package's exact version. A `pip install betterborg` or the standalone installer takes over from here, and the launcher adds nothing.
 2. **The standalone release binary** for macOS and Linux on arm64 or x86_64. It is fetched from the matching GitHub release, verified against the published SHA-256 digest, and cached under `$XDG_CACHE_HOME/betterborg/cli/<version>`, or `~/.cache/betterborg/cli/<version>`, so later runs reuse it. A binary that fails verification is discarded, never executed.
-3. **`uvx --from betterborg==<version> borg`**, if [uv](https://docs.astral.sh/uv/) is on `PATH`.
+3. **`uvx --from betterborg==<version> betterborg`**, if [uv](https://docs.astral.sh/uv/) is on `PATH`.
 
 If none of those resolve, the launcher exits with what it tried and how to fix it.
 

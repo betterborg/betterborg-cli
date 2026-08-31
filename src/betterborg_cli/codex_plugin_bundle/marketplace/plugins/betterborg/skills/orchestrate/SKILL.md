@@ -5,7 +5,7 @@ description: Use Betterborg to analyze, plan, and execute substantial repository
 
 # Orchestrate with Betterborg
 
-Use the Borg MCP server for repository work that benefits from a durable PRD,
+Use the Betterborg MCP server for repository work that benefits from a durable PRD,
 reviewed plan, executable task graph, or supervised execution.
 
 1. Use `init` or `analyze` to establish the current repository state.

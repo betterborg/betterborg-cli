@@ -70,7 +70,7 @@ uvx --from betterborg==VERSION betterborg version
 npx --yes @betterborg/cli@VERSION version
 ```
 
-`betterborg version` must print exactly `borg VERSION`.
+`betterborg version` must print exactly `betterborg VERSION`.
 
 ## Platforms
 

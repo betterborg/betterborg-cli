@@ -77,7 +77,7 @@ def _marketplace_version(root: Path, relative_path: Path) -> str | None:
         if isinstance(plugin, dict) and plugin.get("name") == "betterborg"
     ]
     if len(matches) != 1:
-        raise ValueError("must contain exactly one borg plugin entry")
+        raise ValueError("must contain exactly one betterborg plugin entry")
     return matches[0].get("version")
 
 
@@ -125,7 +125,7 @@ def version_errors(root: Path, tag: str | None = None) -> list[str]:
             continue
         if source_version != version:
             errors.append(
-                f"{relative_path} borg entry has version {source_version!r}; "
+                f"{relative_path} betterborg entry has version {source_version!r}; "
                 f"expected {version!r}"
             )
 

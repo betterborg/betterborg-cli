@@ -48,7 +48,7 @@ the installer requests it.
 ## Continue repository work
 
 Once initialization completes, use `betterborg create`, `betterborg plan`, `betterborg task`,
-and `betterborg execute` as shown by `borg COMMAND --help`. Before executing a
+and `betterborg execute` as shown by `betterborg COMMAND --help`. Before executing a
 published task generation, `betterborg task estimate NAME` shows its P50/P80 work and
 billing-mode estimate.
 

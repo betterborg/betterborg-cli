@@ -166,6 +166,14 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
         "betterborg-linux-x86_64",
     ):
         assert workflow.count(f"artifact: {artifact}") == 1
+    # The manifest job downloads by prefix, so the upload name and the download
+    # pattern have to keep agreeing; a stale pattern silently matches nothing.
+    upload = re.search(r"name: binary-\$\{\{ matrix\.artifact \}\}", workflow)
+    pattern = re.search(r"pattern: (\S+)", workflow)
+    assert upload is not None and pattern is not None
+    prefix = pattern.group(1).removesuffix("*")
+    for artifact in release_artifacts.TARGETS:
+        assert f"binary-{artifact.filename}".startswith(prefix)
     for runner in (
         "macos-14",
         "macos-15-intel",

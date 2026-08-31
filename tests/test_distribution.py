@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import os
 import shutil
@@ -191,10 +192,12 @@ def test_wheel_console_entry_uses_root_run_lifecycle(
             if name.endswith(".dist-info/entry_points.txt")
         )
 
-        assert (
-            "borg = betterborg_cli.cli:main"
-            in archive.read(entry_points).decode("utf-8")
-        )
+        parsed = configparser.ConfigParser()
+        parsed.read_string(archive.read(entry_points).decode("utf-8"))
+
+        assert dict(parsed["console_scripts"]) == {
+            "betterborg": "betterborg_cli.cli:main"
+        }
 
 
 def test_wheel_declares_python_compatible_rich_dependency(
