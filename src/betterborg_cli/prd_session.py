@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, TypeAlias
@@ -20,11 +21,13 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_files import (
     RepositoryPathError,
     is_windows_reserved_filename,
     publish_repository_text,
+    read_repository_text,
 )
 from betterborg_cli.store import (
     Borg,
@@ -69,6 +72,7 @@ _BRAINSTORM_OPENING = (
     "requirements document."
 )
 _WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
+_REQUIREMENTS_STAGE_KEY = "requirements"
 
 Prompt: TypeAlias = Callable[[str], str | None]
 Confirm: TypeAlias = Callable[[str, bool], bool]
@@ -137,10 +141,11 @@ class PrdSession:
         artifact_dir: Path | None = None,
         model: str | None = None,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         if store.get_repository(repository.id) != repository:
             raise ValueError("repository must already be present in the supplied store")
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         if interactive and io is None:
@@ -170,6 +175,11 @@ class PrdSession:
         self.artifact_dir = Path(artifact_dir or paths.artifacts_dir / "prd-sessions")
         self.model = resolved_model
         self.cancel = cancel
+        self.progress = progress
+        if progress is not None:
+            progress.declare(
+                StageSpec(_REQUIREMENTS_STAGE_KEY, "Gather requirements")
+            )
 
     def run(
         self,
@@ -186,9 +196,23 @@ class PrdSession:
         being prompted.
         """
         validate_borg_name(name)
-        initial_markdown = _read_source(source) if source is not None else None
         relative_prd_path = Path(".borg") / "prds" / f"{name}.md"
         prd_path = self.repository.root / relative_prd_path
+        borg = Borg(repository_id=self.repository.id, name=name)
+        session = StoredPrdSession(
+            repository_id=self.repository.id,
+            borg_id=borg.id,
+            prd_path=relative_prd_path,
+        )
+        base_result = {
+            "borg": borg,
+            "session": session,
+            "prd_path": prd_path,
+        }
+        if self._cancelled():
+            return PrdSessionResult(**base_result, confirmed=False)
+
+        initial_markdown = _read_source(source) if source is not None else None
         if source is not None and source.resolve() == prd_path.resolve():
             raise ValueError("source PRD cannot also be the confirmed output path")
         if self.store.get_borg_by_name(self.repository.id, name) is not None:
@@ -196,12 +220,6 @@ class PrdSession:
         if prd_path.exists() or prd_path.is_symlink():
             raise FileExistsError(f"confirmed Borg PRD already exists: {prd_path}")
 
-        borg = Borg(repository_id=self.repository.id, name=name)
-        session = StoredPrdSession(
-            repository_id=self.repository.id,
-            borg_id=borg.id,
-            prd_path=relative_prd_path,
-        )
         with self.store.transaction():
             self.store.add_borg(borg)
             self.store.add_prd_session(session)
@@ -211,83 +229,191 @@ class PrdSession:
                 content=initial_markdown or _BRAINSTORM_OPENING,
             )
 
-        base_result = {
-            "borg": borg,
-            "session": session,
-            "prd_path": prd_path,
-        }
-        if self.cancel is not None and self.cancel.is_set():
+        if self._cancelled():
             return PrdSessionResult(**base_result, confirmed=False)
 
-        round_number = 0
-        while True:
-            round_number += 1
-            try:
+        if self.progress is not None:
+            self.progress.start(_REQUIREMENTS_STAGE_KEY)
+            self.progress.update(_REQUIREMENTS_STAGE_KEY, "1 turn recorded")
+
+        try:
+            round_number = 0
+            while True:
+                round_number += 1
                 payload = self._run_agent(session, round_number)
-            except _PrdSessionCancelled:
-                return PrdSessionResult(**base_result, confirmed=False)
-            questions = _normalize_questions(payload["questions"])
-            draft = payload["prd_markdown"]
-            if bool(questions) == bool(draft):
-                raise PrdSessionError(
-                    "PRD agent must return either material questions or a draft"
-                )
+                questions = _normalize_questions(payload["questions"])
+                draft = payload["prd_markdown"]
+                if bool(questions) == bool(draft):
+                    raise PrdSessionError(
+                        "PRD agent must return either material questions or a draft"
+                    )
 
-            if questions:
-                self.store.append_prd_turn(
-                    session_id=session.id,
+                if questions:
+                    self._append_turn(
+                        session,
+                        role="assistant",
+                        content="\n".join(
+                            f"- {question}" for question in questions
+                        ),
+                    )
+                    if self._cancelled():
+                        return self._stopped_result(base_result, "interrupted")
+                    if not self.interactive:
+                        return self._stopped_result(
+                            base_result,
+                            "questions pending",
+                            questions=questions,
+                        )
+                    if not self._answer_questions(session, questions):
+                        reason = (
+                            "interrupted" if self._cancelled() else "cancelled"
+                        )
+                        return self._stopped_result(base_result, reason)
+                    continue
+
+                body_md = _normalize_draft(draft)
+                self._append_turn(
+                    session,
                     role="assistant",
-                    content="\n".join(f"- {question}" for question in questions),
+                    content=body_md,
                 )
-                if not self.interactive:
-                    return PrdSessionResult(
-                        **base_result,
-                        confirmed=False,
-                        questions=questions,
-                    )
-                if not self._answer_questions(session, questions):
-                    return PrdSessionResult(**base_result, confirmed=False)
-                continue
+                break
 
-            body_md = _normalize_draft(draft)
-            self.store.append_prd_turn(
-                session_id=session.id,
-                role="assistant",
-                content=body_md,
-            )
-            break
+            if self._cancelled():
+                return self._stopped_result(
+                    base_result,
+                    "interrupted",
+                    body_md=body_md,
+                )
 
-        if self.interactive:
-            assert self.io is not None
-            self.io.write(body_md)
-            if self.editor is not None and self.io.confirm(
-                "Review and edit this PRD in your editor?", default=False
-            ):
-                edited = self.editor(body_md)
-                if edited is not None:
-                    body_md = _normalize_draft(edited)
-                    self.store.append_prd_turn(
-                        session_id=session.id,
-                        role="user",
-                        content=body_md,
-                    )
+            if self.interactive:
+                assert self.io is not None
+                with self._suspend_output():
                     self.io.write(body_md)
-            confirmed = self.io.confirm(
-                f"Create Borg {name!r} with this PRD?", default=False
-            )
+                    edit_requested = False
+                    if not self._cancelled() and self.editor is not None:
+                        edit_requested = self.io.confirm(
+                            "Review and edit this PRD in your editor?",
+                            default=False,
+                        )
+                    if edit_requested and not self._cancelled():
+                        edited = self.editor(body_md)
+                        if edited is not None:
+                            body_md = _normalize_draft(edited)
+                            self._append_turn(
+                                session,
+                                role="user",
+                                content=body_md,
+                            )
+                            if not self._cancelled():
+                                self.io.write(body_md)
+                    if not self._cancelled():
+                        confirmed = self.io.confirm(
+                            f"Create Borg {name!r} with this PRD?", default=False
+                        )
 
-        if not confirmed:
-            return PrdSessionResult(
+            if self._cancelled():
+                return self._stopped_result(
+                    base_result,
+                    "interrupted",
+                    body_md=body_md,
+                )
+
+            if not confirmed:
+                return self._stopped_result(
+                    base_result,
+                    "not confirmed",
+                    body_md=body_md,
+                )
+
+            try:
+                _publish_confirmed_prd(
+                    prd_path,
+                    body_md,
+                    root=self.repository.root,
+                )
+            except FileExistsError:
+                raise
+            except BaseException:
+                if not _confirmed_prd_matches(
+                    prd_path,
+                    body_md,
+                    root=self.repository.root,
+                ):
+                    raise
+            result = PrdSessionResult(
                 **base_result,
-                confirmed=False,
+                confirmed=True,
                 body_md=body_md,
             )
+            if self.progress is not None:
+                self.progress.complete(
+                    _REQUIREMENTS_STAGE_KEY,
+                    f"PRD {name!r} confirmed",
+                )
+            return result
+        except _PrdSessionCancelled:
+            return self._stopped_result(base_result, "interrupted")
+        except BaseException as error:
+            if self.progress is not None:
+                record = self.progress.stages[_REQUIREMENTS_STAGE_KEY]
+                if record.state is StageState.RUNNING:
+                    if _is_interruption(error, self.cancel):
+                        self.progress.stop(_REQUIREMENTS_STAGE_KEY, "interrupted")
+                    else:
+                        self.progress.fail(
+                            _REQUIREMENTS_STAGE_KEY,
+                            str(error) or type(error).__name__,
+                        )
+            raise
 
-        _publish_confirmed_prd(prd_path, body_md, root=self.repository.root)
+    def _append_turn(
+        self,
+        session: StoredPrdSession,
+        *,
+        role: str,
+        content: str,
+    ) -> None:
+        self.store.append_prd_turn(
+            session_id=session.id,
+            role=role,
+            content=content,
+        )
+        if self.progress is not None:
+            turn_count = len(self.store.list_prd_turns(session.id))
+            noun = "turn" if turn_count == 1 else "turns"
+            self.progress.update(
+                _REQUIREMENTS_STAGE_KEY,
+                f"{turn_count} {noun} recorded",
+            )
+
+    def _stopped_result(
+        self,
+        base_result: dict[str, object],
+        reason: str,
+        *,
+        body_md: str | None = None,
+        questions: tuple[str, ...] = (),
+    ) -> PrdSessionResult:
+        if self.progress is not None:
+            record = self.progress.stages[_REQUIREMENTS_STAGE_KEY]
+            if record.state is StageState.RUNNING:
+                self.progress.stop(_REQUIREMENTS_STAGE_KEY, reason)
         return PrdSessionResult(
             **base_result,
-            confirmed=True,
+            confirmed=False,
             body_md=body_md,
+            questions=questions,
+        )
+
+    def _cancelled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
+
+    def _suspend_output(self) -> AbstractContextManager[object]:
+        return (
+            self.progress.suspend()
+            if self.progress is not None
+            else nullcontext()
         )
 
     def _run_agent(
@@ -307,6 +433,13 @@ class PrdSession:
             allowed_tools=READ_ONLY_API_TOOLS,
             log_path=self.artifact_dir / f"{session.id}.round-{round_number}.log",
             result_path=self.artifact_dir / f"{session.id}.round-{round_number}.json",
+            activity_sink=(
+                lambda activity: self.progress.activity(
+                    _REQUIREMENTS_STAGE_KEY, activity
+                )
+                if self.progress is not None
+                else None
+            ),
         )
         try:
             result = self.agent.run(spec, cancel=self.cancel)
@@ -326,17 +459,22 @@ class PrdSession:
     ) -> bool:
         assert self.io is not None
         for question in questions:
-            answer = self.io.prompt(question)
+            if self._cancelled():
+                return False
+            with self._suspend_output():
+                answer = self.io.prompt(question)
             if answer is None:
                 return False
             answer = answer.strip()
             if not answer:
                 raise PrdSessionError("material question answers must not be empty")
-            self.store.append_prd_turn(
-                session_id=session.id,
+            self._append_turn(
+                session,
                 role="user",
                 content=answer,
             )
+            if self._cancelled():
+                return False
         return True
 
 
@@ -404,3 +542,24 @@ def _publish_confirmed_prd(path: Path, body: str, *, root: Path) -> None:
         ) from error
     except FileExistsError as error:
         raise FileExistsError(f"confirmed Borg PRD already exists: {path}") from error
+
+
+def _confirmed_prd_matches(path: Path, body: str, *, root: Path) -> bool:
+    try:
+        return read_repository_text(path, root=root) == body
+    except (OSError, UnicodeError, RepositoryPathError):
+        return False
+
+
+def _is_interruption(
+    error: BaseException,
+    cancel: CancellationToken | None,
+) -> bool:
+    if isinstance(error, KeyboardInterrupt) or (
+        cancel is not None and cancel.is_set()
+    ):
+        return True
+    cause = error.__cause__
+    if cause is None:
+        cause = error.__context__
+    return isinstance(cause, KeyboardInterrupt)

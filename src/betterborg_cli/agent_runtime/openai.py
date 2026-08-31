@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import http.client
 import json
 import re
-import urllib.error
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from betterborg_cli.agent_runtime.api_adapter import (
+    AbortableApiRequest,
     ApiCredentialRedactor,
     ApiRunContext,
+)
+from betterborg_cli.agent_runtime.api_http import (
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    UrlResponse,
+    UrlTransportError,
 )
 from betterborg_cli.agent_runtime.api_tools import (
     ApiAgentRole,
@@ -59,7 +63,7 @@ class OpenAITransport(Protocol):
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]: ...
+    ) -> AbortableApiRequest: ...
 
 
 class OpenAIApiError(RuntimeError):
@@ -97,67 +101,85 @@ class UrllibOpenAITransport:
         *,
         api_key: str,
         cancel: CancellationToken | None = None,
-    ) -> Mapping[str, Any]:
-        if cancel is not None and cancel.is_set():
-            raise OpenAIApiError("agent run cancelled")
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-            },
-            method="POST",
+    ) -> AbortableApiRequest:
+        return _OpenAIRequest(
+            MultiprocessUrlRequest(
+                UrlRequestSpec(
+                    self.url,
+                    "POST",
+                    {
+                        "authorization": f"Bearer {api_key}",
+                        "content-type": "application/json",
+                    },
+                    json.dumps(payload).encode("utf-8"),
+                    timeout_seconds=_HTTP_TIMEOUT_SECONDS,
+                ),
+                cancel,
+            )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenAIRequest:
+    request: MultiprocessUrlRequest
+
+    def execute(self) -> Mapping[str, Any]:
         try:
-            chunks: list[bytes] = []
-            with urllib.request.urlopen(
-                request,
-                timeout=_HTTP_TIMEOUT_SECONDS,
-            ) as response:
-                while chunk := response.read(64 * 1024):
-                    chunks.append(chunk)
-                    if cancel is not None and cancel.is_set():
-                        raise OpenAIApiError("agent run cancelled")
-            body = b"".join(chunks).decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as error:
-            try:
-                body = error.read().decode("utf-8", errors="replace")
-            except (OSError, http.client.HTTPException) as body_error:
-                raise OpenAIApiError(
-                    f"OpenAI HTTP {error.code} response body failed: {body_error}",
-                    status_code=error.code,
-                ) from body_error
-            error_type, message = _api_error_details(body, str(error.reason))
-            raise OpenAIApiError(
-                message,
-                status_code=error.code,
-                error_type=error_type,
-            ) from error
-        except urllib.error.URLError as error:
-            raise OpenAIApiError(
-                f"OpenAI network error: {error.reason}",
-                error_type="api_error",
-            ) from error
-        except TimeoutError as error:
-            raise OpenAIApiError(
-                "OpenAI network request timed out",
-                error_type="api_error",
-            ) from error
-        except (OSError, http.client.HTTPException) as error:
-            raise OpenAIApiError(
-                f"OpenAI network response failed: {error}",
-                error_type="api_error",
-            ) from error
-        if cancel is not None and cancel.is_set():
-            raise OpenAIApiError("agent run cancelled")
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as error:
-            raise OpenAIApiError("OpenAI returned malformed JSON") from error
-        if not isinstance(decoded, Mapping):
-            raise OpenAIApiError("OpenAI returned a non-object response")
-        return decoded
+            response = self.request.execute()
+        except UrlTransportError as error:
+            raise _transport_error(error) from error
+        return _decode_response(response)
+
+    def abort(self) -> None:
+        self.request.abort()
+
+    def force(self) -> None:
+        self.request.force()
+
+
+def _decode_response(response: UrlResponse) -> Mapping[str, Any]:
+    body = response.body.decode("utf-8", errors="replace")
+    if not 200 <= response.status_code < 300:
+        error_type, message = _api_error_details(body, response.reason)
+        raise OpenAIApiError(
+            message,
+            status_code=response.status_code,
+            error_type=error_type,
+        )
+    try:
+        decoded = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise OpenAIApiError("OpenAI returned malformed JSON") from error
+    if not isinstance(decoded, Mapping):
+        raise OpenAIApiError("OpenAI returned a non-object response")
+    return decoded
+
+
+def _transport_error(error: UrlTransportError) -> OpenAIApiError:
+    if error.kind == "cancelled":
+        return OpenAIApiError("agent run cancelled")
+    if error.status_code is not None:
+        return OpenAIApiError(
+            (
+                f"OpenAI HTTP {error.status_code} response body failed: "
+                f"{error.message}"
+            ),
+            status_code=error.status_code,
+        )
+    if error.kind == "timeout":
+        return OpenAIApiError(
+            "OpenAI network request timed out",
+            error_type="api_error",
+        )
+    if error.kind == "network":
+        return OpenAIApiError(
+            f"OpenAI network error: {error.message}",
+            error_type="api_error",
+        )
+    return OpenAIApiError(
+        f"OpenAI network response failed: {error.message}",
+        error_type="api_error",
+    )
 
 
 @dataclass(slots=True)
@@ -263,7 +285,6 @@ class OpenAIAdapter:
                 ),
                 api_error_type=OpenAIApiError,
                 cancel=cancel,
-                thread_name="betterborg-openai-request",
                 backoff_seconds=self.transient_backoff_seconds,
                 max_attempts=self.transient_max_attempts,
             )
@@ -325,6 +346,7 @@ class OpenAIAdapter:
                         call,
                         tools,
                         allowed,
+                        runtime=runtime,
                         redactor=runtime.redactor,
                         cancel=cancel,
                     )
@@ -348,25 +370,41 @@ def _create_response(
     *,
     api_key: str,
     cancel: CancellationToken | None,
-) -> Mapping[str, Any]:
-    response = transport.create_response(
-        payload,
-        api_key=api_key,
-        cancel=cancel,
+) -> AbortableApiRequest:
+    return _ClassifiedOpenAIRequest(
+        transport.create_response(
+            payload,
+            api_key=api_key,
+            cancel=cancel,
+        )
     )
-    if response.get("status") != "failed":
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassifiedOpenAIRequest:
+    request: AbortableApiRequest
+
+    def execute(self) -> Mapping[str, Any]:
+        response = self.request.execute()
+        if response.get("status") != "failed":
+            return response
+        detail = response.get("error")
+        if not isinstance(detail, Mapping):
+            return response
+        error_type = detail.get("type") or detail.get("code")
+        error = OpenAIApiError(
+            _incomplete_response_error(response, "failed"),
+            error_type=error_type if isinstance(error_type, str) else None,
+        )
+        if error.transient:
+            raise error
         return response
-    detail = response.get("error")
-    if not isinstance(detail, Mapping):
-        return response
-    error_type = detail.get("type") or detail.get("code")
-    error = OpenAIApiError(
-        _incomplete_response_error(response, "failed"),
-        error_type=error_type if isinstance(error_type, str) else None,
-    )
-    if error.transient:
-        raise error
-    return response
+
+    def abort(self) -> None:
+        self.request.abort()
+
+    def force(self) -> None:
+        self.request.force()
 
 
 def _tool_definition(name: str) -> dict[str, Any]:
@@ -408,6 +446,7 @@ def _execute_tool_call(
     tools: ContainedApiTools,
     allowed: frozenset[str],
     *,
+    runtime: ApiRunContext,
     redactor: ApiCredentialRedactor,
     cancel: CancellationToken | None = None,
 ) -> dict[str, Any]:
@@ -425,6 +464,7 @@ def _execute_tool_call(
         try:
             arguments = _tool_arguments(call)
             value = tools.execute(name, arguments, cancel=cancel)
+            runtime.emit_tool_activity(name, arguments)
         except Exception as error:
             value = {"error": str(error)}
     result["output"] = json.dumps(

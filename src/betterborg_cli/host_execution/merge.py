@@ -18,6 +18,7 @@ from betterborg_cli.agent_runtime import (
     AgentRunSpec,
     AgentStatus,
     BillingMode,
+    CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
@@ -130,9 +131,11 @@ class HostMergePhase:
         *,
         config: HostMergeConfig,
         repository_lock: RepositoryLockFactory,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise MergePhaseError(
                 "merge phase must be bound to the primary Git checkout"
@@ -142,8 +145,12 @@ class HostMergePhase:
         self._adapter = adapter
         self._config = config
         self._repository_lock = repository_lock
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
-        self._primary_git = SafeGit(self.repository_root)
+        if git is not None and git.cwd != self.repository_root:
+            raise MergePhaseError("merge phase Git binding must match repository")
+        self._primary_git = git or SafeGit(self.repository_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._primary_git
+        )
         self.artifact_root = Path(
             config.artifact_root
             or self._paths.artifacts_dir / "host-execution"
@@ -234,7 +241,7 @@ class HostMergePhase:
         approved_commit: str,
         environment: Mapping[str, str] | None,
     ) -> HostMergeResult:
-        git = SafeGit(worktree)
+        git = self._primary_git.for_worktree(worktree)
         if current_branch(git) != runtime.branch:
             raise MergePhaseError("task worktree is on the wrong branch")
 
@@ -513,6 +520,7 @@ class HostMergePhase:
             env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
+            activity_sink=context.activity_sink("merge"),
         )
         operational_error: BaseException | None = None
         try:
@@ -1077,16 +1085,11 @@ class HostMergePhase:
     ) -> HostMergeResult:
         if status not in {TaskRuntimeStatus.BLOCKED, TaskRuntimeStatus.FAILED}:
             raise MergePhaseError(f"invalid terminal merge status: {status.value}")
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=TaskRuntimeStatus.MERGING,
-            new_status=status,
+        context.transition(
+            TaskRuntimeStatus.MERGING,
+            status,
             resume_phase="merging",
             state_reason=reason,
-            now=context.clock(),
         )
         return HostMergeResult(status, reason)
 

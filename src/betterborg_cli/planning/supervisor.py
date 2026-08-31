@@ -23,6 +23,8 @@ from betterborg_cli.planning.pm import (
     task_batch_semantic_digest,
 )
 from betterborg_cli.planning.task_publication import (
+    TaskPublication,
+    TaskPublicationCancelled,
     TaskPublicationError,
     TaskPublisher,
 )
@@ -30,7 +32,13 @@ from betterborg_cli.planning.task_validation import (
     TaskGraphValidationError,
     validate_task_graph,
 )
-from betterborg_cli.planning.turns import DurablePlanningTurns
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    planning_attempt_duration,
+    planning_attempt_result,
+    planning_request_change_attempts,
+)
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
@@ -50,6 +58,8 @@ from betterborg_cli.store import (
 
 SUPERVISOR_ROUND_CAP = 3
 _SUPERVISOR_PHASE = "supervisor_review"
+_PUBLICATION_DETAIL = "publishing approved tasks"
+_RETAINED_APPROVAL_RESULT = "approval retained; task publication pending"
 
 _NONBLANK_STRING: dict[str, Any] = {
     "type": "string",
@@ -118,6 +128,7 @@ class SupervisorResult:
     dependencies: tuple[TaskDependency, ...]
     findings: tuple[TaskFinding, ...]
     attempt: PlanningAttempt
+    publication: TaskPublication | None
 
 
 class SupervisorLoop:
@@ -137,9 +148,12 @@ class SupervisorLoop:
         model: str | None = None,
         pm_model: str | None = None,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise SupervisorCancelled("Supervisor run cancelled")
         project_manager = pm_agent or agent
         require_read_only_agent(
             agent, role="Supervisor", error_factory=SupervisorError
@@ -153,7 +167,7 @@ class SupervisorLoop:
         except AgentSelectionError as error:
             raise SupervisorError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository
@@ -169,8 +183,14 @@ class SupervisorLoop:
         self.model = resolved_model
         self.pm_model = resolved_pm_model
         self.cancel = cancel
+        self.progress = progress
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
+        if progress is not None:
+            if "project-manager" not in progress.stages:
+                progress.declare(StageSpec("project-manager", "Project Manager"))
+            if "supervisor" not in progress.stages:
+                progress.declare(StageSpec("supervisor", "Supervisor"))
         self._turns = DurablePlanningTurns(
             repository,
             borg,
@@ -182,21 +202,86 @@ class SupervisorLoop:
             error_factory=SupervisorError,
             cancelled_error_factory=SupervisorCancelled,
             cancel=cancel,
+            progress=progress,
+            stage_key="supervisor" if progress is not None else None,
             dirty_borg_documents=dirty_borg_documents,
             worktrees_root=worktrees_root,
         )
 
     def run(self) -> SupervisorResult:
         """Resume review and PM revision turns until approval or exhaustion."""
-        approval = self._approval()
-        plan = self._approved_plan(approval)
-        terminal = self._terminal_result(approval)
-        if terminal is not None:
-            return terminal
+        try:
+            approval = self._approval()
+            plan = self._approved_plan(approval)
+            self._seed_project_manager_progress(approval)
+            self._declare_revision_progress(approval)
+            if self._approved_publication_is_pending(approval):
+                self._start_supervisor_progress(approval)
+                self._show_publication_progress()
+            terminal = self._terminal_result(approval)
+            if terminal is not None:
+                self._seed_revision_progress(approval)
+                self._complete_or_seed_supervisor_progress(terminal.attempt)
+                return terminal
+
+            self._seed_revision_progress(approval)
+            self._start_supervisor_progress(approval)
+            result = self._run(approval, plan)
+            if self.progress is not None:
+                self.progress.complete(
+                    "supervisor", result.attempt.summary or "review complete"
+                )
+            return result
+        except (
+            ProjectManagerCancelled,
+            SupervisorCancelled,
+            KeyboardInterrupt,
+        ) as error:
+            if isinstance(error, KeyboardInterrupt):
+                self._cancel_interrupted_review()
+            approval_retained = (
+                isinstance(error, KeyboardInterrupt)
+                and self._approved_publication_is_pending(self._approval())
+            )
+            self._reconcile_progress(
+                _RETAINED_APPROVAL_RESULT if approval_retained else str(error),
+                stopped=True,
+                always_reconcile=True,
+            )
+            if (
+                approval_retained
+                and self._approved_publication_is_pending(self._approval())
+            ):
+                raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
+            raise
+        except Exception as error:
+            self._reconcile_progress(
+                str(error),
+                stopped=self.cancel is not None and self.cancel.is_set(),
+            )
+            raise
+
+    def _run(
+        self, approval: PlanApproval, plan: dict[str, Any]
+    ) -> SupervisorResult:
+        """Execute the active Supervisor parent through all revision cycles."""
 
         while True:
             borg = self._turns.current_borg()
             if borg.state is BorgState.PM_WORKING:
+                child_key = self._active_revision_key(approval)
+                initial_work = (
+                    child_key is None and not self._completed_reviews(approval)
+                )
+                if not initial_work and child_key is None:
+                    raise SupervisorError(
+                        "Project Manager revision requires a rejected "
+                        "Supervisor attempt"
+                    )
+                if initial_work:
+                    self._start_project_manager_progress()
+                else:
+                    self._start_revision_progress(child_key)
                 try:
                     revised = ProjectManagerLoop(
                         self.repository,
@@ -208,6 +293,11 @@ class SupervisorLoop:
                         artifact_dir=self.artifact_dir,
                         model=self.pm_model,
                         cancel=self.cancel,
+                        progress=self.progress,
+                        stage_key=(
+                            "project-manager" if initial_work else "supervisor"
+                        ),
+                        child_key=None if initial_work else child_key,
                         dirty_borg_documents=self.dirty_borg_documents,
                         worktrees_root=self.worktrees_root,
                     ).run()
@@ -219,6 +309,7 @@ class SupervisorLoop:
                     raise SupervisorError(
                         "Project Manager revision did not return to Supervisor"
                     )
+                self._start_supervisor_progress(approval)
                 continue
             if borg.state is not BorgState.SUPERVISOR_WORKING:
                 raise SupervisorError(
@@ -300,13 +391,18 @@ class SupervisorLoop:
                 if decision != "approve":
                     borg = self._turns.transition(borg, next_state)
 
+            publication = None
             if decision == "approve":
+                self._show_publication_progress()
                 try:
-                    generation = (
-                        TaskPublisher(self.repository, self.store)
-                        .publish(generation.id)
-                        .generation
-                    )
+                    publication = TaskPublisher(
+                        self.repository,
+                        self.store,
+                        cancel=self.cancel,
+                    ).publish(generation.id)
+                    generation = publication.generation
+                except TaskPublicationCancelled as error:
+                    raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
                 except TaskPublicationError as error:
                     raise SupervisorError(
                         f"approved task publication failed: {error}"
@@ -323,7 +419,9 @@ class SupervisorLoop:
                     dependencies=dependencies,
                     findings=findings,
                     attempt=completed,
+                    publication=publication,
                 )
+            self._declare_revision_progress(approval)
 
     def _approval(self) -> PlanApproval:
         approvals = self.store.list_plan_approvals(self.borg_id)
@@ -487,6 +585,239 @@ class SupervisorLoop:
             and attempt.request.get("approved_plan_digest") == approval.plan_digest
         ]
 
+    def _pm_attempts(self, approval: PlanApproval) -> list[PlanningAttempt]:
+        return [
+            attempt
+            for attempt in self._turns.attempts("pm_tasks")
+            if attempt.status is PlanningAttemptStatus.COMPLETED
+            and attempt.request.get("plan_approval_id") == str(approval.id)
+            and attempt.request.get("approved_plan_digest") == approval.plan_digest
+        ]
+
+    def _initial_pm_attempt(self, approval: PlanApproval) -> PlanningAttempt | None:
+        return next(
+            (
+                attempt
+                for attempt in self._pm_attempts(approval)
+                if attempt.request.get("base_batch_id") is None
+            ),
+            None,
+        )
+
+    def _revision_reviews(self, approval: PlanApproval) -> list[PlanningAttempt]:
+        return planning_request_change_attempts(
+            self._completed_reviews(approval),
+            _SUPERVISOR_PHASE,
+            round_cap=SUPERVISOR_ROUND_CAP,
+        )
+
+    @staticmethod
+    def _revision_key(review: PlanningAttempt) -> str:
+        return f"pm-revision:{review.id}"
+
+    def _revision_attempt(
+        self, approval: PlanApproval, review: PlanningAttempt
+    ) -> PlanningAttempt | None:
+        batch_id = review.request.get("batch_id")
+        return next(
+            (
+                attempt
+                for attempt in self._pm_attempts(approval)
+                if attempt.started_at >= (review.finished_at or review.started_at)
+                and attempt.request.get("base_batch_id") == batch_id
+            ),
+            None,
+        )
+
+    def _active_revision_key(self, approval: PlanApproval) -> str | None:
+        for review in reversed(self._revision_reviews(approval)):
+            if self._revision_attempt(approval, review) is None:
+                return self._revision_key(review)
+        return None
+
+    def _declare_revision_progress(self, approval: PlanApproval) -> None:
+        if self.progress is None:
+            return
+        for number, review in enumerate(self._revision_reviews(approval), start=1):
+            key = self._revision_key(review)
+            if key not in self.progress.stages["supervisor"].children:
+                self.progress.declare_child(
+                    "supervisor", ChildSpec(key, f"Project Manager revision {number}")
+                )
+
+    def _seed_revision_progress(self, approval: PlanApproval) -> None:
+        if self.progress is None:
+            return
+        for review in self._revision_reviews(approval):
+            attempt = self._revision_attempt(approval, review)
+            if attempt is None:
+                continue
+            key = self._revision_key(review)
+            child = self.progress.stages["supervisor"].children[key]
+            if child.state is StageState.PENDING:
+                self.progress.seed_child_completed(
+                    "supervisor",
+                    key,
+                    planning_attempt_result(attempt, default="task batch ready"),
+                    planning_attempt_duration(attempt),
+                )
+
+    def _start_revision_progress(self, child_key: str | None) -> None:
+        if self.progress is None or child_key is None:
+            return
+        child = self.progress.stages["supervisor"].children[child_key]
+        if child.state is StageState.PENDING:
+            self.progress.start_child("supervisor", child_key)
+
+    def _start_project_manager_progress(self) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["project-manager"]
+        if record.state is StageState.PENDING:
+            self.progress.start("project-manager")
+
+    def _seed_project_manager_progress(self, approval: PlanApproval) -> None:
+        if self.progress is None:
+            return
+        attempt = self._initial_pm_attempt(approval)
+        record = self.progress.stages["project-manager"]
+        if attempt is not None and record.state is StageState.PENDING:
+            self.progress.seed_completed(
+                "project-manager",
+                planning_attempt_result(attempt, default="task batch ready"),
+                planning_attempt_duration(attempt),
+            )
+
+    def _start_supervisor_progress(self, approval: PlanApproval) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        if record.state is StageState.PENDING and (
+            self._initial_pm_attempt(approval) is not None
+            or bool(self._completed_reviews(approval))
+        ):
+            self.progress.start("supervisor")
+
+    def _seed_supervisor_progress(self, attempt: PlanningAttempt) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        if record.state is StageState.PENDING:
+            self.progress.seed_completed(
+                "supervisor",
+                planning_attempt_result(attempt, default="review complete"),
+                planning_attempt_duration(attempt),
+            )
+
+    def _complete_or_seed_supervisor_progress(
+        self, attempt: PlanningAttempt
+    ) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        result = planning_attempt_result(attempt, default="review complete")
+        if record.state is StageState.RUNNING:
+            self.progress.complete("supervisor", result)
+        elif record.state is StageState.PENDING:
+            self._seed_supervisor_progress(attempt)
+
+    def _show_publication_progress(self) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        if record.state is StageState.RUNNING:
+            self.progress.update("supervisor", _PUBLICATION_DETAIL)
+
+    def _approved_publication_is_pending(self, approval: PlanApproval) -> bool:
+        borg = self._turns.current_borg()
+        return borg.state is BorgState.SUPERVISOR_WORKING and any(
+            (attempt.result or {}).get("decision") == "approve"
+            for attempt in self._completed_reviews(approval)
+        )
+
+    def _cancel_interrupted_review(self) -> None:
+        running = next(
+            (
+                attempt
+                for attempt in reversed(self._turns.attempts(_SUPERVISOR_PHASE))
+                if attempt.status is PlanningAttemptStatus.RUNNING
+            ),
+            None,
+        )
+        if running is not None:
+            self._turns.cancel_attempt(running)
+
+    def _finish_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        project_manager = self.progress.stages["project-manager"]
+        if project_manager.state is StageState.RUNNING:
+            if stopped:
+                self.progress.stop("project-manager", result)
+            else:
+                self.progress.fail("project-manager", result)
+        for child in self.progress.stages["supervisor"].children.values():
+            if child.state is not StageState.RUNNING:
+                continue
+            if stopped:
+                self.progress.stop_child("supervisor", child.key, result)
+            else:
+                self.progress.fail_child("supervisor", child.key, result)
+        if self.progress.stages["supervisor"].state is StageState.RUNNING:
+            if stopped:
+                self.progress.stop("supervisor", result)
+            else:
+                self.progress.fail("supervisor", result)
+
+    def _reconcile_progress(
+        self,
+        result: str,
+        *,
+        stopped: bool,
+        always_reconcile: bool = False,
+    ) -> None:
+        if self.progress is None and not always_reconcile:
+            return
+        project_manager = (
+            None
+            if self.progress is None
+            else self.progress.stages["project-manager"]
+        )
+        record = (
+            None if self.progress is None else self.progress.stages["supervisor"]
+        )
+        if (
+            not always_reconcile
+            and project_manager is not None
+            and record is not None
+            and project_manager.state is not StageState.RUNNING
+            and record.state is not StageState.RUNNING
+        ):
+            return
+        approval = self._approval()
+        initial_attempt = self._initial_pm_attempt(approval)
+        if (
+            project_manager is not None
+            and project_manager.state is StageState.RUNNING
+            and initial_attempt is not None
+        ):
+            self.progress.complete(
+                "project-manager",
+                planning_attempt_result(initial_attempt, default="task batch ready"),
+            )
+        try:
+            terminal = self._terminal_result(approval)
+        except (SupervisorCancelled, SupervisorError):
+            terminal = None
+        if self.progress is None:
+            return
+        if terminal is not None:
+            self.progress.complete(
+                "supervisor", terminal.attempt.summary or "review complete"
+            )
+        else:
+            self._finish_progress(result, stopped=stopped)
+
     def _require_revision_progress(
         self, batch: TaskBatch, approval: PlanApproval
     ) -> None:
@@ -589,21 +920,40 @@ class SupervisorLoop:
         )
         if batch is None or generation is None:
             return None
+        publication = None
         if borg.state in {
             BorgState.SUPERVISOR_WORKING,
             BorgState.READY_TO_EXECUTE,
         }:
-            try:
-                publication = TaskPublisher(
-                    self.repository, self.store
-                ).reconcile(self.borg_id)
-                if publication is None or publication.generation.id != generation.id:
-                    return None
-                generation = publication.generation
-            except TaskPublicationError as error:
-                raise SupervisorError(
-                    f"approved task publication failed: {error}"
-                ) from error
+            current = self.store.get_current_task_generation(self.borg_id)
+            publication_is_durable = (
+                current is not None and current.id == generation.id
+            )
+            if (
+                publication_is_durable
+                and self.cancel is not None
+                and self.cancel.is_set()
+            ):
+                generation = current
+            else:
+                try:
+                    publication = TaskPublisher(
+                        self.repository,
+                        self.store,
+                        cancel=self.cancel,
+                    ).reconcile(self.borg_id)
+                    if (
+                        publication is None
+                        or publication.generation.id != generation.id
+                    ):
+                        return None
+                    generation = publication.generation
+                except TaskPublicationCancelled as error:
+                    raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
+                except TaskPublicationError as error:
+                    raise SupervisorError(
+                        f"approved task publication failed: {error}"
+                    ) from error
             if borg.state is BorgState.SUPERVISOR_WORKING:
                 borg = self._turns.transition(borg, BorgState.READY_TO_EXECUTE)
         if (
@@ -626,6 +976,7 @@ class SupervisorLoop:
                 if finding.attempt_id == attempt.id
             ),
             attempt=attempt,
+            publication=publication,
         )
 
 

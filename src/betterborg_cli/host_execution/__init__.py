@@ -57,11 +57,13 @@ from betterborg_cli.host_execution.sanity import (
     SanityPhaseError,
 )
 from betterborg_cli.host_execution.scheduler import (
+    ActivitySink,
     HostSchedulerConfig,
     HostSchedulerResult,
     HostTaskBehavior,
     HostTaskScheduler,
     ScheduledTaskContext,
+    TaskActivitySink,
 )
 from betterborg_cli.host_execution.service import (
     HostExecutionError,
@@ -76,6 +78,7 @@ from betterborg_cli.host_execution.worktrees import (
 )
 
 __all__ = [
+    "ActivitySink",
     "ComposeCleanupResult",
     "ComposeStack",
     "ComposeStackError",
@@ -120,6 +123,7 @@ __all__ = [
     "MergeTip",
     "SafeGit",
     "ScheduledTaskContext",
+    "TaskActivitySink",
     "SanityCommandResult",
     "SanityPhaseError",
     "UnsafeGitError",

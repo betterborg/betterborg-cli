@@ -15,6 +15,7 @@ from betterborg_cli.agent_runtime import (
     AgentRunSpec,
     AgentStatus,
     BillingMode,
+    CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
@@ -127,9 +128,11 @@ class HostReviewFixPhase:
         *,
         config: HostReviewFixConfig,
         fix_adapter: AgentAdapter | None = None,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise ReviewFixPhaseError(
                 "review phase must be bound to the primary Git checkout"
@@ -137,8 +140,14 @@ class HostReviewFixPhase:
         self._review_adapter = review_adapter
         self._fix_adapter = fix_adapter or review_adapter
         self._config = config
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
-        self._primary_git = SafeGit(self.repository_root)
+        if git is not None and git.cwd != self.repository_root:
+            raise ReviewFixPhaseError(
+                "review phase Git binding must match repository"
+            )
+        self._primary_git = git or SafeGit(self.repository_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._primary_git
+        )
         self.artifact_root = Path(
             config.artifact_root
             or self._paths.artifacts_dir / "host-execution"
@@ -388,8 +397,9 @@ class HostReviewFixPhase:
             env={**self._config.environment, **(environment or {})},
             effort=effort,
             billing_mode=billing_mode,
+            activity_sink=context.activity_sink(phase),
         )
-        git = SafeGit(worktree)
+        git = self._primary_git.for_worktree(worktree)
         before_status = git.run(
             ["status", "--porcelain=v1", "-z", "-uall"]
         ).stdout
@@ -693,7 +703,8 @@ class HostReviewFixPhase:
             commit_sha = metadata.get("commit_sha")
             if (
                 not isinstance(commit_sha, str)
-                or SafeGit(worktree).head_sha() != commit_sha
+                or self._primary_git.for_worktree(worktree).head_sha()
+                != commit_sha
             ):
                 return self._block(
                     context,
@@ -740,7 +751,7 @@ class HostReviewFixPhase:
         attestations.sort(key=lambda item: item[:3])
         base_commit = attestations[0][3]
         current_commit = attestations[-1][4]
-        git = SafeGit(worktree)
+        git = self._primary_git.for_worktree(worktree)
         if git.head_sha() != current_commit:
             raise ReviewFixPhaseError(
                 "declared coding/fix commit no longer matches task worktree"
@@ -783,17 +794,12 @@ class HostReviewFixPhase:
         expected_status: TaskRuntimeStatus,
         outcome: _PhaseOutcome,
     ) -> TaskRuntimeStatus:
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=expected_status,
-            new_status=outcome.status,
+        context.transition(
+            expected_status,
+            outcome.status,
             resume_phase=outcome.resume_phase,
             review_round=outcome.review_round,
             state_reason=outcome.reason,
-            now=context.clock(),
         )
         return outcome.status
 

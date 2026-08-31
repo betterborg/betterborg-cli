@@ -31,9 +31,12 @@ class PrimaryCheckoutGuard:
         primary_repo: Path,
         *,
         ignored_prefixes: Iterable[str] = (MANAGED_IGNORE_RULE,),
+        git: SafeGit | None = None,
     ) -> None:
         self._repo = Path(primary_repo).resolve()
-        self._git = SafeGit(self._repo)
+        if git is not None and git.cwd != self._repo:
+            raise ValueError("checkout guard Git binding must match primary repo")
+        self._git = git or SafeGit(self._repo)
         self._ignored_prefixes = tuple(ignored_prefixes)
         self._snapshots: dict[tuple[str, str], _CheckoutSnapshot] = {}
         self._lock = threading.Lock()

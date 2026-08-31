@@ -3,10 +3,13 @@
 import json
 import stat
 import subprocess
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.workspace_trust import (
     TrustStore,
@@ -37,6 +40,76 @@ def test_fingerprint_is_stable_and_changes_for_a_different_repository_path(
     assert moved.repository_path != first.repository_path
     assert moved.git_common_dir != first.git_common_dir
     assert moved.fingerprint != first.fingerprint
+
+
+def test_identity_and_trust_forward_one_token_and_runner(git_repo: Path) -> None:
+    paths = RepoPaths.discover(git_repo)
+    cancel = CancellationToken()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, ".git\n", "")
+
+    direct = WorkspaceIdentity.discover(
+        paths,
+        cancel=cancel,
+        command_runner=runner,
+    )
+    trusted = require_workspace_trust(
+        paths,
+        store=TrustStore(_trust_path_outside(git_repo)),
+        explicit=True,
+        cancel=cancel,
+        command_runner=runner,
+    )
+
+    assert direct == trusted
+    assert [kwargs for _command, kwargs in calls] == [
+        {"check": True, "cancel": cancel},
+        {"check": True, "cancel": cancel},
+    ]
+
+
+def test_trust_cancellation_reaps_identity_git_process_tree(
+    git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    cancel = CancellationToken(grace_seconds=0.05)
+    errors: list[BaseException] = []
+
+    def runner(_command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return run_captured(
+            real_process_harness.resistant_argv("trust-identity"),
+            cancel=kwargs["cancel"],
+            check=kwargs["check"],
+        )
+
+    def trust() -> None:
+        try:
+            require_workspace_trust(
+                paths,
+                store=TrustStore(_trust_path_outside(git_repo)),
+                explicit=True,
+                cancel=cancel,
+                command_runner=runner,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=trust)
+    worker.start()
+    real_process_harness.wait_for_marker("trust-identity.parent.pid")
+    real_process_harness.wait_for_marker("trust-identity.child.pid")
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert not TrustStore(_trust_path_outside(git_repo)).path.exists()
+    real_process_harness.assert_tree_absent("trust-identity")
 
 
 def test_changed_git_common_dir_invalidates_existing_trust(git_repo: Path) -> None:

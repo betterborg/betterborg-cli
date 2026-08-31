@@ -1,21 +1,29 @@
 """Command-line entry point for Betterborg."""
 
+from __future__ import annotations
+
+import errno
 import json
+import multiprocessing
 import os
 import re
 import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from uuid import UUID
 
 import click
 
 from betterborg_cli import __version__
-from betterborg_cli.agent_runtime import BillingMode
+from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
 from betterborg_cli.execution_estimate import (
@@ -34,6 +42,7 @@ from betterborg_cli.host_execution import (
     HostMergePhase,
     HostPreflight,
     HostPreflightBlock,
+    HostPreflightPlan,
     HostReviewFixConfig,
     HostReviewFixPhase,
     HostSanityPhase,
@@ -61,15 +70,28 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.planning.turns import (
+    current_planning_cycle_attempts,
+    latest_planning_review_requests_changes,
+)
 from betterborg_cli.plugins import (
     SUPPORTED_PLUGIN_HOSTS,
     PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ProgressError,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
+from betterborg_cli.run_control import INTERRUPTED_EXIT_CODE, RunControl
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -92,10 +114,100 @@ from betterborg_cli.workspace_trust import (
     require_workspace_trust,
 )
 
+_EXECUTION_ESTIMATE_STAGE_KEY = "estimate-decision"
+
+
+@dataclass(slots=True)
+class CliRunContext:
+    """Cancellation and reporting state shared by one root command invocation."""
+
+    cancellation: CancellationToken
+    progress: RunProgress
+    progress_configured: bool = True
+
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-def cli() -> None:
+@click.pass_context
+def cli(context: click.Context) -> None:
     """Work with Betterborg from the command line."""
+
+    if context.obj is None:
+        context.obj = CliRunContext(
+            CancellationToken(),
+            RunProgress(enabled=False),
+            progress_configured=False,
+        )
+
+
+def main(
+    args: Sequence[str] | None = None,
+    prog_name: str | None = None,
+) -> int:
+    """Run the root Click command under one interruption-aware lifecycle."""
+
+    multiprocessing.freeze_support()
+    arguments = list(args) if args is not None else None
+    requested_arguments = arguments if arguments is not None else sys.argv[1:]
+    machine_readable = "--json" in requested_arguments
+    run = CliRunContext(
+        CancellationToken(),
+        RunProgress(machine_readable=machine_readable),
+    )
+    control = RunControl(run.cancellation, progress=run.progress).install()
+    try:
+        try:
+            result = cli.main(
+                args=arguments,
+                prog_name=prog_name,
+                standalone_mode=False,
+                obj=run,
+            )
+        except click.ClickException as error:
+            if _caused_by_interruption(error):
+                return _interrupted_exit_code(control, run.progress)
+            error.show()
+            return error.exit_code
+        except click.Abort as error:
+            if control.interruption_requested or _caused_by_interruption(error):
+                return _interrupted_exit_code(control, run.progress)
+            click.echo("Aborted!", err=True)
+            return 1
+        except OSError as error:
+            if error.errno != errno.EPIPE:
+                raise
+            return 1
+        if control.interruption_requested:
+            return _interrupted_exit_code(control, run.progress)
+        return result if isinstance(result, int) else 0
+    finally:
+        control.close()
+
+
+def _caused_by_interruption(error: BaseException) -> bool:
+    """Return whether Click directly wrapped an unsuppressed interrupt."""
+
+    cause = error.__cause__
+    if cause is None and not error.__suppress_context__:
+        cause = error.__context__
+    return isinstance(cause, KeyboardInterrupt)
+
+
+def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
+    """Map interruption only after strict progress reconciliation succeeds."""
+
+    if control.interruption_requested:
+        control.wait_for_cancellation()
+        if dispatch_error := control.dispatcher_error:
+            click.ClickException(
+                f"cancellation dispatch failed: {dispatch_error}"
+            ).show()
+            return 1
+    try:
+        progress.close()
+    except ProgressError as error:
+        click.ClickException(str(error)).show()
+        return 1
+    return INTERRUPTED_EXIT_CODE
 
 
 @cli.command()
@@ -151,13 +263,35 @@ def _stdin_is_interactive() -> bool:
     return click.get_text_stream("stdin").isatty()
 
 
+def _repository_progress(machine_readable: bool) -> RunProgress | None:
+    context = click.get_current_context(silent=True)
+    if context is None:
+        return None
+    run = context.find_root().obj
+    if not isinstance(run, CliRunContext):
+        return None
+    if not run.progress_configured:
+        run.progress = RunProgress(machine_readable=machine_readable)
+        run.progress_configured = True
+    return run.progress
+
+
+def _suspend_progress(
+    progress: RunProgress | None,
+) -> AbstractContextManager[object]:
+    return progress.suspend() if progress is not None else nullcontext()
+
+
 def _trusted_workspace_callback(function):
     """Gate a callback before it can load repository-controlled context."""
 
     @wraps(function)
     def guarded(*args, explicit_trust: bool = False, **kwargs):
         try:
-            paths = RepoPaths.discover()
+            context = click.get_current_context().find_root()
+            run = context.obj
+            cancel = run.cancellation if isinstance(run, CliRunContext) else None
+            paths = RepoPaths.discover(cancel=cancel)
             interactive = _stdin_is_interactive() and not kwargs.get(
                 "json_output", False
             )
@@ -166,10 +300,11 @@ def _trusted_workspace_callback(function):
                 explicit=explicit_trust,
                 interactive=interactive,
                 confirm=lambda prompt: click.confirm(prompt, default=False),
+                cancel=cancel,
             )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             raise click.ClickException(str(error)) from error
-        return function(*args, repository_path=paths.root, **kwargs)
+        return function(*args, paths=paths, cancel=cancel, **kwargs)
 
     return guarded
 
@@ -182,9 +317,12 @@ def _trusted_workspace_callback(function):
     help="Trust without prompting after accepting the host-access consequence.",
 )
 @_trusted_workspace_callback
-def trust_workspace(repository_path: Path) -> None:
+def trust_workspace(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+) -> None:
     """Trust this workspace for host-capable agent operations."""
-    click.echo(f"Trusted workspace: {repository_path}")
+    click.echo(f"Trusted workspace: {paths.root}")
 
 
 @cli.command(name="init")
@@ -202,13 +340,14 @@ def trust_workspace(repository_path: Path) -> None:
 )
 @_trusted_workspace_callback
 def initialize_repository(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     json_output: bool,
 ) -> None:
     """Register and analyze the current Git repository."""
-    paths = RepoPaths.discover(repository_path)
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
+    progress = _repository_progress(json_output)
     try:
         if not database.resolve().is_relative_to(paths.root):
             raise ValueError(f"repository state path escapes repository: {database}")
@@ -222,12 +361,19 @@ def initialize_repository(
                     paths,
                     interactive=interactive,
                 ),
+                cancel=cancel,
+                progress=progress,
             )
             result = service.initialize()
 
             if result.initialized and interactive:
-                _write_initialized(result)
+                if cancel is not None and cancel.is_set():
+                    return
+                with _suspend_progress(progress):
+                    _write_initialized(result)
                 config = load_repository_config(paths)
+                if cancel is not None and cancel.is_set():
+                    return
                 io = _interactive_io()
                 creator = CreateService(
                     result.repository,
@@ -240,6 +386,8 @@ def initialize_repository(
                     ),
                     io=io,
                     editor=_edit_markdown,
+                    cancel=cancel,
+                    progress=progress,
                 )
                 OnboardingDispatcher(
                     result.repository,
@@ -247,30 +395,39 @@ def initialize_repository(
                     io,
                     creator,
                     result.improvement_prds,
+                    cancel=cancel,
+                    progress=progress,
                 ).run()
+    except click.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
+    if cancel is not None and cancel.is_set():
+        return
     commands = create_commands(paths.root, result.improvement_prds)
-    if json_output:
-        click.echo(
-            json.dumps(
-                {
-                    "repository_id": str(result.repository.id),
-                    "initialized": result.initialized,
-                    "score": result.analysis.overall_score,
-                    "create_commands": [shlex.join(command) for command in commands],
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+    with _suspend_progress(progress):
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "repository_id": str(result.repository.id),
+                        "initialized": result.initialized,
+                        "score": result.analysis.overall_score,
+                        "create_commands": [
+                            shlex.join(command) for command in commands
+                        ],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             )
-        )
-    elif not result.initialized:
-        click.echo(f"Repository already initialized: {result.repository.id}")
-    elif not interactive:
-        _write_initialized(result)
-        for command in commands:
-            click.echo(shlex.join(command))
+        elif not result.initialized:
+            click.echo(f"Repository already initialized: {result.repository.id}")
+        elif not interactive:
+            _write_initialized(result)
+            for command in commands:
+                click.echo(shlex.join(command))
 
 
 @cli.command(name="analyze")
@@ -288,13 +445,14 @@ def initialize_repository(
 )
 @_trusted_workspace_callback
 def analyze_repository(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     json_output: bool,
 ) -> None:
     """Re-analyze an initialized Git repository and refresh its outputs."""
-    paths = RepoPaths.discover(repository_path)
     database = paths.state_dir / "borg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
+    progress = _repository_progress(json_output)
     try:
         if not database.resolve().is_relative_to(paths.root):
             raise ValueError(f"repository state path escapes repository: {database}")
@@ -308,6 +466,8 @@ def analyze_repository(
                     paths,
                     interactive=interactive,
                 ),
+                cancel=cancel,
+                progress=progress,
             ).analyze()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
@@ -315,27 +475,28 @@ def analyze_repository(
     analysis = result.analysis
     previous_score = result.previous_analysis.overall_score
     score_delta = analysis.overall_score - previous_score
-    if json_output:
-        click.echo(
-            json.dumps(
-                {
-                    "analysis_id": str(analysis.id),
-                    "repository_id": str(result.repository.id),
-                    "score": analysis.overall_score,
-                    "previous_score": previous_score,
-                    "delta": score_delta,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+    with _suspend_progress(progress):
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "analysis_id": str(analysis.id),
+                        "repository_id": str(result.repository.id),
+                        "score": analysis.overall_score,
+                        "previous_score": previous_score,
+                        "delta": score_delta,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             )
-        )
-    else:
-        click.echo(
-            f"Analyzed repository {result.repository.id}: "
-            f"score {analysis.overall_score:.2f}/5 "
-            f"(previous {previous_score:.2f}/5, "
-            f"delta {score_delta:+.2f})."
-        )
+        else:
+            click.echo(
+                f"Analyzed repository {result.repository.id}: "
+                f"score {analysis.overall_score:.2f}/5 "
+                f"(previous {previous_score:.2f}/5, "
+                f"delta {score_delta:+.2f})."
+            )
 
 
 @cli.command(name="create")
@@ -354,7 +515,8 @@ def analyze_repository(
 )
 @_trusted_workspace_callback
 def create_borg(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     name: str,
     source: Path | None,
 ) -> None:
@@ -365,7 +527,7 @@ def create_borg(
         raise click.ClickException(str(error)) from error
     if not _stdin_is_interactive():
         raise click.ClickException("borg create requires an interactive terminal")
-    paths = RepoPaths.discover(repository_path)
+    progress = _repository_progress(False)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -384,17 +546,24 @@ def create_borg(
                 ),
                 io=io,
                 editor=_edit_markdown,
+                cancel=cancel,
+                progress=progress,
             ).create(name, source)
+    except click.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
-    if result.confirmed:
-        click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
-        click.echo(f"borg plan start {result.borg.name}")
-    elif result.questions:
-        click.echo("Borg PRD needs more input before it can be created.")
-    else:
-        click.echo("Borg draft saved without a confirmed PRD.")
+    if cancel is not None and cancel.is_set():
+        return
+    with _suspend_progress(progress):
+        if result.confirmed:
+            click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
+            click.echo(f"borg plan start {result.borg.name}")
+        elif result.questions:
+            click.echo("Borg PRD needs more input before it can be created.")
+        else:
+            click.echo("Borg draft saved without a confirmed PRD.")
 
 
 @cli.group()
@@ -411,9 +580,13 @@ def plan() -> None:
     help="Trust this workspace without prompting before planning.",
 )
 @_trusted_workspace_callback
-def start_plan(repository_path: Path, name: str) -> None:
+def start_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+) -> None:
     """Start or resume planning for the named Borg."""
-    borg = _continue_planning(repository_path, name)
+    borg = _continue_planning(paths, name, cancel=cancel)
     _write_planning_gate(name, borg, changed=False)
 
 
@@ -444,10 +617,15 @@ def show_plan(name: str, json_output: bool) -> None:
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
-    if json_output:
-        click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
-    else:
-        click.echo(render_plan_markdown(stored_plan), nl=False)
+    run = click.get_current_context().find_root().obj
+    suspension = (
+        run.progress.suspend() if isinstance(run, CliRunContext) else nullcontext()
+    )
+    with suspension:
+        if json_output:
+            click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
+        else:
+            click.echo(render_plan_markdown(stored_plan), nl=False)
 
 
 @cli.group()
@@ -638,25 +816,63 @@ def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
 )
 @_trusted_workspace_callback
 def execute_borg(
-    repository_path: Path,
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
     name: str,
     auto_execute: bool,
     push_project: bool,
     open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
-    paths = RepoPaths.discover(repository_path)
+    progress = _repository_progress(False)
+    if progress is not None:
+        progress.declare(
+            StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
+        )
+        progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
 
     def decide(estimate):
-        _write_execution_estimate(name, estimate)
-        if auto_execute:
-            return ExecutionDecisionRequest("auto_execute", "bypassed")
-        click.confirm(
-            "Approve this estimate and begin host execution?",
-            default=False,
-            abort=True,
-        )
+        suspension = progress.suspend() if progress is not None else nullcontext()
+        with suspension:
+            _write_execution_estimate(name, estimate)
+            if auto_execute:
+                return ExecutionDecisionRequest("auto_execute", "bypassed")
+            approved = click.confirm(
+                "Approve this estimate and begin host execution?",
+                default=False,
+            )
+        if not approved:
+            if progress is not None:
+                progress.complete(_EXECUTION_ESTIMATE_STAGE_KEY, "declined")
+            return None
         return ExecutionDecisionRequest("interactive", "approved")
+
+    def invoke_host(
+        host_paths,
+        store,
+        host_config,
+        repository_id,
+        borg_id,
+        generation_id,
+        *,
+        cancel,
+        progress,
+    ):
+        decision = store.get_current_execution_decision(borg_id)
+        if decision is None or decision.generation_id != generation_id:
+            raise RuntimeError("host execution has no current execution decision")
+        if progress is not None:
+            progress.complete(_EXECUTION_ESTIMATE_STAGE_KEY, decision.decision)
+        return _invoke_host_execution(
+            host_paths,
+            store,
+            host_config,
+            repository_id,
+            borg_id,
+            generation_id,
+            cancel=cancel,
+            progress=progress,
+        )
 
     try:
         config = load_repository_config(paths)
@@ -665,7 +881,9 @@ def execute_borg(
             config,
             name,
             decide=decide,
-            invoke_host=_invoke_host_execution,
+            invoke_host=invoke_host,
+            cancel=cancel,
+            progress=progress,
         )
         generation = workflow.publication.generation
         if workflow.decision_event == "concurrent":
@@ -684,37 +902,186 @@ def execute_borg(
                 f"Using recorded execution decision for generation {generation.id}."
             )
         result = workflow.host_result
-        if result is None:
-            raise RuntimeError("execution estimate did not receive a decision")
     except (OSError, RuntimeError, ValueError, sqlite3.IntegrityError) as error:
+        _reconcile_execution_estimate(progress, cancel, error)
+        if progress is not None:
+            progress.close()
         raise click.ClickException(str(error)) from error
+    except (KeyboardInterrupt, click.Abort) as error:
+        _reconcile_execution_estimate(progress, cancel, error)
+        if isinstance(error, click.Abort) and progress is not None:
+            progress.close()
+        raise
 
+    if result is None:
+        if progress is not None:
+            progress.close()
+        raise click.Abort()
+
+    follow_up_error: BaseException | None = None
+    if (
+        result.active_operation_id is None
+        and result.status is ExecutionRunStatus.COMPLETED
+    ):
+        try:
+            if push_project:
+                push_git = SafeGit(
+                    paths.root,
+                    cancel=cancel,
+                    activity=(
+                        (lambda activity: progress.activity("push-project", activity))
+                        if progress is not None
+                        else None
+                    ),
+                )
+                _run_execution_follow_up(
+                    progress,
+                    "push-project",
+                    "Push project branch",
+                    lambda: _push_project_base(push_git, name),
+                    cancel=cancel,
+                )
+            if open_pull_request:
+                approval = workflow.approval
+                plan = approval.manifest.get("plan") if approval is not None else None
+                if not isinstance(plan, dict):
+                    plan = None
+                prd_session = workflow.prd_session
+                prd_path = prd_session.prd_path if prd_session is not None else None
+                _run_execution_follow_up(
+                    progress,
+                    "rollup-pr",
+                    "Open rollup pull request",
+                    lambda: _open_rollup_pull_request(
+                        paths.root,
+                        name,
+                        plan,
+                        prd_path,
+                        cancel=cancel,
+                        command_runner=run_captured,
+                        activity=(
+                            (lambda activity: progress.activity("rollup-pr", activity))
+                            if progress is not None
+                            else None
+                        ),
+                    ),
+                    cancel=cancel,
+                )
+        except BaseException as error:
+            follow_up_error = error
+
+    close_error: BaseException | None = None
+    if progress is not None:
+        try:
+            progress.close()
+        except BaseException as error:
+            close_error = error
     _write_host_execution_result(result)
-    if (
-        push_project
-        and result.active_operation_id is None
-        and result.status is ExecutionRunStatus.COMPLETED
-    ):
-        _push_project_base(paths.root, name)
-    if (
-        open_pull_request
-        and result.active_operation_id is None
-        and result.status is ExecutionRunStatus.COMPLETED
-    ):
-        approval = workflow.approval
-        plan = approval.manifest.get("plan") if approval is not None else None
-        if not isinstance(plan, dict):
-            plan = None
-        prd_session = workflow.prd_session
-        prd_path = prd_session.prd_path if prd_session is not None else None
-        _open_rollup_pull_request(paths.root, name, plan, prd_path)
+    if follow_up_error is not None:
+        raise follow_up_error
+    if close_error is not None:
+        raise close_error
 
 
-def _push_project_base(repository_root: Path, name: str) -> None:
+def _reconcile_execution_estimate(
+    progress: RunProgress | None,
+    cancel: CancellationToken | None,
+    error: BaseException,
+) -> None:
+    if progress is None:
+        return
+    stage = progress.stages[_EXECUTION_ESTIMATE_STAGE_KEY]
+    if stage.state is not StageState.RUNNING:
+        return
+    detail = str(error).strip() or type(error).__name__
+    if isinstance(error, KeyboardInterrupt | click.Abort) or (
+        cancel is not None and cancel.is_set()
+    ):
+        progress.stop(_EXECUTION_ESTIMATE_STAGE_KEY, detail)
+    else:
+        progress.fail(_EXECUTION_ESTIMATE_STAGE_KEY, detail)
+
+
+def _run_execution_follow_up(
+    progress: RunProgress | None,
+    stage_key: str,
+    label: str,
+    action: Callable[[], str],
+    *,
+    cancel: CancellationToken | None = None,
+) -> None:
+    """Run one optional delivery action under the shared stage lifecycle."""
+    if progress is not None:
+        progress.declare(StageSpec(stage_key, label))
+        progress.start(stage_key)
+    heartbeat_stop = Event()
+    heartbeat_thread: Thread | None = None
+    heartbeat_errors: list[BaseException] = []
+    force_registration = None
+    try:
+        if cancel is not None:
+            # Follow-up has no durable cleanup of its own. Reap its registered
+            # command immediately so the first interrupt can still reconcile
+            # the stage and emit the already-completed core report.
+            force_registration = cancel.register(cancel.force)
+        if progress is not None:
+            heartbeat_thread = Thread(
+                target=_refresh_execution_follow_up,
+                args=(progress, heartbeat_stop, heartbeat_errors),
+                name=f"betterborg-{stage_key}-progress",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+        try:
+            result = action()
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join()
+        if heartbeat_errors:
+            raise heartbeat_errors[0]
+    except BaseException as error:
+        if progress is not None:
+            detail = str(error).strip() or type(error).__name__
+            if isinstance(error, KeyboardInterrupt | click.Abort) or (
+                cancel is not None and cancel.is_set()
+            ):
+                progress.stop(stage_key, detail)
+            else:
+                progress.fail(stage_key, detail)
+        raise
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
+            heartbeat_thread.join()
+        if force_registration is not None:
+            force_registration.unregister()
+    if progress is not None:
+        progress.complete(stage_key, result)
+    else:
+        click.echo(result)
+
+
+def _refresh_execution_follow_up(
+    progress: RunProgress,
+    stopped: Event,
+    errors: list[BaseException],
+) -> None:
+    """Keep plain and interactive follow-up activity visibly current."""
+    while not stopped.wait(0.1):
+        try:
+            progress.refresh()
+        except BaseException as error:
+            errors.append(error)
+            stopped.set()
+            return
+
+
+def _push_project_base(git: SafeGit, name: str) -> str:
     """Publish completed local work while leaving its branch untouched on failure."""
     branch = f"project/{name}"
     try:
-        result = SafeGit(repository_root).push_project_branch(branch)
+        result = git.push_project_branch(branch)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         raise click.ClickException(
             f"Local execution completed, but push of {branch!r} failed: {error}"
@@ -726,7 +1093,7 @@ def _push_project_base(repository_root: Path, name: str) -> None:
         raise click.ClickException(
             f"Local execution completed, but push of {branch!r} failed: {detail}"
         )
-    click.echo(f"Pushed {branch} to origin.")
+    return f"Pushed {branch} to origin."
 
 
 def _open_rollup_pull_request(
@@ -734,7 +1101,11 @@ def _open_rollup_pull_request(
     name: str,
     plan: dict[str, object] | None,
     prd_path: Path | None,
-) -> None:
+    *,
+    cancel: CancellationToken | None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+    activity: Callable[[AgentActivity], None] | None = None,
+) -> str:
     """Open one authenticated GitHub PR after completed local execution."""
     branch = f"project/{name}"
     failure_prefix = "Local execution completed, but rollup PR creation failed"
@@ -753,11 +1124,12 @@ def _open_rollup_pull_request(
         raise click.ClickException(f"{failure_prefix}: {error}") from error
 
     try:
-        remote = subprocess.run(
+        remote = _run_rollup_command(
             ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -778,12 +1150,13 @@ def _open_rollup_pull_request(
         raise click.ClickException(f"{failure_prefix}: gh executable was not found")
     environment = {**os.environ, "GH_PROMPT_DISABLED": "1"}
     try:
-        auth = subprocess.run(
+        auth = _run_rollup_command(
             [gh, "auth", "status", "--active", "--hostname", "github.com"],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=30,
             env=environment,
         )
@@ -796,7 +1169,7 @@ def _open_rollup_pull_request(
         )
 
     try:
-        default = subprocess.run(
+        default = _run_rollup_command(
             [
                 gh,
                 "repo",
@@ -807,10 +1180,11 @@ def _open_rollup_pull_request(
                 "--jq",
                 ".defaultBranchRef.name",
             ],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=30,
             env=environment,
         )
@@ -835,7 +1209,7 @@ def _open_rollup_pull_request(
         else name
     )
     try:
-        created = subprocess.run(
+        created = _run_rollup_command(
             [
                 gh,
                 "pr",
@@ -851,11 +1225,12 @@ def _open_rollup_pull_request(
                 "--body-file",
                 "-",
             ],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
             input=body,
-            text=True,
             timeout=60,
             env=environment,
         )
@@ -867,7 +1242,32 @@ def _open_rollup_pull_request(
         )
     url = created.stdout.strip()
     suffix = f": {url}" if url else "."
-    click.echo(f"Opened rollup pull request for {branch}{suffix}")
+    return f"Opened rollup pull request for {branch}{suffix}"
+
+
+def _run_rollup_command(
+    command: Sequence[str],
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+    cancel: CancellationToken | None,
+    activity: Callable[[AgentActivity], None] | None,
+    **kwargs: object,
+) -> subprocess.CompletedProcess[str]:
+    """Run one visible GitHub delivery command under cancellation control."""
+    if activity is not None:
+        try:
+            activity(AgentActivity(AgentActivityKind.COMMAND, shlex.join(command)))
+        except Exception:
+            pass
+    try:
+        result = command_runner(command, cancel=cancel, **kwargs)
+    except BaseException:
+        if cancel is not None and cancel.is_set():
+            raise KeyboardInterrupt from None
+        raise
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
+    return result
 
 
 def _github_repository(remote: str) -> str | None:
@@ -898,17 +1298,33 @@ def _invoke_host_execution(
     repository_id: UUID,
     borg_id: UUID,
     generation_id: UUID,
+    *,
+    cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> HostExecutionResult:
     """Assemble and invoke the sole concrete phase-07 host service."""
     analysis = store.get_prior_ready_analysis(repository_id)
     if analysis is None:
         raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
     analyzer_plan = analysis.analysis_json
-    preflight = HostPreflight(paths.root)
-    validated = preflight.validate(
-        analyzer_plan,
-        available_secret_names=os.environ.keys(),
-    )
+    try:
+        preflight = HostPreflight(
+            paths.root,
+            cancel=cancel,
+            activity=(
+                (lambda activity: progress.activity("preflight", activity))
+                if progress is not None
+                else None
+            ),
+        )
+        validated = preflight.validate(
+            analyzer_plan,
+            available_secret_names=os.environ.keys(),
+        )
+    except BaseException as error:
+        _finish_execution_preflight(progress, cancel=cancel, error=error)
+        raise
+    _finish_execution_preflight(progress, cancel=cancel, result=validated)
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
@@ -934,12 +1350,15 @@ def _invoke_host_execution(
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
-    environment = HostEnvironmentManager(paths.root)
+    git = SafeGit(paths.root, cancel=cancel)
+    environment = HostEnvironmentManager(paths.root, cancel=cancel, git=git)
     compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
         source_branch=config.default_branch,
+        cancel=cancel,
+        git=git,
     )
     repository_lock = RLock()
 
@@ -958,6 +1377,8 @@ def _invoke_host_execution(
                 billing_mode=_agent_billing_mode(coding_agent.name),
                 effort=config.agents.coding.effort,
             ),
+            cancel=cancel,
+            git=git,
         ),
         review_fix=HostReviewFixPhase(
             paths.root,
@@ -972,6 +1393,8 @@ def _invoke_host_execution(
                 review_effort=config.agents.review.effort,
                 fix_effort=config.agents.review.effort,
             ),
+            cancel=cancel,
+            git=git,
         ),
         merge=HostMergePhase(
             paths.root,
@@ -982,6 +1405,8 @@ def _invoke_host_execution(
                 effort=config.agents.merge.effort,
             ),
             repository_lock=locked_repository,
+            cancel=cancel,
+            git=git,
         ),
         sanity=HostSanityPhase(
             paths.root,
@@ -990,6 +1415,8 @@ def _invoke_host_execution(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=locked_repository,
+            cancel=cancel,
+            git=git,
         ),
     )
     service = HostExecutionService(
@@ -999,6 +1426,7 @@ def _invoke_host_execution(
         worktree_manager=worktrees,
         compose_manager=compose,
         scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
+        progress=progress,
     )
     secrets = {
         name: os.environ[name]
@@ -1010,7 +1438,36 @@ def _invoke_host_execution(
         generation_id,
         analyzer_plan,
         secret_values=secrets,
+        cancel=cancel,
+        validated_preflight=validated,
     )
+
+
+def _finish_execution_preflight(
+    progress: RunProgress | None,
+    *,
+    cancel: CancellationToken | None,
+    result: HostPreflightPlan | HostPreflightBlock | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """Close Preflight at validation, before acquisition or task setup."""
+    if progress is None:
+        return
+    stage = progress.stages.get("preflight")
+    if stage is None or stage.state is not StageState.RUNNING:
+        return
+    if error is not None:
+        detail = str(error).strip() or type(error).__name__
+        if isinstance(error, KeyboardInterrupt | click.Abort) or (
+            cancel is not None and cancel.is_set()
+        ):
+            progress.stop("preflight", detail)
+        else:
+            progress.fail("preflight", detail)
+    elif isinstance(result, HostPreflightBlock):
+        progress.fail("preflight", result.reason)
+    else:
+        progress.complete("preflight", "ready")
 
 
 def _execution_agent_trust_requirement(primary_paths: RepoPaths):
@@ -1243,9 +1700,12 @@ def _format_runtime_cost(value: object) -> str:
     help="Trust this workspace without prompting before decomposition.",
 )
 @_trusted_workspace_callback
-def approve_plan(repository_path: Path, name: str) -> None:
+def approve_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+) -> None:
     """Approve the current plan and prepare its executable task generation."""
-    paths = RepoPaths.discover(repository_path)
     resumable = False
 
     def mark_resumable() -> None:
@@ -1254,6 +1714,7 @@ def approve_plan(repository_path: Path, name: str) -> None:
 
     try:
         config = load_repository_config(paths)
+        progress = _repository_progress(False)
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -1265,6 +1726,8 @@ def approve_plan(repository_path: Path, name: str) -> None:
                 interactive=_stdin_is_interactive(),
             ),
             on_bound=mark_resumable,
+            cancel=cancel,
+            progress=progress,
         )
     except (SupervisorCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
@@ -1309,7 +1772,12 @@ def approve_plan(repository_path: Path, name: str) -> None:
     help="Trust this workspace without prompting before revising the plan.",
 )
 @_trusted_workspace_callback
-def change_plan(repository_path: Path, name: str, note: str | None) -> None:
+def change_plan(
+    paths: RepoPaths,
+    cancel: CancellationToken | None,
+    name: str,
+    note: str | None,
+) -> None:
     """Request changes to a plan awaiting human approval."""
     if note is None:
         note = _prompt("Change note")
@@ -1317,19 +1785,19 @@ def change_plan(repository_path: Path, name: str, note: str | None) -> None:
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
-    borg = _continue_planning(repository_path, name, change_note=note)
+    borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
     _write_planning_gate(name, borg, changed=True)
 
 
 def _continue_planning(
-    repository_path: Path,
+    paths: RepoPaths,
     name: str,
     *,
     change_note: str | None = None,
     io: InteractiveIO | None = None,
+    cancel: CancellationToken | None = None,
 ) -> Borg:
     """Load and drain one initial or change-request planning lifecycle."""
-    paths = RepoPaths.discover(repository_path)
     change_requested = change_note is not None
     resumable = False
     try:
@@ -1377,13 +1845,23 @@ def _continue_planning(
                     interactive=_stdin_is_interactive(),
                 )
                 planning_io = io or _interactive_io()
-                if borg.state is BorgState.DRAFT:
+                progress = _repository_progress(False)
+                if borg.state is BorgState.DRAFT or (
+                    borg.state
+                    in {
+                        BorgState.ARCHITECT_WORKING,
+                        BorgState.ARCHITECT_AWAITING_ANSWERS,
+                    }
+                    and not _awaiting_architect_revision(store, borg)
+                ):
                     borg = ArchitectLoop(
                         repository,
                         borg,
                         store,
                         agent,
                         io=planning_io,
+                        cancel=cancel,
+                        progress=progress,
                     ).run().borg
                 borg = TechLeadLoop(
                     repository,
@@ -1392,6 +1870,8 @@ def _continue_planning(
                     agent,
                     architect_agent=agent,
                     io=planning_io,
+                    cancel=cancel,
+                    progress=progress,
                 ).run().borg
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
@@ -1412,6 +1892,13 @@ def _continue_planning(
             ) from error
         raise click.ClickException(str(error)) from error
     return borg
+
+
+def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
+    """Return whether the current Architect state follows a Tech Lead rejection."""
+    return latest_planning_review_requests_changes(
+        current_planning_cycle_attempts(store, borg.id), "tech_review"
+    )
 
 
 def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:

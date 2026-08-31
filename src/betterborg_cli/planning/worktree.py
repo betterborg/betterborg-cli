@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.repo_analysis import (
     build_machine_report,
     render_markdown_report,
@@ -53,6 +56,8 @@ def materialize_planning_worktree(
     current_plan: str | None = None,
     dirty_borg_documents: Sequence[Path] = (),
     worktrees_root: Path | None = None,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
 ) -> Iterator[Path]:
     """Yield an ephemeral detached worktree with current planning evidence.
 
@@ -61,16 +66,32 @@ def materialize_planning_worktree(
     cross the checkout boundary only when the caller names a dirty ``.borg``
     document explicitly.
     """
-    paths = _validate_inputs(repository, borg, store)
+    paths = _validate_inputs(
+        repository,
+        borg,
+        store,
+        cancel=cancel,
+        command_runner=command_runner,
+    )
     supplied_documents = _read_deliberate_borg_documents(
-        paths.root, dirty_borg_documents
+        paths.root,
+        dirty_borg_documents,
+        cancel=cancel,
+        command_runner=command_runner,
     )
     root = Path(worktrees_root or paths.worktrees_dir / "planning").resolve()
     if root == paths.root or root.is_relative_to(paths.root):
         raise PlanningWorktreeError("planning worktrees must be outside the checkout")
     root.mkdir(parents=True, exist_ok=True)
     destination = root / f"{borg.id}-{uuid4().hex}"
-    head_sha = _git_output(paths.root, "rev-parse", "--verify", "HEAD^{commit}")
+    head_sha = _git_output(
+        paths.root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        cancel=cancel,
+        command_runner=command_runner,
+    )
 
     created = False
     active_error: BaseException | None = None
@@ -83,6 +104,8 @@ def materialize_planning_worktree(
                 "--detach",
                 str(destination),
                 head_sha,
+                cancel=cancel,
+                command_runner=command_runner,
             )
             created = True
             _materialize_context(
@@ -109,14 +132,13 @@ def materialize_planning_worktree(
         active_error = error
         raise
     finally:
-        if created:
+        if created or os.path.lexists(destination):
             try:
-                _run_git(
+                _remove_worktree(
                     paths.root,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(destination),
+                    destination,
+                    cancel=cancel,
+                    command_runner=command_runner,
                 )
             except (
                 OSError,
@@ -134,7 +156,12 @@ def materialize_planning_worktree(
 
 
 def _validate_inputs(
-    repository: Repository, borg: Borg, store: SqliteStore
+    repository: Repository,
+    borg: Borg,
+    store: SqliteStore,
+    *,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
 ) -> RepoPaths:
     if store.get_repository(repository.id) != repository:
         raise PlanningWorktreeError(
@@ -144,7 +171,11 @@ def _validate_inputs(
         raise PlanningWorktreeError(
             "Borg must already belong to the supplied repository and store"
         )
-    paths = RepoPaths.discover(repository.root)
+    paths = RepoPaths.discover(
+        repository.root,
+        cancel=cancel,
+        command_runner=command_runner,
+    )
     if paths.root != repository.root:
         raise PlanningWorktreeError(
             "repository root does not match its discovered Git root"
@@ -305,7 +336,11 @@ def _materialize_context(
 
 
 def _read_deliberate_borg_documents(
-    repository_root: Path, documents: Sequence[Path]
+    repository_root: Path,
+    documents: Sequence[Path],
+    *,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
 ) -> dict[Path, str]:
     supplied: dict[Path, str] = {}
     for document in documents:
@@ -314,7 +349,7 @@ def _read_deliberate_borg_documents(
             raise PlanningWorktreeError(
                 f"dirty Borg document was supplied more than once: {relative}"
             )
-        status = subprocess.run(
+        status = command_runner(
             [
                 "git",
                 "-C",
@@ -326,9 +361,9 @@ def _read_deliberate_borg_documents(
                 relative.as_posix(),
             ],
             check=True,
-            capture_output=True,
-            text=True,
+            cancel=cancel,
         )
+        _raise_for_git_failure(status)
         if not status.stdout:
             raise PlanningWorktreeError(
                 f"supplied Borg document is not dirty: {relative.as_posix()}"
@@ -414,20 +449,89 @@ def _timestamp(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _run_git(repository_root: Path, *arguments: str) -> None:
-    subprocess.run(
+def _run_git(
+    repository_root: Path,
+    *arguments: str,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+    terminate_on_cancel: bool = True,
+    deadline: float | None = None,
+) -> None:
+    result = command_runner(
         ["git", "-C", str(repository_root), *arguments],
         check=True,
-        capture_output=True,
-        text=True,
+        cancel=cancel,
+        terminate_on_cancel=terminate_on_cancel,
+        deadline=deadline,
     )
+    _raise_for_git_failure(result)
 
 
-def _git_output(repository_root: Path, *arguments: str) -> str:
-    result = subprocess.run(
+def _git_output(
+    repository_root: Path,
+    *arguments: str,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+) -> str:
+    result = command_runner(
         ["git", "-C", str(repository_root), *arguments],
         check=True,
-        capture_output=True,
-        text=True,
+        cancel=cancel,
     )
+    _raise_for_git_failure(result)
     return result.stdout.strip()
+
+
+def _remove_worktree(
+    repository_root: Path,
+    destination: Path,
+    *,
+    cancel: CancellationToken | None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    arguments = ("worktree", "remove", "--force", str(destination))
+    if cancel is None:
+        _run_git(
+            repository_root,
+            *arguments,
+            command_runner=command_runner,
+        )
+        return
+
+    if not cancel.is_set():
+        try:
+            _run_git(
+                repository_root,
+                *arguments,
+                cancel=cancel,
+                command_runner=command_runner,
+            )
+            return
+        except subprocess.CalledProcessError:
+            if not cancel.is_set():
+                raise
+            # Cancellation can be observed after Git has completed removal.
+            # In that race the owned worktree is already safely absent.
+            if not os.path.lexists(destination):
+                return
+
+    _run_git(
+        repository_root,
+        *arguments,
+        cancel=cancel,
+        command_runner=command_runner,
+        terminate_on_cancel=False,
+        deadline=cancel.force_deadline,
+    )
+
+
+def _raise_for_git_failure(
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,13 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.planning.plan_contracts import PlanValidationError
-from betterborg_cli.planning.turns import DurablePlanningTurns
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    planning_attempt_duration,
+    planning_attempt_result,
+)
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
@@ -225,9 +231,14 @@ class ArchitectLoop:
         artifact_dir: Path | None = None,
         model: str | None = None,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
+        stage_key: str = "architect",
+        child_key: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
+        if cancel is not None and cancel.is_set():
+            raise ArchitectCancelled("Architect run cancelled")
         require_read_only_agent(
             agent, role="Architect", error_factory=ArchitectError
         )
@@ -236,7 +247,7 @@ class ArchitectLoop:
         except AgentSelectionError as error:
             raise ArchitectError(str(error)) from error
 
-        paths = RepoPaths.discover(repository.root)
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository
@@ -249,8 +260,24 @@ class ArchitectLoop:
         ).resolve()
         self.model = resolved_model
         self.cancel = cancel
+        self.progress = progress
+        self.stage_key = stage_key
+        self.child_key = child_key
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
+        if progress is not None:
+            if child_key is None and stage_key not in progress.stages:
+                progress.declare(StageSpec(stage_key, "Architect"))
+            elif child_key is not None:
+                if stage_key not in progress.stages:
+                    raise ValueError(
+                        "Architect revision parent must already be declared"
+                    )
+                if child_key not in progress.stages[stage_key].children:
+                    progress.declare_child(
+                        stage_key,
+                        ChildSpec(child_key, "Architect revision"),
+                    )
         self._turns = DurablePlanningTurns(
             repository,
             borg,
@@ -262,18 +289,42 @@ class ArchitectLoop:
             error_factory=ArchitectError,
             cancelled_error_factory=ArchitectCancelled,
             cancel=cancel,
+            progress=progress,
+            stage_key=stage_key if progress is not None else None,
+            child_key=child_key if progress is not None else None,
             dirty_borg_documents=dirty_borg_documents,
             worktrees_root=worktrees_root,
         )
 
     def run(self) -> ArchitectResult:
         """Continue from durable history until a plan is ready for Tech Lead review."""
-        borg = self._turns.current_borg()
-        completed_plan = self._completed_plan()
-        if completed_plan is not None:
-            return ArchitectResult(
-                borg=borg, plan=completed_plan.result or {}, attempt=completed_plan
+        try:
+            completed_plan = self._completed_plan()
+            if completed_plan is not None:
+                self._seed_progress(completed_plan)
+                return ArchitectResult(
+                    borg=self._turns.current_borg(),
+                    plan=completed_plan.result or {},
+                    attempt=completed_plan,
+                )
+
+            self._start_progress()
+            result = self._run()
+            self._complete_progress(result.attempt)
+            return result
+        except (ArchitectCancelled, KeyboardInterrupt) as error:
+            self._reconcile_progress(str(error), stopped=True)
+            raise
+        except Exception as error:
+            self._reconcile_progress(
+                str(error),
+                stopped=self.cancel is not None and self.cancel.is_set(),
             )
+            raise
+
+    def _run(self) -> ArchitectResult:
+        """Execute fresh Architect work after its progress record starts."""
+        borg = self._turns.current_borg()
 
         if borg.state is BorgState.DRAFT:
             borg = self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
@@ -485,13 +536,15 @@ class ArchitectLoop:
     def _answer_question_round(self, borg: Borg, question: PlanningQuestion) -> Borg:
         answers: list[dict[str, object]] = []
         for item in question.questions:
-            why = str(item.get("why") or "").strip()
-            hint = str(item.get("hint") or "").strip()
-            if why:
-                self.io.write(f"Why this matters: {why}")
-            if hint:
-                self.io.write(f"Answer guidance: {hint}")
-            answer = self.io.prompt(str(item["question"]))
+            suspension = self.progress.suspend() if self.progress else nullcontext()
+            with suspension:
+                why = str(item.get("why") or "").strip()
+                hint = str(item.get("hint") or "").strip()
+                if why:
+                    self.io.write(f"Why this matters: {why}")
+                if hint:
+                    self.io.write(f"Answer guidance: {hint}")
+                answer = self.io.prompt(str(item["question"]))
             if answer is None:
                 raise ArchitectCancelled("Architect questions are awaiting answers")
             answer = answer.strip()
@@ -502,6 +555,86 @@ class ArchitectLoop:
         with self.store.transaction():
             self.store.answer_planning_question(question.id, answers)
             return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
+
+    def _start_progress(self) -> None:
+        if self.progress is None:
+            return
+        if self.child_key is None:
+            self.progress.start(self.stage_key)
+        else:
+            child = self.progress.stages[self.stage_key].children[self.child_key]
+            if child.state is StageState.PENDING:
+                self.progress.start_child(self.stage_key, self.child_key)
+            elif child.state is not StageState.RUNNING:
+                raise ArchitectError(
+                    "Architect revision progress "
+                    f"{self.child_key!r} is already terminal"
+                )
+
+    def _seed_progress(self, attempt: PlanningAttempt) -> None:
+        if self.progress is None:
+            return
+        result = planning_attempt_result(attempt, default="plan ready")
+        duration = planning_attempt_duration(attempt)
+        if self.child_key is None:
+            record = self.progress.stages[self.stage_key]
+            if record.state is StageState.PENDING:
+                self.progress.seed_completed(self.stage_key, result, duration)
+        else:
+            child = self.progress.stages[self.stage_key].children[self.child_key]
+            if child.state is StageState.PENDING:
+                self.progress.seed_child_completed(
+                    self.stage_key, self.child_key, result, duration
+                )
+
+    def _complete_progress(self, attempt: PlanningAttempt) -> None:
+        if self.progress is None:
+            return
+        if self.child_key is None:
+            self.progress.complete(
+                self.stage_key,
+                planning_attempt_result(attempt, default="plan ready"),
+            )
+        else:
+            self.progress.complete_child(
+                self.stage_key,
+                self.child_key,
+                planning_attempt_result(attempt, default="plan ready"),
+            )
+
+    def _reconcile_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        record = (
+            self.progress.stages[self.stage_key]
+            if self.child_key is None
+            else self.progress.stages[self.stage_key].children[self.child_key]
+        )
+        if record.state is not StageState.RUNNING:
+            return
+        completed_plan = self._completed_plan()
+        if completed_plan is not None:
+            self._complete_progress(completed_plan)
+        elif stopped:
+            self._stop_progress(result)
+        else:
+            self._fail_progress(result)
+
+    def _fail_progress(self, result: str) -> None:
+        if self.progress is None:
+            return
+        if self.child_key is None:
+            self.progress.fail(self.stage_key, result)
+        else:
+            self.progress.fail_child(self.stage_key, self.child_key, result)
+
+    def _stop_progress(self, result: str) -> None:
+        if self.progress is None:
+            return
+        if self.child_key is None:
+            self.progress.stop(self.stage_key, result)
+        else:
+            self.progress.stop_child(self.stage_key, self.child_key, result)
 
     def _complete_attempt(
         self, attempt: PlanningAttempt, payload: dict[str, Any], summary: str

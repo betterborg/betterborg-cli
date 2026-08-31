@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
-from betterborg_cli.agent_runtime.base import AgentAdapter
+from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
     ImprovementPrd,
@@ -18,6 +20,7 @@ from betterborg_cli.repo_analysis import (
     build_machine_report,
     generate_improvement_prds,
     generate_role_prompts,
+    get_durable_role_prompt,
     render_markdown_report,
     resolve_theme_key,
     run_analyzer,
@@ -29,13 +32,12 @@ from betterborg_cli.repository_config import (
     RepositoryConfig,
     load_repository_config,
 )
-from betterborg_cli.repository_files import (
-    RepositoryPathError,
-    publish_repository_text,
-)
+from betterborg_cli.repository_files import RepositoryPathError, publish_repository_text
 from betterborg_cli.store import Operation, Repository, RepositoryAnalysis, SqliteStore
 
 _INITIALIZED_OPERATION = "repository.initialized"
+_PROMPTS_STAGE_KEY = "prompts"
+_IMPROVEMENT_PRDS_STAGE_KEY = "improvement-prds"
 
 AnalysisAgent: TypeAlias = AgentAdapter | SelectedAgent
 AgentFactory: TypeAlias = Callable[[RepositoryConfig], AnalysisAgent]
@@ -77,10 +79,31 @@ class RepositoryService:
         paths: RepoPaths,
         store: SqliteStore,
         agent_factory: AgentFactory,
+        *,
+        cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self.paths = paths
         self.store = store
         self._agent_factory = agent_factory
+        self.cancel = cancel
+        self.progress = progress
+        if progress is not None:
+            progress.declare(StageSpec("discover", "Discover evidence"))
+            progress.declare(StageSpec("analyze", "Analyze repository"))
+            progress.declare(
+                StageSpec(
+                    _PROMPTS_STAGE_KEY,
+                    "Generate role prompts",
+                    tuple(
+                        ChildSpec(role, f"{role.title()} prompt")
+                        for role in PROMPT_ROLES
+                    ),
+                )
+            )
+            progress.declare(
+                StageSpec(_IMPROVEMENT_PRDS_STAGE_KEY, "Draft improvement PRDs")
+            )
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
@@ -88,6 +111,9 @@ class RepositoryService:
         ensure_managed_gitignore(self.paths)
 
         analysis = self.store.get_prior_ready_analysis(repository.id)
+        if analysis is not None:
+            self._seed_retained_analysis(analysis)
+        retained_prompt_roles = self._seed_retained_prompts(repository)
         if self._is_initialized(repository):
             if analysis is None:
                 raise RepositoryInitializationError(
@@ -107,17 +133,22 @@ class RepositoryService:
                 self.store,
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "analysis",
+                cancel=self.cancel,
+                progress=self.progress,
             )
 
         self._write_score(analysis)
-        prompt_runs = self._generate_missing_prompts(repository, analysis, agent)
-        _require_complete_prompts(prompt_runs)
-
-        improvement_prds = generate_improvement_prds(
+        prompt_runs = self._generate_missing_prompts(
+            repository,
             analysis,
-            self.paths,
-            _suggested_borg_names(analysis),
+            agent,
+            retained_prompt_roles=retained_prompt_roles,
         )
+        _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
+
+        improvement_prds = self._generate_improvement_prds(analysis)
+        self._raise_if_cancelled()
         self.store.append_operation(
             Operation(
                 repository_id=repository.id,
@@ -147,6 +178,8 @@ class RepositoryService:
             self.store,
             agent,
             artifact_dir=self.paths.artifacts_dir / "analysis",
+            cancel=self.cancel,
+            progress=self.progress,
         )
         previous_analysis = self.store.get_prior_ready_analysis(
             repository.id,
@@ -166,15 +199,15 @@ class RepositoryService:
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=PROMPT_ROLES,
+                cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_PROMPTS_STAGE_KEY,
             )
         )
         _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
 
-        improvement_prds = generate_improvement_prds(
-            analysis,
-            self.paths,
-            _suggested_borg_names(analysis),
-        )
+        improvement_prds = self._generate_improvement_prds(analysis)
         return RepositoryReanalysis(
             repository=repository,
             analysis=analysis,
@@ -220,17 +253,7 @@ class RepositoryService:
         return repository, config
 
     def _write_initial_config(self, repository: Repository) -> None:
-        tracked_dir = self.paths.tracked_dir
-        if not tracked_dir.resolve().is_relative_to(self.paths.root):
-            raise RepositoryInitializationError(
-                f"tracked Borg directory escapes repository: {tracked_dir}"
-            )
-        tracked_dir.mkdir(parents=True, exist_ok=True)
-        if not tracked_dir.resolve(strict=True).is_relative_to(self.paths.root):
-            raise RepositoryInitializationError(
-                f"tracked Borg directory escapes repository: {tracked_dir}"
-            )
-        default_branch = _default_branch(self.paths.root)
+        default_branch = _default_branch(self.paths.root, cancel=self.cancel)
         body = (
             f"version = {CONFIG_VERSION}\n\n"
             "[repository]\n"
@@ -238,13 +261,17 @@ class RepositoryService:
             f"default_branch = {json.dumps(default_branch, ensure_ascii=False)}\n"
         )
         try:
-            with (tracked_dir / CONFIG_FILENAME).open(
-                "x", encoding="utf-8", errors="strict", newline="\n"
-            ) as config_file:
-                config_file.write(body)
+            publish_repository_text(
+                self.paths.tracked_dir / CONFIG_FILENAME,
+                body,
+                root=self.paths.root,
+                overwrite=False,
+            )
         except FileExistsError:
             # Another initializer won the creation race; its identity is canonical.
             return
+        except RepositoryPathError as error:
+            raise RepositoryInitializationError(str(error)) from error
 
     def _is_initialized(self, repository: Repository) -> bool:
         return any(
@@ -252,23 +279,61 @@ class RepositoryService:
             for operation in self.store.list_operations(repository.id)
         )
 
+    def _seed_retained_analysis(self, analysis: RepositoryAnalysis) -> None:
+        if self.progress is None:
+            return
+        self.progress.seed_completed(
+            "discover",
+            f"evidence retained for analysis {analysis.id}",
+        )
+        self.progress.seed_completed(
+            "analyze",
+            f"score {analysis.overall_score:.2f}/5",
+        )
+
     def _write_score(self, analysis: RepositoryAnalysis) -> None:
         packages = self.store.list_packages(analysis.id)
         report = render_markdown_report(build_machine_report(analysis, packages))
         _publish_text(self.paths.score_report, report, root=self.paths.root)
+
+    def _seed_retained_prompts(self, repository: Repository) -> frozenset[str]:
+        retained_roles = frozenset(
+            role
+            for role in PROMPT_ROLES
+            if get_durable_role_prompt(
+                repository,
+                self.store,
+                role=role,
+                path=self.paths.prompts_dir / f"{role}.system.md",
+            )
+            is not None
+        )
+        if self.progress is None:
+            return retained_roles
+        for role in PROMPT_ROLES:
+            if role in retained_roles:
+                self.progress.seed_child_completed(
+                    _PROMPTS_STAGE_KEY,
+                    role,
+                    "prompt retained",
+                )
+        if len(retained_roles) == len(PROMPT_ROLES):
+            self.progress.seed_completed(
+                _PROMPTS_STAGE_KEY,
+                f"{len(PROMPT_ROLES)} prompts retained",
+            )
+        return retained_roles
 
     def _generate_missing_prompts(
         self,
         repository: Repository,
         analysis: RepositoryAnalysis,
         agent: AnalysisAgent,
+        *,
+        retained_prompt_roles: frozenset[str],
     ) -> tuple[PromptGeneration, ...]:
-        latest = self.store.get_latest_generated_prompts(repository.id)
         missing_roles = tuple(
-            role
-            for role in PROMPT_ROLES
-            if role not in latest
-            or not (self.paths.prompts_dir / f"{role}.system.md").is_file()
+            role for role in PROMPT_ROLES if role not in retained_prompt_roles
         )
         if not missing_roles:
             return ()
@@ -280,23 +345,83 @@ class RepositoryService:
                 agent,
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=missing_roles,
+                cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_PROMPTS_STAGE_KEY,
             )
         )
 
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise KeyboardInterrupt
 
-def _default_branch(repository_root: Path) -> str:
+    def _generate_improvement_prds(
+        self,
+        analysis: RepositoryAnalysis,
+    ) -> tuple[ImprovementPrd, ...]:
+        self._raise_if_cancelled()
+        if self.progress is not None:
+            if self.cancel is not None and not self.cancel.start_if_active(
+                lambda: self.progress.start(_IMPROVEMENT_PRDS_STAGE_KEY)
+            ):
+                raise KeyboardInterrupt
+            if self.cancel is None:
+                self.progress.start(_IMPROVEMENT_PRDS_STAGE_KEY)
+        try:
+            documents = generate_improvement_prds(
+                analysis,
+                self.paths,
+                _suggested_borg_names(analysis),
+                cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_IMPROVEMENT_PRDS_STAGE_KEY,
+            )
+        except BaseException as error:
+            if (
+                self.progress is not None
+                and self.progress.stages[_IMPROVEMENT_PRDS_STAGE_KEY].state
+                is StageState.RUNNING
+            ):
+                if isinstance(error, KeyboardInterrupt) or (
+                    self.cancel is not None and self.cancel.is_set()
+                ):
+                    self.progress.stop(_IMPROVEMENT_PRDS_STAGE_KEY, "interrupted")
+                else:
+                    self.progress.fail(_IMPROVEMENT_PRDS_STAGE_KEY, str(error))
+            raise
+        if self.progress is not None:
+            noun = "PRD" if len(documents) == 1 else "PRDs"
+            self.progress.complete(
+                _IMPROVEMENT_PRDS_STAGE_KEY,
+                f"{len(documents)} {noun}",
+            )
+        return documents
+
+
+def _default_branch(
+    repository_root: Path,
+    *,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+) -> str:
+    command = ["git", "-C", str(repository_root), "symbolic-ref", "--short", "HEAD"]
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repository_root), "symbolic-ref", "--short", "HEAD"],
+        result = command_runner(
+            command,
             check=True,
-            capture_output=True,
-            text=True,
+            cancel=cancel,
         )
     except subprocess.CalledProcessError as error:
         raise RepositoryInitializationError(
             "cannot initialize a repository while Git HEAD is detached"
         ) from error
+    if result.returncode == -1 and cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
     branch = result.stdout.strip()
+    if result.returncode != 0:
+        raise RepositoryInitializationError(
+            "cannot initialize a repository while Git HEAD is detached"
+        )
     if not branch:
         raise RepositoryInitializationError("cannot determine the default Git branch")
     return branch

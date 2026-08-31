@@ -15,6 +15,7 @@ from betterborg_cli.agent_runtime import (
     AgentRunSpec,
     AgentStatus,
     BillingMode,
+    CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
     AgentAttemptArtifacts,
@@ -117,17 +118,23 @@ class HostCodingPhase:
         adapter: AgentAdapter,
         *,
         config: HostCodingConfig,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise CodingPhaseError(
                 "coding phase must be bound to the primary Git checkout"
             )
         self._adapter = adapter
         self._config = config
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
-        self._primary_git = SafeGit(self.repository_root)
+        if git is not None and git.cwd != self.repository_root:
+            raise CodingPhaseError("coding phase Git binding must match repository")
+        self._primary_git = git or SafeGit(self.repository_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._primary_git
+        )
         self.artifact_root = Path(
             config.artifact_root
             or self._paths.artifacts_dir / "host-execution"
@@ -162,7 +169,7 @@ class HostCodingPhase:
         if resumed is not None:
             return resumed
 
-        worktree_git = SafeGit(worktree)
+        worktree_git = self._primary_git.for_worktree(worktree)
         base_head = worktree_git.head_sha()
         attempt_number = 1 + sum(
             attempt.phase == "coding"
@@ -226,6 +233,7 @@ class HostCodingPhase:
             env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
+            activity_sink=context.activity_sink("coding"),
         )
         result: AgentResult
         operational_error: BaseException | None = None
@@ -363,7 +371,8 @@ class HostCodingPhase:
             commit_sha = metadata.get("commit_sha")
             head_matches = (
                 isinstance(commit_sha, str)
-                and SafeGit(worktree).head_sha() == commit_sha
+                and self._primary_git.for_worktree(worktree).head_sha()
+                == commit_sha
             )
             if not head_matches:
                 return self._block(
@@ -430,15 +439,10 @@ class HostCodingPhase:
     ) -> TaskRuntimeStatus:
         if status is TaskRuntimeStatus.CODING:
             return status
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=TaskRuntimeStatus.CODING,
-            new_status=status,
+        context.transition(
+            TaskRuntimeStatus.CODING,
+            status,
             state_reason=reason,
-            now=context.clock(),
         )
         return status
 
@@ -454,15 +458,10 @@ class HostCodingPhase:
             TaskRuntimeStatus.CODING,
         }:
             raise CodingPhaseError(reason)
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=runtime.status,
-            new_status=TaskRuntimeStatus.BLOCKED,
+        context.transition(
+            runtime.status,
+            TaskRuntimeStatus.BLOCKED,
             state_reason=reason,
-            now=context.clock(),
         )
         return TaskRuntimeStatus.BLOCKED
 

@@ -109,6 +109,14 @@ borg init --yes
 to `.borg/config.toml`, a PRD, shell output, or any tracked file; use the shell
 environment or a secret manager.
 
+Provider API agents use contained file tools that reject absolute paths,
+traversal, and symlinks escaping the run directory. Analysis and planning
+agents receive only those file tools. Coding, review, and merge agents may
+also receive an argv-only command runner after workspace trust. Avoiding a
+shell keeps metacharacters literal, but it is not a sandbox: programs invoked
+by the command runner remain host-capable. Native Claude and Codex tools are
+outside this API file-tool boundary.
+
 ## Recovery
 
 If `borg` is installed but not found, confirm that the console-script directory

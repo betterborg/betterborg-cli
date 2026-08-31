@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution.compose import (
     ComposeStack,
     ComposeStackError,
@@ -32,6 +33,7 @@ from betterborg_cli.host_execution.merge import MergeTip
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import ExecutionEvent, TaskRuntime, TaskRuntimeStatus
 
@@ -96,9 +98,11 @@ class HostSanityPhase:
         repository_lock: RepositoryLockFactory,
         command_runner: CommandRunner | None = None,
         timeout_seconds: float = 600,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        paths = RepoPaths.discover(self.repository_root)
+        paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if paths.root != self.repository_root:
             raise SanityPhaseError("sanity phase must use the primary checkout")
         if plan.repository_root.resolve() != self.repository_root:
@@ -112,10 +116,14 @@ class HostSanityPhase:
         self._compose_manager = compose_manager
         self._worktree_manager = worktree_manager
         self._repository_lock = repository_lock
-        self._run = command_runner or subprocess.run
+        self._run = command_runner or run_captured
         self._timeout_seconds = timeout_seconds
-        self._git = SafeGit(self.repository_root)
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
+        if git is not None and git.cwd != self.repository_root:
+            raise SanityPhaseError("sanity phase Git binding must match repository")
+        self._git = git or SafeGit(self.repository_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._git
+        )
 
     def run(
         self,
@@ -187,6 +195,8 @@ class HostSanityPhase:
                         stack_to_stop,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                 except BaseException as cleanup_error:
                     cleanup_detail = (
@@ -258,6 +268,8 @@ class HostSanityPhase:
                         prior_stack,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                     prior_stack = None
                 materialization = self._environment_manager.materialize_claimed_task(
@@ -266,12 +278,15 @@ class HostSanityPhase:
                     context.claim,
                     context.owner_token,
                     secret_values=secret_values,
+                    task_transition=context.transition,
                 )
                 sanity_stack = self._compose_manager.start_claimed_sanity_stack(
                     context.store,
                     self.plan,
                     context.claim,
                     context.owner_token,
+                    cancel=context.cancel,
+                    activity=context.activity,
                 )
                 service_environment = service_url_environment(self.plan.services)
                 if sanity_stack is not None:
@@ -281,6 +296,8 @@ class HostSanityPhase:
                     materialization_environment=materialization.environment,
                     service_environment=service_environment,
                     secret_values=secret_values,
+                    cancel=context.cancel,
+                    activity=context.activity_sink("sanity"),
                 )
                 command_results.extend(commands)
                 failure = next(
@@ -295,7 +312,7 @@ class HostSanityPhase:
                     )
                 if not commands:
                     raise SanityPhaseError("sanity command catalog is empty")
-                if not SafeGit(worktree).is_clean():
+                if not self._git.for_worktree(worktree).is_clean():
                     raise SanityPhaseError(
                         "sanity commands changed tracked or untracked task files"
                     )
@@ -310,6 +327,8 @@ class HostSanityPhase:
                         stack_to_stop,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                 except BaseException as cleanup_error:
                     if active_error is None:
@@ -380,6 +399,8 @@ class HostSanityPhase:
         materialization_environment: Mapping[str, str],
         service_environment: Mapping[str, str],
         secret_values: Mapping[str, str],
+        cancel: CancellationToken,
+        activity: Callable[[AgentActivity], None] | None,
     ) -> tuple[SanityCommandResult, ...]:
         results: list[SanityCommandResult] = []
         masks = declared_secret_mask_values(self.plan, secret_values)
@@ -398,16 +419,17 @@ class HostSanityPhase:
                 redact_secrets(command.cwd, masks),
                 redact_secrets(command.evidence, masks),
             )
+            self._report_command(command.argv, masks, activity)
             try:
                 completed = self._run(
                     list(command.argv),
                     cwd=cwd,
                     env=environment,
                     check=False,
-                    capture_output=True,
-                    text=True,
                     timeout=self._timeout_seconds,
+                    cancel=cancel,
                 )
+                self._raise_if_cancelled(cancel)
                 result = SanityCommandResult(
                     redacted_command,
                     completed.returncode,
@@ -415,6 +437,7 @@ class HostSanityPhase:
                     redact_secrets(completed.stderr or "", masks),
                 )
             except subprocess.TimeoutExpired as error:
+                self._raise_if_cancelled(cancel, error)
                 result = SanityCommandResult(
                     redacted_command,
                     -1,
@@ -426,6 +449,7 @@ class HostSanityPhase:
                     ),
                 )
             except OSError as error:
+                self._raise_if_cancelled(cancel, error)
                 result = SanityCommandResult(
                     redacted_command,
                     -1,
@@ -436,6 +460,31 @@ class HostSanityPhase:
             if result.returncode != 0:
                 break
         return tuple(results)
+
+    @staticmethod
+    def _report_command(
+        command: Sequence[str],
+        masks: Sequence[str],
+        activity: Callable[[AgentActivity], None] | None,
+    ) -> None:
+        if activity is None:
+            return
+        redacted = [redact_secrets(argument, masks) for argument in command]
+        try:
+            activity(AgentActivity(AgentActivityKind.COMMAND, shlex.join(redacted)))
+        except Exception:
+            return
+
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel: CancellationToken,
+        cause: BaseException | None = None,
+    ) -> None:
+        if not cancel.is_set():
+            return
+        if cause is None:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt from cause
 
     def _runtime_and_worktree(
         self, context: ScheduledTaskContext, tip: MergeTip
@@ -451,9 +500,10 @@ class HostSanityPhase:
             raise SanityPhaseError("merge tip belongs to another project base")
         return runtime, worktree
 
-    @staticmethod
-    def _verify_tip(runtime: TaskRuntime, worktree: Path, tip: MergeTip) -> None:
-        git = SafeGit(worktree)
+    def _verify_tip(
+        self, runtime: TaskRuntime, worktree: Path, tip: MergeTip
+    ) -> None:
+        git = self._git.for_worktree(worktree)
         if git.current_branch() != runtime.branch:
             raise SanityPhaseError("merged worktree is on the wrong branch")
         if git.head_sha() != tip.commit_sha:
@@ -547,6 +597,8 @@ class HostSanityPhase:
                 resume_phase="merging",
                 state_reason=reason,
             )
+        else:
+            context.reconcile_progress()
         return HostSanityResult(TaskRuntimeStatus.BLOCKED, reason, commands=commands)
 
 

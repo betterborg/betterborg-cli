@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from threading import Event, Lock, Thread
@@ -21,6 +21,8 @@ from betterborg_cli.host_execution.compose import (
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
     HostEnvironmentManager,
+    declared_secret_mask_values,
+    redact_secrets,
 )
 from betterborg_cli.host_execution.guard import PrimaryCheckoutContaminationError
 from betterborg_cli.host_execution.merge import HostMergePhase
@@ -37,13 +39,45 @@ from betterborg_cli.host_execution.scheduler import (
     HostSchedulerResult,
     HostTaskScheduler,
     ScheduledTaskContext,
+    TaskActivitySink,
 )
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
+from betterborg_cli.progress import AgentActivity, RunProgress, StageState
 from betterborg_cli.store import ExecutionRunStatus, SqliteStore, TaskRuntimeStatus
 
 
 class HostExecutionError(RuntimeError):
     """Raised when run-scoped host setup cannot be completed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionActivityBinding:
+    """Mask one acquired run's activity before any reporter can observe it."""
+
+    mask_values: tuple[str, ...] = field(repr=False)
+    reporter: TaskActivitySink | None = field(repr=False)
+    progress: RunProgress | None = field(default=None, repr=False)
+
+    def emit(self, task_id: UUID, activity: AgentActivity) -> None:
+        """Publish a freshly redacted activity without affecting execution."""
+        detail = activity.detail
+        if detail is not None:
+            detail = redact_secrets(detail, self.mask_values)
+        redacted = AgentActivity(activity.kind, detail)
+        try:
+            if self.reporter is not None:
+                self.reporter(task_id, redacted)
+        except Exception:
+            # Activity reporters are observational and cannot change execution.
+            pass
+        try:
+            if self.progress is not None:
+                stage = self.progress.stages.get(str(task_id))
+                if stage is not None and stage.state is StageState.RUNNING:
+                    self.progress.activity(stage.key, redacted)
+        except Exception:
+            # The generic progress reporter is observational too.
+            pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +187,7 @@ class HostTaskRuntime:
         merge: HostMergePhase,
         sanity: HostSanityPhase,
         secret_values: Mapping[str, str] | None = None,
+        task_activity: TaskActivitySink | None = None,
         publication_lock: Any | None = None,
     ) -> None:
         self.plan = plan
@@ -163,9 +198,13 @@ class HostTaskRuntime:
         self._merge = merge
         self._sanity = sanity
         self._secret_values = dict(secret_values or {})
+        self._task_activity = task_activity
         self._publication_lock = publication_lock or Lock()
 
-    def with_secret_values(self, secret_values: Mapping[str, str]) -> HostTaskRuntime:
+    def with_secret_values(
+        self,
+        secret_values: Mapping[str, str],
+    ) -> HostTaskRuntime:
         """Bind one run's validated secret values without shared mutation."""
         return HostTaskRuntime(
             self.plan,
@@ -176,6 +215,24 @@ class HostTaskRuntime:
             merge=self._merge,
             sanity=self._sanity,
             secret_values=secret_values,
+            task_activity=self._task_activity,
+            publication_lock=self._publication_lock,
+        )
+
+    def with_task_activity(
+        self, task_activity: TaskActivitySink | None
+    ) -> HostTaskRuntime:
+        """Bind one acquired run's already-redacting task reporter."""
+        return HostTaskRuntime(
+            self.plan,
+            environment_manager=self._environment,
+            compose_manager=self._compose,
+            coding=self._coding,
+            review_fix=self._review_fix,
+            merge=self._merge,
+            sanity=self._sanity,
+            secret_values=self._secret_values,
+            task_activity=task_activity,
             publication_lock=self._publication_lock,
         )
 
@@ -196,6 +253,7 @@ class HostTaskRuntime:
             owner_token,
             tuple(worktrees),
             secret_values=secret_values,
+            activity=self._task_activity,
         )
 
     def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
@@ -209,8 +267,11 @@ class HostTaskRuntime:
                 context.claim,
                 context.owner_token,
                 secret_values=self._secret_values,
+                activity=context.activity,
+                task_transition=context.transition,
             )
         except EnvironmentMaterializationError:
+            context.reconcile_progress()
             return self._durable_status(context)
         if context.cancel.is_set():
             return self._durable_status(context)
@@ -223,6 +284,8 @@ class HostTaskRuntime:
                 self.plan,
                 context.claim,
                 context.owner_token,
+                cancel=context.cancel,
+                activity=context.activity,
             )
             service_environment = dict(materialization.environment)
             service_environment.update(service_url_environment(self.plan.services))
@@ -274,6 +337,7 @@ class HostTaskRuntime:
                         ).status
                         stack = None
         except ComposeStackError:
+            context.reconcile_progress()
             return self._durable_status(context)
         except EnvironmentMaterializationError as error:
             runtime = context.runtime
@@ -296,6 +360,8 @@ class HostTaskRuntime:
                     stack,
                     context.claim,
                     context.owner_token,
+                    cancel=context.cancel,
+                    activity=context.activity,
                 )
 
         return published_status or self._durable_status(context)
@@ -372,6 +438,8 @@ class HostExecutionService:
         compose_manager: HostComposeManager,
         scheduler_config: HostSchedulerConfig | None = None,
         clock=None,
+        activity: TaskActivitySink | None = None,
+        progress: RunProgress | None = None,
     ) -> None:
         self._store = store
         self._preflight = preflight
@@ -380,6 +448,8 @@ class HostExecutionService:
         self._compose = compose_manager
         self._scheduler_config = scheduler_config
         self._clock = clock
+        self._activity = activity
+        self._progress = progress
 
     def run(
         self,
@@ -390,23 +460,35 @@ class HostExecutionService:
         secret_values: Mapping[str, str] | None = None,
         external_urls: Mapping[str, str] | None = None,
         cancel: CancellationToken | None = None,
+        validated_preflight: HostPreflightPlan | HostPreflightBlock | None = None,
     ) -> HostExecutionResult:
         """Validate, reconcile, acquire, prepare, and schedule host work."""
         secrets = dict(secret_values or {})
-        validated = self._preflight.validate(
-            analyzer_plan,
-            available_secret_names=secrets,
-            external_urls=external_urls,
-        )
+        validated = validated_preflight
+        if validated is None:
+            validated = self._preflight.validate(
+                analyzer_plan,
+                available_secret_names=secrets,
+                external_urls=external_urls,
+            )
+        elif self._preflight.validated_result is not validated:
+            raise HostExecutionError(
+                "prevalidated host plan was not produced by this preflight"
+            )
         if isinstance(validated, HostPreflightBlock):
             return HostExecutionResult(validated)
         if validated != self._runtime.plan:
             raise HostExecutionError(
                 "concrete task runtime does not match the validated preflight plan"
             )
-        runtime = self._runtime.with_secret_values(secrets)
-
-        cleanup = list(self._cleanup_stale())
+        activity = _ExecutionActivityBinding(
+            declared_secret_mask_values(validated, secrets),
+            self._activity,
+            self._progress,
+        )
+        cleanup = list(
+            self._cleanup_stale(cancel=cancel, activity=activity.emit)
+        )
         config = self._scheduler_config or HostSchedulerConfig()
         acquired_at = self._now()
         acquisition = self._store.acquire_execution_run(
@@ -415,8 +497,16 @@ class HostExecutionService:
             lease_duration=config.lease_duration,
             now=acquired_at,
         )
-        behavior = runtime
+        behavior = self._runtime
         if acquisition.acquired:
+            runtime = self._runtime.with_secret_values(secrets)
+            task_activity = (
+                activity.emit
+                if self._activity is not None or self._progress is not None
+                else None
+            )
+            if isinstance(runtime, HostTaskRuntime):
+                runtime = runtime.with_task_activity(task_activity)
             owner_token = acquisition.owner_token
             if owner_token is None:
                 raise HostExecutionError("acquired execution run has no owner token")
@@ -437,7 +527,9 @@ class HostExecutionService:
                 # can happen after the pre-acquisition reconciliation above,
                 # so repeat cleanup while the new lease is heartbeating and
                 # before any new worktree setup or task dispatch begins.
-                cleanup.extend(self._cleanup_stale())
+                cleanup.extend(
+                    self._cleanup_stale(cancel=cancel, activity=activity.emit)
+                )
                 heartbeats.checkpoint()
                 prepared = self._worktrees.prepare_current_task_worktrees(
                     self._store,
@@ -478,6 +570,8 @@ class HostExecutionService:
                     owner_token,
                     cleanup,
                     setup_error,
+                    cancel=cancel,
+                    activity=activity.emit,
                 )
                 raise
             else:
@@ -489,14 +583,24 @@ class HostExecutionService:
                         owner_token,
                         cleanup,
                         setup_error,
+                        cancel=cancel,
+                        activity=activity.emit,
                     )
                     raise
             behavior = partial(self._run_claimed_task, runtime, borg.name)
-
         scheduler = HostTaskScheduler(
             self._store,
             behavior,
             config=self._scheduler_config,
+            activity=(
+                activity.emit
+                if self._activity is not None or self._progress is not None
+                else None
+            ),
+            progress=self._progress,
+            interruption_cleanup=lambda: cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity.emit)
+            ),
             **({"clock": self._clock} if self._clock is not None else {}),
         )
 
@@ -505,7 +609,13 @@ class HostExecutionService:
             acquisition,
             cancel=cancel,
         )
-        cleanup.extend(self._cleanup_stale())
+        # Cancelled runs already clean stale projects inside the scheduler's
+        # interruption fence.  Retrying a failed teardown here could mutate a
+        # cleanup-blocked task after progress and counts were finalized.
+        if scheduled.status is not ExecutionRunStatus.CANCELLED:
+            cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity.emit)
+            )
         return HostExecutionResult(validated, scheduled, tuple(cleanup))
 
     def _run_claimed_task(
@@ -542,11 +652,21 @@ class HostExecutionService:
                 return TaskRuntimeStatus.BLOCKED
         return runtime(context)
 
-    def _cleanup_stale(self) -> tuple[ComposeCleanupResult, ...]:
+    def _cleanup_stale(
+        self,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: TaskActivitySink | None = None,
+    ) -> tuple[ComposeCleanupResult, ...]:
         resources = self._store.reconcile_expired_execution_runs(now=self._now())
         if not resources:
             return ()
-        return self._compose.cleanup_stale_projects(self._store, resources)
+        return self._compose.cleanup_stale_projects(
+            self._store,
+            resources,
+            cancel=cancel,
+            activity=activity,
+        )
 
     def _interrupt_failed_setup(
         self,
@@ -554,6 +674,9 @@ class HostExecutionService:
         owner_token: str,
         cleanup: list[ComposeCleanupResult],
         error: BaseException,
+        *,
+        cancel: CancellationToken | None,
+        activity: TaskActivitySink | None,
     ) -> None:
         try:
             self._store.interrupt_execution_run(
@@ -565,7 +688,9 @@ class HostExecutionService:
         except BaseException as interrupt_error:
             error.add_note(f"setup run interruption failed: {interrupt_error}")
         try:
-            cleanup.extend(self._cleanup_stale())
+            cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity)
+            )
         except BaseException as cleanup_error:
             error.add_note(f"setup stale cleanup failed: {cleanup_error}")
 

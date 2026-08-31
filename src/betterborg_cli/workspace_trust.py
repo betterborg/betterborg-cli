@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.repo_paths import RepoPaths
 
 _TRUST_FORMAT_VERSION = 1
@@ -33,22 +35,38 @@ class WorkspaceIdentity:
     fingerprint: str
 
     @classmethod
-    def discover(cls, paths: RepoPaths) -> WorkspaceIdentity:
+    def discover(
+        cls,
+        paths: RepoPaths,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+    ) -> WorkspaceIdentity:
         """Resolve the repository's Git storage and derive its fingerprint."""
+        command = [
+            "git",
+            "-C",
+            str(paths.root),
+            "rev-parse",
+            "--git-common-dir",
+        ]
         try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(paths.root),
-                    "rev-parse",
-                    "--git-common-dir",
-                ],
+            result = command_runner(
+                command,
                 check=True,
-                capture_output=True,
-                text=True,
+                cancel=cancel,
             )
         except subprocess.CalledProcessError as error:
+            raise ValueError(
+                f"cannot resolve Git common directory for {paths.root}"
+            ) from error
+        if result.returncode != 0:
+            error = subprocess.CalledProcessError(
+                result.returncode,
+                command,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
             raise ValueError(
                 f"cannot resolve Git common directory for {paths.root}"
             ) from error
@@ -164,9 +182,15 @@ def require_workspace_trust(
     explicit: bool = False,
     interactive: bool = False,
     confirm: Callable[[str], bool] | None = None,
+    cancel: CancellationToken | None = None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
 ) -> WorkspaceIdentity:
     """Require trust before a caller loads repository-controlled context."""
-    identity = WorkspaceIdentity.discover(paths)
+    identity = WorkspaceIdentity.discover(
+        paths,
+        cancel=cancel,
+        command_runner=command_runner,
+    )
     trust_store = store or TrustStore()
     if trust_store.path.resolve().is_relative_to(identity.repository_path):
         raise RuntimeError(

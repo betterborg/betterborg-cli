@@ -107,7 +107,7 @@ def require_ready_worktree(
         ) from error
     if fingerprint != materializations[-1].fingerprint:
         raise HostAgentPhaseError("claimed task environment marker has drifted")
-    if current_branch(SafeGit(worktree)) != runtime.branch:
+    if current_branch(primary_git.for_worktree(worktree)) != runtime.branch:
         raise HostAgentPhaseError("claimed task worktree is on the wrong branch")
     return runtime, worktree
 

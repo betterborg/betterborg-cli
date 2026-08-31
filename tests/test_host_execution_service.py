@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
+from progress_test_support import FakeClock as ProgressClock
+from progress_test_support import TTYStringIO
 from test_execution_preflight import FakeComposeRunner
 from test_host_scheduler import FakeClock
 
@@ -23,8 +29,10 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
     MockAdapter,
     MockResponse,
+    run_captured,
 )
 from betterborg_cli.host_execution import (
+    ComposeCleanupResult,
     EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
@@ -49,11 +57,21 @@ from betterborg_cli.host_execution import (
     HostTaskRuntime,
     HostWorktreeManager,
     MergeTip,
+    SafeGit,
 )
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
     task_markdown_digest,
+)
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ChildSpec,
+    RunProgress,
+    StageRecord,
+    StageSpec,
+    StageState,
 )
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
@@ -61,6 +79,7 @@ from betterborg_cli.store import (
     BorgState,
     ComposeResource,
     ExecutionAttemptStatus,
+    ExecutionEvent,
     ExecutionRunStatus,
     PlanApproval,
     Repository,
@@ -160,7 +179,9 @@ class _Compose:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
-    def cleanup_stale_projects(self, store, resources) -> tuple[object, ...]:
+    def cleanup_stale_projects(
+        self, store, resources, **kwargs
+    ) -> tuple[object, ...]:
         self.calls.append("stale-cleanup")
         return ()
 
@@ -178,14 +199,27 @@ class _Environment:
 
     def materialize_claimed_task(self, store, plan, claim, owner_token, **kwargs):
         self.calls.append("environment")
-        store.transition_task_runtime(
-            claim.run_id,
-            owner_token,
-            claim.id,
-            claim.claim_token,
-            expected_status=TaskRuntimeStatus.CLAIMED,
-            new_status=TaskRuntimeStatus.CODING,
-        )
+        transition = kwargs.get("task_transition")
+        if transition is None:
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.CLAIMED,
+                new_status=TaskRuntimeStatus.ENVIRONMENT,
+            )
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.ENVIRONMENT,
+                new_status=TaskRuntimeStatus.CODING,
+            )
+        else:
+            transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.ENVIRONMENT)
+            transition(TaskRuntimeStatus.ENVIRONMENT, TaskRuntimeStatus.CODING)
         return SimpleNamespace(environment={"CACHE": "prepared"})
 
 
@@ -485,6 +519,13 @@ def _concrete_host_fixture(
     review_delay_seconds: float = 0,
     dependency_chain: bool = False,
     prerequisite_at_later_position: bool = False,
+    cancel: CancellationToken | None = None,
+    git_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    environment_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    environment_activity: Callable[[AgentActivity], None] | None = None,
+    compose_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    sanity_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    activity: Callable[[UUID, AgentActivity], None] | None = None,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
@@ -650,17 +691,31 @@ def _concrete_host_fixture(
         ),
         compose_networks=("default",),
     )
-    environment = HostEnvironmentManager(repository_root, clock=clock)
-    compose_runner = FakeComposeRunner()
+    git = SafeGit(
+        repository_root,
+        cancel=cancel,
+        command_runner=git_runner or run_captured,
+    )
+    environment = HostEnvironmentManager(
+        repository_root,
+        clock=clock,
+        cancel=cancel,
+        git=git,
+        command_runner=environment_runner,
+        activity=environment_activity,
+    )
+    compose_observer = FakeComposeRunner()
     compose = HostComposeManager(
         repository_root,
-        command_runner=compose_runner,
+        command_runner=compose_runner or compose_observer,
         clock=clock,
     )
     worktrees = HostWorktreeManager(
         repository_root,
         tmp_path / "concrete-worktrees",
         source_branch="main",
+        cancel=cancel,
+        git=git,
     )
     coding = MockAdapter()
     for position, _ in enumerate(tasks):
@@ -694,17 +749,23 @@ def _concrete_host_fixture(
             repository_root,
             coding,
             config=HostCodingConfig(model="coding-model"),
+            cancel=cancel,
+            git=git,
         ),
         review_fix=HostReviewFixPhase(
             repository_root,
             review,
             config=HostReviewFixConfig(review_model="review-model"),
+            cancel=cancel,
+            git=git,
         ),
         merge=HostMergePhase(
             repository_root,
             merge,
             config=HostMergeConfig(model="merge-model"),
             repository_lock=lambda: repository_lock,
+            cancel=cancel,
+            git=git,
         ),
         sanity=HostSanityPhase(
             repository_root,
@@ -713,6 +774,9 @@ def _concrete_host_fixture(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=lambda: repository_lock,
+            command_runner=sanity_runner,
+            cancel=cancel,
+            git=git,
         ),
     )
     service = HostExecutionService(
@@ -728,6 +792,7 @@ def _concrete_host_fixture(
             poll_interval_seconds=0.005,
         ),
         clock=clock,
+        activity=activity,
     )
     return _ConcreteHostFixture(
         store,
@@ -738,11 +803,112 @@ def _concrete_host_fixture(
         coding,
         review,
         merge,
-        compose_runner,
+        compose_observer,
         environment,
         worktrees,
         clock,
     )
+
+
+def test_service_setup_reuses_bound_git_and_reaps_cancelled_guard(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    armed = threading.Event()
+    resistant = real_process_harness.resistant_argv("service-guard-git")
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(command, **kwargs):  # noqa: ANN001, ANN003
+        arguments = tuple(command)
+        if armed.is_set() and arguments[1:3] == (
+            "status",
+            "--porcelain=v1",
+        ):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        git_runner=runner,
+    )
+    try:
+        armed.set()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker("service-guard-git.child.pid")
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-guard-git")
+        assert observed_tokens == [cancel]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status
+            is TaskRuntimeStatus.PENDING
+            for task in fixture.tasks
+        )
+    finally:
+        fixture.store.close()
+
+
+def test_service_setup_reaps_cancelled_environment_command(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("service-environment")
+    observed_tokens: list[CancellationToken | None] = []
+    activities: list[AgentActivity] = []
+
+    def runner(_command, **kwargs):  # noqa: ANN001, ANN003
+        observed_tokens.append(kwargs.get("cancel"))
+        return run_captured(resistant, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        environment_runner=runner,
+        environment_activity=activities.append,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker(
+                "service-environment.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-environment")
+        assert observed_tokens == [cancel]
+        assert activities == [
+            AgentActivity(AgentActivityKind.COMMAND, "git status --short")
+        ]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status
+            is TaskRuntimeStatus.PENDING
+            for task in fixture.tasks
+        )
+        attempts = fixture.store.list_environment_attempts(fixture.tasks[0].id)
+        assert attempts[-1].status is ExecutionAttemptStatus.FAILED
+    finally:
+        fixture.store.close()
 
 
 def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> None:
@@ -759,6 +925,26 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
         merge=_Merge(calls),
         sanity=_Sanity(calls),
     )
+    displayed_transitions: list[tuple[str | None, str]] = []
+    displayed_completions: list[str] = []
+
+    class RecordingProgress(RunProgress):
+        def update(self, stage_key: str, detail: str | None) -> StageRecord:
+            record = super().update(stage_key, detail)
+            runtime_row = store.get_task_runtime(records[0].id)
+            assert runtime_row is not None
+            displayed_transitions.append((detail, runtime_row.status.value))
+            return record
+
+        def complete(
+            self, stage_key: str, result: object | None = None
+        ) -> StageRecord:
+            runtime_row = store.get_task_runtime(records[0].id)
+            assert runtime_row is not None
+            displayed_completions.append(runtime_row.status.value)
+            return super().complete(stage_key, result)
+
+    progress = RecordingProgress(stream=StringIO(), enabled=False)
     try:
         result = HostExecutionService(
             store,
@@ -767,10 +953,19 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             worktree_manager=_Worktrees(calls),
             compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
         ).run(borg.id, generation.id, {})
 
         assert result.status is ExecutionRunStatus.COMPLETED
         assert store.get_task_runtime(records[0].id).status is TaskRuntimeStatus.DONE
+        assert displayed_transitions == [
+            ("environment", "claimed"),
+            ("environment", "environment"),
+            ("coding", "coding"),
+            ("review", "review"),
+            ("merging", "merging"),
+        ]
+        assert displayed_completions == ["done"]
         assert calls == [
             "preflight",
             "worktrees",
@@ -783,6 +978,172 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             "services-start",
             "sanity",
             "services-stop",
+        ]
+    finally:
+        store.close()
+
+
+def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    token = 'declared"secret/slash space?x=1&y=2'
+    escaped = json.dumps(token)[1:-1]
+    encoded = quote(token, safe="")
+    plan = replace(
+        _plan(tmp_path),
+        required_secret_names=("EXECUTION_TOKEN",),
+        secret_requirements=(
+            HostSecret(
+                name="EXECUTION_TOKEN",
+                scope="agent",
+                used_by=("coding",),
+                evidence="activity redaction fixture",
+            ),
+        ),
+    )
+
+    class ActivityEnvironment(_Environment):
+        def materialize_claimed_task(
+            self, store, plan, claim, owner_token, **kwargs
+        ):
+            activity = kwargs["activity"]
+            assert activity is not None
+            activity(
+                AgentActivity(
+                    AgentActivityKind.COMMAND,
+                    f"local {token} {escaped} {encoded}",
+                )
+            )
+            return super().materialize_claimed_task(
+                store, plan, claim, owner_token, **kwargs
+            )
+
+    class ActivityCoding(_Coding):
+        def run(self, context, *, environment=None) -> TaskRuntimeStatus:
+            for agent_label in ("coding", "review", "fix", "merge"):
+                activity_sink = context.activity_sink(agent_label)
+                assert activity_sink is not None
+                activity_sink(
+                    AgentActivity(
+                        AgentActivityKind.READING,
+                        f"agent {token} {escaped} {encoded}",
+                    )
+                )
+            return super().run(context, environment=environment)
+
+    child_key = str(records[0].id)
+    plain_stream = StringIO()
+    live_stream = TTYStringIO()
+    plain_clock = ProgressClock()
+    live_clock = ProgressClock()
+    progress_instances = (
+        RunProgress(
+            [StageSpec("execute", "Execute", (ChildSpec(child_key, "Task"),))],
+            stream=plain_stream,
+            clock=plain_clock,
+            heartbeat_interval=1,
+        ),
+        RunProgress(
+            [StageSpec("execute", "Execute", (ChildSpec(child_key, "Task"),))],
+            stream=live_stream,
+            clock=live_clock,
+            heartbeat_interval=1,
+        ),
+    )
+    for progress in progress_instances:
+        progress.start("execute")
+        progress.start_child("execute", child_key)
+    service_stream = StringIO()
+    service_progress = RunProgress(
+        stream=service_stream,
+        clock=ProgressClock(),
+        heartbeat_interval=1,
+    )
+    received: list[AgentActivity] = []
+
+    def report(task_id: UUID, activity: AgentActivity) -> None:
+        assert task_id == records[0].id
+        received.append(activity)
+        for progress, clock in zip(
+            progress_instances, (plain_clock, live_clock), strict=True
+        ):
+            progress.child_activity("execute", child_key, activity)
+            clock.advance(2)
+            progress.refresh()
+        run = store.list_execution_runs(borg.id)[-1]
+        store.append_execution_event(
+            ExecutionEvent(
+                run_id=run.id,
+                task_id=task_id,
+                kind="task.activity",
+                payload={"detail": activity.detail},
+            )
+        )
+
+    compose = _Compose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=ActivityEnvironment(calls),
+        compose_manager=compose,
+        coding=ActivityCoding(
+            calls,
+            {
+                "CACHE": "prepared",
+                "SERVICE_URL": "http://127.0.0.1",
+                "EXECUTION_TOKEN": token,
+            },
+        ),
+        review_fix=_Review(calls),
+        merge=_Merge(calls),
+        sanity=_Sanity(calls),
+    )
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            activity=report,
+            progress=service_progress,
+        ).run(
+            borg.id,
+            generation.id,
+            {},
+            secret_values={"EXECUTION_TOKEN": token},
+        )
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        events = store.list_task_execution_events(
+            records[0].id, kind="task.activity"
+        )
+        surfaces = (
+            repr(received),
+            repr(
+                progress_instances[0].records["execute"].children[child_key]
+            ),
+            plain_stream.getvalue(),
+            live_stream.getvalue(),
+            repr(service_progress.records[child_key]),
+            repr(events),
+        )
+        for surface in surfaces:
+            assert token not in surface
+            assert escaped not in surface
+            assert encoded not in surface
+            assert "[REDACTED]" in surface
+        assert token not in service_stream.getvalue()
+        assert escaped not in service_stream.getvalue()
+        assert encoded not in service_stream.getvalue()
+        assert [activity.detail for activity in received] == [
+            "local [REDACTED] [REDACTED] [REDACTED]",
+            "coding: agent [REDACTED] [REDACTED] [REDACTED]",
+            "review: agent [REDACTED] [REDACTED] [REDACTED]",
+            "fix: agent [REDACTED] [REDACTED] [REDACTED]",
+            "merge: agent [REDACTED] [REDACTED] [REDACTED]",
         ]
     finally:
         store.close()
@@ -855,59 +1216,78 @@ def test_cancellation_during_materialization_does_not_start_services(
 
 def test_cancellation_during_compose_startup_does_not_start_coding(
     tmp_path: Path,
+    real_process_harness,
 ) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    plan = _plan(tmp_path)
     cancel = CancellationToken()
-    starting_services = threading.Event()
+    fake = FakeComposeRunner()
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities: list[tuple[UUID, AgentActivity]] = []
 
-    class PausingCompose(_Compose):
-        def start_claimed_stack(self, *args, **kwargs):
-            self.calls.append("services-start")
-            starting_services.set()
-            assert cancel.wait(timeout=2)
-            return SimpleNamespace(environment={"SERVICE_URL": "http://127.0.0.1"})
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        command = tuple(argv)
+        invocations.append((command, dict(kwargs)))
+        if "up" in command:
+            return run_captured(
+                real_process_harness.resistant_argv("service-compose-startup"),
+                **kwargs,
+            )
+        return fake(argv, **kwargs)
 
-    compose = PausingCompose(calls)
-    runtime = HostTaskRuntime(
-        plan,
-        environment_manager=_Environment(calls),
-        compose_manager=compose,
-        coding=_Coding(calls),
-        review_fix=_Review(calls),
-        merge=_Merge(calls),
-        sanity=_Sanity(calls),
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        compose_runner=runner,
+        activity=lambda task_id, item: activities.append((task_id, item)),
     )
     try:
-        service = HostExecutionService(
-            store,
-            _Preflight(plan, calls),
-            runtime,
-            worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
-            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
-        )
         with ThreadPoolExecutor(max_workers=1) as executor:
             running = executor.submit(
-                service.run,
-                borg.id,
-                generation.id,
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
                 {},
                 cancel=cancel,
             )
-            assert starting_services.wait(timeout=2)
+            real_process_harness.wait_for_marker(
+                "service-compose-startup.child.pid"
+            )
             cancel.cancel()
-            result = running.result(timeout=2)
+            result = running.result(timeout=5)
 
+        real_process_harness.assert_tree_absent("service-compose-startup")
+        up = next(item for item in invocations if "up" in item[0])
+        down = next(item for item in invocations if "down" in item[0])
         assert result.status is ExecutionRunStatus.CANCELLED
-        assert store.get_task_runtime(records[0].id).status is (
-            TaskRuntimeStatus.PENDING
-        )
-        assert "services-stop" in calls
-        assert "coding" not in calls
+        assert fixture.coding.calls == []
+        assert up[1]["cancel"] is cancel
+        assert up[1]["terminate_on_cancel"] is True
+        assert down[1]["cancel"] is cancel
+        assert down[1]["terminate_on_cancel"] is False
+        assert down[1]["deadline"] == cancel.force_deadline
+        compose_activities = [
+            item for _task_id, item in activities if " compose " in item.detail
+        ]
+        assert [item.kind for item in compose_activities] == [
+            AgentActivityKind.COMMAND,
+            AgentActivityKind.COMMAND,
+        ]
+        assert " up " in f" {compose_activities[0].detail} "
+        assert " down " in f" {compose_activities[1].detail} "
+        assert fixture.store.list_stale_compose_resources() == []
+        assert result.operation_id is not None
+        events = [
+            event.kind
+            for event in fixture.store.list_execution_events(result.operation_id)
+            if event.kind.startswith("compose.")
+        ]
+        assert set(events) == {
+            "compose.starting",
+            "compose.stopping",
+            "compose.stopped",
+            "compose.cleanup_completed",
+        }
     finally:
-        store.close()
+        fixture.store.close()
 
 
 def test_external_only_service_url_reaches_every_agent_phase(tmp_path: Path) -> None:
@@ -1339,6 +1719,69 @@ def test_concrete_sanity_restarts_compose_after_merged_descriptor_change(
                 text=True,
             ).stdout
             == "services:\n  healthy:\n    image: fixture-after-coding\n"
+        )
+        assert fixture.compose.active == set()
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_during_concrete_sanity_command_reaps_process_tree(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("service-sanity-command")
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities: list[tuple[UUID, AgentActivity]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        invocations.append((tuple(argv), dict(kwargs)))
+        return run_captured(resistant, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        sanity_runner=runner,
+        activity=lambda task_id, item: activities.append((task_id, item)),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker(
+                "service-sanity-command.child.pid"
+            )
+            cancel.cancel()
+            result = running.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-sanity-command")
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert len(invocations) == 1
+        command, kwargs = invocations[0]
+        assert command == ("git", "status", "--short")
+        assert kwargs["cancel"] is cancel
+        assert kwargs["timeout"] == 600
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == TaskRuntimeStatus.MERGING.value
+        sanity_activities = [
+            item
+            for task_id, item in activities
+            if task_id == task.id and item.detail.startswith("sanity:")
+        ]
+        assert sanity_activities == [
+            AgentActivity(AgentActivityKind.COMMAND, "sanity: git status --short")
+        ]
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert _git(repository.root, "rev-parse", f"project/{fixture.borg.name}") != (
+            _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
         )
         assert fixture.compose.active == set()
     finally:
@@ -1847,11 +2290,19 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
                 {},
                 cancel=cancel,
             )
-            for _ in range(200):
-                if len(fixture.review.calls) >= 2:
+            # Wait for the fix turn to claim its queued response, not merely
+            # to start. The adapter records the call before it pops, and
+            # returns early without popping when cancellation has already been
+            # requested, so cancelling in between leaves that response at the
+            # head of the queue. The resumed fix would then replay the turn
+            # that changes no files instead of the one that commits.
+            remaining_after_fix = 2
+            for _ in range(400):
+                if len(fixture.review.responses) <= remaining_after_fix:
                     break
                 threading.Event().wait(0.005)
             assert len(fixture.review.calls) == 2
+            assert len(fixture.review.responses) == remaining_after_fix
             cancel.cancel()
             cancelled = running.result(timeout=3)
 
@@ -2559,6 +3010,33 @@ def test_preflight_block_prevents_run_acquisition(tmp_path: Path) -> None:
         store.close()
 
 
+def test_cancelled_preflight_propagates_before_run_acquisition(tmp_path: Path) -> None:
+    store, borg, generation, _ = _store_fixture(tmp_path)
+    calls: list[str] = []
+    cancel = CancellationToken()
+
+    class CancelledPreflight:
+        def validate(self, *args, **kwargs):
+            calls.append("preflight")
+            cancel.cancel()
+            raise KeyboardInterrupt
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            HostExecutionService(
+                store,
+                CancelledPreflight(),
+                _ConcurrentRuntime(_plan(tmp_path)),
+                worktree_manager=_Worktrees(calls),
+                compose_manager=_Compose(calls),
+            ).run(borg.id, generation.id, {}, cancel=cancel)
+
+        assert store.list_execution_runs(borg.id) == []
+        assert calls == ["preflight"]
+    finally:
+        store.close()
+
+
 def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
     tmp_path: Path,
 ) -> None:
@@ -2699,7 +3177,7 @@ def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
             return start if self.calls == 1 else expired_at
 
     class CleanupCompose(_Compose):
-        def cleanup_stale_projects(self, cleanup_store, resources):
+        def cleanup_stale_projects(self, cleanup_store, resources, **kwargs):
             self.calls.append("stale-cleanup")
             for stale in resources:
                 cleanup_store.confirm_compose_project_cleanup(
@@ -2787,6 +3265,7 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
     cancel = CancellationToken()
     second_started = threading.Event()
     invocations: list[str] = []
+    first_progress = RunProgress(stream=StringIO(), enabled=False)
 
     @dataclass
     class CancellingRuntime:
@@ -2813,6 +3292,7 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             worktree_manager=_Worktrees(calls),
             compose_manager=_Compose(calls),
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=first_progress,
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
             running = executor.submit(
@@ -2831,8 +3311,11 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
         assert store.get_task_runtime(records[1].id).status is (
             TaskRuntimeStatus.PENDING
         )
+        assert first_progress.stages[str(records[0].id)].state.value == "completed"
+        assert first_progress.stages[str(records[1].id)].state.value == "stopped"
 
         resumed_ids: list[str] = []
+        resumed_progress = RunProgress(stream=StringIO(), enabled=False)
 
         @dataclass
         class ResumeRuntime:
@@ -2852,10 +3335,152 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             ResumeRuntime(plan),
             worktree_manager=_Worktrees(calls),
             compose_manager=_Compose(calls),
+            progress=resumed_progress,
         ).run(borg.id, generation.id, {})
 
         assert resumed.status is ExecutionRunStatus.COMPLETED
         assert resumed_ids == [str(records[1].id)]
         assert len(invocations) == 2
+        retained = resumed_progress.stages[str(records[0].id)]
+        resumed_stage = resumed_progress.stages[str(records[1].id)]
+        assert retained.state.value == resumed_stage.state.value == "completed"
+        assert retained.retained is True
+        assert retained.started_at is None
+        assert resumed_stage.retained is False
+        assert resumed_stage.started_at is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cleanup_succeeds", [True, False])
+def test_cancelled_service_reconciles_compose_cleanup_before_result(
+    tmp_path: Path,
+    cleanup_succeeds: bool,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    cancel = CancellationToken()
+    started = threading.Event()
+    clock = FakeClock()
+    progress = RunProgress(stream=StringIO(), enabled=False)
+
+    @dataclass
+    class ComposeRuntime:
+        plan: HostPreflightPlan
+
+        def with_secret_values(self, secret_values):  # noqa: ANN001
+            return self
+
+        def __call__(self, context) -> TaskRuntimeStatus:  # noqa: ANN001
+            store.add_compose_resource(
+                ComposeResource(
+                    run_id=context.claim.run_id,
+                    claim_id=context.claim.id,
+                    task_id=context.claim.task_id,
+                    project_name="cancelled-task",
+                    resource_type="project",
+                    resource_name="cancelled-task",
+                    created_at=clock(),
+                ),
+                context.owner_token,
+                context.claim.claim_token,
+                now=clock(),
+            )
+            started.set()
+            assert context.cancel.wait(timeout=2)
+            return TaskRuntimeStatus.DONE
+
+    class CleanupCompose(_Compose):
+        def cleanup_stale_projects(  # noqa: ANN001
+            self, cleanup_store, resources, **kwargs
+        ):
+            self.calls.append("stale-cleanup")
+            assert resources
+            assert progress.stages[str(records[0].id)].state is StageState.RUNNING
+            outcomes = []
+            for resource in resources:
+                command = ("docker", "compose", "down")
+                if cleanup_succeeds:
+                    cleanup_store.confirm_compose_project_cleanup(
+                        resource.run_id,
+                        resource.task_id,
+                        resource.project_name,
+                        command=command,
+                        now=clock(),
+                    )
+                    outcomes.append(
+                        ComposeCleanupResult(
+                            resource.run_id,
+                            resource.task_id,
+                            resource.project_name,
+                            command,
+                            True,
+                        )
+                    )
+                else:
+                    error = "cleanup command failed"
+                    assert cleanup_store.record_compose_cleanup_failure(
+                        resource.run_id,
+                        resource.task_id,
+                        resource.project_name,
+                        command=command,
+                        error=error,
+                        now=clock(),
+                    )
+                    outcomes.append(
+                        ComposeCleanupResult(
+                            resource.run_id,
+                            resource.task_id,
+                            resource.project_name,
+                            command,
+                            False,
+                            error,
+                        )
+                    )
+            return tuple(outcomes)
+
+    try:
+        service = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            ComposeRuntime(plan),
+            worktree_manager=_Worktrees(calls),
+            compose_manager=CleanupCompose(calls),
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            clock=clock,
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                service.run,
+                borg.id,
+                generation.id,
+                {},
+                cancel=cancel,
+            )
+            assert started.wait(timeout=2)
+            cancel.cancel()
+            result = running.result(timeout=2)
+
+        runtime = store.get_task_runtime(records[0].id)
+        assert runtime is not None
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert len(result.cleanup) == 1
+        assert calls.count("stale-cleanup") == 1
+        stage = progress.stages[str(records[0].id)]
+        if cleanup_succeeds:
+            assert runtime.status is TaskRuntimeStatus.PENDING
+            assert result.scheduler is not None
+            assert result.scheduler.pending == 1
+            assert result.scheduler.blocked == 0
+            assert stage.state is StageState.STOPPED
+        else:
+            assert runtime.status is TaskRuntimeStatus.BLOCKED
+            assert result.scheduler is not None
+            assert result.scheduler.pending == 0
+            assert result.scheduler.blocked == 1
+            assert stage.state is StageState.FAILED
+            assert runtime.state_reason in str(stage.result)
     finally:
         store.close()

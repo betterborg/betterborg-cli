@@ -9,7 +9,6 @@ is therefore available only to trusted execution roles.
 from __future__ import annotations
 
 import os
-import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -17,7 +16,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from betterborg_cli.agent_runtime.base import CancellationToken
-from betterborg_cli.agent_runtime.process import terminate_process
+from betterborg_cli.agent_runtime.process import run_captured
 
 
 class ApiAgentRole(StrEnum):
@@ -162,6 +161,11 @@ def api_tool_definition(name: str) -> ApiToolDefinition:
         return _TOOL_DEFINITIONS[name]
     except KeyError as error:
         raise ValueError(f"unknown API tool: {name}") from error
+
+
+def api_patch_paths(patch: str) -> tuple[str, ...]:
+    """Return the affected relative paths from a valid contained API patch."""
+    return tuple(action.relative_path for action in _parse_patch(patch))
 
 
 def select_api_tool_names(
@@ -342,49 +346,18 @@ class ContainedApiTools:
             for argument in command
         ):
             raise ValueError("command arguments must be strings without NUL bytes")
-        if cancel is not None and cancel.is_set():
-            return CommandResult(
-                argv=command,
-                returncode=-1,
-                stdout="",
-                stderr="",
-            )
-        process = subprocess.Popen(
+        result = run_captured(
             command,
             cwd=self._cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
             env=self._environment,
-            start_new_session=os.name == "posix",
+            cancel=cancel,
         )
-        while True:
-            if cancel is not None and cancel.is_set():
-                terminate_process(process)
-                stdout, stderr = process.communicate()
-                return CommandResult(
-                    argv=command,
-                    returncode=-1,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-            try:
-                stdout, stderr = process.communicate(timeout=0.1)
-            except subprocess.TimeoutExpired:
-                continue
-            if cancel is not None and cancel.is_set():
-                return CommandResult(
-                    argv=command,
-                    returncode=-1,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-            return CommandResult(
-                argv=command,
-                returncode=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
-            )
+        return CommandResult(
+            argv=command,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
 
     def execute(
         self,

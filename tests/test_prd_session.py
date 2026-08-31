@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from progress_test_support import FakeClock, TTYStringIO
 
+from betterborg_cli import prd_session as prd_session_module
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
-from betterborg_cli.agent_runtime.base import AgentCapabilities
+from betterborg_cli.agent_runtime.base import AgentCapabilities, CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.prd_session import InteractiveIO, PrdSession, PrdSessionError
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageState,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
 
@@ -97,6 +106,274 @@ def test_empty_brainstorm_asks_material_questions_and_confirms(
     assert "Maintainers adopting the CLI" in adapter.calls[1].user_prompt
     assert output == [result.body_md]
     assert store.list_operations(repository.id) == []
+
+
+def test_requirements_progress_records_activity_turns_and_confirmed_publication(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    activity = AgentActivity(AgentActivityKind.READING, "pyproject.toml")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# Durable draft\n\nPublish after confirmation.",
+            },
+            activities=(activity,),
+        )
+    )
+    progress = RunProgress(stream=StringIO())
+    session = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=_io(confirmations=iter([True])),
+        progress=progress,
+    )
+
+    result = session.run("Progress")
+
+    record = progress.stages["requirements"]
+    assert result.confirmed
+    assert record.state is StageState.COMPLETED
+    assert record.result == "PRD 'Progress' confirmed"
+    assert record.activity == activity
+    assert record.detail == "2 turns recorded"
+    assert [turn.role for turn in store.list_prd_turns(result.session.id)] == [
+        "user",
+        "assistant",
+    ]
+    assert result.prd_path.read_text(encoding="utf-8") == result.body_md
+
+
+def test_cancellation_reconciles_the_durable_assistant_turn_before_stopping(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+
+    def cancel_with_questions(_spec):
+        cancel.cancel()
+        return {
+            "questions": ["Which compatibility promise matters most?"],
+            "prd_markdown": None,
+        }
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(dynamic=cancel_with_questions)
+    )
+    progress = RunProgress(stream=StringIO())
+    session = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("cancelled work must not prompt"),
+            confirm=lambda _message, _default: pytest.fail(
+                "cancelled work must not confirm"
+            ),
+            write=lambda _message: pytest.fail("cancelled work must not render"),
+        ),
+        cancel=cancel,
+        progress=progress,
+    )
+
+    result = session.run("CancelledAfterTurn")
+
+    assert result.cancelled
+    assert progress.stages["requirements"].state is StageState.STOPPED
+    assert progress.stages["requirements"].result == "interrupted"
+    assert [turn.role for turn in store.list_prd_turns(result.session.id)] == [
+        "user",
+        "assistant",
+    ]
+    assert len(adapter.calls) == 1
+    assert not result.prd_path.exists()
+
+
+def test_cancellation_keeps_a_recorded_answer_and_starts_no_later_turn(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    adapter = _responses(
+        {
+            "questions": ["Who needs this behavior?"],
+            "prd_markdown": None,
+        }
+    )
+
+    def answer_then_cancel(_message: str) -> str:
+        cancel.cancel()
+        return "Repository maintainers"
+
+    progress = RunProgress(stream=StringIO())
+    session = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=answer_then_cancel,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        cancel=cancel,
+        progress=progress,
+    )
+
+    result = session.run("CancelledAfterAnswer")
+
+    turns = store.list_prd_turns(result.session.id)
+    assert [turn.role for turn in turns] == ["user", "assistant", "user"]
+    assert turns[-1].content == "Repository maintainers"
+    assert progress.stages["requirements"].state is StageState.STOPPED
+    assert len(adapter.calls) == 1
+    assert not result.prd_path.exists()
+
+
+def test_cancellation_before_run_creates_no_session_records(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    adapter = _responses(
+        {"questions": [], "prd_markdown": "# Must not run\n"}
+    )
+    progress = RunProgress(stream=StringIO())
+    session = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("cancelled work must not prompt"),
+            confirm=lambda _message, _default: pytest.fail(
+                "cancelled work must not confirm"
+            ),
+            write=lambda _message: pytest.fail("cancelled work must not render"),
+        ),
+        cancel=cancel,
+        progress=progress,
+    )
+    cancel.cancel()
+
+    result = session.run("NeverStarted")
+
+    assert result.cancelled
+    assert adapter.calls == []
+    assert progress.stages["requirements"].state is StageState.PENDING
+    with store.locked_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM borgs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM prd_sessions").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM prd_turns").fetchone()[0]
+            == 0
+        )
+
+
+def test_cancellation_during_editor_confirmation_does_not_launch_editor(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    adapter = _responses(
+        {"questions": [], "prd_markdown": "# Draft\n\nReview this."}
+    )
+    confirmations: list[str] = []
+
+    def cancel_editor_confirmation(message: str, _default: bool) -> bool:
+        confirmations.append(message)
+        cancel.cancel()
+        return True
+
+    progress = RunProgress(stream=StringIO())
+    result = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("draft needs no answers"),
+            confirm=cancel_editor_confirmation,
+            write=lambda _message: None,
+        ),
+        editor=lambda _body: pytest.fail("cancelled work must not launch editor"),
+        cancel=cancel,
+        progress=progress,
+    ).run("CancelledEditor")
+
+    assert result.cancelled
+    assert confirmations == ["Review and edit this PRD in your editor?"]
+    assert progress.stages["requirements"].state is StageState.STOPPED
+    assert [turn.role for turn in store.list_prd_turns(result.session.id)] == [
+        "user",
+        "assistant",
+    ]
+    assert not result.prd_path.exists()
+
+
+@pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
+def test_draft_editor_and_confirmations_suspend_renderer_heartbeats(
+    repository_store,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    repository, store = repository_store
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    stream = TTYStringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+    snapshots: list[tuple[str, str]] = []
+
+    def cross_heartbeat() -> None:
+        before = stream.getvalue()
+        clock.now += 10
+        progress.refresh()
+        snapshots.append((before, stream.getvalue()))
+
+    confirmations = iter((True, True))
+
+    def confirm(_message: str, _default: bool) -> bool:
+        cross_heartbeat()
+        return next(confirmations)
+
+    def write(_message: str) -> None:
+        cross_heartbeat()
+
+    def edit(_body: str) -> str:
+        cross_heartbeat()
+        return "# Edited draft\n\nConfirmed by a human."
+
+    def answer(_message: str) -> str:
+        cross_heartbeat()
+        return "Repository maintainers"
+
+    result = PrdSession(
+        repository,
+        store,
+        _responses(
+            {
+                "questions": ["Who needs the first release?"],
+                "prd_markdown": None,
+            },
+            {"questions": [], "prd_markdown": "# Draft\n\nNeeds review."}
+        ),
+        io=InteractiveIO(prompt=answer, confirm=confirm, write=write),
+        editor=edit,
+        progress=progress,
+    ).run("Suspended")
+
+    assert result.confirmed
+    assert len(snapshots) == 6
+    assert all(before == after for before, after in snapshots)
 
 
 @pytest.mark.parametrize(
@@ -214,6 +491,7 @@ def test_rejecting_final_confirmation_does_not_publish_the_draft(
     repository_store,
 ) -> None:
     repository, store = repository_store
+    progress = RunProgress(stream=StringIO())
     session = PrdSession(
         repository,
         store,
@@ -221,6 +499,7 @@ def test_rejecting_final_confirmation_does_not_publish_the_draft(
             {"questions": [], "prd_markdown": "# Not yet\n\nNeeds review."}
         ),
         io=_io(confirmations=iter([False])),
+        progress=progress,
     )
 
     result = session.run("NotYet")
@@ -229,6 +508,8 @@ def test_rejecting_final_confirmation_does_not_publish_the_draft(
     assert result.body_md == "# Not yet\n\nNeeds review.\n"
     assert not result.prd_path.exists()
     assert store.get_borg(result.borg.id) == result.borg
+    assert progress.stages["requirements"].state is StageState.STOPPED
+    assert progress.stages["requirements"].result == "not confirmed"
 
 
 def test_machine_mode_uses_explicit_confirmation_without_io_or_editor(
@@ -460,3 +741,43 @@ def test_confirmed_prd_does_not_overwrite_a_racing_destination(
         session.run("Race")
 
     assert destination.read_text(encoding="utf-8") == "# Existing\n"
+
+
+def test_confirmed_publication_winning_cancellation_race_completes_after_reconcile(
+    repository_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    progress = RunProgress(stream=StringIO())
+    publish = prd_session_module._publish_confirmed_prd
+
+    def publish_then_interrupt(path: Path, body: str, *, root: Path) -> None:
+        publish(path, body, root=root)
+        cancel.cancel()
+        raise KeyboardInterrupt("interrupted after stable publication")
+
+    monkeypatch.setattr(
+        prd_session_module,
+        "_publish_confirmed_prd",
+        publish_then_interrupt,
+    )
+    session = PrdSession(
+        repository,
+        store,
+        _responses(
+            {
+                "questions": [],
+                "prd_markdown": "# Confirmed\n\nThe stable file won the race.",
+            }
+        ),
+        io=_io(confirmations=iter([True])),
+        cancel=cancel,
+        progress=progress,
+    )
+
+    result = session.run("PublicationRace")
+
+    assert result.confirmed
+    assert result.prd_path.read_text(encoding="utf-8") == result.body_md
+    assert progress.stages["requirements"].state is StageState.COMPLETED

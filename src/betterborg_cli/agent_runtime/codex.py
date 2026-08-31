@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -33,8 +34,18 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     extract_json,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 _PROVIDER = "codex"
+_COMMAND_DETAIL_LIMIT = 160
+_READ_COMMANDS = frozenset({"cat", "head", "sed", "tail"})
+_SEARCH_COMMANDS = frozenset({"fd", "find", "grep", "ls", "rg", "tree"})
+_SHELL_COMMANDS = frozenset({"bash", "dash", "sh", "zsh"})
+_READ_TOOLS = frozenset({"read_file", "read_text_file"})
+_SEARCH_TOOLS = frozenset(
+    {"find_files", "glob", "grep", "list_directory", "list_files", "search_files"}
+)
+_WRITE_TOOLS = frozenset({"apply_patch", "edit_file", "write_file"})
 _PROMPT_SCHEMA_INSTRUCTIONS = """
 ## Output format requirement
 
@@ -130,6 +141,7 @@ class CodexAdapter(NativeCliAdapter):
                     missing_ok=True
                 ),
                 accept_payload_on_nonzero_exit=True,
+                translate_event=_translate_event,
             )
 
     def _command(
@@ -193,6 +205,103 @@ def _sandbox_for(spec: AgentRunSpec) -> str:
     if is_read_only_tool_set(spec.allowed_tools):
         return "read-only"
     return "danger-full-access"
+
+
+def _translate_event(event: Mapping[str, Any]) -> AgentActivity | None:
+    if event.get("type") not in {"item.started", "item.completed"}:
+        return None
+    item = event.get("item")
+    if not isinstance(item, Mapping):
+        return None
+
+    item_type = item.get("type")
+    if item_type == "command_execution":
+        command = item.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        return AgentActivity(
+            _command_activity_kind(command),
+            _truncate_command(command),
+        )
+    if item_type == "file_change":
+        path = _changed_path(item)
+        if path is not None:
+            return AgentActivity(AgentActivityKind.WRITING, path)
+        return None
+    if item_type == "web_search":
+        query = item.get("query")
+        if isinstance(query, str) and query:
+            return AgentActivity(AgentActivityKind.SEARCHING, query)
+        return None
+    if item_type == "mcp_tool_call":
+        return _mcp_tool_activity(item)
+    return None
+
+
+def _command_activity_kind(command: str) -> AgentActivityKind:
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return AgentActivityKind.COMMAND
+    if not words:
+        return AgentActivityKind.COMMAND
+
+    executable = Path(words[0]).name
+    if executable in _SHELL_COMMANDS and len(words) >= 3 and words[1].startswith("-"):
+        return _command_activity_kind(words[2])
+    if executable in _READ_COMMANDS:
+        return AgentActivityKind.READING
+    if executable in _SEARCH_COMMANDS:
+        return AgentActivityKind.SEARCHING
+    return AgentActivityKind.COMMAND
+
+
+def _truncate_command(command: str) -> str:
+    detail = " ".join(command.split())
+    if len(detail) <= _COMMAND_DETAIL_LIMIT:
+        return detail
+    return detail[: _COMMAND_DETAIL_LIMIT - 1].rstrip() + "…"
+
+
+def _changed_path(item: Mapping[str, Any]) -> str | None:
+    changes = item.get("changes")
+    if not isinstance(changes, list):
+        return None
+    for change in changes:
+        if not isinstance(change, Mapping):
+            continue
+        path = change.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
+def _mcp_tool_activity(item: Mapping[str, Any]) -> AgentActivity | None:
+    tool = item.get("tool")
+    if not isinstance(tool, str) or not tool:
+        return None
+    tool = tool.rsplit(".", 1)[-1].lower()
+    arguments = item.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return None
+    detail = _argument_detail(arguments)
+    if detail is None:
+        return None
+    if tool in _READ_TOOLS:
+        return AgentActivity(AgentActivityKind.READING, detail)
+    if tool in _SEARCH_TOOLS:
+        return AgentActivity(AgentActivityKind.SEARCHING, detail)
+    if tool in _WRITE_TOOLS:
+        return AgentActivity(AgentActivityKind.WRITING, detail)
+    return None
+
+
+def _argument_detail(arguments: Mapping[str, Any]) -> str | None:
+    for key in ("file_path", "path", "pattern", "query"):
+        detail = arguments.get(key)
+        if isinstance(detail, str) and detail:
+            return detail
+    return None
 
 
 def _stdin_prompt(

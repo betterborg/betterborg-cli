@@ -24,6 +24,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity
 
 DynamicResponse = Callable[[AgentRunSpec], Any]
 
@@ -43,6 +44,7 @@ class MockResponse:
     resume_token: str | None = None
     retryable: bool = False
     raise_error: Exception | None = None
+    activities: tuple[AgentActivity, ...] = ()
 
     def __post_init__(self) -> None:
         if self.delay_seconds < 0:
@@ -120,6 +122,7 @@ class MockAdapter(AgentAdapter):
             time.sleep(response.delay_seconds)
 
         if response.raise_error is not None:
+            _emit_activities(spec, response.activities)
             raise response.raise_error
         if response.dynamic is not None:
             generated = response.dynamic(spec)
@@ -133,10 +136,13 @@ class MockAdapter(AgentAdapter):
                     usage=response.usage,
                     billing_mode=response.billing_mode,
                     artifacts=response.artifacts,
+                    activities=response.activities,
                     resume_token=response.resume_token,
                     retryable=response.retryable,
                 )
             )
+
+        _emit_activities(spec, response.activities)
 
         billing_mode = response.billing_mode or spec.billing_mode
         if response.exit_code != 0 or response.payload is None:
@@ -208,3 +214,18 @@ class MockAdapter(AgentAdapter):
             or spec.resume_token,
             retryable=True,
         )
+
+
+def _emit_activities(
+    spec: AgentRunSpec,
+    activities: tuple[AgentActivity, ...],
+) -> None:
+    sink = spec.activity_sink
+    if sink is None:
+        return
+    for activity in activities:
+        try:
+            sink(activity)
+        except Exception:
+            # Rendering and reporting callbacks are observational only.
+            continue

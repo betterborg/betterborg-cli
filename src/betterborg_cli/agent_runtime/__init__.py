@@ -8,6 +8,13 @@ from betterborg_cli.agent_runtime.anthropic import (
     AnthropicTransport,
     UrllibAnthropicTransport,
 )
+from betterborg_cli.agent_runtime.api_adapter import AbortableApiRequest
+from betterborg_cli.agent_runtime.api_http import (
+    MultiprocessUrlRequest,
+    UrlRequestSpec,
+    UrlResponse,
+    UrlTransportError,
+)
 from betterborg_cli.agent_runtime.api_tools import (
     READ_ONLY_API_TOOLS,
     ApiAgentRole,
@@ -30,7 +37,12 @@ from betterborg_cli.agent_runtime.base import (
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationDeliveryError,
+    CancellationRegistration,
+    CancellationRegistrationWindow,
+    CancellationState,
     CancellationToken,
+    ForceTarget,
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.claude import ClaudeAdapter
@@ -43,21 +55,17 @@ from betterborg_cli.agent_runtime.openai import (
     OpenAITransport,
     UrllibOpenAITransport,
 )
-from betterborg_cli.agent_runtime.process import ProcessRunner, run_streamed
+from betterborg_cli.agent_runtime.process import (
+    ProcessRunner,
+    run_captured,
+    run_streamed,
+)
 from betterborg_cli.agent_runtime.retry import (
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
     RetryOutcome,
     retry_outcome_to_result,
     run_with_transient_retry,
-)
-from betterborg_cli.agent_runtime.selection import (
-    AgentSelectionError,
-    SelectedAgent,
-    require_read_only_agent,
-    resolve_adapter_model,
-    resolve_agent_model,
-    select_agent,
 )
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
@@ -66,6 +74,27 @@ from betterborg_cli.agent_runtime.structured import (
     extract_structured_result_file,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
+
+_SELECTION_EXPORTS = {
+    "AgentSelectionError",
+    "SelectedAgent",
+    "require_read_only_agent",
+    "resolve_adapter_model",
+    "resolve_agent_model",
+    "select_agent",
+}
+
+
+def __getattr__(name: str):
+    """Load selection exports without imposing its repository import graph."""
+    if name not in _SELECTION_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from betterborg_cli.agent_runtime import selection
+
+    value = getattr(selection, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "DEFAULT_TRANSIENT_BACKOFF_SECONDS",
@@ -74,6 +103,8 @@ __all__ = [
     "ANTHROPIC_API_VERSION",
     "OPENAI_API_URL",
     "AgentAdapter",
+    "AgentActivity",
+    "AgentActivityKind",
     "AgentArtifact",
     "AgentCapabilities",
     "AgentResult",
@@ -84,17 +115,24 @@ __all__ = [
     "AnthropicAdapter",
     "AnthropicApiError",
     "AnthropicTransport",
+    "AbortableApiRequest",
     "ApiAgentRole",
     "ApiToolDefinition",
     "ApiToolError",
     "BillingMode",
+    "CancellationDeliveryError",
+    "CancellationRegistration",
+    "CancellationRegistrationWindow",
+    "CancellationState",
     "CancellationToken",
     "ClaudeAdapter",
     "CodexAdapter",
     "CommandResult",
     "ContainedApiTools",
+    "ForceTarget",
     "MockAdapter",
     "MockResponse",
+    "MultiprocessUrlRequest",
     "OpenAIAdapter",
     "OpenAIApiError",
     "OpenAITransport",
@@ -108,12 +146,16 @@ __all__ = [
     "ToolGrantError",
     "UrllibAnthropicTransport",
     "UrllibOpenAITransport",
+    "UrlRequestSpec",
+    "UrlResponse",
+    "UrlTransportError",
     "api_tool_definition",
     "combine_agent_usage",
     "extract_json",
     "extract_structured_result",
     "extract_structured_result_file",
     "retry_outcome_to_result",
+    "run_captured",
     "run_streamed",
     "run_with_transient_retry",
     "require_read_only_agent",

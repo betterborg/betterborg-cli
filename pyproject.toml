@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
   "click>=8.1,<9",
   "mcp>=1.12,<2",
+  "rich>=15,<16",
 ]
 
 [project.urls]
@@ -30,7 +31,7 @@ Repository = "https://github.com/betterborg/betterborg-cli"
 Issues = "https://github.com/betterborg/betterborg-cli/issues"
 
 [project.scripts]
-borg = "betterborg_cli.cli:cli"
+borg = "betterborg_cli.cli:main"
 
 [dependency-groups]
 binary = [
@@ -75,8 +76,8 @@ betterborg_cli = [
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-testpaths = ["tests"]
 pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py311"

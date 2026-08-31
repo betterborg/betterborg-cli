@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
-from test_adapter_harness import claude_spec
+from test_adapter_harness import (
+    claude_spec,
+    native_event_stream,
+    redacting_execution_activity_sink,
+    write_native_output,
+)
 
 from betterborg_cli.agent_runtime import (
+    AgentActivity,
+    AgentActivityKind,
     AgentArtifact,
     AgentStatus,
     AgentUsage,
@@ -50,10 +58,19 @@ def _envelope(
     return json.dumps(payload)
 
 
-def _stream(*events: str | Mapping[str, Any]) -> str:
-    return "\n".join(
-        event if isinstance(event, str) else json.dumps(event) for event in events
-    )
+def _tool_event(name: str, tool_input: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": name,
+                    "input": dict(tool_input),
+                }
+            ]
+        },
+    }
 
 
 @pytest.mark.parametrize("role", list(ApiAgentRole))
@@ -65,6 +82,239 @@ def test_every_role_discloses_native_host_capability(
     assert adapter.capabilities.host_capable
     assert adapter.capabilities.supports_billing(BillingMode.SUBSCRIPTION)
     assert not adapter.capabilities.supports_billing(BillingMode.API)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input", "expected"),
+    (
+        (
+            "Read",
+            {"file_path": "src/betterborg_cli/cli.py"},
+            AgentActivity(AgentActivityKind.READING, "src/betterborg_cli/cli.py"),
+        ),
+        (
+            "Glob",
+            {"pattern": "tests/test_*.py"},
+            AgentActivity(AgentActivityKind.SEARCHING, "tests/test_*.py"),
+        ),
+        (
+            "Grep",
+            {"pattern": "NativeInvocation", "path": "src"},
+            AgentActivity(AgentActivityKind.SEARCHING, "NativeInvocation"),
+        ),
+        (
+            "Bash",
+            {"command": "make test"},
+            AgentActivity(AgentActivityKind.COMMAND, "make test"),
+        ),
+        (
+            "Edit",
+            {"file_path": "src/betterborg_cli/agent_runtime/claude.py"},
+            AgentActivity(
+                AgentActivityKind.WRITING,
+                "src/betterborg_cli/agent_runtime/claude.py",
+            ),
+        ),
+        (
+            "Write",
+            {"file_path": "tests/test_claude_adapter.py"},
+            AgentActivity(
+                AgentActivityKind.WRITING,
+                "tests/test_claude_adapter.py",
+            ),
+        ),
+    ),
+)
+def test_native_tool_events_emit_neutral_activity_without_changing_logs(
+    tmp_path: Path,
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+    expected: AgentActivity,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _tool_event(tool_name, tool_input),
+        _envelope(
+            {"status": "completed", "version": "activity"},
+            usage={"input_tokens": 4, "output_tokens": 2},
+        ),
+    )
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        return 0
+
+    spec = claude_spec(tmp_path, activity_sink=activities.append)
+    result = ClaudeAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.usage == AgentUsage(tokens_input=4, tokens_output=2)
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        expected,
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
+def test_fragmented_large_tool_event_emits_activity_without_changing_log(
+    tmp_path: Path,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _tool_event(
+            "Write",
+            {
+                "file_path": "large-output.txt",
+                "content": "x" * (64 * 1024),
+            },
+        ),
+        _envelope({"status": "completed", "version": "fragmented"}),
+    )
+    process_chunk_size = 64 * 1024
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        log_path.write_text(transcript, encoding="utf-8")
+        assert on_line is not None
+        for offset in range(0, len(transcript), process_chunk_size):
+            on_line(transcript[offset : offset + process_chunk_size])
+        return 0
+
+    spec = claude_spec(tmp_path, activity_sink=activities.append)
+    result = ClaudeAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "fragmented"}
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        AgentActivity(AgentActivityKind.WRITING, "large-output.txt"),
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
+def test_native_activity_uses_execution_secret_redaction_without_changing_result(
+    tmp_path: Path,
+) -> None:
+    secret = 'native"secret/slash?x=1'
+    escaped = json.dumps(secret)[1:-1]
+    encoded = quote(secret, safe="")
+    detail = f"{secret} {escaped} {encoded}"
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _tool_event("Read", {"file_path": detail}),
+        _envelope({"status": "completed", "version": "unchanged"}),
+    )
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        return 0
+
+    result = ClaudeAdapter(ApiAgentRole.CODING, proc_runner=runner).run(
+        claude_spec(
+            tmp_path,
+            activity_sink=redacting_execution_activity_sink(secret, activities),
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "unchanged"}
+    assert activities[1].detail == "[REDACTED] [REDACTED] [REDACTED]"
+    assert all(value not in repr(activities) for value in (secret, escaped, encoded))
+
+
+def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
+    tmp_path: Path,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        "not-json",
+        _tool_event("UnknownProviderTool", {"provider_detail": "secret"}),
+        _tool_event("Read", {"path": "missing-file-path"}),
+        {"type": "usage", "usage": {"input_tokens": 999}},
+        _envelope({"status": "completed", "version": "fallback"}),
+    )
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        return 0
+
+    spec = claude_spec(tmp_path, activity_sink=activities.append)
+    result = ClaudeAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "fallback"}
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING)
+    ] * 6
+
+
+def test_activity_callback_failure_does_not_change_native_result(
+    tmp_path: Path,
+) -> None:
+    callback_calls = 0
+    transcript = native_event_stream(
+        _tool_event("Read", {"file_path": "README.md"}),
+        _envelope({"status": "completed", "version": "callback"}),
+    )
+
+    def fail_activity(_activity: AgentActivity) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        raise RuntimeError("progress renderer failed")
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        return 0
+
+    spec = claude_spec(tmp_path, activity_sink=fail_activity)
+    result = ClaudeAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "callback"}
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert callback_calls == 3
 
 
 def test_native_command_validates_and_persists_result_metadata(
@@ -80,6 +330,7 @@ def test_native_command_validates_and_persists_result_metadata(
         log_path: Path,
         cancel: CancellationToken | None,
         env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
         prompt_path = Path(command[-1])
         captured.update(
@@ -90,8 +341,9 @@ def test_native_command_validates_and_persists_result_metadata(
             system_prompt=prompt_path.read_text(encoding="utf-8"),
             prompt_path=prompt_path,
         )
-        log_path.write_text(
-            _stream(
+        write_native_output(
+            log_path,
+            native_event_stream(
                 {"type": "system", "subtype": "init", "session_id": "test"},
                 {"type": "assistant", "message": {"content": [{"type": "text"}]}},
                 _envelope(
@@ -106,7 +358,7 @@ def test_native_command_validates_and_persists_result_metadata(
                     turns=3,
                 ),
             ),
-            encoding="utf-8",
+            on_line,
         )
         return 0
 
@@ -176,11 +428,13 @@ def test_read_only_tool_allowlist_uses_plan_mode(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
         captured_command.extend(command)
-        log_path.write_text(
+        write_native_output(
+            log_path,
             _envelope({"status": "completed", "version": "1.2.3"}),
-            encoding="utf-8",
+            on_line,
         )
         return 0
 
@@ -211,8 +465,13 @@ def test_schema_invalid_result_fails_without_persisting_result(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
-        log_path.write_text(_envelope({"status": "completed"}), encoding="utf-8")
+        write_native_output(
+            log_path,
+            _envelope({"status": "completed"}),
+            on_line,
+        )
         return 0
 
     spec = claude_spec(tmp_path)
@@ -234,6 +493,7 @@ def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> No
         _log_path: Path,
         runner_cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         assert runner_cancel is cancel
         cancel.cancel()
@@ -253,6 +513,7 @@ def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> No
 
 def test_transient_error_retries_same_native_invocation(tmp_path: Path) -> None:
     calls: list[tuple[list[str], str]] = []
+    activities: list[AgentActivity] = []
     responses = [
         _envelope(
             "model overloaded",
@@ -273,21 +534,25 @@ def test_transient_error_retries_same_native_invocation(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
         calls.append((list(command), stdin_text))
-        log_path.write_text(responses.pop(0), encoding="utf-8")
+        write_native_output(log_path, responses.pop(0), on_line)
         return 0
 
     result = ClaudeAdapter(
         ApiAgentRole.PLANNING,
         proc_runner=runner,
         transient_backoff_seconds=0,
-    ).run(claude_spec(tmp_path))
+    ).run(claude_spec(tmp_path, activity_sink=activities.append))
 
     assert result.status == AgentStatus.COMPLETED
     assert result.attempts == 2
     assert result.usage == AgentUsage(tokens_input=5)
     assert calls[0] == calls[1]
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING)
+    ] * 4
 
 
 def test_process_spawn_failure_returns_failed_result(
@@ -325,10 +590,12 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
-        log_path.write_text(
+        write_native_output(
+            log_path,
             _envelope("rate limited", is_error=True, api_error_status=429),
-            encoding="utf-8",
+            on_line,
         )
         return 1
 
@@ -349,7 +616,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
 def test_stream_json_and_prose_wrapped_result_are_supported(
     tmp_path: Path,
 ) -> None:
-    transcript = _stream(
+    transcript = native_event_stream(
         {"type": "system", "subtype": "init"},
         {"type": "assistant", "message": {"content": []}},
         _envelope(
@@ -364,8 +631,9 @@ def test_stream_json_and_prose_wrapped_result_are_supported(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
     ) -> int:
-        log_path.write_text(transcript, encoding="utf-8")
+        write_native_output(log_path, transcript, on_line)
         return 0
 
     result = ClaudeAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from pathlib import Path
 
@@ -17,7 +18,12 @@ from test_host_coding import (
     _review_payload,
 )
 
-from betterborg_cli.agent_runtime import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime import (
+    CancellationToken,
+    MockAdapter,
+    MockResponse,
+    run_captured,
+)
 from betterborg_cli.host_execution import (
     HostMergeConfig,
     HostMergePhase,
@@ -27,6 +33,7 @@ from betterborg_cli.host_execution import (
     UnsafeGitError,
 )
 from betterborg_cli.host_execution._locking import path_lock
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
 
 
@@ -112,13 +119,63 @@ def _phase(
     fixture: CodingFixture,
     adapter: MockAdapter,
     repository_lock: Callable[[], AbstractContextManager[None]],
+    *,
+    cancel: CancellationToken | None = None,
+    git: SafeGit | None = None,
 ) -> HostMergePhase:
     return HostMergePhase(
         fixture.repository,
         adapter,
         config=HostMergeConfig(model="merge-model"),
         repository_lock=repository_lock,
+        cancel=cancel,
+        git=git,
     )
+
+
+def test_merge_phase_reuses_bound_git_and_reaps_cancelled_project_tip_probe(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture = _approved_merge_fixture(tmp_path)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("merge-project-tip-git")
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(command, **kwargs):  # noqa: ANN001, ANN003
+        arguments = tuple(command)
+        if (
+            arguments[1:3] == ("rev-parse", "--verify")
+            and arguments[-1].startswith("refs/heads/project/")
+        ):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    git = SafeGit(
+        fixture.repository,
+        cancel=cancel,
+        command_runner=runner,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        phase = _phase(
+            fixture,
+            MockAdapter(),
+            RecordingLock(),
+            cancel=cancel,
+            git=git,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(phase.run, fixture.context(store, cancel=cancel))
+            real_process_harness.wait_for_marker(
+                "merge-project-tip-git.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+    real_process_harness.assert_tree_absent("merge-project-tip-git")
+    assert observed_tokens == [cancel]
 
 
 def test_clean_merge_produces_tip_without_agent_or_base_advance(
@@ -400,6 +457,7 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
         fixture, "feature.txt", "project version\n"
     )
     repository_lock = RecordingLock()
+    received: list[AgentActivity] = []
 
     def resolve(spec):
         assert not repository_lock.locked()
@@ -411,12 +469,17 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
         )
         _git(spec.cwd, "add", "feature.txt")
         _git(spec.cwd, "commit", "--quiet", "-m", "resolve project merge")
-        return MockResponse(payload=_completed_payload(fixture.task))
+        return MockResponse(
+            payload=_completed_payload(fixture.task),
+            activities=(
+                AgentActivity(AgentActivityKind.WRITING, "feature.txt"),
+            ),
+        )
 
     adapter = MockAdapter().queue(MockResponse(dynamic=resolve))
     with SqliteStore.open(fixture.database) as store:
         result = _phase(fixture, adapter, repository_lock).run(
-            fixture.context(store)
+            fixture.context(store, activity=received.append)
         )
         attempts = store.list_agent_attempts(fixture.task.id)
         runtime = store.get_task_runtime(fixture.task.id)
@@ -424,6 +487,10 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
     assert result.status is TaskRuntimeStatus.MERGING
     assert result.tip is not None and result.tip.agent_used
     assert len(adapter.calls) == 1
+    assert adapter.calls[0].activity_sink is not None
+    assert received == [
+        AgentActivity(AgentActivityKind.WRITING, "merge: feature.txt")
+    ]
     assert [attempt.phase for attempt in attempts] == [
         "coding",
         "review",

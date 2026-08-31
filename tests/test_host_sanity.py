@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
@@ -20,7 +21,7 @@ from test_host_merge import (
     _phase as merge_phase,
 )
 
-from betterborg_cli.agent_runtime import MockAdapter
+from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_captured
 from betterborg_cli.host_execution import (
     HostCommand,
     HostComposeManager,
@@ -31,6 +32,7 @@ from betterborg_cli.host_execution import (
     HostSecret,
     HostService,
     HostWorktreeManager,
+    SafeGit,
     WorktreeError,
 )
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
@@ -53,18 +55,22 @@ class _RecordingCompose:
         self.started: list[object] = []
         self.stopped: list[object] = []
 
-    def start_claimed_stack(self, store, plan, claim, owner_token):  # noqa: ANN001
+    def start_claimed_stack(  # noqa: ANN001
+        self, store, plan, claim, owner_token, **kwargs
+    ):
         assert self.repository_lock.locked()
         self.started.append(claim)
         return self.stack
 
     def start_claimed_sanity_stack(  # noqa: ANN001
-        self, store, plan, claim, owner_token
+        self, store, plan, claim, owner_token, **kwargs
     ):
-        return self.start_claimed_stack(store, plan, claim, owner_token)
+        return self.start_claimed_stack(
+            store, plan, claim, owner_token, **kwargs
+        )
 
     def stop_claimed_stack(  # noqa: ANN001
-        self, store, stack, claim, owner_token
+        self, store, stack, claim, owner_token, **kwargs
     ) -> None:
         assert self.repository_lock.locked()
         assert stack is not None
@@ -135,6 +141,9 @@ def _sanity_phase(
     repository_lock: RecordingLock,
     compose,  # noqa: ANN001
     runner,  # noqa: ANN001
+    *,
+    cancel: CancellationToken | None = None,
+    git: SafeGit | None = None,
 ) -> HostSanityPhase:
     return HostSanityPhase(
         fixture.repository,
@@ -145,16 +154,161 @@ def _sanity_phase(
                 "PATH": os.environ["PATH"],
                 "UNDECLARED_HOST": "no",
             },
+            cancel=cancel,
+            git=git,
         ),
         compose_manager=compose,
         worktree_manager=HostWorktreeManager(
             fixture.repository,
             fixture.repository.parent / "worktrees",
             source_branch="main",
+            cancel=cancel,
+            git=git,
         ),
         repository_lock=repository_lock,
         command_runner=runner,
+        cancel=cancel,
+        git=git,
     )
+
+
+def test_sanity_attestation_reuses_bound_git_and_reaps_cancelled_probe(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _plan(fixture)
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("sanity-attestation-git")
+    observed_tokens: list[CancellationToken | None] = []
+    activities = []
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+    assert runtime is not None and runtime.worktree_path is not None
+    worktree = Path(runtime.worktree_path).resolve()
+
+    def git_runner(command, **kwargs):  # noqa: ANN001, ANN003
+        arguments = tuple(command)
+        if (
+            Path(kwargs["cwd"]).resolve() == worktree
+            and arguments[-3:] == ("rev-parse", "--abbrev-ref", "HEAD")
+        ):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    git = SafeGit(
+        fixture.repository,
+        cancel=cancel,
+        command_runner=git_runner,
+        activity=activities.append,
+    )
+
+    def command_runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _sanity_phase(
+            fixture,
+            plan,
+            repository_lock,
+            compose,
+            command_runner,
+            cancel=cancel,
+            git=git,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                phase.run,
+                fixture.context(store, cancel=cancel),
+                tip,
+            )
+            real_process_harness.wait_for_marker(
+                "sanity-attestation-git.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+    real_process_harness.assert_tree_absent("sanity-attestation-git")
+    assert observed_tokens == [cancel]
+    assert any("rev-parse --abbrev-ref HEAD" in item.detail for item in activities)
+
+
+def test_sanity_catalog_command_reports_redacted_activity_and_reaps_cancellation(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    secret = 'sanity"secret/with space?x=1&y=2'
+    escaped_secret = json.dumps(secret)[1:-1]
+    encoded_secret = quote(secret, safe="")
+    original_plan = _plan(fixture)
+    plan = replace(
+        original_plan,
+        commands=(
+            replace(
+                original_plan.commands[0],
+                argv=(
+                    "catalog-install",
+                    secret,
+                    escaped_secret,
+                    encoded_secret,
+                ),
+            ),
+            original_plan.commands[1],
+        ),
+    )
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("sanity-catalog-command")
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        invocations.append((tuple(argv), dict(kwargs)))
+        return run_captured(resistant, **kwargs)
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _sanity_phase(
+            fixture,
+            plan,
+            repository_lock,
+            compose,
+            runner,
+            cancel=cancel,
+        )
+        context = fixture.context(store, cancel=cancel, activity=activities.append)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                phase.run,
+                context,
+                tip,
+                secret_values={"BUILD_TOKEN": secret, "AGENT_TOKEN": "agent"},
+            )
+            real_process_harness.wait_for_marker(
+                "sanity-catalog-command.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    real_process_harness.assert_tree_absent("sanity-catalog-command")
+    assert len(invocations) == 1
+    command, kwargs = invocations[0]
+    assert command == plan.commands[0].argv
+    assert kwargs["cancel"] is cancel
+    assert kwargs["timeout"] == 600
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
+    assert len(activities) == 1
+    detail = activities[0].detail
+    assert detail.startswith("sanity: catalog-install")
+    assert detail.count("[REDACTED]") == 3
+    assert secret not in detail
+    assert escaped_secret not in detail
+    assert encoded_secret not in detail
 
 
 def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(

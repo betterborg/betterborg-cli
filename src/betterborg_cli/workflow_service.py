@@ -7,15 +7,16 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.execution_estimate import (
     EXECUTION_ESTIMATE_VERSION,
     estimate_generation,
     phase_billing_from_config,
 )
-from betterborg_cli.host_execution import HostExecutionResult
+from betterborg_cli.host_execution import HostExecutionResult, HostPreflightBlock
 from betterborg_cli.planning import (
     SupervisorLoop,
     TaskPublication,
@@ -24,6 +25,7 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     validate_plan,
 )
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig
 from betterborg_cli.repository_files import (
@@ -43,10 +45,24 @@ from betterborg_cli.store import (
 )
 
 PlanningAgentFactory = Callable[[], Any]
-HostInvoker = Callable[
-    [RepoPaths, SqliteStore, RepositoryConfig, UUID, UUID, UUID],
-    HostExecutionResult,
-]
+_EXECUTION_PREFLIGHT_STAGE_KEY = "preflight"
+
+
+class HostInvoker(Protocol):
+    """Invoke host execution with the command's shared control context."""
+
+    def __call__(
+        self,
+        paths: RepoPaths,
+        store: SqliteStore,
+        config: RepositoryConfig,
+        repository_id: UUID,
+        borg_id: UUID,
+        generation_id: UUID,
+        *,
+        cancel: CancellationToken | None,
+        progress: RunProgress | None,
+    ) -> HostExecutionResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,21 +104,29 @@ def approve_plan_workflow(
     *,
     planning_agent: PlanningAgentFactory,
     on_bound: Callable[[], None] | None = None,
+    cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = _repository(store, config)
         borg = _borg(store, repository, name)
-        approval, plan_path = bind_plan_approval(paths, store, borg)
+        approval, plan_path = bind_plan_approval(
+            paths,
+            store,
+            borg,
+            cancel=cancel,
+        )
         if on_bound is not None:
             on_bound()
         borg = store.get_borg(borg.id)
         if borg is None:
             raise RuntimeError(f"Borg {name!r} disappeared during approval")
 
+        publication = None
         if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
             agent = planning_agent()
-            borg = SupervisorLoop(
+            supervisor = SupervisorLoop(
                 repository,
                 borg,
                 store,
@@ -110,11 +134,23 @@ def approve_plan_workflow(
                 pm_agent=agent,
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
-            ).run().borg
+                cancel=cancel,
+                progress=progress,
+            ).run()
+            borg = supervisor.borg
+            publication = supervisor.publication
+            if borg.state is BorgState.READY_TO_EXECUTE and publication is None:
+                raise RuntimeError(
+                    "Supervisor reached ready state without durable task publication"
+                )
 
-        publication = None
         if borg.state is BorgState.READY_TO_EXECUTE:
-            publication = TaskPublisher(repository, store).reconcile(borg.id)
+            if publication is None:
+                publication = TaskPublisher(
+                    repository,
+                    store,
+                    cancel=cancel,
+                ).reconcile(borg.id)
             if publication is None:
                 raise RuntimeError(
                     f"Borg {name!r} is ready to execute but has no current tasks"
@@ -134,6 +170,8 @@ def execute_workflow(
     *,
     decide: Callable[[dict[str, Any]], ExecutionDecisionRequest | None],
     invoke_host: HostInvoker,
+    cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -143,7 +181,9 @@ def execute_workflow(
             raise ValueError(f"Borg {name!r} is not ready to execute")
 
         publication = TaskPublisher(
-            repository, store
+            repository,
+            store,
+            cancel=cancel,
         ).inspect_current_task_files(borg.id)
         generation = publication.generation
         approval = next(
@@ -218,14 +258,42 @@ def execute_workflow(
             raise RuntimeError(
                 "current generation has an unsupported execution decision"
             )
-        host_result = invoke_host(
-            paths,
-            store,
-            config,
-            repository.id,
-            borg.id,
-            generation.id,
-        )
+        if progress is not None:
+            progress.declare(
+                StageSpec(_EXECUTION_PREFLIGHT_STAGE_KEY, "Preflight")
+            )
+            progress.start(_EXECUTION_PREFLIGHT_STAGE_KEY)
+        try:
+            host_result = invoke_host(
+                paths,
+                store,
+                config,
+                repository.id,
+                borg.id,
+                generation.id,
+                cancel=cancel,
+                progress=progress,
+            )
+        except BaseException as error:
+            if _preflight_is_running(progress):
+                assert progress is not None
+                detail = str(error).strip() or type(error).__name__
+                if isinstance(error, KeyboardInterrupt) or (
+                    cancel is not None and cancel.is_set()
+                ):
+                    progress.stop(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+                else:
+                    progress.fail(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+            raise
+        if _preflight_is_running(progress):
+            assert progress is not None
+            if isinstance(host_result.preflight, HostPreflightBlock):
+                progress.fail(
+                    _EXECUTION_PREFLIGHT_STAGE_KEY,
+                    host_result.preflight.reason,
+                )
+            else:
+                progress.complete(_EXECUTION_PREFLIGHT_STAGE_KEY, "ready")
 
     return ExecutionWorkflowResult(
         borg,
@@ -239,10 +307,20 @@ def execute_workflow(
     )
 
 
+def _preflight_is_running(progress: RunProgress | None) -> bool:
+    return (
+        progress is not None
+        and progress.stages[_EXECUTION_PREFLIGHT_STAGE_KEY].state
+        is StageState.RUNNING
+    )
+
+
 def bind_plan_approval(
     paths: RepoPaths,
     store: SqliteStore,
     borg: Borg,
+    *,
+    cancel: CancellationToken | None = None,
 ) -> tuple[PlanApproval, Path]:
     """Bind or recover one approval for the latest exact Architect plan."""
     plan_attempt = validated_current_plan_attempt(paths, store, borg)
@@ -276,7 +354,7 @@ def bind_plan_approval(
         else:
             if existing != body:
                 raise ValueError(f"approved plan Markdown drifted: {relative_path}")
-        require_git_trackable(relative_path, root=paths.root)
+        require_git_trackable(relative_path, root=paths.root, cancel=cancel)
         return approval, plan_path
 
     if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
@@ -285,7 +363,7 @@ def bind_plan_approval(
             f"{borg.state.value!r}; a plan must be awaiting approval"
         )
     publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
-    require_git_trackable(relative_path, root=paths.root)
+    require_git_trackable(relative_path, root=paths.root, cancel=cancel)
     approval = PlanApproval(
         borg_id=borg.id,
         attempt_id=plan_attempt.id,

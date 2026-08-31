@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -24,8 +26,11 @@ from betterborg_cli.agent_runtime import (
     AgentUsage,
     ApiAgentRole,
     CancellationToken,
+    MockAdapter,
+    MockResponse,
     OpenAIAdapter,
     SelectedAgent,
+    run_captured,
     select_agent,
 )
 from betterborg_cli.repo_paths import RepoPaths
@@ -34,7 +39,7 @@ from betterborg_cli.repository_config import (
     AgentChoices,
     RepositoryConfig,
 )
-from betterborg_cli.workspace_trust import UntrustedWorkspaceError
+from betterborg_cli.workspace_trust import UntrustedWorkspaceError, WorkspaceIdentity
 
 
 def _refusing_trust(*_args: Any, **_kwargs: Any) -> None:
@@ -135,6 +140,7 @@ def test_configured_native_role_applies_overrides_after_trust_before_spawn(
         log_path: Path,
         _cancel: object,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         events.append("spawn")
         captured.update(command=list(command), cwd=cwd, stdin=stdin_text)
@@ -189,6 +195,260 @@ def test_configured_native_role_applies_overrides_after_trust_before_spawn(
     assert result.status == AgentStatus.COMPLETED
     assert result.model == "role-model"
     assert result.usage == AgentUsage(tokens_input=4, tokens_output=2, num_turns=1)
+
+
+def test_selected_agent_forwards_one_token_through_discovery_and_trust(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    cancel = CancellationToken()
+    events: list[tuple[str, object]] = []
+    original_paths_discover = RepoPaths.discover.__func__
+    original_identity_discover = WorkspaceIdentity.discover.__func__
+
+    def discover_paths(cls, start=None, *, cancel=None, command_runner=None):
+        events.append(("paths", cancel))
+        runner = run_captured if command_runner is None else command_runner
+        return original_paths_discover(cls, start, command_runner=runner)
+
+    def discover_identity(cls, discovered, *, cancel=None, command_runner=None):
+        events.append(("identity", cancel))
+        runner = run_captured if command_runner is None else command_runner
+        return original_identity_discover(
+            cls,
+            discovered,
+            command_runner=runner,
+        )
+
+    def trust(_paths: RepoPaths, **kwargs: Any) -> None:
+        events.append(("trust", kwargs["cancel"]))
+        assert callable(kwargs["command_runner"])
+
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(discover_paths))
+    monkeypatch.setattr(
+        WorkspaceIdentity,
+        "discover",
+        classmethod(discover_identity),
+    )
+    adapter = MockAdapter(
+        capabilities=replace(MockAdapter().capabilities, host_capable=True)
+    ).queue(MockResponse(payload={"status": "completed", "version": "1"}))
+    selected = SelectedAgent(
+        role=ApiAgentRole.CODING,
+        adapter=adapter,
+        paths=paths,
+        trust_requirement=trust,
+    )
+
+    result = selected.run(_spec(git_repo), cancel=cancel)
+
+    assert result.status is AgentStatus.COMPLETED
+    assert events == [
+        ("paths", cancel),
+        ("identity", cancel),
+        ("identity", cancel),
+        ("trust", cancel),
+    ]
+
+
+def test_contained_selected_agent_forwards_token_to_compatible_trust(
+    git_repo: Path,
+) -> None:
+    cancel = CancellationToken()
+    observed: list[object] = []
+
+    def trust(_paths: RepoPaths, **kwargs: Any) -> None:
+        observed.append(kwargs["cancel"])
+        assert callable(kwargs["command_runner"])
+
+    adapter = MockAdapter(
+        capabilities=replace(MockAdapter().capabilities, host_capable=True)
+    ).queue(MockResponse(payload={"status": "completed", "version": "1"}))
+    selected = SelectedAgent(
+        role=ApiAgentRole.CODING,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+        trust_requirement=trust,
+    )
+
+    result = selected.run_contained(
+        _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS),
+        cancel=cancel,
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert observed == [cancel]
+
+
+def test_contained_agent_cancellation_reaps_trust_probe_before_adapter(
+    git_repo: Path,
+    real_process_harness: Any,
+) -> None:
+    cancel = CancellationToken(grace_seconds=0.05)
+    errors: list[BaseException] = []
+
+    def trust(_paths: RepoPaths, **kwargs: Any) -> None:
+        assert kwargs["cancel"] is cancel
+        result = kwargs["command_runner"](
+            real_process_harness.resistant_argv("contained-trust"),
+            cancel=kwargs["cancel"],
+        )
+        if result.returncode != 0:
+            raise ValueError("contained trust discovery cancelled")
+
+    adapter = MockAdapter(
+        capabilities=replace(MockAdapter().capabilities, host_capable=True)
+    ).queue(MockResponse(payload={"status": "completed", "version": "1"}))
+    selected = SelectedAgent(
+        role=ApiAgentRole.CODING,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+        trust_requirement=trust,
+    )
+
+    def invoke() -> None:
+        try:
+            selected.run_contained(
+                _spec(git_repo, allowed_tools=READ_ONLY_API_TOOLS),
+                cancel=cancel,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    real_process_harness.wait_for_marker("contained-trust.parent.pid")
+    real_process_harness.wait_for_marker("contained-trust.child.pid")
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert str(errors[0]) == "contained trust discovery cancelled"
+    assert adapter.calls == []
+    real_process_harness.assert_tree_absent("contained-trust")
+
+
+@pytest.mark.parametrize(
+    "blocked_probe",
+    ["run-root", "selected-identity", "run-identity", "trust"],
+)
+def test_selected_agent_cancellation_reaps_each_discovery_probe_before_adapter(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_process_harness: Any,
+    blocked_probe: str,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    cancel = CancellationToken(grace_seconds=0.05)
+    errors: list[BaseException] = []
+    original_paths_discover = RepoPaths.discover.__func__
+    original_identity_discover = WorkspaceIdentity.discover.__func__
+    identity_calls = 0
+
+    def blocked_runner(
+        _command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        return run_captured(
+            real_process_harness.resistant_argv(blocked_probe),
+            cancel=kwargs["cancel"],
+            check=kwargs["check"],
+        )
+
+    def discover_paths(cls, start=None, *, cancel=None, command_runner=None):
+        runner = (
+            blocked_runner
+            if blocked_probe == "run-root"
+            else (run_captured if command_runner is None else command_runner)
+        )
+        return original_paths_discover(
+            cls,
+            start,
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    def discover_identity(cls, discovered, *, cancel=None, command_runner=None):
+        nonlocal identity_calls
+        identity_calls += 1
+        target_call = 1 if blocked_probe == "selected-identity" else 2
+        runner = (
+            blocked_runner
+            if blocked_probe in {"selected-identity", "run-identity"}
+            and identity_calls == target_call
+            else (run_captured if command_runner is None else command_runner)
+        )
+        return original_identity_discover(
+            cls,
+            discovered,
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    def trust(_paths: RepoPaths, **kwargs: Any) -> None:
+        if blocked_probe != "trust":
+            return
+        result = blocked_runner([], check=True, cancel=kwargs["cancel"])
+        if result.returncode != 0:
+            raise ValueError("trust discovery cancelled")
+
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(discover_paths))
+    monkeypatch.setattr(
+        WorkspaceIdentity,
+        "discover",
+        classmethod(discover_identity),
+    )
+    adapter = MockAdapter(
+        capabilities=replace(MockAdapter().capabilities, host_capable=True)
+    ).queue(MockResponse(payload={"status": "completed", "version": "1"}))
+    selected = SelectedAgent(
+        role=ApiAgentRole.CODING,
+        adapter=adapter,
+        paths=paths,
+        trust_requirement=trust,
+    )
+
+    def invoke() -> None:
+        try:
+            selected.run(_spec(git_repo), cancel=cancel)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    real_process_harness.wait_for_marker(f"{blocked_probe}.parent.pid")
+    real_process_harness.wait_for_marker(f"{blocked_probe}.child.pid")
+    cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert adapter.calls == []
+    real_process_harness.assert_tree_absent(blocked_probe)
+
+
+def test_custom_trust_type_error_is_not_treated_as_keyword_incompatibility(
+    git_repo: Path,
+) -> None:
+    def broken_trust(
+        _paths: RepoPaths,
+        *,
+        store: object,
+        explicit: bool,
+        interactive: bool,
+        confirm: object,
+    ) -> None:
+        raise TypeError("trust implementation failed")
+
+    selected = _selected_codex(git_repo, trust_requirement=broken_trust)
+    selected.adapter.proc_runner = (  # type: ignore[attr-defined]
+        lambda *_args, **_kwargs: pytest.fail("unexpected spawn")
+    )
+
+    with pytest.raises(TypeError, match="trust implementation failed"):
+        selected.run(_spec(git_repo))
 
 
 def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
@@ -303,6 +563,7 @@ def test_contained_run_sandboxes_a_native_cli_under_read_only_tools(
         log_path: Path,
         _cancel: Any,
         _env: Any,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         commands.append(command)
         log_path.write_text("", encoding="utf-8")

@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import json
 import re
-import threading
+import shlex
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+from betterborg_cli.agent_runtime.api_tools import ApiToolError, api_patch_paths
 from betterborg_cli.agent_runtime.base import (
     AgentResult,
     AgentRunSpec,
     AgentStatus,
     AgentUsage,
     BillingMode,
+    CancellationDeliveryError,
+    CancellationRegistration,
     CancellationToken,
+    ForceTarget,
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.retry import run_with_transient_retry
@@ -25,6 +29,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +56,25 @@ class ApiCredentialRedactor:
         if isinstance(value, list):
             return [self.value(item) for item in value]
         return value
+
+
+class AbortableApiRequest(Protocol):
+    """One attempt-local API request owned until execution is cleaned up."""
+
+    def execute(self) -> Mapping[str, Any]:
+        """Execute the request and return its decoded provider response."""
+
+    def abort(self) -> None:
+        """Request nonblocking graceful cancellation; repeated calls are safe."""
+
+    def force(self) -> None:
+        """Request nonblocking forced cancellation; repeated calls are safe."""
+
+
+ApiRequestFactory = Callable[
+    [CancellationToken | None],
+    AbortableApiRequest,
+]
 
 
 @dataclass(slots=True)
@@ -122,6 +146,24 @@ class ApiRunContext:
         with self.spec.log_path.open("a", encoding="utf-8") as log:
             log.write(json.dumps(self.redactor.value(event), sort_keys=True) + "\n")
 
+    def emit_activity(self, activity: AgentActivity | None) -> None:
+        """Emit one credential-safe observational activity when configured."""
+        sink = self.spec.activity_sink
+        if sink is None or activity is None:
+            return
+        detail = activity.detail
+        if detail is not None:
+            detail = self.redactor.text(detail)
+        try:
+            sink(AgentActivity(activity.kind, detail))
+        except Exception:
+            # Rendering and reporting callbacks are observational only.
+            return
+
+    def emit_tool_activity(self, name: str, arguments: Mapping[str, Any]) -> None:
+        """Translate and emit one provider-neutral contained-tool activity."""
+        self.emit_activity(_tool_activity(name, arguments))
+
     def record_response(self, response: Mapping[str, Any], usage: AgentUsage) -> None:
         """Record provider-parsed response accounting and model metadata."""
         self.usage.append(usage)
@@ -154,58 +196,70 @@ class ApiRunContext:
 
     def request(
         self,
-        send: Callable[[CancellationToken | None], Mapping[str, Any]],
+        factory: ApiRequestFactory,
         *,
         api_error_type: type[Exception],
         cancel: CancellationToken | None,
-        thread_name: str,
         backoff_seconds: float,
         max_attempts: int,
     ) -> Mapping[str, Any] | AgentResult:
         """Send one cancellable request with bounded transient retries."""
-        state = _RequestState()
+        state: _RequestState | None = None
 
         def request_once() -> int:
-            state.response = None
-            state.error = None
-            if cancel is None:
-                try:
-                    state.response = send(None)
-                except Exception as error:
-                    state.error = error
-            else:
-                if cancel.is_set():
-                    return -1
-                completed = threading.Event()
+            nonlocal state
+            attempt = _RequestState()
+            state = attempt
+            if cancel is not None and cancel.is_set():
+                return -1
 
-                def send_request() -> None:
+            self.emit_activity(AgentActivity(AgentActivityKind.THINKING))
+
+            request: AbortableApiRequest | None = None
+            registration: CancellationRegistration | None = None
+            try:
+                request = factory(cancel)
+                if cancel is not None:
                     try:
-                        state.response = send(cancel)
-                    except Exception as error:
-                        state.error = error
-                    finally:
-                        completed.set()
+                        registration = cancel.register(
+                            request.abort,
+                            request.force,
+                            force_target=ForceTarget(
+                                ("api-request", id(request))
+                            ),
+                        )
+                    except CancellationDeliveryError as error:
+                        registration = error.registration
+                        raise
+                attempt.response = request.execute()
+            except Exception as error:
+                attempt.error = error
+            finally:
+                try:
+                    if (
+                        request is not None
+                        and cancel is not None
+                        and cancel.is_set()
+                    ):
+                        request.abort()
+                finally:
+                    if registration is not None:
+                        registration.unregister()
 
-                threading.Thread(
-                    target=send_request,
-                    name=thread_name,
-                    daemon=True,
-                ).start()
-                while not completed.wait(0.05):
-                    if cancel.is_set():
-                        return -1
-                if cancel.is_set():
-                    return -1
-            if state.error is not None:
-                self.append_log({"error": str(state.error)})
-                if isinstance(state.error, api_error_type):
-                    status_code = getattr(state.error, "status_code", None)
+            if cancel is not None and cancel.is_set():
+                return -1
+            if attempt.error is not None:
+                self.append_log({"error": str(attempt.error)})
+                if isinstance(attempt.error, api_error_type):
+                    status_code = getattr(attempt.error, "status_code", None)
                     return status_code if isinstance(status_code, int) else 1
                 return 1
             return 0
 
         def classify_request(_exit_code: int) -> str | None:
-            if isinstance(state.error, api_error_type) and getattr(
+            if state is not None and isinstance(
+                state.error, api_error_type
+            ) and getattr(
                 state.error, "transient", False
             ):
                 return str(state.error)
@@ -227,6 +281,47 @@ class ApiRunContext:
                 error=f"transient retry exhausted: {retry.transient_reason}",
                 retryable=True,
             )
-        if retry.exit_code != 0 or state.response is None:
-            return self.result(AgentStatus.FAILED, error=str(state.error))
+        if retry.exit_code != 0 or state is None or state.response is None:
+            error = state.error if state is not None else None
+            return self.result(AgentStatus.FAILED, error=str(error))
         return state.response
+
+
+def _tool_activity(
+    name: str,
+    arguments: Mapping[str, Any],
+) -> AgentActivity | None:
+    if name == "read_file":
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            return AgentActivity(AgentActivityKind.READING, path)
+        return None
+    if name == "search_text":
+        query = arguments.get("query")
+        if isinstance(query, str) and query:
+            return AgentActivity(AgentActivityKind.SEARCHING, query)
+        return None
+    if name == "list_files":
+        path = arguments.get("path", ".")
+        if isinstance(path, str):
+            return AgentActivity(AgentActivityKind.SEARCHING, path or ".")
+        return None
+    if name == "run_command":
+        argv = arguments.get("argv")
+        if (
+            isinstance(argv, list)
+            and argv
+            and all(isinstance(item, str) for item in argv)
+        ):
+            return AgentActivity(AgentActivityKind.COMMAND, shlex.join(argv))
+        return None
+    if name == "apply_patch":
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            return None
+        try:
+            paths = api_patch_paths(patch)
+        except (ApiToolError, TypeError, ValueError):
+            return None
+        return AgentActivity(AgentActivityKind.WRITING, ", ".join(paths))
+    return None

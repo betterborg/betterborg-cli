@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -12,21 +13,27 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import quote
 from uuid import UUID
 
+from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
+from betterborg_cli.host_execution.scheduler import TaskActivitySink
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     EnvironmentAttempt,
     ExecutionAttemptStatus,
     SqliteStore,
     TaskClaim,
+    TaskRuntime,
     TaskRuntimeStatus,
 )
 from betterborg_cli.store.models import utcnow
@@ -72,6 +79,7 @@ class _PathSnapshot:
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+ActivitySink = Callable[[AgentActivity], None]
 Clock = Callable[[], datetime]
 
 
@@ -254,10 +262,13 @@ class HostEnvironmentManager:
         preparation_root: Path | None = None,
         environment: Mapping[str, str] | None = None,
         command_runner: CommandRunner | None = None,
+        activity: ActivitySink | None = None,
         clock: Clock = utcnow,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise EnvironmentMaterializationError(
                 "environment manager must be bound to the Git worktree root"
@@ -273,12 +284,20 @@ class HostEnvironmentManager:
         self.preparation_root = Path(
             preparation_root or default_preparation_root
         ).resolve()
-        self._git = SafeGit(self.repository_root)
+        if git is not None and git.cwd != self.repository_root:
+            raise EnvironmentMaterializationError(
+                "environment manager Git binding must match repository"
+            )
+        self._git = git or SafeGit(self.repository_root, cancel=cancel)
         self._validate_managed_paths()
         self._environment = dict(os.environ if environment is None else environment)
-        self._run = command_runner or subprocess.run
+        self._run = command_runner or run_captured
+        self._activity = activity
+        self._cancel = cancel
         self._clock = clock
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._git
+        )
 
     def prepare_reusable_caches(
         self,
@@ -289,6 +308,7 @@ class HostEnvironmentManager:
         worktrees: Sequence[tuple[UUID, Path]],
         *,
         secret_values: Mapping[str, str] | None = None,
+        activity: TaskActivitySink | None = None,
     ) -> tuple[str, ...]:
         """Prepare every distinct task fingerprint before claims may dispatch."""
         if plan.repository_root.resolve() != self.repository_root:
@@ -334,6 +354,11 @@ class HostEnvironmentManager:
                     completion_marker=marker,
                     command_environments=command_environments,
                     prepared_before_dispatch=True,
+                    activity=(
+                        partial(activity, task_id)
+                        if activity is not None
+                        else None
+                    ),
                 )
             prepared.append(fingerprint)
         return tuple(prepared)
@@ -346,6 +371,8 @@ class HostEnvironmentManager:
         owner_token: str,
         *,
         secret_values: Mapping[str, str] | None = None,
+        activity: ActivitySink | None = None,
+        task_transition: Callable[..., TaskRuntime] | None = None,
     ) -> EnvironmentMaterialization:
         """Move one claimed task through environment setup into coding.
 
@@ -372,15 +399,14 @@ class HostEnvironmentManager:
             and claim.resume_phase != TaskRuntimeStatus.ENVIRONMENT.value
         )
         if runtime.status is TaskRuntimeStatus.CLAIMED:
-            runtime = store.transition_task_runtime(
-                claim.run_id,
+            runtime = self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=TaskRuntimeStatus.CLAIMED,
                 new_status=TaskRuntimeStatus.ENVIRONMENT,
                 resume_phase=claim.resume_phase,
-                now=self._clock(),
+                task_transition=task_transition,
             )
         elif runtime.status not in {
             TaskRuntimeStatus.ENVIRONMENT,
@@ -417,6 +443,7 @@ class HostEnvironmentManager:
                 source_worktree=worktree,
                 descriptors=descriptors,
                 command_environments=command_environments,
+                activity=activity,
             )
             materialization_reused = self._materialize_worktree(
                 store,
@@ -427,21 +454,28 @@ class HostEnvironmentManager:
                 worktree=worktree,
                 cache_path=cache_path,
                 command_environments=command_environments,
+                activity=activity,
             )
         except BaseException as error:
-            self._block_environment_task(store, claim, owner_token, error)
+            self._raise_if_cancelled(error)
+            self._block_environment_task(
+                store,
+                claim,
+                owner_token,
+                error,
+                task_transition=task_transition,
+            )
             raise
 
         if not preserving_active_phase:
-            store.transition_task_runtime(
-                claim.run_id,
+            self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=TaskRuntimeStatus.ENVIRONMENT,
                 new_status=TaskRuntimeStatus.CODING,
                 resume_phase=(claim.resume_phase if reclaimed_agent_work else None),
-                now=self._clock(),
+                task_transition=task_transition,
             )
         return EnvironmentMaterialization(
             fingerprint=fingerprint,
@@ -465,6 +499,7 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None,
     ) -> bool:
         if not plan.prepare_commands:
             return False
@@ -490,6 +525,7 @@ class HostEnvironmentManager:
                 cache_path=cache_path,
                 completion_marker=marker,
                 command_environments=command_environments,
+                activity=activity,
             )
             return False
 
@@ -506,6 +542,7 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None,
     ) -> bool:
         marker = self._materialization_marker(worktree)
         if (
@@ -537,6 +574,7 @@ class HostEnvironmentManager:
             cache_path=cache_path,
             completion_marker=marker,
             command_environments=command_environments,
+            activity=activity,
         )
         return False
 
@@ -560,6 +598,7 @@ class HostEnvironmentManager:
         preparation_descriptors: Sequence[_EnvironmentDescriptor] = (),
         completion_marker: Path | None = None,
         prepared_before_dispatch: bool = False,
+        activity: ActivitySink | None = None,
     ) -> None:
         if claim is not None:
             run_id = claim.run_id
@@ -616,6 +655,7 @@ class HostEnvironmentManager:
                         commands,
                         worktree=worktree,
                         command_environments=command_environments,
+                        activity=activity,
                     )
                     if completion_marker is not None:
                         _write_marker(completion_marker, fingerprint)
@@ -631,6 +671,7 @@ class HostEnvironmentManager:
                     descriptors=preparation_descriptors,
                     command_environments=command_environments,
                     completion_marker=completion_marker,
+                    activity=activity,
                 )
         except BaseException as error:
             duration = time.monotonic() - started
@@ -650,6 +691,7 @@ class HostEnvironmentManager:
                 duration_seconds=duration,
                 now=self._clock(),
             )
+            self._raise_if_cancelled(error)
             if isinstance(error, EnvironmentMaterializationError):
                 raise EnvironmentMaterializationError(redacted) from error
             raise EnvironmentMaterializationError(redacted) from error
@@ -681,6 +723,7 @@ class HostEnvironmentManager:
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
         completion_marker: Path | None,
+        activity: ActivitySink | None,
     ) -> list[dict[str, object]]:
         with self._guard.protect(fingerprint, "environment prepare"):
             with self._preparation_worktree(
@@ -690,6 +733,7 @@ class HostEnvironmentManager:
                     commands,
                     worktree=preparation_worktree,
                     command_environments=command_environments,
+                    activity=activity,
                 )
             if completion_marker is not None:
                 _write_marker(completion_marker, fingerprint)
@@ -703,25 +747,28 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None = None,
     ) -> list[dict[str, object]]:
         before = self._tracked_state(worktree)
         results: list[dict[str, object]] = []
         for command in commands:
             cwd = command_cwd(worktree, command.cwd)
             environment, mask_values = command_environments[command.stage]
+            self._report_command(command.argv, mask_values, activity=activity)
             try:
                 completed = self._run(
                     list(command.argv),
                     cwd=cwd,
                     env=dict(environment),
                     check=False,
-                    capture_output=True,
-                    text=True,
+                    cancel=self._cancel,
                 )
             except (OSError, subprocess.SubprocessError) as error:
+                self._raise_if_cancelled(error)
                 raise EnvironmentMaterializationError(
                     f"unable to run {command.argv[0]!r}: {error}"
                 ) from error
+            self._raise_if_cancelled()
             stdout = redact_secrets(completed.stdout or "", mask_values)
             stderr = redact_secrets(completed.stderr or "", mask_values)
             results.append(
@@ -750,6 +797,33 @@ class HostEnvironmentManager:
                 f"command: {details}"
             )
         return results
+
+    def _report_command(
+        self,
+        command: Sequence[str],
+        mask_values: Sequence[str],
+        *,
+        activity: ActivitySink | None = None,
+    ) -> None:
+        """Publish one redacted environment command without affecting setup."""
+        sink = activity if activity is not None else self._activity
+        if sink is None:
+            return
+        redacted = [redact_secrets(argument, mask_values) for argument in command]
+        try:
+            sink(
+                AgentActivity(AgentActivityKind.COMMAND, shlex.join(redacted))
+            )
+        except Exception:
+            return
+
+    def _raise_if_cancelled(self, cause: BaseException | None = None) -> None:
+        """Keep cancellation distinct from an environment setup failure."""
+        if self._cancel is None or not self._cancel.is_set():
+            return
+        if cause is None:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt from cause
 
     def _base_command_environment(
         self,
@@ -810,7 +884,7 @@ class HostEnvironmentManager:
         path = self.preparation_root / identity
         self.preparation_root.mkdir(parents=True, exist_ok=True)
         self._remove_stale_preparation_worktree(path)
-        source_sha = SafeGit(source_worktree).head_sha()
+        source_sha = self._git.for_worktree(source_worktree).head_sha()
         try:
             self._git.run(
                 ["worktree", "add", "--detach", str(path), source_sha]
@@ -858,7 +932,7 @@ class HostEnvironmentManager:
             )
 
     def _assert_no_tracked_changes(self, worktree: Path, when: str) -> None:
-        output = SafeGit(worktree).run(
+        output = self._git.for_worktree(worktree).run(
             ["status", "--porcelain=v1", "-z", "-uno"]
         ).stdout
         if output:
@@ -869,7 +943,7 @@ class HostEnvironmentManager:
             )
 
     def _tracked_state(self, worktree: Path) -> tuple[str, str, str]:
-        git = SafeGit(worktree)
+        git = self._git.for_worktree(worktree)
         status = git.run(["status", "--porcelain=v1", "-z", "-uno"]).stdout
         diff = git.run(["diff", "--binary", "HEAD", "--"]).stdout
         return git.head_sha(), status, diff
@@ -896,7 +970,7 @@ class HostEnvironmentManager:
             raise EnvironmentMaterializationError(
                 "checkout-local environment marker escapes task worktree"
             )
-        if not SafeGit(worktree).is_ignored(marker):
+        if not self._git.for_worktree(worktree).is_ignored(marker):
             raise EnvironmentMaterializationError(
                 "checkout-local environment marker is not ignored by Git"
             )
@@ -929,6 +1003,8 @@ class HostEnvironmentManager:
         claim: TaskClaim,
         owner_token: str,
         error: BaseException,
+        *,
+        task_transition: Callable[..., TaskRuntime] | None = None,
     ) -> None:
         runtime = store.get_task_runtime(claim.task_id)
         if runtime is None or runtime.status not in {
@@ -939,20 +1015,44 @@ class HostEnvironmentManager:
             return
         reason = str(error) or error.__class__.__name__
         try:
-            store.transition_task_runtime(
-                claim.run_id,
+            self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=runtime.status,
                 new_status=TaskRuntimeStatus.BLOCKED,
                 state_reason=reason,
-                now=self._clock(),
+                task_transition=task_transition,
             )
         except BaseException as transition_error:
             error.add_note(
                 f"task could not be durably blocked: {transition_error}"
             )
+
+    def _transition_claimed_task(
+        self,
+        store: SqliteStore,
+        claim: TaskClaim,
+        owner_token: str,
+        *,
+        expected_status: TaskRuntimeStatus,
+        new_status: TaskRuntimeStatus,
+        task_transition: Callable[..., TaskRuntime] | None,
+        **changes: object,
+    ) -> TaskRuntime:
+        """Use the scheduler-owned transition seam when one is available."""
+        if task_transition is not None:
+            return task_transition(expected_status, new_status, **changes)
+        return store.transition_task_runtime(
+            claim.run_id,
+            owner_token,
+            claim.id,
+            claim.claim_token,
+            expected_status=expected_status,
+            new_status=new_status,
+            now=self._clock(),
+            **changes,
+        )
 
 
 def _command_payload(commands: Sequence[HostCommand]) -> list[dict[str, object]]:

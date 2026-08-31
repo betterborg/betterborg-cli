@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution import (
     ComposeStackError,
     EnvironmentMaterializationError,
@@ -34,6 +35,7 @@ from betterborg_cli.host_execution import (
     service_url_environment,
 )
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
+from betterborg_cli.progress import AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
@@ -689,6 +691,86 @@ def test_build_secret_is_redacted_outside_used_by_stage(
     assert "[REDACTED]" in persisted
 
 
+def test_environment_command_reports_redacted_activity_and_reaps_on_cancel(
+    execution_preflight_fixture,
+    real_process_harness,
+) -> None:
+    fixture = execution_preflight_fixture()
+    cancel = CancellationToken()
+    token = 'token"with/slash space?x=1&y=2'
+    command = real_process_harness.resistant_argv("environment-command")
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="unused",
+        secrets=(
+            HostSecret(
+                name="PACKAGE_TOKEN",
+                scope="build",
+                used_by=("environment",),
+                evidence="fixture",
+            ),
+        ),
+    )
+    plan = replace(
+        plan,
+        materialize_commands=(
+            HostCommand(
+                stage="environment",
+                argv=(*command, token),
+                cwd=".",
+                evidence="fixture",
+            ),
+        ),
+    )
+    activities = []
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        observed_tokens.append(kwargs.get("cancel"))
+        return run_captured(argv, **kwargs)
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={"PATH": os.environ["PATH"]},
+        command_runner=runner,
+        activity=activities.append,
+        cancel=cancel,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                manager.materialize_claimed_task,
+                store,
+                plan,
+                claim,
+                fixture.owner_token,
+                secret_values={"PACKAGE_TOKEN": token},
+            )
+            real_process_harness.wait_for_marker(
+                "environment-command.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        runtime = store.get_task_runtime(claim.task_id)
+
+    real_process_harness.assert_tree_absent("environment-command")
+    assert observed_tokens == [cancel]
+    assert len(activities) == 1
+    assert activities[0].kind is AgentActivityKind.COMMAND
+    assert activities[0].detail is not None
+    assert token not in activities[0].detail
+    assert json.dumps(token)[1:-1] not in activities[0].detail
+    assert quote(token, safe="") not in activities[0].detail
+    assert "[REDACTED]" in activities[0].detail
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.ENVIRONMENT
+
+
 def test_tracked_changes_are_rejected_and_task_work_is_preserved(
     execution_preflight_fixture,
 ) -> None:
@@ -745,6 +827,10 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
     results_lock = threading.Lock()
 
     def run_compose(*args, **kwargs):
+        for name in ("cancel", "terminate_on_cancel", "deadline"):
+            kwargs.pop(name, None)
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
         result = subprocess.run(*args, **kwargs)
         with results_lock:
             compose_results.append(result)
@@ -1111,6 +1197,184 @@ def test_compose_subprocess_environment_excludes_host_credentials(
         "BETTERBORG_UNRELATED_TOKEN" not in environment
         for environment in runner.environments
     )
+
+
+def test_compose_startup_cancellation_reaps_tree_and_confirms_cleanup(
+    execution_preflight_fixture,
+    real_process_harness,
+) -> None:
+    fixture = execution_preflight_fixture()
+    cancel = CancellationToken()
+    fake = FakeComposeRunner()
+    activities = []
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        command = tuple(argv)
+        invocations.append((command, dict(kwargs)))
+        if "up" in command:
+            return run_captured(
+                real_process_harness.resistant_argv("compose-startup"),
+                **kwargs,
+            )
+        return fake(argv, **kwargs)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager = fixture.compose_manager(runner)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            startup = executor.submit(
+                manager.start_claimed_stack,
+                store,
+                _compose_plan(fixture.repository),
+                claim,
+                fixture.owner_token,
+                cancel=cancel,
+                activity=activities.append,
+            )
+            real_process_harness.wait_for_marker("compose-startup.child.pid")
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                startup.result(timeout=5)
+
+        resources = store.list_compose_resources(claim.task_id)
+        runtime = store.get_task_runtime(claim.task_id)
+        events = [
+            event.kind
+            for event in store.list_execution_events(fixture.run_id)
+            if event.kind.startswith("compose.")
+        ]
+
+    real_process_harness.assert_tree_absent("compose-startup")
+    up = next(item for item in invocations if "up" in item[0])
+    down = next(item for item in invocations if "down" in item[0])
+    assert up[1]["cancel"] is cancel
+    assert up[1]["terminate_on_cancel"] is True
+    assert up[1]["deadline"] is None
+    assert down[1]["cancel"] is cancel
+    assert down[1]["terminate_on_cancel"] is False
+    assert down[1]["deadline"] == cancel.force_deadline
+    assert resources
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CLAIMED
+    assert events[:2] == ["compose.starting", "compose.stopping"]
+    assert set(events[2:]) == {"compose.stopped", "compose.cleanup_completed"}
+    assert [activity.kind for activity in activities] == [
+        AgentActivityKind.COMMAND,
+        AgentActivityKind.COMMAND,
+    ]
+    assert " up " in f" {activities[0].detail} "
+    assert " down " in f" {activities[1].detail} "
+
+
+def test_compose_cleanup_deadline_reaps_tree_and_preserves_fence(
+    execution_preflight_fixture,
+    real_process_harness,
+) -> None:
+    fixture = execution_preflight_fixture()
+    cancel = CancellationToken()
+    fake = FakeComposeRunner()
+    down_kwargs: dict[str, object] = {}
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        command = tuple(argv)
+        if "down" in command:
+            down_kwargs.update(kwargs)
+            return run_captured(
+                real_process_harness.resistant_argv("compose-cleanup"),
+                **kwargs,
+            )
+        return fake(argv, **kwargs)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager = fixture.compose_manager(runner)
+        stack = manager.start_claimed_stack(
+            store,
+            _compose_plan(fixture.repository),
+            claim,
+            fixture.owner_token,
+            cancel=cancel,
+        )
+        assert stack is not None
+        cancel.cancel()
+        with pytest.raises(ComposeStackError, match="teardown failed"):
+            manager.stop_claimed_stack(
+                store,
+                stack,
+                claim,
+                fixture.owner_token,
+                cancel=cancel,
+            )
+        resources = store.list_compose_resources(claim.task_id)
+        runtime = store.get_task_runtime(claim.task_id)
+        events = {
+            event.kind for event in store.list_execution_events(fixture.run_id)
+        }
+
+    real_process_harness.assert_tree_absent("compose-cleanup")
+    assert down_kwargs["cancel"] is cancel
+    assert down_kwargs["terminate_on_cancel"] is False
+    assert down_kwargs["deadline"] == cancel.force_deadline
+    assert resources
+    assert "compose.cleanup_failed" in events
+    assert "compose.cleanup_completed" not in events
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert runtime.state_reason is not None
+    assert "Compose teardown failed" in runtime.state_reason
+
+
+def test_compose_cancellation_after_readiness_confirms_bounded_cleanup(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    cancel = CancellationToken()
+    runner = FakeComposeRunner()
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager = fixture.compose_manager(runner)
+        stack = manager.start_claimed_stack(
+            store,
+            _compose_plan(fixture.repository),
+            claim,
+            fixture.owner_token,
+            cancel=cancel,
+        )
+        assert stack is not None
+        runner.pause_down.add(stack.project_name)
+        cancel.cancel()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            cleanup = executor.submit(
+                manager.stop_claimed_stack,
+                store,
+                stack,
+                claim,
+                fixture.owner_token,
+                cancel=cancel,
+            )
+            assert runner.down_entered.wait(timeout=2)
+            before_release = [
+                event.kind
+                for event in store.list_execution_events(fixture.run_id)
+                if event.kind.startswith("compose.")
+            ]
+            runner.release_down.set()
+            cleanup.result(timeout=2)
+
+        after_release = [
+            event.kind
+            for event in store.list_execution_events(fixture.run_id)
+            if event.kind.startswith("compose.")
+        ]
+
+    assert before_release[-1] == "compose.stopping"
+    assert "compose.cleanup_completed" not in before_release
+    assert set(after_release[-2:]) == {
+        "compose.stopped",
+        "compose.cleanup_completed",
+    }
+    assert runner.active == set()
+    assert runner.down_projects == [stack.project_name]
 
 
 def test_compose_cleanup_metadata_excludes_resolved_env_file_secrets(
@@ -1520,9 +1784,11 @@ class FakeComposeRunner:
         self.fail_all_down = False
         self.timeout_down: set[str] = set()
         self.pause_up: set[str] = set()
+        self.pause_down: set[str] = set()
         self.up_entered = threading.Event()
         self.release_up = threading.Event()
         self.down_entered = threading.Event()
+        self.release_down = threading.Event()
         self.service_health: dict[str, str] = {"healthy": "healthy"}
         self.config_services: dict[str, dict[str, object]] = {
             "healthy": {"networks": {"default": None}},
@@ -1559,6 +1825,10 @@ class FakeComposeRunner:
                 )
         if "down" in command:
             self.down_entered.set()
+            if project in self.pause_down and not self.release_down.wait(timeout=10):
+                return subprocess.CompletedProcess(
+                    argv, 13, "", "timed out waiting for test teardown release"
+                )
         with self._lock:
             self.environments.append(dict(kwargs["env"]))
             self.timeouts.append(kwargs["timeout"])

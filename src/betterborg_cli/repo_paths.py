@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.repository_files import publish_repository_text
 
 MANAGED_IGNORE_BEGIN = "# >>> Betterborg managed ignores >>>"
 MANAGED_IGNORE_END = "# <<< Betterborg managed ignores <<<"
@@ -52,20 +57,34 @@ class RepoPaths:
         return self.tracked_dir / "score.md"
 
     @classmethod
-    def discover(cls, start: Path | None = None) -> RepoPaths:
+    def discover(
+        cls,
+        start: Path | None = None,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
+    ) -> RepoPaths:
         """Discover the nearest containing Git repository from ``start``."""
         candidate = (start or Path.cwd()).resolve()
         if candidate.is_file():
             candidate = candidate.parent
 
+        command = ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"]
         try:
-            result = subprocess.run(
-                ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            result = command_runner(
+                command,
                 check=True,
-                capture_output=True,
-                text=True,
+                cancel=cancel,
             )
         except subprocess.CalledProcessError as error:
+            raise ValueError(f"not inside a Git repository: {candidate}") from error
+        if result.returncode != 0:
+            error = subprocess.CalledProcessError(
+                result.returncode,
+                command,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
             raise ValueError(f"not inside a Git repository: {candidate}") from error
 
         root = Path(result.stdout.strip()).resolve()
@@ -113,4 +132,9 @@ def ensure_managed_gitignore(paths: RepoPaths) -> None:
     if retained:
         retained.append("")
     retained.extend([MANAGED_IGNORE_BEGIN, MANAGED_IGNORE_RULE, MANAGED_IGNORE_END])
-    paths.gitignore.write_text("\n".join(retained) + "\n", encoding="utf-8")
+    publish_repository_text(
+        paths.gitignore,
+        "\n".join(retained) + "\n",
+        root=paths.root,
+        overwrite=True,
+    )

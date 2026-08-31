@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
+
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
+
+GitCommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+ActivitySink = Callable[[AgentActivity], None]
 
 
 class UnsafeGitError(RuntimeError):
@@ -268,40 +276,34 @@ def _hardened_git_environment(
     return result
 
 
-def _common_git_directory(root: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=_hardened_git_environment(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return f"fallback::{root.resolve()}"
-    value = result.stdout.strip()
-    if result.returncode != 0 or not value:
-        return f"fallback::{root.resolve()}"
-    path = Path(value)
-    return str(path.resolve() if path.is_absolute() else (root / path).resolve())
-
-
-def _fetch_lock(root: Path) -> threading.Lock:
-    key = _common_git_directory(root)
-    with _FETCH_LOCKS_GUARD:
-        return _FETCH_LOCKS.setdefault(key, threading.Lock())
-
-
 class SafeGit:
     """A Git runner permanently bound to one exact worktree root."""
 
-    def __init__(self, cwd: Path) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner: GitCommandRunner = run_captured,
+        activity: ActivitySink | None = None,
+    ) -> None:
         self._cwd = Path(cwd).resolve()
+        self._cancel = cancel
+        self._run = command_runner
+        self._activity = activity
 
     @property
     def cwd(self) -> Path:
         return self._cwd
+
+    def for_worktree(self, cwd: Path) -> SafeGit:
+        """Bind another exact worktree to this runner, token, and activity sink."""
+        return SafeGit(
+            cwd,
+            cancel=self._cancel,
+            command_runner=self._run,
+            activity=self._activity,
+        )
 
     def run(
         self,
@@ -317,30 +319,33 @@ class SafeGit:
         run_environment = _hardened_git_environment(env)
         self.assert_exact_worktree_root(env=run_environment)
         command = ["git", *arguments]
-        options = {
-            "cwd": str(self._cwd),
-            "check": check,
-            "capture_output": capture,
-            "text": True,
-            "env": run_environment,
-            "timeout": timeout,
-        }
+        # ``run_captured`` always captures output. Retain ``capture`` in the
+        # public signature for compatibility with existing callers; host Git
+        # operations do not rely on inherited stdio.
+        del capture
         if arguments[0] == "fetch":
-            with _fetch_lock(self._cwd):
-                return subprocess.run(command, **options)
-        return subprocess.run(command, **options)
+            with self._fetch_lock():
+                return self._invoke(
+                    command,
+                    check=check,
+                    env=run_environment,
+                    timeout=timeout,
+                )
+        return self._invoke(
+            command,
+            check=check,
+            env=run_environment,
+            timeout=timeout,
+        )
 
     def assert_exact_worktree_root(
         self, *, env: Mapping[str, str] | None = None
     ) -> None:
         """Refuse parent-repository discovery from a nested directory."""
         try:
-            result = subprocess.run(
+            result = self._invoke(
                 ["git", "rev-parse", "--show-toplevel"],
-                cwd=str(self._cwd),
                 check=False,
-                capture_output=True,
-                text=True,
                 timeout=5,
                 env=_hardened_git_environment(env),
             )
@@ -457,15 +462,76 @@ class SafeGit:
             return False
         if not self.is_ancestor(current, destination):
             return False
-        result = subprocess.run(
+        result = self._invoke(
             ["git", "update-ref", reference, destination, current],
-            cwd=str(self._cwd),
             check=False,
-            capture_output=True,
-            text=True,
             env=_hardened_git_environment(),
         )
         return result.returncode == 0
+
+    def _common_git_directory(self) -> str:
+        try:
+            result = self._invoke(
+                ["git", "-C", str(self._cwd), "rev-parse", "--git-common-dir"],
+                check=False,
+                timeout=5,
+                env=_hardened_git_environment(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            self._raise_if_cancelled()
+            return f"fallback::{self._cwd}"
+        value = result.stdout.strip()
+        if result.returncode != 0 or not value:
+            return f"fallback::{self._cwd}"
+        path = Path(value)
+        return str(
+            path.resolve()
+            if path.is_absolute()
+            else (self._cwd / path).resolve()
+        )
+
+    def _fetch_lock(self) -> threading.Lock:
+        key = self._common_git_directory()
+        with _FETCH_LOCKS_GUARD:
+            return _FETCH_LOCKS.setdefault(key, threading.Lock())
+
+    def _invoke(
+        self,
+        command: Sequence[str],
+        *,
+        check: bool,
+        env: Mapping[str, str],
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        self._report_command(command)
+        try:
+            result = self._run(
+                command,
+                cwd=self._cwd,
+                check=check,
+                env=env,
+                timeout=timeout,
+                cancel=self._cancel,
+            )
+        except BaseException:
+            self._raise_if_cancelled()
+            raise
+        self._raise_if_cancelled()
+        return result
+
+    def _report_command(self, command: Sequence[str]) -> None:
+        if self._activity is None:
+            return
+        try:
+            self._activity(
+                AgentActivity(AgentActivityKind.COMMAND, shlex.join(command))
+            )
+        except Exception:
+            return
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise KeyboardInterrupt
 
     def worktree_list(self) -> list[dict[str, str]]:
         output = self.run(["worktree", "list", "--porcelain"]).stdout

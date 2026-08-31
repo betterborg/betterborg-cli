@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
+import signal
 import subprocess
 from dataclasses import replace
 from datetime import timedelta
@@ -12,6 +15,7 @@ from uuid import uuid4
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution import (
     HostWorktreeManager,
     PrimaryCheckoutContaminationError,
@@ -69,6 +73,133 @@ def test_safe_git_rejects_destructive_operations(
 ) -> None:
     with pytest.raises(UnsafeGitError):
         SafeGit(committed_git_repo).run(arguments)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["exact-root", "common-dir", "command", "update-ref", "worktree", "guard", "ready"],
+)
+def test_safe_git_bindings_cancel_and_reap_every_command_path(
+    committed_git_repo: Path,
+    real_process_harness,
+    target: str,
+) -> None:
+    if target == "update-ref":
+        _git(committed_git_repo, "branch", "project/cancel-safe-git")
+        (committed_git_repo / "advance.txt").write_text("advance\n", encoding="utf-8")
+        _git(committed_git_repo, "add", "advance.txt")
+        _git(committed_git_repo, "commit", "-m", "advance safe git fixture")
+
+    resistant = real_process_harness.resistant_argv(f"safe-git-{target}")
+    source = r'''
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
+from betterborg_cli.host_execution import PrimaryCheckoutGuard, SafeGit
+from betterborg_cli.run_control import RunControl
+
+repository = Path(sys.argv[1])
+marker_root = Path(sys.argv[2])
+target = sys.argv[3]
+resistant = tuple(json.loads(sys.argv[4]))
+
+
+def matches(command) -> bool:
+    argv = tuple(command)
+    if target == "exact-root":
+        return argv[-2:] == ("rev-parse", "--show-toplevel")
+    if target == "common-dir":
+        return argv[-2:] == ("rev-parse", "--git-common-dir")
+    if target == "command":
+        return argv[1:3] == ("status", "--porcelain")
+    if target == "update-ref":
+        return argv[1:2] == ("update-ref",)
+    if target == "worktree":
+        return argv[1:3] == ("worktree", "list")
+    if target == "guard":
+        return argv[1:3] == ("status", "--porcelain=v1")
+    if target == "ready":
+        return argv[-3:] == ("rev-parse", "--abbrev-ref", "HEAD")
+    return False
+
+
+def runner(command, **kwargs):
+    if matches(command):
+        (marker_root / f"safe-git-{target}.token").write_text(
+            "bound" if kwargs.get("cancel") is cancel else "missing",
+            encoding="utf-8",
+        )
+        return run_captured(resistant, **kwargs)
+    return run_captured(command, **kwargs)
+
+
+cancel = CancellationToken()
+control = RunControl(cancel).install()
+git = SafeGit(repository, cancel=cancel, command_runner=runner)
+try:
+    with control.protected():
+        if target == "common-dir":
+            git.run(["fetch"], check=False)
+        elif target == "command":
+            git.run(["status", "--porcelain"])
+        elif target == "update-ref":
+            git.fast_forward_branch("project/cancel-safe-git", "HEAD")
+        elif target == "worktree":
+            git.worktree_list()
+        elif target == "guard":
+            PrimaryCheckoutGuard(repository, git=git).assert_clean()
+        elif target == "ready":
+            git.for_worktree(repository).current_branch()
+        else:
+            git.assert_exact_worktree_root()
+except KeyboardInterrupt:
+    raise SystemExit(130) from None
+finally:
+    control.close()
+'''
+    process = real_process_harness.launch_python(
+        source,
+        str(committed_git_repo),
+        str(real_process_harness.root),
+        target,
+        json.dumps(resistant),
+        name=f"safe-git-{target}",
+    )
+    real_process_harness.wait_for_marker(f"safe-git-{target}.child.pid")
+    real_process_harness.signal(process, signal.SIGINT)
+    assert real_process_harness.wait_for_exit(process) == 130
+    real_process_harness.assert_tree_absent(f"safe-git-{target}")
+    assert real_process_harness.wait_for_marker(
+        f"safe-git-{target}.token"
+    ) == "bound"
+
+
+def test_safe_git_reports_every_bound_command_activity(
+    committed_git_repo: Path,
+) -> None:
+    cancel = CancellationToken()
+    calls: list[tuple[tuple[str, ...], CancellationToken | None]] = []
+    activities = []
+
+    def runner(command, **kwargs):
+        calls.append((tuple(command), kwargs.get("cancel")))
+        return run_captured(command, **kwargs)
+
+    SafeGit(
+        committed_git_repo,
+        cancel=cancel,
+        command_runner=runner,
+        activity=activities.append,
+    ).run(["status", "--porcelain"])
+
+    assert all(token is cancel for _command, token in calls)
+    assert [activity.detail for activity in activities] == [
+        shlex.join(command) for command, _token in calls
+    ]
 
 
 @pytest.mark.parametrize("subcommand", ["diff", "log", "show"])

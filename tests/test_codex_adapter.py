@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
-from test_adapter_harness import codex_spec
+from test_adapter_harness import (
+    codex_spec,
+    native_event_stream,
+    redacting_execution_activity_sink,
+    write_native_output,
+)
 
 from betterborg_cli.agent_runtime import (
+    AgentActivity,
+    AgentActivityKind,
     AgentArtifact,
     AgentStatus,
     AgentUsage,
@@ -47,6 +55,14 @@ def _write_invocation_result(command: Sequence[str], payload: Any) -> None:
     result_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _item_event(
+    event_type: str,
+    item_type: str,
+    **item: Any,
+) -> dict[str, Any]:
+    return {"type": event_type, "item": {"type": item_type, **item}}
+
+
 @pytest.mark.parametrize("role", list(ApiAgentRole))
 def test_every_role_discloses_native_host_capability(role: ApiAgentRole) -> None:
     adapter = CodexAdapter(role, proc_runner=lambda *_args: 0)
@@ -56,6 +72,241 @@ def test_every_role_discloses_native_host_capability(role: ApiAgentRole) -> None
     assert not adapter.capabilities.supports_billing(BillingMode.API)
     assert not adapter.capabilities.tool_allowlist
     assert adapter.capabilities.read_only_sandbox
+
+
+@pytest.mark.parametrize(
+    ("event_type", "item_type", "item", "expected"),
+    (
+        (
+            "item.started",
+            "command_execution",
+            {"command": "cat README.md"},
+            AgentActivity(AgentActivityKind.READING, "cat README.md"),
+        ),
+        (
+            "item.completed",
+            "command_execution",
+            {"command": "/bin/bash -lc 'rg NativeInvocation src'"},
+            AgentActivity(
+                AgentActivityKind.SEARCHING,
+                "/bin/bash -lc 'rg NativeInvocation src'",
+            ),
+        ),
+        (
+            "item.started",
+            "command_execution",
+            {"command": "make test"},
+            AgentActivity(AgentActivityKind.COMMAND, "make test"),
+        ),
+        (
+            "item.completed",
+            "file_change",
+            {"changes": [{"path": "src/betterborg_cli/agent_runtime/codex.py"}]},
+            AgentActivity(
+                AgentActivityKind.WRITING,
+                "src/betterborg_cli/agent_runtime/codex.py",
+            ),
+        ),
+        (
+            "item.started",
+            "web_search",
+            {"query": "Codex JSONL events"},
+            AgentActivity(AgentActivityKind.SEARCHING, "Codex JSONL events"),
+        ),
+        (
+            "item.started",
+            "mcp_tool_call",
+            {"tool": "filesystem.read_file", "arguments": {"path": "pyproject.toml"}},
+            AgentActivity(AgentActivityKind.READING, "pyproject.toml"),
+        ),
+        (
+            "item.completed",
+            "mcp_tool_call",
+            {
+                "tool": "filesystem.search_files",
+                "arguments": {"pattern": "test_*.py"},
+            },
+            AgentActivity(AgentActivityKind.SEARCHING, "test_*.py"),
+        ),
+        (
+            "item.started",
+            "mcp_tool_call",
+            {"tool": "filesystem.write_file", "arguments": {"path": "result.json"}},
+            AgentActivity(AgentActivityKind.WRITING, "result.json"),
+        ),
+    ),
+)
+def test_native_item_events_emit_neutral_activity_without_changing_logs(
+    tmp_path: Path,
+    event_type: str,
+    item_type: str,
+    item: Mapping[str, Any],
+    expected: AgentActivity,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _item_event(event_type, item_type, **item),
+        _usage_event(10, 4, 3),
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "activity"}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, activity_sink=activities.append)
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.usage == AgentUsage(
+        tokens_input=6,
+        tokens_output=3,
+        tokens_cache_read=4,
+        tokens_cache_write=0,
+        num_turns=1,
+    )
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [
+        AgentActivity(AgentActivityKind.THINKING),
+        expected,
+        AgentActivity(AgentActivityKind.THINKING),
+    ]
+
+
+def test_generic_command_activity_is_single_line_and_bounded(tmp_path: Path) -> None:
+    activities: list[AgentActivity] = []
+    command_text = "python -c '" + ("x" * 200) + "'\nwith another line"
+    transcript = json.dumps(
+        _item_event("item.started", "command_execution", command=command_text)
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "bounded"}
+        )
+        return 0
+
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(
+        codex_spec(tmp_path, activity_sink=activities.append)
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    command_activity = activities[1]
+    assert command_activity.kind is AgentActivityKind.COMMAND
+    assert command_activity.detail is not None
+    assert len(command_activity.detail) == 160
+    assert "\n" not in command_activity.detail
+    assert command_activity.detail.endswith("…")
+
+
+def test_native_activity_uses_execution_secret_redaction_without_changing_result(
+    tmp_path: Path,
+) -> None:
+    secret = 'native"secret/slash?x=1'
+    escaped = json.dumps(secret)[1:-1]
+    encoded = quote(secret, safe="")
+    detail = f"{secret} {escaped} {encoded}"
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _item_event("item.started", "web_search", query=detail),
+        _usage_event(3, 1, 2),
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "unchanged"}
+        )
+        return 0
+
+    result = CodexAdapter(ApiAgentRole.CODING, proc_runner=runner).run(
+        codex_spec(
+            tmp_path,
+            activity_sink=redacting_execution_activity_sink(secret, activities),
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "unchanged"}
+    assert activities[1].detail == "[REDACTED] [REDACTED] [REDACTED]"
+    assert all(value not in repr(activities) for value in (secret, escaped, encoded))
+
+
+def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(
+    tmp_path: Path,
+) -> None:
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        "not-json",
+        {"type": "item.started", "item": "malformed"},
+        _item_event("item.started", "unknown_provider_item", provider_name="secret"),
+        _item_event(
+            "item.started",
+            "mcp_tool_call",
+            tool="provider_specific_tool",
+            arguments={"secret": "value"},
+        ),
+        _item_event("item.completed", "command_execution", command=42),
+        _item_event("item.completed", "agent_message", text="final result"),
+        _usage_event(8, 3, 2),
+    )
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "fallback"}
+        )
+        return 0
+
+    spec = codex_spec(tmp_path, activity_sink=activities.append)
+    result = CodexAdapter(ApiAgentRole.ANALYSIS, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "fallback"}
+    assert result.usage == AgentUsage(
+        tokens_input=5,
+        tokens_output=2,
+        tokens_cache_read=3,
+        tokens_cache_write=0,
+        num_turns=1,
+    )
+    assert spec.log_path.read_text(encoding="utf-8") == transcript
+    assert activities == [AgentActivity(AgentActivityKind.THINKING)] * 8
 
 
 def test_native_command_validates_and_persists_result_metadata(
@@ -71,6 +322,7 @@ def test_native_command_validates_and_persists_result_metadata(
         log_path: Path,
         cancel: CancellationToken | None,
         env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         invocation_result_path = Path(command[command.index("-o") + 1])
@@ -168,6 +420,7 @@ def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         captured_command.extend(command)
         log_path.write_text("{}\n", encoding="utf-8")
@@ -197,6 +450,7 @@ def test_schema_invalid_result_fails_without_persisting_result(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("{}\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
@@ -221,6 +475,7 @@ def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> No
         _log_path: Path,
         runner_cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         assert runner_cancel is cancel
         cancel.cancel()
@@ -250,6 +505,7 @@ def test_transient_error_retries_and_accumulates_jsonl_usage(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         calls.append((list(command), stdin_text))
         if len(calls) == 1:
@@ -303,6 +559,7 @@ def test_schema_invalid_partial_result_does_not_suppress_transient_retry(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         nonlocal calls
         calls += 1
@@ -386,6 +643,7 @@ def test_transient_exhaustion_is_resumable(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text(
             '{"type":"error","message":"status 429: rate limit"}\n',
@@ -415,6 +673,7 @@ def test_nonzero_exit_with_fresh_valid_result_completes(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("Codex completed before exiting\n", encoding="utf-8")
         _write_invocation_result(
@@ -440,6 +699,7 @@ def test_nonzero_exit_with_invalid_result_still_fails(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("Codex exited after a partial result\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
@@ -467,6 +727,7 @@ def test_valid_result_prevents_transient_retry_despite_nonzero_exit(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         nonlocal calls
         calls += 1
@@ -518,6 +779,7 @@ def test_optional_schema_fields_are_normalized_for_strict_transport(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
@@ -590,6 +852,7 @@ def test_optional_typed_enum_and_const_accept_null_transport_placeholders(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         schema_path = Path(command[command.index("--output-schema") + 1])
         captured_schema.update(json.loads(schema_path.read_text(encoding="utf-8")))
@@ -627,6 +890,7 @@ def test_unconstrained_optional_null_is_preserved(tmp_path: Path) -> None:
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("ok\n", encoding="utf-8")
         _write_invocation_result(
@@ -667,6 +931,7 @@ def test_unrepresentable_strict_schema_falls_back_to_prompt_and_local_validation
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         captured["command"] = list(command)
         captured["stdin"] = stdin_text
@@ -709,6 +974,7 @@ def test_constraints_removed_from_transport_remain_authoritative_locally(
         log_path: Path,
         _cancel: CancellationToken | None,
         _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
     ) -> int:
         log_path.write_text("ok\n", encoding="utf-8")
         _write_invocation_result(

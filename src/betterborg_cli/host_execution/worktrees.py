@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.store import SqliteStore, TaskRuntime, TaskRuntimeStatus
@@ -40,6 +41,8 @@ class HostWorktreeManager:
         worktree_root: Path,
         *,
         source_branch: str,
+        cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.worktree_root = Path(worktree_root).resolve()
@@ -48,8 +51,10 @@ class HostWorktreeManager:
         ):
             raise WorktreeError("task worktrees must be siblings of the checkout")
         self.source_branch = source_branch
-        self._git = SafeGit(self.repo_root)
-        self._guard = PrimaryCheckoutGuard(self.repo_root)
+        if git is not None and git.cwd != self.repo_root:
+            raise WorktreeError("worktree manager Git binding must match repository")
+        self._git = git or SafeGit(self.repo_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(self.repo_root, git=self._git)
 
     def ensure_project_base(self, project_name: str) -> str:
         """Create or fast-forward ``project/<name>`` from the configured source."""
@@ -162,7 +167,7 @@ class HostWorktreeManager:
             raise WorktreeError(
                 f"claimed task path is not its registered worktree: {path}"
             )
-        task_git = SafeGit(path)
+        task_git = self._git.for_worktree(path)
         if not task_git.is_clean():
             raise WorktreeError(
                 f"refusing to refresh dirty claimed task worktree: {path}"
