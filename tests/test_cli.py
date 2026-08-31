@@ -578,18 +578,28 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     )
 
 
-def test_main_surfaces_reconciliation_failure_after_interrupt(
+def test_main_surfaces_reconciliation_failure_after_sigint(
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
+    observed: dict[str, cli_module.CliRunContext] = {}
+
     @click.command()
-    def command() -> None:
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        observed["run"] = run
+        run.progress.declare(StageSpec("work", "Work"))
+        run.progress.start("work")
         try:
             try:
-                raise KeyboardInterrupt
+                os.kill(os.getpid(), signal.SIGINT)
             except KeyboardInterrupt as interruption:
+                deadline = time.monotonic() + 1
+                while not run.progress.cancelling and time.monotonic() < deadline:
+                    time.sleep(0.001)
                 raise RuntimeError("durability reconciliation failed") from interruption
         except RuntimeError as failure:
+            run.progress.fail("work", str(failure))
             raise click.ClickException(
                 "could not reconcile interruption"
             ) from failure
@@ -600,8 +610,13 @@ def test_main_surfaces_reconciliation_failure_after_interrupt(
 
     captured = capsys.readouterr()
     assert exit_code == 1
+    run = observed["run"]
+    assert run.cancellation.is_set()
+    assert run.progress.cancelling
+    assert run.progress.stages["work"].state is StageState.FAILED
     assert captured.out == ""
-    assert captured.err == "Error: could not reconcile interruption\n"
+    assert "failed Work — durability reconciliation failed" in captured.err
+    assert captured.err.endswith("Error: could not reconcile interruption\n")
 
 
 @pytest.mark.parametrize("wrapper", [click.ClickException, click.Abort])

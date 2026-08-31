@@ -153,7 +153,7 @@ def main(
                 obj=run,
             )
         except click.ClickException as error:
-            if control.interruption_requested or _caused_by_interruption(error):
+            if _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
             error.show()
             return error.exit_code
