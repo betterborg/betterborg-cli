@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
@@ -21,11 +21,13 @@ from betterborg_cli.agent_runtime.base import (
 )
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.agent_runtime.structured import validate_structured_result
+from betterborg_cli.progress import AgentActivity, RunProgress, StageState
 from betterborg_cli.repo_analysis.analyzer import (
     AnalyzerError,
     resolve_analysis_model,
 )
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_files import RepositoryPathError, read_repository_text
 from betterborg_cli.store import (
     GeneratedPrompt,
     Repository,
@@ -118,6 +120,8 @@ def generate_role_prompts(
     config: PromptManagerConfig | None = None,
     roles: Iterable[str] | None = None,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
+    stage_key: str = "prompts",
 ) -> list[PromptGeneration]:
     """Generate and persist independent coding, review, and merge prompts.
 
@@ -131,7 +135,14 @@ def generate_role_prompts(
     if resolved_config.effort is not None and agent.name == "anthropic":
         raise AnalyzerError("Anthropic does not support an effort override")
     model = resolve_analysis_model(agent, resolved_config.model)
-    paths = RepoPaths.discover(repository.root, cancel=cancel)
+    try:
+        paths = RepoPaths.discover(repository.root, cancel=cancel)
+    except BaseException:
+        if cancel is not None and cancel.is_set():
+            raise KeyboardInterrupt from None
+        raise
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
     if paths.root != repository.root:
         raise ValueError("repository root does not match its discovered Git root")
 
@@ -140,24 +151,115 @@ def generate_role_prompts(
     _prepare_stable_prompt_directory(paths)
     prior_prompts = store.get_latest_generated_prompts(repository.id)
 
-    def generate(role: str) -> PromptGeneration:
-        return _generate_one_role(
-            role=role,
-            repository=repository,
-            analysis=analysis,
-            store=store,
-            agent=agent,
-            artifact_dir=artifact_dir,
-            prompt_path=paths.prompts_dir / f"{role}.system.md",
-            prior_prompt=prior_prompts.get(role),
-            model=model,
-            effort=resolved_config.effort,
-            cancel=cancel,
-        )
+    _raise_if_cancelled(cancel)
+    if progress is not None:
+        progress.start(stage_key)
 
+    def generate(role: str) -> PromptGeneration:
+        prompt_path = paths.prompts_dir / f"{role}.system.md"
+        try:
+            if progress is not None:
+                progress.start_child(stage_key, role)
+            _raise_if_cancelled(cancel)
+            outcome = _generate_one_role(
+                role=role,
+                repository=repository,
+                analysis=analysis,
+                store=store,
+                agent=agent,
+                artifact_dir=artifact_dir,
+                prompt_path=prompt_path,
+                prior_prompt=prior_prompts.get(role),
+                model=model,
+                effort=resolved_config.effort,
+                cancel=cancel,
+                activity_sink=(
+                    lambda activity: progress.child_activity(
+                        stage_key, role, activity
+                    )
+                    if progress is not None
+                    else None
+                ),
+            )
+        except BaseException as error:
+            retained = get_durable_role_prompt(
+                repository,
+                store,
+                role=role,
+                path=prompt_path,
+                analysis_id=analysis.id,
+            )
+            if retained is not None:
+                outcome = PromptGeneration(
+                    role=role,
+                    ok=True,
+                    path=prompt_path,
+                    prompt=retained,
+                )
+                _complete_prompt_child(progress, stage_key, outcome)
+                return outcome
+            _terminalize_prompt_child(
+                progress,
+                stage_key,
+                role,
+                error=str(error) or type(error).__name__,
+                interrupted=_is_interruption(error, cancel),
+            )
+            raise
+
+        retained = (
+            get_durable_role_prompt(
+                repository,
+                store,
+                role=role,
+                path=prompt_path,
+                analysis_id=analysis.id,
+            )
+            if outcome.ok
+            else None
+        )
+        if retained is not None:
+            outcome = PromptGeneration(
+                role=role,
+                ok=True,
+                path=prompt_path,
+                prompt=retained,
+            )
+            _complete_prompt_child(progress, stage_key, outcome)
+            return outcome
+        if outcome.ok:
+            outcome = PromptGeneration(
+                role=role,
+                ok=False,
+                path=prompt_path,
+                error="prompt publication could not be reconciled",
+            )
+        _terminalize_prompt_child(
+            progress,
+            stage_key,
+            role,
+            error=outcome.error or "generation failed",
+            interrupted=cancel is not None and cancel.is_set(),
+        )
+        return outcome
+
+    outcomes: list[PromptGeneration] = []
+    errors: list[BaseException] = []
     with ThreadPoolExecutor(max_workers=len(selected_roles)) as executor:
         futures = [executor.submit(generate, role) for role in selected_roles]
-        return [future.result() for future in futures]
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except BaseException as error:
+                errors.append(error)
+
+    _terminalize_prompt_parent(progress, stage_key, selected_roles, outcomes, errors)
+    if errors:
+        raise errors[0]
+    if cancel is not None and cancel.is_set() and any(not run.ok for run in outcomes):
+        raise KeyboardInterrupt
+    by_role = {outcome.role: outcome for outcome in outcomes}
+    return [by_role[role] for role in selected_roles]
 
 
 def _generate_one_role(
@@ -173,6 +275,7 @@ def _generate_one_role(
     model: str,
     effort: str | None,
     cancel: CancellationToken | None,
+    activity_sink: Callable[[AgentActivity], None] | None,
 ) -> PromptGeneration:
     spec = AgentRunSpec(
         system_prompt=_system_prompt(role),
@@ -188,6 +291,7 @@ def _generate_one_role(
         allowed_tools=READ_ONLY_API_TOOLS,
         log_path=artifact_dir / f"{analysis.id}.{role}.log",
         result_path=artifact_dir / f"{analysis.id}.{role}.json",
+        activity_sink=activity_sink,
     )
     try:
         result = agent.run(spec, cancel=cancel)
@@ -237,6 +341,91 @@ def _generate_one_role(
         path=prompt_path,
         prompt=prompt,
     )
+
+
+def get_durable_role_prompt(
+    repository: Repository,
+    store: SqliteStore,
+    *,
+    role: str,
+    path: Path,
+    analysis_id: UUID | None = None,
+) -> GeneratedPrompt | None:
+    """Return the latest prompt only when its stable file matches metadata."""
+    prompt = store.get_latest_generated_prompts(repository.id).get(role)
+    if prompt is None or (
+        analysis_id is not None and prompt.analysis_id != analysis_id
+    ):
+        return None
+    try:
+        body = read_repository_text(path, root=repository.root)
+    except (OSError, UnicodeError, RepositoryPathError):
+        return None
+    return prompt if body == prompt.body_md else None
+
+
+def _complete_prompt_child(
+    progress: RunProgress | None,
+    stage_key: str,
+    outcome: PromptGeneration,
+) -> None:
+    if progress is not None:
+        progress.complete_child(
+            stage_key,
+            outcome.role,
+            f"prompt v{outcome.version}",
+        )
+
+
+def _terminalize_prompt_child(
+    progress: RunProgress | None,
+    stage_key: str,
+    role: str,
+    *,
+    error: str,
+    interrupted: bool,
+) -> None:
+    if progress is None:
+        return
+    if interrupted:
+        progress.stop_child(stage_key, role, "interrupted")
+    else:
+        progress.fail_child(stage_key, role, error)
+
+
+def _terminalize_prompt_parent(
+    progress: RunProgress | None,
+    stage_key: str,
+    selected_roles: tuple[str, ...],
+    outcomes: list[PromptGeneration],
+    errors: list[BaseException],
+) -> None:
+    if progress is None:
+        return
+    parent = progress.stages[stage_key]
+    if parent.state is not StageState.RUNNING:
+        return
+    children = [parent.children[role] for role in selected_roles]
+    if any(child.state is StageState.STOPPED for child in children):
+        progress.stop(stage_key, "interrupted")
+    elif errors or any(not outcome.ok for outcome in outcomes):
+        progress.fail(stage_key, "prompt generation incomplete")
+    else:
+        progress.complete(stage_key, f"{len(parent.children)} prompts")
+
+
+def _is_interruption(
+    error: BaseException,
+    cancel: CancellationToken | None,
+) -> bool:
+    return isinstance(error, KeyboardInterrupt) or (
+        cancel is not None and cancel.is_set()
+    )
+
+
+def _raise_if_cancelled(cancel: CancellationToken | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
 
 
 def _render_user_prompt(

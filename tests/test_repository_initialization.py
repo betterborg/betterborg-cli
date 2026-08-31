@@ -25,7 +25,7 @@ from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
 from betterborg_cli.progress import RunProgress, StageState
-from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES, run_analyzer
+from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
@@ -817,28 +817,42 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
         MockResponse(payload=_analysis_payload())
     )
 
+    def partial_prompt_response(spec):
+        role = next(
+            role for role in PROMPT_ROLES if f".{role}." in spec.result_path.name
+        )
+        if role == "review":
+            raise RuntimeError("review generator unavailable")
+        return {
+            "body_md": f"# {role.title()} agent\n\nRetained role instructions."
+        }
+
+    for _role in PROMPT_ROLES:
+        initial_adapter.queue(MockResponse(dynamic=partial_prompt_response))
+
     with SqliteStore.open(paths.state_dir / "retained.sqlite3") as store:
         setup = RepositoryService(paths, store, lambda _config: initial_adapter)
-        repository, _config = setup._ensure_repository()
-        analysis = run_analyzer(
-            repository,
-            store,
-            initial_adapter,
-            artifact_dir=paths.artifacts_dir / "analysis",
-        )
-        paths.prompts_dir.mkdir(parents=True, exist_ok=True)
-        for role in ("coding", "merge"):
-            body = f"# {role.title()} agent\n\nRetained role instructions."
-            (paths.prompts_dir / f"{role}.system.md").write_text(
-                body,
-                encoding="utf-8",
-            )
-            store.append_generated_prompt(
-                repository_id=repository.id,
-                analysis_id=analysis.id,
-                role=role,
-                body_md=body,
-            )
+        with pytest.raises(
+            RepositoryInitializationError,
+            match="review: adapter crashed: review generator unavailable",
+        ):
+            setup.initialize()
+
+        repository = store.get_repository(load_repository_config(paths).repository_id)
+        assert repository is not None
+        analysis = store.get_prior_ready_analysis(repository.id)
+        assert analysis is not None
+        assert set(store.get_latest_generated_prompts(repository.id)) == {
+            "coding",
+            "merge",
+        }
+        call_names = [call.result_path.name for call in initial_adapter.calls]
+        assert call_names[0] == f"{analysis.id}.json"
+        assert set(call_names[1:]) == {
+            f"{analysis.id}.coding.json",
+            f"{analysis.id}.review.json",
+            f"{analysis.id}.merge.json",
+        }
 
         retry_adapter = MockAdapter(name="openai").queue(
             MockResponse(
@@ -870,3 +884,47 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
         assert record.started_at is None
         assert record.finished_at is None
         assert record.duration_seconds is None
+
+    prompt_stage = progress.stages["prompts"]
+    assert prompt_stage.state is StageState.COMPLETED
+    assert prompt_stage.retained is False
+    assert prompt_stage.started_at is not None
+    assert prompt_stage.result == "3 prompts"
+    for role in ("coding", "merge"):
+        child = prompt_stage.children[role]
+        assert child.state is StageState.COMPLETED
+        assert child.retained is True
+        assert child.started_at is None
+        assert child.finished_at is None
+        assert child.duration_seconds is None
+    review = prompt_stage.children["review"]
+    assert review.state is StageState.COMPLETED
+    assert review.retained is False
+    assert review.started_at is not None
+
+    all_retained_progress = RunProgress(stream=StringIO())
+
+    def fail_factory(_config):
+        pytest.fail("an all-retained initialization must not select an agent")
+
+    with SqliteStore.open(paths.state_dir / "retained.sqlite3") as store:
+        retained_result = RepositoryService(
+            paths,
+            store,
+            fail_factory,
+            progress=all_retained_progress,
+        ).initialize()
+
+    assert retained_result.initialized is False
+    retained_parent = all_retained_progress.stages["prompts"]
+    assert retained_parent.state is StageState.COMPLETED
+    assert retained_parent.retained is True
+    assert retained_parent.started_at is None
+    assert retained_parent.finished_at is None
+    assert retained_parent.duration_seconds is None
+    assert all(
+        child.state is StageState.COMPLETED
+        and child.retained
+        and child.started_at is None
+        for child in retained_parent.children.values()
+    )

@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
+from threading import Barrier, Thread
+from typing import Any
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ChildSpec,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
     AnalyzerError,
@@ -18,6 +33,7 @@ from betterborg_cli.repo_analysis import (
     prompts_manager,
 )
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     Repository,
     RepositoryAnalysis,
@@ -144,6 +160,306 @@ def test_generates_all_role_metadata_at_stable_paths(git_repo: Path) -> None:
         assert '"overall_score": 3' in spec.user_prompt
         assert "Prior" not in spec.user_prompt
         assert spec.allowed_tools == ("list_files", "read_file", "search_text")
+
+
+def test_role_children_run_concurrently_and_reconcile_durable_activity(
+    git_repo: Path,
+) -> None:
+    repository = Repository(root=git_repo)
+    barrier = Barrier(len(PROMPT_ROLES))
+    adapter = MockAdapter(name="openai")
+
+    def respond(spec):
+        role = next(
+            role for role in PROMPT_ROLES if f".{role}." in spec.result_path.name
+        )
+        barrier.wait(timeout=2)
+        return MockResponse(
+            payload={
+                "body_md": (
+                    f"# {role.title()} agent\n\n"
+                    f"Complete repository-specific {role} guidance."
+                )
+            },
+            activities=(
+                AgentActivity(AgentActivityKind.READING, f"{role}.toml"),
+            ),
+        )
+
+    for _role in PROMPT_ROLES:
+        adapter.queue(MockResponse(dynamic=respond))
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+        model="prompt-model",
+    )
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                tuple(
+                    ChildSpec(role, f"{role.title()} prompt")
+                    for role in PROMPT_ROLES
+                ),
+            )
+        ],
+        stream=StringIO(),
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        runs = generate_role_prompts(
+            repository,
+            analysis,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+            progress=progress,
+        )
+
+        assert all(run.ok for run in runs)
+        latest = store.get_latest_generated_prompts(repository.id)
+        assert all(
+            (git_repo / f".borg/prompts/{role}.system.md").read_text()
+            == latest[role].body_md
+            for role in PROMPT_ROLES
+        )
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.COMPLETED
+    assert parent.result == "3 prompts"
+    for role in PROMPT_ROLES:
+        child = parent.children[role]
+        assert child.state is StageState.COMPLETED
+        assert child.retained is False
+        assert child.activity == AgentActivity(
+            AgentActivityKind.READING,
+            f"{role}.toml",
+        )
+        assert child.result == "prompt v1"
+
+
+def test_cancellation_during_prompt_root_discovery_starts_no_prompt_work(
+    git_repo: Path,
+    real_process_harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    adapter, selected = _selected_adapter(
+        git_repo,
+        {
+            role: f"# {role.title()} agent\n\nComplete role guidance."
+            for role in PROMPT_ROLES
+        },
+    )
+    cancel = CancellationToken(grace_seconds=0.05)
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                tuple(
+                    ChildSpec(role, f"{role.title()} prompt")
+                    for role in PROMPT_ROLES
+                ),
+            )
+        ],
+        stream=StringIO(),
+    )
+    original_discover = RepoPaths.discover.__func__
+
+    def blocking_discover(
+        cls,
+        start: Path | None = None,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner=run_captured,
+    ) -> RepoPaths:
+        def blocking_runner(
+            _command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            return run_captured(
+                real_process_harness.resistant_argv("prompt-discovery"),
+                cancel=kwargs["cancel"],
+                check=bool(kwargs["check"]),
+            )
+
+        return original_discover(
+            cls,
+            start,
+            cancel=cancel,
+            command_runner=blocking_runner,
+        )
+
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(blocking_discover))
+    errors: list[BaseException] = []
+    forced_exits: list[int] = []
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        def generate() -> None:
+            try:
+                generate_role_prompts(
+                    repository,
+                    analysis,
+                    store,
+                    selected,
+                    artifact_dir=git_repo / "artifacts",
+                    cancel=cancel,
+                    progress=progress,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        control = RunControl(
+            cancel,
+            progress=progress,
+            exit_function=forced_exits.append,
+        ).install()
+        try:
+            worker = Thread(target=generate)
+            worker.start()
+            real_process_harness.wait_for_marker("prompt-discovery.parent.pid")
+            real_process_harness.wait_for_marker("prompt-discovery.child.pid")
+            with pytest.raises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGINT)
+            assert control.wait_for_cancellation(timeout=1)
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+        finally:
+            control.close()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], KeyboardInterrupt)
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    real_process_harness.assert_tree_absent("prompt-discovery")
+    assert forced_exits == []
+    assert adapter.calls == []
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.PENDING
+    assert all(
+        child.state is StageState.PENDING for child in parent.children.values()
+    )
+
+
+def test_cancellation_after_durable_prompt_publication_completes_the_child(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    adapter, selected = _selected_adapter(
+        git_repo,
+        {"coding": "# Coding agent\n\nComplete repository-specific guidance."},
+    )
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                (ChildSpec("coding", "Coding prompt"),),
+            )
+        ],
+        stream=StringIO(),
+    )
+    reconcile = prompts_manager.get_durable_role_prompt
+
+    def reconcile_after_cancellation(*args, **kwargs):
+        retained = reconcile(*args, **kwargs)
+        cancel.cancel()
+        progress.begin_cancellation()
+        return retained
+
+    monkeypatch.setattr(
+        prompts_manager,
+        "get_durable_role_prompt",
+        reconcile_after_cancellation,
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        runs = generate_role_prompts(
+            repository,
+            analysis,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+            roles=("coding",),
+            cancel=cancel,
+            progress=progress,
+        )
+
+        assert runs[0].ok
+        assert store.get_latest_generated_prompts(repository.id)["coding"] == (
+            runs[0].prompt
+        )
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.COMPLETED
+    assert parent.children["coding"].state is StageState.COMPLETED
+    assert parent.children["coding"].result == "prompt v1"
+
+
+def test_cancellation_before_prompt_publication_stops_without_retaining(
+    git_repo: Path,
+) -> None:
+    repository = Repository(root=git_repo)
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                (ChildSpec("coding", "Coding prompt"),),
+            )
+        ],
+        stream=StringIO(),
+    )
+    adapter = MockAdapter(name="openai")
+
+    def interrupt(_spec):
+        cancel.cancel()
+        progress.begin_cancellation()
+        raise KeyboardInterrupt
+
+    adapter.queue(MockResponse(dynamic=interrupt))
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+                cancel=cancel,
+                progress=progress,
+            )
+
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.STOPPED
+    assert parent.children["coding"].state is StageState.STOPPED
+    assert not (git_repo / ".borg/prompts/coding.system.md").exists()
 
 
 @pytest.mark.parametrize("symlink_path", [Path(".borg"), Path(".borg/prompts")])

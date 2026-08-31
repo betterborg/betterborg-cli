@@ -25,6 +25,7 @@ from betterborg_cli.repo_analysis.prompts_manager import (
     PromptGeneration,
     PromptManagerConfig,
     generate_role_prompts,
+    get_durable_role_prompt,
 )
 from betterborg_cli.repo_analysis.reporting import (
     build_machine_report,
@@ -84,6 +85,7 @@ __all__ = [
     "compute_repo_overall_score",
     "discovery_limits_from_mapping",
     "generate_role_prompts",
+    "get_durable_role_prompt",
     "generate_improvement_prds",
     "rank_recommendation_themes",
     "render_json_report",
