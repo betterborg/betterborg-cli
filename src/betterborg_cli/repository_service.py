@@ -141,6 +141,7 @@ class RepositoryService:
             retained_prompt_roles=retained_prompt_roles,
         )
         _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
 
         improvement_prds = generate_improvement_prds(
             analysis,
@@ -203,6 +204,7 @@ class RepositoryService:
             )
         )
         _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
 
         improvement_prds = generate_improvement_prds(
             analysis,
@@ -351,6 +353,10 @@ class RepositoryService:
                 stage_key=_PROMPTS_STAGE_KEY,
             )
         )
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise KeyboardInterrupt
 
 
 def _default_branch(

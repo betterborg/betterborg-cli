@@ -27,6 +27,7 @@ from betterborg_cli.cli import cli
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_analysis import analyzer as analyzer_module
+from betterborg_cli.repo_analysis import prompts_manager as prompts_manager_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
 from betterborg_cli.repository_service import (
@@ -807,6 +808,56 @@ def test_default_branch_keeps_detached_head_classification(
         match="Git HEAD is detached",
     ):
         _default_branch(committed_git_repo, command_runner=rejected)
+
+
+def test_prompt_cancellation_after_durable_fanout_starts_no_later_init_work(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    adapter, selected = _adapter(committed_git_repo)
+    cancel = CancellationToken()
+    durable_roles: set[str] = set()
+    durable_roles_lock = threading.Lock()
+    reconcile = prompts_manager_module.get_durable_role_prompt
+
+    def reconcile_then_cancel(*args: object, **kwargs: object):
+        retained = reconcile(*args, **kwargs)
+        analysis_id = kwargs.get("analysis_id")
+        role = kwargs.get("role")
+        if retained is not None and analysis_id is not None and isinstance(role, str):
+            with durable_roles_lock:
+                durable_roles.add(role)
+                if durable_roles == set(PROMPT_ROLES):
+                    cancel.cancel()
+        return retained
+
+    monkeypatch.setattr(
+        prompts_manager_module,
+        "get_durable_role_prompt",
+        reconcile_then_cancel,
+    )
+
+    with SqliteStore.open(paths.state_dir / "cancel-prompts.sqlite3") as store:
+        service = RepositoryService(
+            paths,
+            store,
+            lambda _config: selected,
+            cancel=cancel,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            service.initialize()
+
+        repository = store.get_repository(load_repository_config(paths).repository_id)
+        assert repository is not None
+        assert set(store.get_latest_generated_prompts(repository.id)) == set(
+            PROMPT_ROLES
+        )
+        assert store.list_operations(repository.id) == []
+
+    assert len(adapter.calls) == 4
+    assert list(paths.improvement_prds_dir.glob("*.md")) == []
 
 
 def test_incomplete_initialization_seeds_retained_analysis_without_restart(

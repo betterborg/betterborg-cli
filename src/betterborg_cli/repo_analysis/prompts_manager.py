@@ -158,9 +158,7 @@ def generate_role_prompts(
     def generate(role: str) -> PromptGeneration:
         prompt_path = paths.prompts_dir / f"{role}.system.md"
         try:
-            if progress is not None:
-                progress.start_child(stage_key, role)
-            _raise_if_cancelled(cancel)
+            _start_prompt_child(progress, stage_key, role, cancel)
             outcome = _generate_one_role(
                 role=role,
                 repository=repository,
@@ -269,8 +267,7 @@ def generate_role_prompts(
         if any(_is_interruption(error, cancel) for error in errors):
             raise KeyboardInterrupt
         raise errors[0]
-    if cancel is not None and cancel.is_set() and any(not run.ok for run in outcomes):
-        raise KeyboardInterrupt
+    _raise_if_cancelled(cancel)
     by_role = {outcome.role: outcome for outcome in outcomes}
     return [by_role[role] for role in selected_roles]
 
@@ -392,6 +389,24 @@ def _complete_prompt_child(
             outcome.role,
             f"prompt v{outcome.version}",
         )
+
+
+def _start_prompt_child(
+    progress: RunProgress | None,
+    stage_key: str,
+    role: str,
+    cancel: CancellationToken | None,
+) -> None:
+    _raise_if_cancelled(cancel)
+    if progress is None:
+        return
+    if cancel is not None and not cancel.start_if_active(
+        lambda: progress.start_child(stage_key, role)
+    ):
+        raise KeyboardInterrupt
+    if cancel is None:
+        progress.start_child(stage_key, role)
+    _raise_if_cancelled(cancel)
 
 
 def _terminalize_prompt_child(

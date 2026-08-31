@@ -365,6 +365,19 @@ class CancellationToken:
         """Return whether cancellation was requested."""
         return self._event.is_set()
 
+    def start_if_active(self, start: Callable[[], None]) -> bool:
+        """Run one short work-start transition unless cancellation won the race."""
+        if not callable(start):
+            raise TypeError("start must be callable")
+        with self._lock:
+            if (
+                self._state is not CancellationState.ACTIVE
+                or self._force_requested_signal
+            ):
+                return False
+            start()
+            return True
+
     def is_forced(self) -> bool:
         """Return whether forced cancellation was requested."""
         return self._force_event.is_set()

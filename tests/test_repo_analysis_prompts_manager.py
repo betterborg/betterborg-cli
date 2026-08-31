@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
-from threading import Barrier, Lock, Thread
+from threading import Barrier, Event, Thread
 from typing import Any
 
 import pytest
@@ -389,21 +389,20 @@ def test_cancellation_after_durable_prompt_publication_completes_the_child(
         store.add_repository(repository)
         analysis = _append_analysis(store, repository, score=3)
 
-        runs = generate_role_prompts(
-            repository,
-            analysis,
-            store,
-            selected,
-            artifact_dir=git_repo / "artifacts",
-            roles=("coding",),
-            cancel=cancel,
-            progress=progress,
-        )
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+                cancel=cancel,
+                progress=progress,
+            )
 
-        assert runs[0].ok
-        assert store.get_latest_generated_prompts(repository.id)["coding"] == (
-            runs[0].prompt
-        )
+        retained = store.get_latest_generated_prompts(repository.id)["coding"]
+        assert retained.body_md.startswith("# Coding agent")
 
     parent = progress.stages["prompts"]
     assert parent.state is StageState.COMPLETED
@@ -583,7 +582,7 @@ def test_cancellation_after_prompt_file_replace_rolls_back_publication(
     assert list(stable_path.parent.glob(".coding.system.md.*.bak")) == []
 
 
-def test_cancellation_between_prompt_parent_and_child_start_stops_parent(
+def test_token_cancellation_before_prompt_child_start_stops_parent(
     git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -609,20 +608,38 @@ def test_cancellation_between_prompt_parent_and_child_start_stops_parent(
             for role in PROMPT_ROLES
         },
     )
-    original_start_child = progress.start_child
-    cancellation_lock = Lock()
-    cancellation_started = False
+    release_workers = Event()
 
-    def cancel_before_child_start(stage_key: str, child_key: str):
-        nonlocal cancellation_started
-        with cancellation_lock:
-            if not cancellation_started:
-                cancellation_started = True
+    class CancelBeforeWorkerExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.executor = ThreadPoolExecutor(max_workers=max_workers)
+            self.submissions = 0
+
+        def __enter__(self) -> CancelBeforeWorkerExecutor:
+            self.executor.__enter__()
+            return self
+
+        def __exit__(self, *exc_info: object) -> bool | None:
+            release_workers.set()
+            return self.executor.__exit__(*exc_info)
+
+        def submit(self, function: Callable[..., Any], *args: Any):
+            def wait_then_generate():
+                assert release_workers.wait(1)
+                return function(*args)
+
+            future = self.executor.submit(wait_then_generate)
+            self.submissions += 1
+            if self.submissions == len(PROMPT_ROLES):
                 cancel.cancel()
-                progress.begin_cancellation()
-        return original_start_child(stage_key, child_key)
+                release_workers.set()
+            return future
 
-    monkeypatch.setattr(progress, "start_child", cancel_before_child_start)
+    monkeypatch.setattr(
+        prompts_manager,
+        "ThreadPoolExecutor",
+        CancelBeforeWorkerExecutor,
+    )
 
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
