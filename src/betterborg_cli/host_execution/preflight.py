@@ -203,8 +203,8 @@ class HostPreflight:
                             ),
                             evidence=str(error),
                             guidance=(
-                                "Run 'borg trust --yes' for this exact workspace, "
-                                "then retry."
+                                "Run 'betterborg trust --yes' for this "
+                                "exact workspace, then retry."
                             ),
                         ),
                     )

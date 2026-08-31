@@ -205,7 +205,7 @@ def require_workspace_trust(
     if not interactive or confirm is None:
         raise UntrustedWorkspaceError(
             f"workspace is not trusted on this machine: {paths.root}. "
-            "Run 'borg trust --yes' to trust it explicitly."
+            "Run 'betterborg trust --yes' to trust it explicitly."
         )
 
     consequence = (

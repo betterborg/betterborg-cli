@@ -22,10 +22,10 @@ class Target:
 
 
 TARGETS = (
-    Target("borg-darwin-arm64", "darwin", "arm64"),
-    Target("borg-darwin-x86_64", "darwin", "x86_64"),
-    Target("borg-linux-arm64", "linux", "arm64"),
-    Target("borg-linux-x86_64", "linux", "x86_64"),
+    Target("betterborg-darwin-arm64", "darwin", "arm64"),
+    Target("betterborg-darwin-x86_64", "darwin", "x86_64"),
+    Target("betterborg-linux-arm64", "linux", "arm64"),
+    Target("betterborg-linux-x86_64", "linux", "x86_64"),
 )
 
 

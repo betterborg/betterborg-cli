@@ -405,7 +405,7 @@ def validated_current_plan_attempt(
     if attempt is None:
         raise ValueError(
             f"Borg {borg.name!r} does not have a stored plan; "
-            f"run 'borg plan start {borg.name}' first"
+            f"run 'betterborg plan start {borg.name}' first"
         )
     validate_plan(attempt.result, paths.root, check_repository_state=False)
     return attempt
@@ -414,7 +414,7 @@ def validated_current_plan_attempt(
 def _repository(store: SqliteStore, config: RepositoryConfig) -> Repository:
     repository = store.get_repository(config.repository_id)
     if repository is None:
-        raise ValueError("repository is not initialized; run 'borg init' first")
+        raise ValueError("repository is not initialized; run 'betterborg init' first")
     return repository
 
 

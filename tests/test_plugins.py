@@ -26,8 +26,8 @@ from betterborg_cli.plugins import PluginInstaller
 def _ready_preflight() -> PluginActivationPreflight:
     return PluginActivationPreflight(
         status=PluginActivationStatus.READY,
-        executable=Path("/persistent/bin/borg"),
-        version="borg test",
+        executable=Path("/persistent/bin/betterborg"),
+        version="betterborg test",
     )
 
 
@@ -223,7 +223,7 @@ def test_selected_install_preserves_unrelated_and_unselected_state(
     assert result.exit_code == 0, result.output
     assert state == {
         "unrelated": ["team-tools"],
-        "claude": ["borg test"],
+        "claude": ["betterborg test"],
         "codex": [],
     }
 
@@ -238,7 +238,7 @@ def test_bundled_plugins_are_thin_registrations_of_the_same_mcp_server() -> None
         (codex / "plugins/borg/.mcp.json").read_text(encoding="utf-8")
     )["borg"]
 
-    assert claude_mcp == codex_mcp == {"command": "borg", "args": ["mcp"]}
+    assert claude_mcp == codex_mcp == {"command": "betterborg", "args": ["mcp"]}
     for bundle in (claude, codex):
         files = [entry for entry in bundle.rglob("*") if entry.is_file()]
         assert not any(entry.suffix == ".py" for entry in files)

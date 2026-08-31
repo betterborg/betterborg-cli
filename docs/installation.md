@@ -2,24 +2,24 @@
 
 ## Persistent install
 
-Install the published PyPI package to get a persistent `borg` command:
+Install the published PyPI package to get a persistent `betterborg` command:
 
 ```console
 pip install betterborg
-borg version
+betterborg version
 ```
 
-The distribution is named `betterborg`; it installs the `borg` console command.
+The distribution is named `betterborg`; it installs the `betterborg` console command.
 Requires Python 3.11 or newer. Any tool that installs a Python console script
 works: `pipx install betterborg` and `uv tool install betterborg` both produce
 the same persistent command.
 
 A persistent install is required for host plugin activation. Activate the
-Claude Code and Codex integrations once `borg version` works from the same
+Claude Code and Codex integrations once `betterborg version` works from the same
 launch environment your host uses:
 
 ```console
-borg plugins install --all
+betterborg plugins install --all
 ```
 
 ## Standalone binary
@@ -42,7 +42,7 @@ curl -fsSL \
 
 The installer selects ARM64 or x86_64 from the release manifest, verifies the
 binary's SHA-256 digest and exact version before atomically replacing
-`~/.local/bin/borg`, and only then runs `borg plugins install --all`. It prints
+`~/.local/bin/betterborg`, and only then runs `betterborg plugins install --all`. It prints
 PATH guidance when `~/.local/bin` is not already visible.
 
 ## Ephemeral wrappers
@@ -51,12 +51,12 @@ Use either public package wrapper without a persistent install:
 
 ```console
 npx --yes @betterborg/cli version
-uvx --from betterborg borg version
+uvx --from betterborg betterborg version
 ```
 
 The npm package is a launcher, not a second CLI implementation. It resolves an
-exact compatible `borg`, or uses exact-version `uvx`. Plugin activation
-deliberately refuses to run from these wrappers: it resolves `borg` on the host
+exact compatible `betterborg`, or uses exact-version `uvx`. Plugin activation
+deliberately refuses to run from these wrappers: it resolves `betterborg` on the host
 launch PATH and rejects transient extraction directories, so a plugin can never
 point at a path that disappears.
 
@@ -66,11 +66,11 @@ Pin the synchronized version whenever reproducibility matters:
 
 ```console
 pip install betterborg==VERSION
-uvx --from betterborg==VERSION borg version
+uvx --from betterborg==VERSION betterborg version
 npx --yes @betterborg/cli@VERSION version
 ```
 
-`borg version` must print exactly `borg VERSION`.
+`betterborg version` must print exactly `borg VERSION`.
 
 ## Platforms
 
@@ -84,15 +84,15 @@ Run commands from a Git worktree. Trust is machine-local and bound to the
 resolved worktree and Git common directory:
 
 ```console
-borg trust
+betterborg trust
 ```
 
-Use `borg trust --yes` only for a deliberate noninteractive decision. A fresh
+Use `betterborg trust --yes` only for a deliberate noninteractive decision. A fresh
 initialization needs one agent transport. Every command prefers the `claude`
 or `codex` CLI whenever one is on `PATH`:
 
 ```console
-borg init --yes
+betterborg init --yes
 ```
 
 Selection tests only for the executable, so a CLI on `PATH` must already be
@@ -102,7 +102,7 @@ supply a key instead:
 
 ```console
 export OPENAI_API_KEY='your-provider-key'
-borg init --yes
+betterborg init --yes
 ```
 
 `ANTHROPIC_API_KEY` is the supported alternative. Never write a provider key
@@ -119,11 +119,11 @@ outside this API file-tool boundary.
 
 ## Recovery
 
-If `borg` is installed but not found, confirm that the console-script directory
+If `betterborg` is installed but not found, confirm that the console-script directory
 your installer used is on `PATH`, then restart open terminals and plugin hosts.
 
 A plugin activation failure leaves the CLI installed and working. Fix the host
-setup, then rerun `borg plugins install --all`. Run `/reload-plugins` in open
+setup, then rerun `betterborg plugins install --all`. Run `/reload-plugins` in open
 Claude Code sessions after installation or an upgrade, and start a new Codex
 session when the installer requests it.
 

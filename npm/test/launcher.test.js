@@ -41,7 +41,7 @@ function assertExecutableMode(pathname) {
 
 test("package metadata exposes the public scoped borg command", () => {
   assert.equal(metadata.name, "@betterborg/cli");
-  assert.equal(metadata.bin.borg, "bin/borg.js");
+  assert.equal(metadata.bin.betterborg, "bin/betterborg.js");
   assert.equal(metadata.publishConfig.access, "public");
   assert.deepEqual(metadata.repository, {
     type: "git",
@@ -86,10 +86,10 @@ test("packed package includes the readme, license, and attribution notice", () =
 });
 
 test("target mapping accepts only released platforms and architectures", () => {
-  assert.equal(targetFor("darwin", "arm64"), "borg-darwin-arm64");
-  assert.equal(targetFor("darwin", "x64"), "borg-darwin-x86_64");
-  assert.equal(targetFor("linux", "arm64"), "borg-linux-arm64");
-  assert.equal(targetFor("linux", "x64"), "borg-linux-x86_64");
+  assert.equal(targetFor("darwin", "arm64"), "betterborg-darwin-arm64");
+  assert.equal(targetFor("darwin", "x64"), "betterborg-darwin-x86_64");
+  assert.equal(targetFor("linux", "arm64"), "betterborg-linux-arm64");
+  assert.equal(targetFor("linux", "x64"), "betterborg-linux-x86_64");
   assert.equal(targetFor("win32", "x64"), null);
   assert.equal(targetFor("linux", "ia32"), null);
 });
@@ -111,7 +111,7 @@ test("only a lone exact version flag is translated", () => {
 
 test("a cached binary must match its exact checksum sidecar", (t) => {
   const directory = temporaryDirectory(t);
-  const target = "borg-linux-x86_64";
+  const target = "betterborg-linux-x86_64";
   const binary = path.join(directory, target);
   const checksum = `${binary}.sha256`;
   fs.writeFileSync(binary, "trusted bytes");
@@ -131,7 +131,7 @@ test("a cached binary must match its exact checksum sidecar", (t) => {
 
 test("resolution prefers a compatible installed CLI", async (t) => {
   const directory = temporaryDirectory(t);
-  const borg = executable(directory, "borg");
+  const borg = executable(directory, "betterborg");
   let downloads = 0;
   const resolved = await resolveCli("1.2.3", {
     architecture: "x64",
@@ -143,7 +143,7 @@ test("resolution prefers a compatible installed CLI", async (t) => {
     spawnSync: (command, arguments_) => {
       assert.equal(command, borg);
       assert.deepEqual(arguments_, ["version"]);
-      return { status: 0, stdout: "borg 1.2.3\n" };
+      return { status: 0, stdout: "betterborg 1.2.3\n" };
     },
   });
 
@@ -157,14 +157,14 @@ test("resolution prefers a compatible installed CLI", async (t) => {
 
 test("Windows resolution skips its own npm shims and falls back to uvx", async () => {
   for (const [launcherPath, shimDirectory] of [
-    ["C:\\npm\\node_modules\\@betterborg\\cli\\bin\\borg.js", "C:\\npm"],
+    ["C:\\npm\\node_modules\\@betterborg\\cli\\bin\\betterborg.js", "C:\\npm"],
     [
-      "C:\\project\\node_modules\\@betterborg\\cli\\bin\\borg.js",
+      "C:\\project\\node_modules\\@betterborg\\cli\\bin\\betterborg.js",
       "C:\\project\\node_modules\\.bin",
     ],
   ]) {
     const available = new Set([
-      `${shimDirectory}\\borg.cmd`.toLowerCase(),
+      `${shimDirectory}\\betterborg.cmd`.toLowerCase(),
       "c:\\tools\\uvx.cmd",
     ]);
     const fileSystem = {
@@ -189,14 +189,14 @@ test("Windows resolution skips its own npm shims and falls back to uvx", async (
 
     assert.deepEqual(resolved, {
       command: "C:\\tools\\uvx.CMD",
-      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "betterborg"],
       source: "uvx",
     });
   }
 });
 
 test("Windows probes an installed cmd shim through an explicit command shell", async () => {
-  const borg = "C:\\tools\\borg.CMD";
+  const borg = "C:\\tools\\betterborg.CMD";
   const fileSystem = {
     constants: { X_OK: 1 },
     accessSync(candidate) {
@@ -211,19 +211,19 @@ test("Windows probes an installed cmd shim through an explicit command shell", a
     architecture: "x64",
     environment: { PATH: "C:\\tools", PATHEXT: ".CMD" },
     fileSystem,
-    launcherPath: "C:\\npm\\node_modules\\@betterborg\\cli\\bin\\borg.js",
+    launcherPath: "C:\\npm\\node_modules\\@betterborg\\cli\\bin\\betterborg.js",
     pathDelimiter: ";",
     pathModule: path.win32,
     platform: "win32",
     spawnSync: (command, arguments_, options) => {
       invocation = { command, arguments_, options };
-      return { status: 0, stdout: "borg 1.2.3\n" };
+      return { status: 0, stdout: "betterborg 1.2.3\n" };
     },
   });
 
   assert.deepEqual(invocation, {
     command: "cmd.exe",
-    arguments_: ["/d", "/s", "/v:off", "/c", '"C:\\tools\\borg.CMD ^"version^""'],
+    arguments_: ["/d", "/s", "/v:off", "/c", '"C:\\tools\\betterborg.CMD ^"version^""'],
     options: {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
@@ -239,7 +239,7 @@ test("Windows probes an installed cmd shim through an explicit command shell", a
 });
 
 test("POSIX resolution skips its own regular npm shim and falls back to uvx", async () => {
-  const shim = "/project/node_modules/.bin/borg";
+  const shim = "/project/node_modules/.bin/betterborg";
   const uvx = "/tools/uvx";
   const available = new Set([shim, uvx]);
   const fileSystem = {
@@ -256,7 +256,7 @@ test("POSIX resolution skips its own regular npm shim and falls back to uvx", as
     environment: { PATH: "/project/node_modules/.bin:/tools" },
     fileSystem,
     launcherPath:
-      "/project/node_modules/.pnpm/@betterborg+cli@1.2.3/node_modules/@betterborg/cli/bin/borg.js",
+      "/project/node_modules/.pnpm/@betterborg+cli@1.2.3/node_modules/@betterborg/cli/bin/betterborg.js",
     pathDelimiter: ":",
     pathModule: path.posix,
     platform: "linux",
@@ -265,7 +265,7 @@ test("POSIX resolution skips its own regular npm shim and falls back to uvx", as
 
   assert.deepEqual(resolved, {
     command: uvx,
-    argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+    argumentsPrefix: ["--from", "betterborg==1.2.3", "betterborg"],
     source: "uvx",
   });
 });
@@ -284,7 +284,7 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
       fs.writeFileSync(
         destination,
         url.endsWith(".sha256")
-          ? `${expected}  borg-darwin-arm64\n`
+          ? `${expected}  betterborg-darwin-arm64\n`
           : content,
       );
     },
@@ -293,16 +293,16 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
     randomBytes: () => Buffer.from("12345678"),
   });
 
-  assert.equal(resolved.command, path.join(cache, "borg-darwin-arm64"));
+  assert.equal(resolved.command, path.join(cache, "betterborg-darwin-arm64"));
   assert.equal(resolved.source, "release");
   assert.equal(verifiedBinary(
     resolved.command,
     `${resolved.command}.sha256`,
-    "borg-darwin-arm64",
+    "betterborg-darwin-arm64",
   ), true);
   assert.deepEqual(downloads.map((url) => url.split("/").at(-1)), [
-    "borg-darwin-arm64",
-    "borg-darwin-arm64.sha256",
+    "betterborg-darwin-arm64",
+    "betterborg-darwin-arm64.sha256",
   ]);
   assertExecutableMode(resolved.command);
 
@@ -338,7 +338,7 @@ test(
 
     assert.deepEqual(resolved, {
       command: uvx,
-      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "betterborg"],
       source: "uvx",
     });
   },
@@ -374,7 +374,7 @@ test("entrypoint failures print only an actionable message", () => {
     process: processLike,
   });
 
-  assert.deepEqual(messages, ["borg: install uv and retry"]);
+  assert.deepEqual(messages, ["betterborg: install uv and retry"]);
   assert.equal(processLike.exitCode, 1);
 });
 
@@ -393,7 +393,7 @@ test("launch forwards ordinary arguments, exit status, and signals", async () =>
   processLike.kill = (pid, signal) => parentSignals.push([pid, signal]);
   let invocation;
   const completed = launch(
-    { command: "/cache/borg", argumentsPrefix: [] },
+    { command: "/cache/betterborg", argumentsPrefix: [] },
     ["plan", "--version=literal", "two words"],
     {
       process: processLike,
@@ -411,7 +411,7 @@ test("launch forwards ordinary arguments, exit status, and signals", async () =>
   await completed;
 
   assert.deepEqual(invocation, {
-    command: "/cache/borg",
+    command: "/cache/betterborg",
     arguments_: ["plan", "--version=literal", "two words"],
     options: { stdio: "inherit" },
   });
@@ -428,7 +428,7 @@ test("launch forwards a numeric child exit status", async () => {
   const completed = launch(
     {
       command: "uvx",
-      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "betterborg"],
     },
     ["tasks"],
     { process: processLike, spawn: () => child },
@@ -447,7 +447,7 @@ test("launch escapes arguments passed through a Windows command shell", async ()
   const completed = launch(
     {
       command: "C:\\tools\\uvx.CMD",
-      argumentsPrefix: ["--from", "betterborg==1.2.3", "borg"],
+      argumentsPrefix: ["--from", "betterborg==1.2.3", "betterborg"],
     },
     ["two words", "literal&pipe|redirect<>", "100%", "bang!", "(group)"],
     {
@@ -470,7 +470,7 @@ test("launch escapes arguments passed through a Windows command shell", async ()
       "/s",
       "/v:off",
       "/c",
-      '"C:\\tools\\uvx.CMD ^"--from^" ^"betterborg==1.2.3^" ^"borg^" ^"two^ words^" ^"literal^&pipe^|redirect^<^>^" ^"100^%^" ^"bang^!^" ^"^(group^)^""',
+      '"C:\\tools\\uvx.CMD ^"--from^" ^"betterborg==1.2.3^" ^"betterborg^" ^"two^ words^" ^"literal^&pipe^|redirect^<^>^" ^"100^%^" ^"bang^!^" ^"^(group^)^""',
     ],
     options: { stdio: "inherit", windowsVerbatimArguments: true },
   });
@@ -503,7 +503,7 @@ test("Windows cmd launch preserves literal arguments without injection", async (
   const recorder = path.join(directory, "record-arguments.js");
   const output = path.join(directory, "arguments.json");
   const sentinel = path.join(directory, "injected.txt");
-  const shim = path.join(directory, "borg.cmd");
+  const shim = path.join(directory, "betterborg.cmd");
   fs.writeFileSync(
     recorder,
     `require("node:fs").writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)));\n`,

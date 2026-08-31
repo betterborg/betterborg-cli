@@ -431,8 +431,8 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
         raise ValueError("plugin manifest must register bundled skills")
     if manifest.get("mcpServers") != "./.mcp.json":
         raise ValueError("plugin manifest must register the MCP companion file")
-    if mcp != {"borg": {"command": "borg", "args": ["mcp"]}}:
-        raise ValueError("MCP registration must execute `borg mcp`")
+    if mcp != {"borg": {"command": "betterborg", "args": ["mcp"]}}:
+        raise ValueError("MCP registration must execute `betterborg mcp`")
     return bundle_digest(source), version
 
 

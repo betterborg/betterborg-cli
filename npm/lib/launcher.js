@@ -18,7 +18,7 @@ function targetFor(platform, architecture) {
   if (!operatingSystem || !targetArchitecture) {
     return null;
   }
-  return `borg-${operatingSystem}-${targetArchitecture}`;
+  return `betterborg-${operatingSystem}-${targetArchitecture}`;
 }
 
 function translateVersionArguments(arguments_) {
@@ -110,8 +110,8 @@ function launcherExecutables(dependencies) {
       }
       const names =
         dependencies.platform === "win32"
-          ? ["borg", "borg.cmd", "borg.ps1"]
-          : ["borg"];
+          ? ["betterborg", "betterborg.cmd", "betterborg.ps1"]
+          : ["betterborg"];
       for (const shimDirectory of shimDirectories) {
         for (const name of names) {
           executables.push(dependencies.pathModule.resolve(shimDirectory, name));
@@ -158,7 +158,7 @@ function executableOnPath(name, dependencies, excludedPaths = []) {
 
 function installedCli(version, dependencies) {
   const candidate = executableOnPath(
-    "borg",
+    "betterborg",
     dependencies,
     launcherExecutables(dependencies),
   );
@@ -182,7 +182,7 @@ function installedCli(version, dependencies) {
   );
   if (
     completed.status === 0 &&
-    completed.stdout.trim() === `borg ${version}`
+    completed.stdout.trim() === `betterborg ${version}`
   ) {
     return candidate;
   }
@@ -317,7 +317,7 @@ async function resolveCli(version, overrides = {}) {
   if (uvx) {
     return {
       command: uvx,
-      argumentsPrefix: ["--from", `betterborg==${version}`, "borg"],
+      argumentsPrefix: ["--from", `betterborg==${version}`, "betterborg"],
       source: "uvx",
     };
   }
@@ -326,7 +326,7 @@ async function resolveCli(version, overrides = {}) {
     ? `could not install the ${target} release${releaseFailure ? ` (${releaseFailure})` : ""}`
     : `no standalone release supports ${dependencies.platform}/${dependencies.architecture}`;
   throw new Error(
-    `${targetDescription}, and uvx is not on PATH. Install uv from https://docs.astral.sh/uv/ or install betterborg==${version} so borg is on PATH.`,
+    `${targetDescription}, and uvx is not on PATH. Install uv from https://docs.astral.sh/uv/ or install betterborg==${version} so betterborg is on PATH.`,
   );
 }
 
@@ -405,7 +405,7 @@ function reportFailure(error, dependencies = {}) {
   const logger = dependencies.console || console;
   const processLike = dependencies.process || process;
   const message = error instanceof Error ? error.message : String(error);
-  logger.error(`borg: ${message}`);
+  logger.error(`betterborg: ${message}`);
   processLike.exitCode = 1;
 }
 

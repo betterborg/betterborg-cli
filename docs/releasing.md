@@ -87,8 +87,8 @@ different commit under the reviewed tag's version.
    digests match. It compares their SHA-256 digests again after any upload.
 4. The PyPI verification gate must succeed before any standalone build starts.
    The reusable build workflow then produces and version-smokes
-   `borg-darwin-arm64`, `borg-darwin-x86_64`, `borg-linux-arm64`, and
-   `borg-linux-x86_64`, writes one `.sha256` sidecar per binary, and generates
+   `betterborg-darwin-arm64`, `betterborg-darwin-x86_64`, `betterborg-linux-arm64`, and
+   `betterborg-linux-x86_64`, writes one `.sha256` sidecar per binary, and generates
    `release-manifest.json`, and packages `install.sh` beside them. Each
    protected binary/checksum pair, the manifest, and the installer receives a
    GitHub artifact attestation.
@@ -165,15 +165,15 @@ curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
   https://github.com/betterborg/betterborg-cli/releases/download/vVERSION/install.sh \
   --output install.sh
 BETTERBORG_VERSION=VERSION sh ./install.sh
-~/.local/bin/borg version
-uvx --refresh --from betterborg==VERSION borg version
+~/.local/bin/betterborg version
+uvx --refresh --from betterborg==VERSION betterborg version
 npx --yes @betterborg/cli@VERSION version
 ```
 
 Each path also runs `init --yes --json` with only `OPENAI_API_KEY`, never
 `ANTHROPIC_API_KEY`, and scans captured output plus disposable HOME, cache,
 data, state, paths, symlinks, and files for raw and encoded credential forms.
-The version output from curl, uvx, and npx must be exactly `borg VERSION`.
+The version output from curl, uvx, and npx must be exactly `betterborg VERSION`.
 
 Exit status `0` means every public digest and smoke matches. Exit status `2`
 means publication is safely partial and lists only the next digest-gated step;
@@ -359,7 +359,7 @@ gh attestation verify borg-OPERATING_SYSTEM-ARCHITECTURE \
 ```
 
 On Darwin, use `shasum -a 256 -c` in place of `sha256sum --check`. The version
-output must be exactly `borg VERSION`.
+output must be exactly `betterborg VERSION`.
 
 There is no destructive rollback for PyPI or GitHub Release bytes. For a
 release defect, stop promoting the affected version, direct existing binary

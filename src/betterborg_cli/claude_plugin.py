@@ -432,8 +432,8 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     version = manifest.get("version")
     if not isinstance(version, str) or not version.strip():
         raise ValueError("plugin version must be a non-empty string")
-    if mcp != {"mcpServers": {"borg": {"command": "borg", "args": ["mcp"]}}}:
-        raise ValueError("MCP registration must execute `borg mcp`")
+    if mcp != {"mcpServers": {"borg": {"command": "betterborg", "args": ["mcp"]}}}:
+        raise ValueError("MCP registration must execute `betterborg mcp`")
     return bundle_digest(source), version
 
 

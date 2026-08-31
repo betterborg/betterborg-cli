@@ -168,7 +168,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert len(adapter.calls) == 4
     assert selections == 1
     assert (
-        "borg create theme-ci --prd "
+        "betterborg create theme-ci --prd "
         ".borg/prds/improvements/theme-ci.md\n"
     ) in first.output
     prompts_complete = "completed Generate role prompts — 3 prompts"
@@ -335,7 +335,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     assert result.exit_code == 0, result.output
     expected = {
         "create_commands": [
-            "borg create theme-ci --prd "
+            "betterborg create theme-ci --prd "
             ".borg/prds/improvements/theme-ci.md"
         ],
         "initialized": True,
@@ -644,7 +644,7 @@ def test_analyze_rejects_an_uninitialized_repository(
     result = cli_runner.invoke(cli, ["analyze", "--yes"])
 
     assert result.exit_code == 1
-    assert "repository is not initialized; run 'borg init' first" in result.output
+    assert "repository is not initialized; run 'betterborg init' first" in result.output
     assert not paths.tracked_dir.joinpath("config.toml").exists()
 
 
@@ -780,7 +780,7 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     sender = threading.Thread(target=interrupt_after_probe_starts)
     sender.start()
     try:
-        exit_code = cli_module.main(["init", "--yes"], prog_name="borg")
+        exit_code = cli_module.main(["init", "--yes"], prog_name="betterborg")
     finally:
         sender.join(timeout=2)
 
@@ -911,7 +911,7 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
         publish_then_cancel,
     )
 
-    exit_code = cli_module.main(["init", "--yes"], prog_name="borg")
+    exit_code = cli_module.main(["init", "--yes"], prog_name="betterborg")
 
     assert exit_code == 130
     assert published == [paths.improvement_prds_dir / "theme-ci.md"]

@@ -42,7 +42,7 @@ def command_shapes(version: str) -> dict[str, tuple[str, ...]]:
             "--refresh",
             "--from",
             f"betterborg=={version}",
-            "borg",
+            "betterborg",
         ),
         "npx": ("npx", "--yes", f"@betterborg/cli@{version}"),
     }
@@ -95,7 +95,7 @@ def _commands_for_installation(
         protected_smoke.fail_with_output(
             "checksum-verifying curl installation failed", captures[-1], credential
         )
-    return [str(fixture / "home/.local/bin/borg")], environment
+    return [str(fixture / "home/.local/bin/betterborg")], environment
 
 
 def verify_installations(

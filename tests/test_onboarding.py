@@ -314,14 +314,14 @@ def test_machine_handoff_commands_are_exact_and_mutation_free(
 
     assert commands == (
         (
-            "borg",
+            "betterborg",
             "create",
             "sentinel",
             "--prd",
             ".borg/prds/improvements/checks.md",
         ),
         (
-            "borg",
+            "betterborg",
             "create",
             "scribe",
             "--prd",

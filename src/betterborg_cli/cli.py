@@ -213,7 +213,7 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
 @cli.command()
 def version() -> None:
     """Print the installed Betterborg CLI version."""
-    click.echo(f"borg {__version__}")
+    click.echo(f"betterborg {__version__}")
 
 
 @cli.command(name="mcp")
@@ -526,14 +526,16 @@ def create_borg(
     except ValueError as error:
         raise click.ClickException(str(error)) from error
     if not _stdin_is_interactive():
-        raise click.ClickException("borg create requires an interactive terminal")
+        raise click.ClickException("betterborg create requires an interactive terminal")
     progress = _repository_progress(False)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
-                raise ValueError("repository is not initialized; run 'borg init' first")
+                raise ValueError(
+                    "repository is not initialized; run 'betterborg init' first"
+                )
             io = _interactive_io()
             result = CreateService(
                 repository,
@@ -559,7 +561,7 @@ def create_borg(
     with _suspend_progress(progress):
         if result.confirmed:
             click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
-            click.echo(f"borg plan start {result.borg.name}")
+            click.echo(f"betterborg plan start {result.borg.name}")
         elif result.questions:
             click.echo("Borg PRD needs more input before it can be created.")
         else:
@@ -606,11 +608,14 @@ def show_plan(name: str, json_output: bool) -> None:
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
-                raise ValueError("repository is not initialized; run 'borg init' first")
+                raise ValueError(
+                    "repository is not initialized; run 'betterborg init' first"
+                )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(
-                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                    f"Borg {name!r} does not exist; "
+                    f"run 'betterborg create {name}' first"
                 )
             attempt = validated_current_plan_attempt(paths, store, borg)
             stored_plan = attempt.result
@@ -1305,7 +1310,9 @@ def _invoke_host_execution(
     """Assemble and invoke the sole concrete phase-07 host service."""
     analysis = store.get_prior_ready_analysis(repository_id)
     if analysis is None:
-        raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
+        raise RuntimeError(
+            "repository has no completed analysis; run 'betterborg analyze'"
+        )
     analyzer_plan = analysis.analysis_json
     try:
         preflight = HostPreflight(
@@ -1560,11 +1567,13 @@ def _current_task_publication(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
+            raise ValueError(
+                "repository is not initialized; run 'betterborg init' first"
+            )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
-                f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                f"Borg {name!r} does not exist; run 'betterborg create {name}' first"
             )
         publication = TaskPublisher(repository, store).inspect_current_task_files(
             borg.id
@@ -1580,11 +1589,13 @@ def _current_task_runtime(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
+            raise ValueError(
+                "repository is not initialized; run 'betterborg init' first"
+            )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
-                f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                f"Borg {name!r} does not exist; run 'betterborg create {name}' first"
             )
         runtime_rows = store.list_task_runtime(borg.id)
         generation_ids = {row.generation_id for row in runtime_rows}
@@ -1734,7 +1745,7 @@ def approve_plan(
         detail = f" ({message})" if message else ""
         raise click.ClickException(
             f"Decomposition for Borg {name!r} was interrupted{detail}. "
-            f"Run 'borg plan approve {name}' to resume."
+            f"Run 'betterborg plan approve {name}' to resume."
         ) from error
     except (OSError, RuntimeError, ValueError) as error:
         if resumable:
@@ -1742,7 +1753,7 @@ def approve_plan(
             detail = f" ({message})" if message else ""
             raise click.ClickException(
                 f"Decomposition for Borg {name!r} could not continue{detail}. "
-                f"Run 'borg plan approve {name}' to resume."
+                f"Run 'betterborg plan approve {name}' to resume."
             ) from error
         raise click.ClickException(str(error)) from error
 
@@ -1805,11 +1816,14 @@ def _continue_planning(
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
-                raise ValueError("repository is not initialized; run 'borg init' first")
+                raise ValueError(
+                    "repository is not initialized; run 'betterborg init' first"
+                )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(
-                    f"Borg {name!r} does not exist; run 'borg create {name}' first"
+                    f"Borg {name!r} does not exist; "
+                    f"run 'betterborg create {name}' first"
                 )
 
             if change_note is not None:
@@ -1879,7 +1893,7 @@ def _continue_planning(
         action = "Plan change" if change_requested else "Planning"
         raise click.ClickException(
             f"{action} for Borg {name!r} was interrupted{detail}. "
-            f"Run 'borg plan start {name}' to resume."
+            f"Run 'betterborg plan start {name}' to resume."
         ) from error
     except (OSError, RuntimeError, ValueError) as error:
         if resumable:
@@ -1888,7 +1902,7 @@ def _continue_planning(
             action = "Plan change" if change_requested else "Planning"
             raise click.ClickException(
                 f"{action} for Borg {name!r} could not continue{detail}. "
-                f"Run 'borg plan start {name}' to resume."
+                f"Run 'betterborg plan start {name}' to resume."
             ) from error
         raise click.ClickException(str(error)) from error
     return borg
@@ -1906,15 +1920,18 @@ def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
     if borg.state is BorgState.PLAN_APPROVAL_PENDING:
         suffix = " after applying the change" if changed else ""
         click.echo(f"Plan approval pending for Borg {name!r}{suffix}.")
-        click.echo(f"Review it with: borg plan show {name}")
+        click.echo(f"Review it with: betterborg plan show {name}")
     elif borg.state is BorgState.BLOCKED:
         suffix = " while applying the change" if changed else ""
         click.echo(f"Planning blocked for Borg {name!r}{suffix}.")
-        click.echo(f"Review the saved Tech Lead findings with: borg plan show {name}")
+        click.echo(
+            f"Review the saved Tech Lead findings with: "
+            f"betterborg plan show {name}"
+        )
     else:
         raise click.ClickException(
             f"Planning stopped in unexpected state {borg.state.value!r}. "
-            f"Run 'borg plan start {name}' to resume."
+            f"Run 'betterborg plan start {name}' to resume."
         )
 
 

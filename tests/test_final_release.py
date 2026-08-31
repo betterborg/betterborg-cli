@@ -179,7 +179,7 @@ def test_partial_fixture_stops_at_the_first_ordered_publication_gate(
         (fixture / "github" / "release.json").write_text("null\n", encoding="utf-8")
         (fixture / "npm.json").write_text("null\n", encoding="utf-8")
     elif partial == "github":
-        missing = "borg-linux-x86_64"
+        missing = "betterborg-linux-x86_64"
         (fixture / "github" / "assets" / missing).unlink()
         metadata_path = fixture / "github" / "release.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -247,7 +247,7 @@ def test_public_digest_mismatch_is_terminal_for_every_surface(
         payload["urls"][0]["digests"]["sha256"] = "0" * 64
         (fixture / "pypi.json").write_text(json.dumps(payload), encoding="utf-8")
     elif surface == "github":
-        (fixture / "github" / "assets" / "borg-linux-arm64").write_bytes(
+        (fixture / "github" / "assets" / "betterborg-linux-arm64").write_bytes(
             b"different public bytes"
         )
     else:
@@ -428,9 +428,9 @@ def test_public_install_and_command_docs_match_release_artifacts() -> None:
         "releases/latest/download/install.sh",
         "uvx --from betterborg",
         "npx --yes @betterborg/cli",
-        "borg version",
-        "borg trust",
-        "borg init",
+        "betterborg version",
+        "betterborg trust",
+        "betterborg init",
         "Darwin",
         "Linux",
         "ARM64",

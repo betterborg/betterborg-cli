@@ -5,7 +5,7 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
 > [!NOTE]
 > Pre-alpha. Interfaces may change between releases.
 
-This package is a launcher, not the CLI itself. It resolves a `borg` matching its own version, then forwards your arguments, stdio, and signals to it. Nothing is downloaded at install time.
+This package is a launcher, not the CLI itself. It resolves a `betterborg` matching its own version, then forwards your arguments, stdio, and signals to it. Nothing is downloaded at install time.
 
 ## Try it
 
@@ -22,7 +22,7 @@ npm install --global @betterborg/cli
 Then activate the agent-host integrations, which need a persistent install rather than `npx`:
 
 ```bash
-borg plugins install --all
+betterborg plugins install --all
 ```
 
 Run `/reload-plugins` in any open Claude Code session, and start a new Codex session when prompted.
@@ -30,22 +30,22 @@ Run `/reload-plugins` in any open Claude Code session, and start a new Codex ses
 From inside a Git repository, run the loop:
 
 ```bash
-borg trust                     # trust this worktree (machine-local)
-borg init                      # register and analyze the repository
-borg create my-feature         # or: borg create my-feature --prd spec.md
-borg plan start my-feature     # agents plan, review, and iterate
-borg plan approve my-feature   # your gate: nothing is decomposed before this
-borg task estimate my-feature  # P50/P80 work and cost
-borg execute my-feature        # approve the estimate, then run
+betterborg trust                     # trust this worktree (machine-local)
+betterborg init                      # register and analyze the repository
+betterborg create my-feature         # or: betterborg create my-feature --prd spec.md
+betterborg plan start my-feature     # agents plan, review, and iterate
+betterborg plan approve my-feature   # your gate: nothing is decomposed before this
+betterborg task estimate my-feature  # P50/P80 work and cost
+betterborg execute my-feature        # approve the estimate, then run
 ```
 
-`borg execute` hands off reviewed local branches. Add `--push` or `--pr` to publish them. `borg --help` is the full command index.
+`betterborg execute` hands off reviewed local branches. Add `--push` or `--pr` to publish them. `betterborg --help` is the full command index.
 
 ## How the launcher finds the CLI
 
 On each run, in order:
 
-1. **An installed `borg` on `PATH`**, if `borg version` reports this package's exact version. A `pip install betterborg` or the standalone installer takes over from here, and the launcher adds nothing.
+1. **An installed `betterborg` on `PATH`**, if `betterborg version` reports this package's exact version. A `pip install betterborg` or the standalone installer takes over from here, and the launcher adds nothing.
 2. **The standalone release binary** for macOS and Linux on arm64 or x86_64. It is fetched from the matching GitHub release, verified against the published SHA-256 digest, and cached under `$XDG_CACHE_HOME/betterborg/cli/<version>`, or `~/.cache/betterborg/cli/<version>`, so later runs reuse it. A binary that fails verification is discarded, never executed.
 3. **`uvx --from betterborg==<version> borg`**, if [uv](https://docs.astral.sh/uv/) is on `PATH`.
 

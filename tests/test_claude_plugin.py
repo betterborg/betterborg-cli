@@ -120,12 +120,12 @@ class _FakeClaude:
 
 def _host(tmp_path: Path, fake: _FakeClaude):
     bin_dir = tmp_path / "host-bin"
-    borg = executable(bin_dir / "borg", f"printf 'borg {__version__}\\n'")
+    borg = executable(bin_dir / "betterborg", f"printf 'betterborg {__version__}\\n'")
     claude = executable(bin_dir / "claude", "exit 0")
 
     def lookup(name: str, *, path: str):
         assert path == str(bin_dir)
-        return str({"borg": borg, "claude": claude}[name])
+        return str({"betterborg": borg, "claude": claude}[name])
 
     environment = {"PATH": str(bin_dir), "HOME": str(tmp_path / "home")}
     spawns: list[Path] = []
@@ -165,7 +165,7 @@ def test_fresh_activation_materializes_registers_enables_and_spawns_mcp(
     assert json.loads(marketplace.read_text())["name"] == "betterborg"
     mcp_config = result.bundle_path / "plugins/borg/.mcp.json"
     assert json.loads(mcp_config.read_text()) == {
-        "mcpServers": {"borg": {"command": "borg", "args": ["mcp"]}}
+        "mcpServers": {"borg": {"command": "betterborg", "args": ["mcp"]}}
     }
     assert fake.installed is True
     assert fake.enabled is True
@@ -261,11 +261,11 @@ def test_mixed_scope_installations_reconcile_user_enabled_state(
 
 
 def test_verify_borg_mcp_spawns_installed_cli() -> None:
-    executable = Path(sys.executable).with_name("borg").resolve(strict=True)
+    executable = Path(sys.executable).with_name("betterborg").resolve(strict=True)
     preflight = PluginActivationPreflight(
         status=PluginActivationStatus.READY,
         executable=executable,
-        version="borg test",
+        version="betterborg test",
     )
 
     verify_borg_mcp(preflight, os.environ)

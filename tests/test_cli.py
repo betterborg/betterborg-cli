@@ -103,7 +103,7 @@ def test_main_enables_multiprocessing_before_click_dispatch(
     )
     monkeypatch.setattr(cli_module, "cli", command)
 
-    assert cli_module.main([], prog_name="borg") == 0
+    assert cli_module.main([], prog_name="betterborg") == 0
     assert events == ["freeze-support", "click"]
 
 
@@ -168,7 +168,7 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
 
     monkeypatch.setattr(cli_module, "cli", command)
 
-    exit_code = cli_module.main([], prog_name="borg")
+    exit_code = cli_module.main([], prog_name="betterborg")
 
     assert exit_code == 130
     assert isinstance(observed["run"], cli_module.CliRunContext)
@@ -225,7 +225,7 @@ def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
 
     monkeypatch.setattr(cli_module, "cli", command)
 
-    exit_code = cli_module.main([], prog_name="borg")
+    exit_code = cli_module.main([], prog_name="betterborg")
 
     assert exit_code == 130
     assert observed["cancelled"] is True
@@ -280,7 +280,7 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     monkeypatch.setattr(cli_module, "cli", command)
     observer.start()
     try:
-        exit_code = cli_module.main([], prog_name="borg")
+        exit_code = cli_module.main([], prog_name="betterborg")
     finally:
         release_cancellation.set()
         observer.join(timeout=1)
@@ -356,7 +356,7 @@ def test_json_init_reconciles_cancellation_on_run_control_reporter(
 
     exit_code = cli_module.main(
         ["init", "--yes", "--json"],
-        prog_name="borg",
+        prog_name="betterborg",
     )
 
     captured = capsys.readouterr()
@@ -408,18 +408,18 @@ def test_main_dispatches_sigint_with_socket_only_selector(
     )
     monkeypatch.setattr(cli_module, "cli", command)
 
-    assert cli_module.main([], prog_name="borg") == 130
+    assert cli_module.main([], prog_name="betterborg") == 130
 
 
 def test_main_preserves_click_usage_error_formatting(
     capsys: pytest.CaptureFixture,
 ) -> None:
-    exit_code = cli_module.main(["version", "unexpected"], prog_name="borg")
+    exit_code = cli_module.main(["version", "unexpected"], prog_name="betterborg")
 
     captured = capsys.readouterr()
     assert exit_code == 2
     assert captured.out == ""
-    assert "Usage: borg version [OPTIONS]" in captured.err
+    assert "Usage: betterborg version [OPTIONS]" in captured.err
     assert "Error: Got unexpected extra argument (unexpected)" in captured.err
 
 
@@ -433,7 +433,7 @@ def test_main_preserves_click_exception_formatting(
 
     monkeypatch.setattr(cli_module, "cli", command)
 
-    exit_code = cli_module.main([], prog_name="borg")
+    exit_code = cli_module.main([], prog_name="betterborg")
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -606,7 +606,7 @@ def test_main_surfaces_reconciliation_failure_after_sigint(
 
     monkeypatch.setattr(cli_module, "cli", command)
 
-    exit_code = cli_module.main([], prog_name="borg")
+    exit_code = cli_module.main([], prog_name="betterborg")
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -637,7 +637,7 @@ def test_main_refuses_interrupted_exit_with_unreconciled_started_work(
 
     monkeypatch.setattr(cli_module, "cli", command)
 
-    exit_code = cli_module.main([], prog_name="borg")
+    exit_code = cli_module.main([], prog_name="betterborg")
 
     captured = capsys.readouterr()
     progress = observed["run"].progress
@@ -728,7 +728,7 @@ def test_create_without_prd_runs_brainstorm_and_prints_plan_handoff(
         "# Release guide\n\nHelp maintainers ship safely.\n"
     )
     assert output == ["# Release guide\n\nHelp maintainers ship safely.\n"]
-    assert result.output.endswith("borg plan start release-guide\n")
+    assert result.output.endswith("betterborg plan start release-guide\n")
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         assert store.get_borg_by_name(repository.id, "release-guide") is not None
         assert store.list_operations(repository.id) == []
@@ -785,7 +785,7 @@ def test_create_with_prd_propagates_and_preserves_exact_input(
     assert confirmed.read_text(encoding="utf-8") == (
         "# Reviewed PRD\n\nHuman-approved requirements.\n"
     )
-    assert result.output.endswith("borg plan start improve-docs\n")
+    assert result.output.endswith("betterborg plan start improve-docs\n")
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "improve-docs")
         assert borg is not None
@@ -832,7 +832,7 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
     )
 
     assert result.exit_code == 0, result.output
-    assert "borg plan start" not in result.output
+    assert "betterborg plan start" not in result.output
     assert "draft saved without a confirmed PRD" in result.output
     assert not paths.tracked_dir.joinpath("prds/wait-for-approval.md").exists()
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -897,7 +897,7 @@ def test_main_sigint_during_prd_confirmation_stops_without_publishing(
 
     exit_code = cli_module.main(
         ["create", name, "--yes"],
-        prog_name="borg",
+        prog_name="betterborg",
     )
 
     captured = capsys.readouterr()
@@ -910,7 +910,7 @@ def test_main_sigint_during_prd_confirmation_stops_without_publishing(
     assert captured.err == ""
     assert "Error:" not in captured.out
     assert "Aborted!" not in captured.out
-    assert "borg plan start" not in captured.out
+    assert "betterborg plan start" not in captured.out
     assert "draft saved" not in captured.out
     assert not paths.tracked_dir.joinpath("prds", f"{name}.md").exists()
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -932,7 +932,7 @@ def test_version_does_not_initialize_repository(
     result = cli_runner.invoke(cli, ["version"])
 
     assert result.exit_code == 0
-    assert result.output == f"borg {__version__}\n"
+    assert result.output == f"betterborg {__version__}\n"
     assert list(tmp_path.iterdir()) == []
 
 

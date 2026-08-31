@@ -222,7 +222,7 @@ def verify_cli_initialization(
     the credential scan walks, so machine state written outside the repository
     is still checked for leaks.
     """
-    expected_version_output = f"borg {version}".encode()
+    expected_version_output = f"betterborg {version}".encode()
     for attempt in range(1, attempts + 1):
         completed = run_command(
             runner,

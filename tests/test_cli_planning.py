@@ -70,7 +70,7 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert prompts == ["Which platforms are required?"]
     assert outputs == ["Why this matters: This controls the test matrix."]
     assert "Plan approval pending" in result.output
-    assert "borg plan show inline-plan" in result.output
+    assert "betterborg plan show inline-plan" in result.output
     assert len(adapter.calls) == 4
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "inline-plan")
@@ -118,7 +118,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
 
     assert interrupted.exit_code == 1
     assert "was interrupted" in interrupted.output
-    assert "borg plan start resume-plan" in interrupted.output
+    assert "betterborg plan start resume-plan" in interrupted.output
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-plan")
         assert borg is not None
@@ -177,7 +177,7 @@ def test_plan_start_reports_review_cap_as_blocked(
 
     assert result.exit_code == 0, result.output
     assert "Planning blocked" in result.output
-    assert "borg plan show blocked-plan" in result.output
+    assert "betterborg plan show blocked-plan" in result.output
     assert len(adapter.calls) == 7
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-plan")
@@ -312,7 +312,7 @@ def test_plan_show_reports_when_no_plan_is_stored(
 
     assert result.exit_code == 1
     assert "does not have a stored plan" in result.output
-    assert "borg plan start missing-plan" in result.output
+    assert "betterborg plan start missing-plan" in result.output
 
 
 def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
@@ -399,7 +399,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
 
     assert changed.exit_code == 0, changed.output
     assert "Plan approval pending" in changed.output
-    assert "borg plan show change-plan" in changed.output
+    assert "betterborg plan show change-plan" in changed.output
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "change-plan")
         assert borg is not None
@@ -529,7 +529,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
     assert failed.exit_code == 1
     assert "could not continue" in failed.output
     assert "planning provider unavailable" in failed.output
-    assert "borg plan start resume-change" in failed.output
+    assert "betterborg plan start resume-change" in failed.output
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-change")
         assert borg is not None

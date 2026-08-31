@@ -239,7 +239,7 @@ def create_commands(
     """Return one shell-free create argv for each ranked generated theme."""
     return tuple(
         (
-            "borg",
+            "betterborg",
             "create",
             document.suggested_borg_name,
             "--prd",

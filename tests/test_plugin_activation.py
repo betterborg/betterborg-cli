@@ -15,9 +15,9 @@ from betterborg_cli.plugin_activation import (
 )
 
 
-def _borg(directory: Path, body: str = "printf 'borg 0.1.0\\n'") -> Path:
+def _borg(directory: Path, body: str = "printf 'betterborg 0.1.0\\n'") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    executable = directory / "borg"
+    executable = directory / "betterborg"
     executable.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return executable
@@ -71,7 +71,7 @@ def test_persistent_borg_is_verified_before_bundle_materialization(
 
     assert result.preflight.status is PluginActivationStatus.READY
     assert result.preflight.executable == executable.resolve()
-    assert result.preflight.version == "borg 0.1.0"
+    assert result.preflight.version == "betterborg 0.1.0"
     assert result.bundle == host_home / ".local" / "share" / "betterborg" / "plugin"
     assert events == [
         ("version", (str(executable.resolve()), "version")),

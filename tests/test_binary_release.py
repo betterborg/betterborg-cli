@@ -50,14 +50,14 @@ def test_release_manifest_has_exact_stable_shape(tmp_path: Path) -> None:
         ],
     }
     assert set(expected_assets) == {
-        "borg-darwin-arm64",
-        "borg-darwin-arm64.sha256",
-        "borg-darwin-x86_64",
-        "borg-darwin-x86_64.sha256",
-        "borg-linux-arm64",
-        "borg-linux-arm64.sha256",
-        "borg-linux-x86_64",
-        "borg-linux-x86_64.sha256",
+        "betterborg-darwin-arm64",
+        "betterborg-darwin-arm64.sha256",
+        "betterborg-darwin-x86_64",
+        "betterborg-darwin-x86_64.sha256",
+        "betterborg-linux-arm64",
+        "betterborg-linux-arm64.sha256",
+        "betterborg-linux-x86_64",
+        "betterborg-linux-x86_64.sha256",
         "install.sh",
         "release-manifest.json",
     }
@@ -66,7 +66,7 @@ def test_release_manifest_has_exact_stable_shape(tmp_path: Path) -> None:
 def test_manifest_rejects_a_stale_checksum(tmp_path: Path) -> None:
     directory = tmp_path / "release"
     _artifact_set(directory)
-    artifact = directory / "borg-linux-x86_64"
+    artifact = directory / "betterborg-linux-x86_64"
     artifact.write_bytes(b"changed after checksum")
 
     with pytest.raises(
@@ -160,10 +160,10 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     workflow = BINARY_WORKFLOW.read_text(encoding="utf-8")
 
     for artifact in (
-        "borg-darwin-arm64",
-        "borg-darwin-x86_64",
-        "borg-linux-arm64",
-        "borg-linux-x86_64",
+        "betterborg-darwin-arm64",
+        "betterborg-darwin-x86_64",
+        "betterborg-linux-arm64",
+        "betterborg-linux-x86_64",
     ):
         assert workflow.count(f"artifact: {artifact}") == 1
     for runner in (
@@ -186,7 +186,7 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     assert linux_build.index("mkdir release") < linux_build.index("docker run")
     assert "mkdir -p release" not in linux_build
     assert 'test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"' in workflow
-    assert 'version)" = "borg $REVIEWED_VERSION"' in workflow
+    assert 'version)" = "betterborg $REVIEWED_VERSION"' in workflow
     assert "scripts/release_artifacts.py checksum" in workflow
     assert "scripts/release_artifacts.py manifest" in workflow
     assert workflow.count("uses: actions/attest@v4") == 2

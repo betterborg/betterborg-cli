@@ -1064,7 +1064,7 @@ def _paths(
 
 
 def _cli_command(*arguments: str) -> str:
-    return shlex.join(("borg", *arguments))
+    return shlex.join(("betterborg", *arguments))
 
 
 def _relative(paths: RepoPaths, path: Path) -> str:
@@ -1241,7 +1241,9 @@ def _create(
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
+            raise ValueError(
+                "repository is not initialized; run 'betterborg init' first"
+            )
         result = CreateService(
             repository,
             store,
@@ -1309,7 +1311,9 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
-            raise ValueError("repository is not initialized; run 'borg init' first")
+            raise ValueError(
+                "repository is not initialized; run 'betterborg init' first"
+            )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(f"Borg {name!r} does not exist")
@@ -1427,7 +1431,9 @@ def _plan(
         with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
-                raise ValueError("repository is not initialized; run 'borg init' first")
+                raise ValueError(
+                    "repository is not initialized; run 'betterborg init' first"
+                )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")

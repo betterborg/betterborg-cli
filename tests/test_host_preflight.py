@@ -500,7 +500,7 @@ def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
     assert isinstance(result, HostPreflightBlock)
     assert not loaded
     assert "workspace trust is required" in result.reason
-    assert "borg trust --yes" in result.reason
+    assert "betterborg trust --yes" in result.reason
 
 
 def test_validates_complete_plan_and_ignores_unselected_service(

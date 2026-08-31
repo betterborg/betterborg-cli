@@ -78,7 +78,7 @@ def test_partial_draft_fixture_reports_each_remaining_publication_step(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture, names = _release_fixture(tmp_path / "partial", draft=True)
-    missing = "borg-linux-x86_64"
+    missing = "betterborg-linux-x86_64"
     (fixture / "assets" / missing).unlink()
     metadata_path = fixture / "release.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -104,11 +104,11 @@ def test_digest_mismatch_fixture_is_terminal_and_requires_a_new_version(
     mismatch: str,
 ) -> None:
     fixture, _names = _release_fixture(tmp_path / mismatch, draft=True)
-    (fixture / "assets" / "borg-darwin-x86_64.sha256").unlink()
+    (fixture / "assets" / "betterborg-darwin-x86_64.sha256").unlink()
     if mismatch == "checksum":
         (fixture / "assets" / "release-manifest.json").unlink()
-        (fixture / "assets" / "borg-linux-arm64").unlink()
-        (fixture / "assets" / "borg-linux-arm64.sha256").write_text(
+        (fixture / "assets" / "betterborg-linux-arm64").unlink()
+        (fixture / "assets" / "betterborg-linux-arm64.sha256").write_text(
             "not a canonical checksum\n", encoding="utf-8"
         )
     else:
@@ -152,7 +152,7 @@ def test_published_partial_release_is_terminal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture, _names = _release_fixture(tmp_path / "published-partial")
-    (fixture / "assets" / "borg-darwin-arm64.sha256").unlink()
+    (fixture / "assets" / "betterborg-darwin-arm64.sha256").unlink()
 
     result = _run_fixture(monkeypatch, fixture)
 
@@ -164,7 +164,7 @@ def test_published_partial_release_is_terminal(
 
 @pytest.mark.parametrize(
     ("missing", "draft"),
-    [(None, False), ("borg-linux-x86_64", True)],
+    [(None, False), ("betterborg-linux-x86_64", True)],
 )
 def test_live_verification_does_not_credit_attestations_without_subject_bytes(
     tmp_path: Path,
@@ -358,7 +358,7 @@ def test_missing_asset_attestation_is_verified_after_upload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture, names = _release_fixture(tmp_path / "source")
-    missing = "borg-linux-x86_64"
+    missing = "betterborg-linux-x86_64"
     uploaded = False
     bodies = {
         name: (fixture / "assets" / name).read_bytes()

@@ -114,12 +114,12 @@ class _FakeCodex:
 
 def _host(tmp_path: Path):
     bin_dir = tmp_path / "host-bin"
-    borg = executable(bin_dir / "borg", f"printf 'borg {__version__}\\n'")
+    borg = executable(bin_dir / "betterborg", f"printf 'betterborg {__version__}\\n'")
     codex = executable(bin_dir / "codex", "exit 0")
 
     def lookup(name: str, *, path: str):
         assert path == str(bin_dir)
-        return str({"borg": borg, "codex": codex}[name])
+        return str({"betterborg": borg, "codex": codex}[name])
 
     environment = {"PATH": str(bin_dir), "HOME": str(tmp_path / "home")}
     spawns: list[Path] = []
@@ -173,7 +173,7 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
     assert manifest["mcpServers"] == "./.mcp.json"
     assert manifest["skills"] == "./skills/"
     mcp = json.loads(expected.joinpath("plugins/borg/.mcp.json").read_text())
-    assert mcp == {"borg": {"command": "borg", "args": ["mcp"]}}
+    assert mcp == {"borg": {"command": "betterborg", "args": ["mcp"]}}
     assert (
         "plugin",
         "marketplace",

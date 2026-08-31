@@ -17,8 +17,8 @@ PERSISTENT_INSTALL_COMMAND = "uv tool install betterborg"
 _SETUP_GUIDANCE = (
     "Install a persistent Betterborg CLI with "
     f"`{PERSISTENT_INSTALL_COMMAND}`, ensure its bin directory is on the host "
-    "launch PATH, and confirm `borg version` succeeds. A `borg` supplied by "
-    "`uvx` is disposable and cannot back a persistent MCP plugin."
+    "launch PATH, and confirm `betterborg version` succeeds. A `betterborg` "
+    "supplied by `uvx` is disposable and cannot back a persistent MCP plugin."
 )
 
 
@@ -70,7 +70,7 @@ def preflight_plugin_activation(
     executable_lookup: ExecutableLookup = shutil.which,
     version_runner: VersionRunner = subprocess.run,
 ) -> PluginActivationPreflight:
-    """Resolve and verify the persistent ``borg`` seen by a plugin host.
+    """Resolve and verify the persistent ``betterborg`` seen by a plugin host.
 
     Resolution uses the launch environment's PATH rather than an ambient or
     interactive-shell lookup. Explicit transient roots let host installers
@@ -80,22 +80,23 @@ def preflight_plugin_activation(
 
     environment = dict(os.environ if launch_environment is None else launch_environment)
     path = environment.get("PATH", os.defpath)
-    candidate = executable_lookup("borg", path=path)
+    candidate = executable_lookup("betterborg", path=path)
     if candidate is None:
         return _setup_required(
-            "No `borg` executable was found on the host launch PATH."
+            "No `betterborg` executable was found on the host launch PATH."
         )
 
     try:
         executable = Path(candidate).resolve(strict=True)
     except OSError as error:
         return _setup_required(
-            f"The `borg` executable from the host launch PATH is unavailable: {error}."
+            "The `betterborg` executable from the host launch PATH is "
+            f"unavailable: {error}."
         )
 
     if _is_transient(executable, transient_roots):
         return _setup_required(
-            f"The resolved `borg` executable is transient: {executable}."
+            f"The resolved `betterborg` executable is transient: {executable}."
         )
 
     try:
@@ -108,17 +109,18 @@ def preflight_plugin_activation(
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return _setup_required(f"Unable to run `borg version`: {error}.")
+        return _setup_required(f"Unable to run `betterborg version`: {error}.")
 
     version = completed.stdout.strip()
     if completed.returncode != 0:
         detail = completed.stderr.strip() or version or "no diagnostic output"
         return _setup_required(
-            f"`borg version` failed with exit code {completed.returncode}: {detail}."
+            f"`betterborg version` failed with exit code "
+            f"{completed.returncode}: {detail}."
         )
-    if not version.startswith("borg "):
+    if not version.startswith("betterborg "):
         return _setup_required(
-            "`borg version` did not identify the Betterborg CLI."
+            "`betterborg version` did not identify the Betterborg CLI."
         )
 
     return PluginActivationPreflight(
@@ -184,11 +186,11 @@ def verify_borg_mcp(
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PluginActivationVerificationError(
-            f"unable to start `borg mcp`: {error}"
+            f"unable to start `betterborg mcp`: {error}"
         ) from error
     if completed.returncode != 0:
         detail = completed.stderr.strip() or "no diagnostic output"
-        raise PluginActivationVerificationError(f"`borg mcp` failed: {detail}")
+        raise PluginActivationVerificationError(f"`betterborg mcp` failed: {detail}")
     for line in completed.stdout.splitlines():
         try:
             response = json.loads(line)
@@ -197,7 +199,7 @@ def verify_borg_mcp(
         if response.get("id") == 1 and isinstance(response.get("result"), dict):
             return
     raise PluginActivationVerificationError(
-        "`borg mcp` did not answer the initialize request"
+        "`betterborg mcp` did not answer the initialize request"
     )
 
 

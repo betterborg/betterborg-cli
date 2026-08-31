@@ -52,17 +52,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact: borg-darwin-arm64
+          - artifact: betterborg-darwin-arm64
             runner: macos-14
             family: darwin
-          - artifact: borg-darwin-x86_64
+          - artifact: betterborg-darwin-x86_64
             runner: macos-15-intel
             family: darwin
-          - artifact: borg-linux-arm64
+          - artifact: betterborg-linux-arm64
             runner: ubuntu-24.04-arm
             family: linux
             image: quay.io/pypa/manylinux2014_aarch64
-          - artifact: borg-linux-x86_64
+          - artifact: betterborg-linux-x86_64
             runner: ubuntu-24.04
             family: linux
             image: quay.io/pypa/manylinux2014_x86_64
@@ -84,7 +84,7 @@ jobs:
           make sync
           make binary
           mkdir release
-          mv dist/borg "release/$ARTIFACT"
+          mv dist/betterborg "release/$ARTIFACT"
 
       - name: Build Linux one-file binary on glibc 2.17
         if: ${{ matrix.family == 'linux' }}
@@ -118,7 +118,7 @@ jobs:
               /tmp/betterborg-build/bin/pip install --no-build-isolation --no-deps .
               /tmp/betterborg-build/bin/pyinstaller \
                 --clean --noconfirm --distpath /tmp/dist betterborg.spec
-              mv /tmp/dist/borg "release/$ARTIFACT"
+              mv /tmp/dist/betterborg "release/$ARTIFACT"
             '
 
       - name: Smoke Darwin binary version
@@ -127,7 +127,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           REVIEWED_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          test "$("release/$ARTIFACT" version)" = "borg $REVIEWED_VERSION"
+          test "$("release/$ARTIFACT" version)" = "betterborg $REVIEWED_VERSION"
 
       - name: Smoke Linux binary on glibc 2.17
         if: ${{ matrix.family == 'linux' }}
@@ -144,7 +144,7 @@ jobs:
             "$MANYLINUX_IMAGE" \
             bash -euxo pipefail -c '
               test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"
-              test "$("release/$ARTIFACT" version)" = "borg $REVIEWED_VERSION"
+              test "$("release/$ARTIFACT" version)" = "betterborg $REVIEWED_VERSION"
             '
 
       - name: Create SHA-256 checksum

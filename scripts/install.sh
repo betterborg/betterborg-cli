@@ -28,7 +28,7 @@ fail() {
 unsupported() {
     printf 'betterborg installer: %s\n' "$1" >&2
     printf '%s\n' \
-        'Fallback: install uv, then run `uvx --from betterborg borg version`.' >&2
+        'Fallback: install uv, then run `uvx --from betterborg betterborg version`.' >&2
     exit 1
 }
 
@@ -147,7 +147,7 @@ detect_target() {
                 "No standalone Betterborg release supports $detected_system/$detected_architecture."
             ;;
     esac
-    TARGET="borg-$TARGET_OS-$TARGET_ARCH"
+    TARGET="betterborg-$TARGET_OS-$TARGET_ARCH"
 }
 
 detect_target
@@ -201,13 +201,13 @@ ACTUAL_SHA256=$(sha256 "$ARTIFACT")
     fail "downloaded $TARGET failed SHA-256 verification; nothing was installed."
 
 INSTALL_DIRECTORY="$INSTALL_HOME/.local/bin"
-INSTALL_PATH="$INSTALL_DIRECTORY/borg"
+INSTALL_PATH="$INSTALL_DIRECTORY/betterborg"
 mkdir -p "$INSTALL_DIRECTORY" || fail "could not create $INSTALL_DIRECTORY."
 if [ -e "$INSTALL_PATH" ] && [ ! -f "$INSTALL_PATH" ]; then
     fail "$INSTALL_PATH exists and is not a regular file."
 fi
 
-STAGED_EXECUTABLE=$(mktemp "$INSTALL_DIRECTORY/.borg.install.XXXXXXXX") || \
+STAGED_EXECUTABLE=$(mktemp "$INSTALL_DIRECTORY/.betterborg.install.XXXXXXXX") || \
     fail "could not stage the executable in $INSTALL_DIRECTORY."
 cp "$ARTIFACT" "$STAGED_EXECUTABLE" || fail 'could not stage the verified executable.'
 chmod 755 "$STAGED_EXECUTABLE" || fail 'could not make the staged executable runnable.'
@@ -215,8 +215,8 @@ chmod 755 "$STAGED_EXECUTABLE" || fail 'could not make the staged executable run
 if ! STAGED_VERSION=$("$STAGED_EXECUTABLE" version 2>/dev/null); then
     fail 'the verified download could not report its version; nothing was installed.'
 fi
-[ "$STAGED_VERSION" = "borg $VERSION" ] || \
-    fail "the verified download reported '$STAGED_VERSION', expected 'borg $VERSION'; nothing was installed."
+[ "$STAGED_VERSION" = "betterborg $VERSION" ] || \
+    fail "the verified download reported '$STAGED_VERSION', expected 'betterborg $VERSION'; nothing was installed."
 
 mv -f "$STAGED_EXECUTABLE" "$INSTALL_PATH" || \
     fail "could not atomically install $INSTALL_PATH."
@@ -225,7 +225,7 @@ STAGED_EXECUTABLE=
 if ! INSTALLED_VERSION=$("$INSTALL_PATH" version 2>/dev/null); then
     fail "the persistent executable at $INSTALL_PATH failed verification."
 fi
-[ "$INSTALLED_VERSION" = "borg $VERSION" ] || \
+[ "$INSTALLED_VERSION" = "betterborg $VERSION" ] || \
     fail "the persistent executable at $INSTALL_PATH failed version verification."
 
 printf 'Installed Betterborg %s at %s.\n' "$VERSION" "$INSTALL_PATH"

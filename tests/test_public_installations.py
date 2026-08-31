@@ -30,7 +30,7 @@ def test_public_command_shapes_pin_all_three_sources() -> None:
         "--refresh",
         "--from",
         "betterborg==1.2.3",
-        "borg",
+        "betterborg",
     )
     assert commands["npx"] == (
         "npx",
@@ -49,7 +49,7 @@ def test_three_fresh_fixtures_isolate_trust_provider_and_machine_state(
         cwd = kwargs["cwd"]
         calls.append((command, cwd, environment))
         if command[-1:] == ["version"]:
-            stdout = b"borg 1.2.3\n"
+            stdout = b"betterborg 1.2.3\n"
         elif command[-3:] == ["init", "--yes", "--json"]:
             stdout = b'{"initialized":true}\n'
         else:

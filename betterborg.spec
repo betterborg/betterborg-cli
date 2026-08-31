@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Build the local one-file ``borg`` executable with all package assets."""
+"""Build the local one-file ``betterborg`` executable with all package assets."""
 
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -28,7 +28,7 @@ executable = EXE(
     analysis.binaries,
     analysis.datas,
     [],
-    name="borg",
+    name="betterborg",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

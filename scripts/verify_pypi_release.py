@@ -36,7 +36,7 @@ def _uvx_command(version: str, *borg_arguments: str) -> list[str]:
         "--refresh",
         "--from",
         f"betterborg=={version}",
-        "borg",
+        "betterborg",
         *borg_arguments,
     ]
 

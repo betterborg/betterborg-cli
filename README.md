@@ -21,7 +21,7 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
     Or install the standalone release binary for Darwin or Linux, which needs
     no Python toolchain. It selects ARM64 or x86_64 from the release manifest,
     verifies the SHA-256 digest and exact version before replacing
-    `~/.local/bin/borg`, and then runs step 2 for you:
+    `~/.local/bin/betterborg`, and then runs step 2 for you:
 
     ```bash
     curl -fsSL https://install.betterborg.ai | sh
@@ -30,7 +30,7 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
 2. Activate the agent-host integrations:
 
     ```bash
-    borg plugins install --all
+    betterborg plugins install --all
     ```
 
     Then run `/reload-plugins` in any open Claude Code session, and start a new Codex session when prompted.
@@ -38,16 +38,16 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
 3. From inside a Git repository, run the loop:
 
     ```bash
-    borg trust                     # trust this worktree (machine-local)
-    borg init                      # register and analyze the repository
-    borg create my-feature         # or: borg create my-feature --prd spec.md
-    borg plan start my-feature     # agents plan, review, and iterate
-    borg plan approve my-feature   # your gate: nothing is decomposed before this
-    borg task estimate my-feature  # P50/P80 work and cost
-    borg execute my-feature        # approve the estimate, then run
+    betterborg trust                     # trust this worktree (machine-local)
+    betterborg init                      # register and analyze the repository
+    betterborg create my-feature         # or: betterborg create my-feature --prd spec.md
+    betterborg plan start my-feature     # agents plan, review, and iterate
+    betterborg plan approve my-feature   # your gate: nothing is decomposed before this
+    betterborg task estimate my-feature  # P50/P80 work and cost
+    betterborg execute my-feature        # approve the estimate, then run
     ```
 
-`borg execute` hands off reviewed local branches. Add `--push` or `--pr` to publish them. `borg --help` is the full command index.
+`betterborg execute` hands off reviewed local branches. Add `--push` or `--pr` to publish them. `betterborg --help` is the full command index.
 
 To try it without installing:
 

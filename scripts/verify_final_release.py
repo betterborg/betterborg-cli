@@ -195,7 +195,7 @@ class _FixtureRunner:
         shapes = verify_public_installations.command_shapes(self.version)
         if method == "curl":
             installer = fixture / "install.sh"
-            prefix = [str(fixture / "home/.local/bin/borg")]
+            prefix = [str(fixture / "home/.local/bin/betterborg")]
             return (
                 [*shapes["curl"], "--output", str(installer)],
                 ["sh", str(installer)],
@@ -241,7 +241,7 @@ class _FixtureRunner:
         stdout = b""
         stderr = b""
         if command[-1:] == ["version"]:
-            stdout = f"borg {self.version}\n".encode()
+            stdout = f"betterborg {self.version}\n".encode()
         elif command[-3:] == ["init", "--yes", "--json"]:
             stdout = b'{"initialized":true}\n'
             if self.leak == "stdout":

@@ -220,13 +220,13 @@ class RepositoryService:
     def _registered_repository(self) -> tuple[Repository, RepositoryConfig]:
         if not (self.paths.tracked_dir / CONFIG_FILENAME).is_file():
             raise RepositoryInitializationError(
-                "repository is not initialized; run 'borg init' first"
+                "repository is not initialized; run 'betterborg init' first"
             )
         config = load_repository_config(self.paths)
         repository = self.store.get_repository(config.repository_id)
         if repository is None or not self._is_initialized(repository):
             raise RepositoryInitializationError(
-                "repository is not initialized; run 'borg init' first"
+                "repository is not initialized; run 'betterborg init' first"
             )
         if repository.root != self.paths.root:
             raise RepositoryInitializationError(

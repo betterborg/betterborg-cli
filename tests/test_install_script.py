@@ -25,7 +25,7 @@ def _fixture_release(directory: Path, version: str = "1.2.3") -> None:
 printf '%s|%s|%s\\n' "$0" "$*" "$PATH" >> "$INSTALL_LOG"
 case "${1:-}" in
     version)
-        printf 'borg %s\\n' "${REPORTED_VERSION:-$RELEASE_VERSION}"
+        printf 'betterborg %s\\n' "${REPORTED_VERSION:-$RELEASE_VERSION}"
         ;;
     plugins)
         [ "${2:-}" = install ]
@@ -58,7 +58,7 @@ def _run_installer(
     fixture = tmp_path / "release"
     _fixture_release(fixture, version)
     if tamper_target:
-        (fixture / "borg-linux-x86_64").write_text(
+        (fixture / "betterborg-linux-x86_64").write_text(
             "tampered\n", encoding="utf-8"
         )
     tools = tmp_path / "tools"
@@ -66,7 +66,7 @@ def _run_installer(
     home = tmp_path / "home with spaces"
     home.mkdir()
     if existing_install is not None:
-        installed = home / ".local/bin/borg"
+        installed = home / ".local/bin/betterborg"
         installed.parent.mkdir(parents=True)
         installed.write_text(existing_install, encoding="utf-8")
     temporary = tmp_path / "temporary"
@@ -134,15 +134,15 @@ cp "$RELEASE_FIXTURE/${url##*/}" "$destination"
 @pytest.mark.parametrize(
     ("system", "architecture", "kernel", "target"),
     (
-        ("Linux", "x86_64", "6.8.0", "borg-linux-x86_64"),
-        ("Linux", "aarch64", "6.8.0", "borg-linux-arm64"),
-        ("Darwin", "amd64", "23.4.0", "borg-darwin-x86_64"),
-        ("Darwin", "arm64", "23.4.0", "borg-darwin-arm64"),
+        ("Linux", "x86_64", "6.8.0", "betterborg-linux-x86_64"),
+        ("Linux", "aarch64", "6.8.0", "betterborg-linux-arm64"),
+        ("Darwin", "amd64", "23.4.0", "betterborg-darwin-x86_64"),
+        ("Darwin", "arm64", "23.4.0", "betterborg-darwin-arm64"),
         (
             "Linux",
             "x86_64",
             "5.15.153.1-microsoft-standard-WSL2",
-            "borg-linux-x86_64",
+            "betterborg-linux-x86_64",
         ),
     ),
 )
@@ -174,7 +174,7 @@ def test_selected_version_uses_only_versioned_manifest_and_assets(
     assert result.returncode == 0, result.stderr
     assert curl_log.read_text(encoding="utf-8").splitlines() == [
         "https://releases.example.test/download/v1.2.3/release-manifest.json",
-        "https://releases.example.test/download/v1.2.3/borg-linux-x86_64",
+        "https://releases.example.test/download/v1.2.3/betterborg-linux-x86_64",
     ]
 
 
@@ -183,19 +183,19 @@ def test_install_is_atomic_verified_and_activates_plugins_last(
 ) -> None:
     result, home, _curl_log, install_log = _run_installer(tmp_path)
 
-    installed = home / ".local/bin/borg"
+    installed = home / ".local/bin/betterborg"
     assert result.returncode == 0, result.stderr
     assert installed.read_bytes() == (
-        tmp_path / "release/borg-linux-x86_64"
+        tmp_path / "release/betterborg-linux-x86_64"
     ).read_bytes()
     assert installed.stat().st_mode & stat.S_IXUSR
     calls = [line.split("|", 2) for line in install_log.read_text().splitlines()]
-    assert calls[0][0].startswith(str(home / ".local/bin/.borg.install."))
+    assert calls[0][0].startswith(str(home / ".local/bin/.betterborg.install."))
     assert calls[0][1] == "version"
     assert calls[1][0:2] == [str(installed), "version"]
     assert calls[2][0:2] == [str(installed), "plugins install --all"]
     assert calls[2][2].split(":", 1)[0] == str(installed.parent)
-    assert not list(installed.parent.glob(".borg.install.*"))
+    assert not list(installed.parent.glob(".betterborg.install.*"))
     assert "Add " + str(installed.parent) + " to PATH" in result.stdout
     assert f'export PATH="{installed.parent}:$PATH"' in result.stdout
 
@@ -209,7 +209,7 @@ def test_checksum_failure_preserves_existing_install_and_skips_plugins(
         existing_install="existing installation\n",
     )
 
-    existing = home / ".local/bin/borg"
+    existing = home / ".local/bin/betterborg"
     assert result.returncode == 1
     assert "failed SHA-256 verification" in result.stderr
     assert existing.read_text(encoding="utf-8") == "existing installation\n"
@@ -225,14 +225,14 @@ def test_version_failure_does_not_replace_existing_install(
         existing_install="existing installation\n",
     )
 
-    installed = home / ".local/bin/borg"
+    installed = home / ".local/bin/betterborg"
     assert result.returncode == 1
-    assert "expected 'borg 1.2.3'" in result.stderr
+    assert "expected 'betterborg 1.2.3'" in result.stderr
     assert installed.read_text(encoding="utf-8") == "existing installation\n"
     assert [
         line.split("|", 2)[1] for line in install_log.read_text().splitlines()
     ] == ["version"]
-    assert not list(installed.parent.glob(".borg.install.*"))
+    assert not list(installed.parent.glob(".betterborg.install.*"))
 
 
 def test_plugin_failure_occurs_after_persistent_install_verification(
@@ -242,7 +242,7 @@ def test_plugin_failure_occurs_after_persistent_install_verification(
         tmp_path, extra_environment={"PLUGIN_EXIT": "7"}
     )
 
-    installed = home / ".local/bin/borg"
+    installed = home / ".local/bin/betterborg"
     assert result.returncode == 1
     assert installed.is_file()
     assert (
@@ -283,4 +283,4 @@ def test_unsupported_targets_fail_with_one_uvx_fallback_and_wsl_guidance(
     assert result.stderr.count("uvx") == 1
     assert not curl_log.exists()
     assert not install_log.exists()
-    assert not (home / ".local/bin/borg").exists()
+    assert not (home / ".local/bin/betterborg").exists()

@@ -1948,17 +1948,17 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
 @pytest.mark.parametrize(
     ("tool", "arguments", "command"),
     [
-        ("init", {}, "borg init"),
-        ("analyze", {}, "borg analyze"),
+        ("init", {}, "betterborg init"),
+        ("analyze", {}, "betterborg analyze"),
         (
             "create",
             {"name": "new-borg", "source": "docs/my prd.md"},
-            "borg create new-borg --prd 'docs/my prd.md'",
+            "betterborg create new-borg --prd 'docs/my prd.md'",
         ),
         (
             "plan",
             {"name": "new-borg", "action": "start"},
-            "borg plan start new-borg",
+            "betterborg plan start new-borg",
         ),
         (
             "plan",
@@ -1967,17 +1967,17 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
                 "action": "change",
                 "note": "ship safely",
             },
-            "borg plan change new-borg --note 'ship safely'",
+            "betterborg plan change new-borg --note 'ship safely'",
         ),
         (
             "plan",
             {"name": "new-borg", "action": "approve"},
-            "borg plan approve new-borg",
+            "betterborg plan approve new-borg",
         ),
         (
             "execute",
             {"name": "new-borg"},
-            "borg execute new-borg",
+            "betterborg execute new-borg",
         ),
     ],
 )
@@ -2211,7 +2211,7 @@ def test_stdio_stdout_contains_only_protocol_json() -> None:
     ]
 
     process = subprocess.Popen(
-        [str(Path(sys.executable).with_name("borg")), "mcp"],
+        [str(Path(sys.executable).with_name("betterborg")), "mcp"],
         text=True,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

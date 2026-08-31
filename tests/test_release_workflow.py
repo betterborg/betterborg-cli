@@ -159,7 +159,7 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
         child_environment = kwargs.get("env")
         calls.append((command, child_environment))
         if command[-1:] == ["version"]:
-            stdout = b"borg 1.2.3\n"
+            stdout = b"betterborg 1.2.3\n"
         elif command[-2:] == ["--yes", "--json"]:
             stdout = b'{"initialized": true}\n'
         else:
@@ -190,13 +190,13 @@ def test_public_smoke_uses_exact_commands_and_isolated_provider(
     assert timeout == 30
     uvx_calls = [call for call in calls if call[0][0] == "uvx"]
     assert [command for command, _environment in uvx_calls] == [
-        ["uvx", "--refresh", "--from", "betterborg==1.2.3", "borg", "version"],
+        ["uvx", "--refresh", "--from", "betterborg==1.2.3", "betterborg", "version"],
         [
             "uvx",
             "--refresh",
             "--from",
             "betterborg==1.2.3",
-            "borg",
+            "betterborg",
             "init",
             "--yes",
             "--json",
@@ -294,7 +294,7 @@ def test_release_smoke_rejects_wrong_version_output(
     distributions = _release_artifacts(artifacts, version)
 
     def fake_run(command, **_kwargs):
-        stdout = b"borg 1.2.2\n" if command[-1:] == ["version"] else b""
+        stdout = b"betterborg 1.2.2\n" if command[-1:] == ["version"] else b""
         return subprocess.CompletedProcess(command, 0, stdout, b"")
 
     monkeypatch.setenv("OPENAI_API_KEY", "release-secret-value-12345")

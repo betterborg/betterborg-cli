@@ -331,7 +331,7 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     )
 
     assert interrupted.exit_code == 1
-    assert "borg plan approve resume-approval" in interrupted.output
+    assert "betterborg plan approve resume-approval" in interrupted.output
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None
@@ -398,7 +398,7 @@ def test_plan_approve_resumes_publication_before_becoming_ready(
     )
 
     assert interrupted.exit_code == 1
-    assert "borg plan approve resume-publication" in interrupted.output
+    assert "betterborg plan approve resume-publication" in interrupted.output
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-publication")
         assert borg is not None

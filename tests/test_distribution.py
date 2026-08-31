@@ -229,7 +229,7 @@ def test_clean_install_exposes_borg_and_matching_metadata(
     venv.EnvBuilder(with_pip=True).create(environment)
     scripts = environment / ("Scripts" if os.name == "nt" else "bin")
     python = scripts / ("python.exe" if os.name == "nt" else "python")
-    borg = scripts / ("borg.exe" if os.name == "nt" else "borg")
+    borg = scripts / ("betterborg.exe" if os.name == "nt" else "betterborg")
     _run(python, "-m", "pip", "install", artifact)
 
     startup_hook = tmp_path / "startup-hook"
@@ -277,7 +277,7 @@ multiprocessing.freeze_support = freeze_support
         "from importlib.metadata import version; import rich; print(version('rich'))",
     )
 
-    assert completed.stdout.strip() == f"borg {__version__}"
+    assert completed.stdout.strip() == f"betterborg {__version__}"
     assert freeze_marker.read_text(encoding="utf-8") == "called"
     assert worker.stdout.strip() == "200 installed-worker-response"
     assert [request.path for request in server.requests] == ["/installed-worker"]
@@ -304,9 +304,9 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
         REPOSITORY_ROOT / "betterborg.spec",
         cwd=REPOSITORY_ROOT,
     )
-    binary = output / ("borg.exe" if os.name == "nt" else "borg")
+    binary = output / ("betterborg.exe" if os.name == "nt" else "betterborg")
 
-    assert _run(binary, "version").stdout.strip() == f"borg {__version__}"
+    assert _run(binary, "version").stdout.strip() == f"betterborg {__version__}"
     with LocalHttpServer(
         lambda _request: (200, {}, b"frozen-worker-response")
     ) as server:

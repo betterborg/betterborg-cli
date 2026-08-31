@@ -12,7 +12,7 @@
   "bugs": "https://github.com/betterborg/betterborg-cli/issues",
   "type": "commonjs",
   "bin": {
-    "borg": "bin/borg.js"
+    "betterborg": "bin/betterborg.js"
   },
   "files": [
     "LICENSE",
@@ -28,7 +28,7 @@
     "access": "public"
   },
   "scripts": {
-    "lint": "node --check bin/borg.js && node --check lib/launcher.js && node --check test/launcher.test.js",
+    "lint": "node --check bin/betterborg.js && node --check lib/launcher.js && node --check test/launcher.test.js",
     "test": "node --test test/launcher.test.js"
   }
 }

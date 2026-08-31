@@ -16,7 +16,7 @@ Use the locked environment and the repository's standard commands:
 - `make lint` runs static checks.
 - `make test` runs the test suite and public-tree extraction scans.
 - `make build` creates distribution artifacts.
-- `make binary` creates the local one-file `dist/borg` executable.
+- `make binary` creates the local one-file `dist/betterborg` executable.
 
 New public files must remain compatible with the extraction scans in
 `tests/test_public_tree.py`.
