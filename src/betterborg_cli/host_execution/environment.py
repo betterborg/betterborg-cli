@@ -25,6 +25,7 @@ from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
+from betterborg_cli.host_execution.scheduler import TaskActivitySink
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -78,7 +79,6 @@ class _PathSnapshot:
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ActivitySink = Callable[[AgentActivity], None]
-TaskActivitySink = Callable[[UUID, AgentActivity], None]
 Clock = Callable[[], datetime]
 
 
