@@ -235,6 +235,13 @@ class DurablePlanningTurns:
                     ),
                     cancel=self.cancel,
                 )
+        except KeyboardInterrupt:
+            self.store.complete_planning_attempt(
+                attempt.id,
+                status=PlanningAttemptStatus.CANCELLED,
+                summary=f"{self.role} run cancelled",
+            )
+            raise
         except Exception as error:
             raise self.error_factory(
                 f"{self.role} {label} turn crashed: {error}"

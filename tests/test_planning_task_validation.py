@@ -702,6 +702,57 @@ def test_supervisor_publication_cancellation_retains_approval_and_resumes(
         resumed_progress.close()
 
 
+def test_supervisor_interrupt_during_active_turn_cancels_attempt(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-turn-interrupt.sqlite3"
+
+    def interrupt_turn(_spec) -> None:
+        raise KeyboardInterrupt
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-turn-interrupt"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=interrupt_turn)
+        )
+        progress = RunProgress(stream=StringIO())
+
+        with pytest.raises(KeyboardInterrupt):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                approved_plan=plan,
+                progress=progress,
+            ).run()
+
+        attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].status is PlanningAttemptStatus.CANCELLED
+        assert attempts[0].summary == "Supervisor run cancelled"
+        assert progress.stages["supervisor"].state is StageState.STOPPED
+        progress.close()
+
+
 def test_supervisor_cancellation_between_current_and_ready_completes_progress(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
