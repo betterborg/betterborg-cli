@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
@@ -42,6 +42,7 @@ from betterborg_cli.host_execution import (
     HostMergePhase,
     HostPreflight,
     HostPreflightBlock,
+    HostPreflightPlan,
     HostReviewFixConfig,
     HostReviewFixPhase,
     HostSanityPhase,
@@ -78,7 +79,7 @@ from betterborg_cli.plugins import (
     PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
-from betterborg_cli.progress import ProgressError, RunProgress
+from betterborg_cli.progress import ProgressError, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import read_repository_text
@@ -105,6 +106,8 @@ from betterborg_cli.workspace_trust import (
     UntrustedWorkspaceError,
     require_workspace_trust,
 )
+
+_EXECUTION_ESTIMATE_STAGE_KEY = "estimate-decision"
 
 
 @dataclass(slots=True)
@@ -254,7 +257,10 @@ def _stdin_is_interactive() -> bool:
 
 
 def _repository_progress(machine_readable: bool) -> RunProgress | None:
-    run = click.get_current_context().find_root().obj
+    context = click.get_current_context(silent=True)
+    if context is None:
+        return None
+    run = context.find_root().obj
     if not isinstance(run, CliRunContext):
         return None
     if not run.progress_configured:
@@ -811,16 +817,55 @@ def execute_borg(
     open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
-    def decide(estimate):
-        _write_execution_estimate(name, estimate)
-        if auto_execute:
-            return ExecutionDecisionRequest("auto_execute", "bypassed")
-        click.confirm(
-            "Approve this estimate and begin host execution?",
-            default=False,
-            abort=True,
+    progress = _repository_progress(False)
+    if progress is not None:
+        progress.declare(
+            StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
         )
+        progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
+
+    def decide(estimate):
+        suspension = progress.suspend() if progress is not None else nullcontext()
+        with suspension:
+            _write_execution_estimate(name, estimate)
+            if auto_execute:
+                return ExecutionDecisionRequest("auto_execute", "bypassed")
+            approved = click.confirm(
+                "Approve this estimate and begin host execution?",
+                default=False,
+            )
+        if not approved:
+            if progress is not None:
+                progress.complete(_EXECUTION_ESTIMATE_STAGE_KEY, "declined")
+            return None
         return ExecutionDecisionRequest("interactive", "approved")
+
+    def invoke_host(
+        host_paths,
+        store,
+        host_config,
+        repository_id,
+        borg_id,
+        generation_id,
+        *,
+        cancel,
+        progress,
+    ):
+        decision = store.get_current_execution_decision(borg_id)
+        if decision is None or decision.generation_id != generation_id:
+            raise RuntimeError("host execution has no current execution decision")
+        if progress is not None:
+            progress.complete(_EXECUTION_ESTIMATE_STAGE_KEY, decision.decision)
+        return _invoke_host_execution(
+            host_paths,
+            store,
+            host_config,
+            repository_id,
+            borg_id,
+            generation_id,
+            cancel=cancel,
+            progress=progress,
+        )
 
     try:
         config = load_repository_config(paths)
@@ -829,8 +874,9 @@ def execute_borg(
             config,
             name,
             decide=decide,
-            invoke_host=_invoke_host_execution,
+            invoke_host=invoke_host,
             cancel=cancel,
+            progress=progress,
         )
         generation = workflow.publication.generation
         if workflow.decision_event == "concurrent":
@@ -849,33 +895,112 @@ def execute_borg(
                 f"Using recorded execution decision for generation {generation.id}."
             )
         result = workflow.host_result
-        if result is None:
-            raise RuntimeError("execution estimate did not receive a decision")
     except (OSError, RuntimeError, ValueError, sqlite3.IntegrityError) as error:
+        _reconcile_execution_estimate(progress, cancel, error)
+        if progress is not None:
+            progress.close()
         raise click.ClickException(str(error)) from error
+    except (KeyboardInterrupt, click.Abort) as error:
+        _reconcile_execution_estimate(progress, cancel, error)
+        if isinstance(error, click.Abort) and progress is not None:
+            progress.close()
+        raise
 
+    if result is None:
+        if progress is not None:
+            progress.close()
+        raise click.Abort()
+
+    follow_up_error: BaseException | None = None
+    if (
+        result.active_operation_id is None
+        and result.status is ExecutionRunStatus.COMPLETED
+    ):
+        try:
+            if push_project:
+                _run_execution_follow_up(
+                    progress,
+                    "push-project",
+                    "Push project branch",
+                    lambda: _push_project_base(paths.root, name),
+                )
+            if open_pull_request:
+                approval = workflow.approval
+                plan = approval.manifest.get("plan") if approval is not None else None
+                if not isinstance(plan, dict):
+                    plan = None
+                prd_session = workflow.prd_session
+                prd_path = prd_session.prd_path if prd_session is not None else None
+                _run_execution_follow_up(
+                    progress,
+                    "rollup-pr",
+                    "Open rollup pull request",
+                    lambda: _open_rollup_pull_request(
+                        paths.root, name, plan, prd_path
+                    ),
+                )
+        except BaseException as error:
+            follow_up_error = error
+
+    close_error: BaseException | None = None
+    if progress is not None:
+        try:
+            progress.close()
+        except BaseException as error:
+            close_error = error
     _write_host_execution_result(result)
-    if (
-        push_project
-        and result.active_operation_id is None
-        and result.status is ExecutionRunStatus.COMPLETED
-    ):
-        _push_project_base(paths.root, name)
-    if (
-        open_pull_request
-        and result.active_operation_id is None
-        and result.status is ExecutionRunStatus.COMPLETED
-    ):
-        approval = workflow.approval
-        plan = approval.manifest.get("plan") if approval is not None else None
-        if not isinstance(plan, dict):
-            plan = None
-        prd_session = workflow.prd_session
-        prd_path = prd_session.prd_path if prd_session is not None else None
-        _open_rollup_pull_request(paths.root, name, plan, prd_path)
+    if follow_up_error is not None:
+        raise follow_up_error
+    if close_error is not None:
+        raise close_error
 
 
-def _push_project_base(repository_root: Path, name: str) -> None:
+def _reconcile_execution_estimate(
+    progress: RunProgress | None,
+    cancel: CancellationToken | None,
+    error: BaseException,
+) -> None:
+    if progress is None:
+        return
+    stage = progress.stages[_EXECUTION_ESTIMATE_STAGE_KEY]
+    if stage.state is not StageState.RUNNING:
+        return
+    detail = str(error).strip() or type(error).__name__
+    if isinstance(error, KeyboardInterrupt | click.Abort) or (
+        cancel is not None and cancel.is_set()
+    ):
+        progress.stop(_EXECUTION_ESTIMATE_STAGE_KEY, detail)
+    else:
+        progress.fail(_EXECUTION_ESTIMATE_STAGE_KEY, detail)
+
+
+def _run_execution_follow_up(
+    progress: RunProgress | None,
+    stage_key: str,
+    label: str,
+    action: Callable[[], str],
+) -> None:
+    """Run one optional delivery action under the shared stage lifecycle."""
+    if progress is not None:
+        progress.declare(StageSpec(stage_key, label))
+        progress.start(stage_key)
+    try:
+        result = action()
+    except BaseException as error:
+        if progress is not None:
+            detail = str(error).strip() or type(error).__name__
+            if isinstance(error, KeyboardInterrupt | click.Abort):
+                progress.stop(stage_key, detail)
+            else:
+                progress.fail(stage_key, detail)
+        raise
+    if progress is not None:
+        progress.complete(stage_key, result)
+    else:
+        click.echo(result)
+
+
+def _push_project_base(repository_root: Path, name: str) -> str:
     """Publish completed local work while leaving its branch untouched on failure."""
     branch = f"project/{name}"
     try:
@@ -891,7 +1016,7 @@ def _push_project_base(repository_root: Path, name: str) -> None:
         raise click.ClickException(
             f"Local execution completed, but push of {branch!r} failed: {detail}"
         )
-    click.echo(f"Pushed {branch} to origin.")
+    return f"Pushed {branch} to origin."
 
 
 def _open_rollup_pull_request(
@@ -899,7 +1024,7 @@ def _open_rollup_pull_request(
     name: str,
     plan: dict[str, object] | None,
     prd_path: Path | None,
-) -> None:
+) -> str:
     """Open one authenticated GitHub PR after completed local execution."""
     branch = f"project/{name}"
     failure_prefix = "Local execution completed, but rollup PR creation failed"
@@ -1032,7 +1157,7 @@ def _open_rollup_pull_request(
         )
     url = created.stdout.strip()
     suffix = f": {url}" if url else "."
-    click.echo(f"Opened rollup pull request for {branch}{suffix}")
+    return f"Opened rollup pull request for {branch}{suffix}"
 
 
 def _github_repository(remote: str) -> str | None:
@@ -1063,17 +1188,33 @@ def _invoke_host_execution(
     repository_id: UUID,
     borg_id: UUID,
     generation_id: UUID,
+    *,
+    cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> HostExecutionResult:
     """Assemble and invoke the sole concrete phase-07 host service."""
     analysis = store.get_prior_ready_analysis(repository_id)
     if analysis is None:
         raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
     analyzer_plan = analysis.analysis_json
-    preflight = HostPreflight(paths.root)
-    validated = preflight.validate(
-        analyzer_plan,
-        available_secret_names=os.environ.keys(),
-    )
+    try:
+        preflight = HostPreflight(
+            paths.root,
+            cancel=cancel,
+            activity=(
+                (lambda activity: progress.activity("preflight", activity))
+                if progress is not None
+                else None
+            ),
+        )
+        validated = preflight.validate(
+            analyzer_plan,
+            available_secret_names=os.environ.keys(),
+        )
+    except BaseException as error:
+        _finish_execution_preflight(progress, cancel=cancel, error=error)
+        raise
+    _finish_execution_preflight(progress, cancel=cancel, result=validated)
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
@@ -1099,12 +1240,13 @@ def _invoke_host_execution(
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
-    environment = HostEnvironmentManager(paths.root)
+    environment = HostEnvironmentManager(paths.root, cancel=cancel)
     compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
         source_branch=config.default_branch,
+        cancel=cancel,
     )
     repository_lock = RLock()
 
@@ -1123,6 +1265,7 @@ def _invoke_host_execution(
                 billing_mode=_agent_billing_mode(coding_agent.name),
                 effort=config.agents.coding.effort,
             ),
+            cancel=cancel,
         ),
         review_fix=HostReviewFixPhase(
             paths.root,
@@ -1137,6 +1280,7 @@ def _invoke_host_execution(
                 review_effort=config.agents.review.effort,
                 fix_effort=config.agents.review.effort,
             ),
+            cancel=cancel,
         ),
         merge=HostMergePhase(
             paths.root,
@@ -1147,6 +1291,7 @@ def _invoke_host_execution(
                 effort=config.agents.merge.effort,
             ),
             repository_lock=locked_repository,
+            cancel=cancel,
         ),
         sanity=HostSanityPhase(
             paths.root,
@@ -1155,6 +1300,7 @@ def _invoke_host_execution(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=locked_repository,
+            cancel=cancel,
         ),
     )
     service = HostExecutionService(
@@ -1175,7 +1321,36 @@ def _invoke_host_execution(
         generation_id,
         analyzer_plan,
         secret_values=secrets,
+        cancel=cancel,
+        validated_preflight=validated,
     )
+
+
+def _finish_execution_preflight(
+    progress: RunProgress | None,
+    *,
+    cancel: CancellationToken | None,
+    result: HostPreflightPlan | HostPreflightBlock | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """Close Preflight at validation, before acquisition or task setup."""
+    if progress is None:
+        return
+    stage = progress.stages.get("preflight")
+    if stage is None or stage.state is not StageState.RUNNING:
+        return
+    if error is not None:
+        detail = str(error).strip() or type(error).__name__
+        if isinstance(error, KeyboardInterrupt | click.Abort) or (
+            cancel is not None and cancel.is_set()
+        ):
+            progress.stop("preflight", detail)
+        else:
+            progress.fail("preflight", detail)
+    elif isinstance(result, HostPreflightBlock):
+        progress.fail("preflight", result.reason)
+    else:
+        progress.complete("preflight", "ready")
 
 
 def _execution_agent_trust_requirement(primary_paths: RepoPaths):
@@ -1422,6 +1597,7 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
+        progress = _repository_progress(False)
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -1434,6 +1610,7 @@ def approve_plan(
             ),
             on_bound=mark_resumable,
             cancel=cancel,
+            progress=progress,
         )
     except (SupervisorCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
@@ -1551,9 +1728,7 @@ def _continue_planning(
                     interactive=_stdin_is_interactive(),
                 )
                 planning_io = io or _interactive_io()
-                context = click.get_current_context(silent=True)
-                run = context.find_root().obj if context is not None else None
-                progress = run.progress if isinstance(run, CliRunContext) else None
+                progress = _repository_progress(False)
                 if borg.state is BorgState.DRAFT or (
                     borg.state
                     in {

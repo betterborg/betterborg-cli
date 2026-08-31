@@ -19,9 +19,6 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
-from betterborg_cli.planning import task_publication as publication_module
-from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_files import require_git_trackable
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     Borg,
@@ -159,7 +156,6 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
 def test_constructor_discovery_cancellation_reaps_registered_git_tree(
     committed_git_repo: Path,
     real_process_harness: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = committed_git_repo.parent / "cancelled-publisher-constructor.sqlite3"
     repository, _borg, _approval = _publication_context(
@@ -167,33 +163,27 @@ def test_constructor_discovery_cancellation_reaps_registered_git_tree(
     )
     publication_cancel = CancellationToken()
     errors: list[BaseException] = []
-    original_discover = RepoPaths.discover
 
     def blocked_discover(
-        cls,
-        start: Path | None = None,
-        *,
-        cancel: CancellationToken | None = None,
-        command_runner=run_captured,
-    ) -> RepoPaths:
-        assert cls is RepoPaths
-        assert cancel is publication_cancel
-
-        def runner(command: list[str], **kwargs: Any):
-            return run_captured(
-                real_process_harness.resistant_argv("publication-discovery"),
-                check=kwargs["check"],
-                cancel=kwargs["cancel"],
-            )
-
-        return original_discover(start, cancel=cancel, command_runner=runner)
-
-    monkeypatch.setattr(RepoPaths, "discover", classmethod(blocked_discover))
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        assert command[3:] == ["rev-parse", "--show-toplevel"]
+        assert kwargs["cancel"] is publication_cancel
+        return run_captured(
+            real_process_harness.resistant_argv("publication-discovery"),
+            check=kwargs["check"],
+            cancel=kwargs["cancel"],
+        )
 
     def construct() -> None:
         try:
             with SqliteStore.open(database) as store:
-                TaskPublisher(repository, store, cancel=publication_cancel)
+                TaskPublisher(
+                    repository,
+                    store,
+                    cancel=publication_cancel,
+                    command_runner=blocked_discover,
+                )
         except BaseException as error:
             errors.append(error)
 
@@ -214,7 +204,6 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
     committed_git_repo: Path,
     approved_task_generation,
     real_process_harness: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = committed_git_repo.parent / "cancelled-publication.sqlite3"
     repository, borg, approval = _publication_context(committed_git_repo, database)
@@ -223,7 +212,7 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
             store,
             borg,
             approval,
-            body=_task_body("01-cancelled"),
+            body=[_task_body("01-first"), _task_body("02-cancelled")],
             round_number=1,
         ).generation
 
@@ -231,33 +220,24 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
     errors: list[BaseException] = []
     checkpoints: list[str] = []
     commands: list[tuple[str, ...]] = []
-    original_require_git_trackable = publication_module.require_git_trackable
 
-    def blocked_visibility(path: Path, *, root: Path, cancel=None) -> None:
-        assert cancel is publication_cancel
-
-        def runner(
-            command: list[str], **kwargs: Any
-        ) -> subprocess.CompletedProcess[str]:
-            commands.append(tuple(command))
+    def runner(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(tuple(command))
+        assert kwargs["cancel"] is publication_cancel
+        visibility_checks = sum("check-ignore" in item for item in commands)
+        if "check-ignore" in command and visibility_checks == 2:
             return run_captured(
                 real_process_harness.resistant_argv("publication-visibility"),
                 check=kwargs["check"],
                 cancel=kwargs["cancel"],
             )
-
-        require_git_trackable(
-            path,
-            root=root,
-            cancel=cancel,
-            command_runner=runner,
+        return run_captured(
+            command,
+            check=kwargs["check"],
+            cancel=kwargs["cancel"],
         )
-
-    monkeypatch.setattr(
-        publication_module,
-        "require_git_trackable",
-        blocked_visibility,
-    )
 
     def publish() -> None:
         try:
@@ -267,6 +247,7 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
                     store,
                     failure_injector=checkpoints.append,
                     cancel=publication_cancel,
+                    command_runner=runner,
                 ).publish(generation.id)
         except BaseException as error:
             errors.append(error)
@@ -298,14 +279,11 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
     assert persisted is not None
     assert persisted.status is TaskGenerationStatus.PREPARING
     assert [command[3:5] for command in commands] == [
-        ("check-ignore", "--quiet")
+        ("rev-parse", "--show-toplevel"),
+        ("check-ignore", "--quiet"),
+        ("check-ignore", "--quiet"),
     ]
     real_process_harness.assert_tree_absent("publication-visibility")
-    monkeypatch.setattr(
-        publication_module,
-        "require_git_trackable",
-        original_require_git_trackable,
-    )
     with SqliteStore.open(database) as store:
         resumed = TaskPublisher(repository, store).reconcile(borg.id)
 
@@ -314,7 +292,10 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
         assert resumed.generation.status is TaskGenerationStatus.CURRENT
 
 
-@pytest.mark.parametrize("checkpoint", ["during_staging", "before_db_commit"])
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["during_staging", "after_parent_fsync", "before_db_commit"],
+)
 def test_cooperative_publication_cancellation_never_exposes_partial_markdown(
     committed_git_repo: Path,
     approved_task_generation,

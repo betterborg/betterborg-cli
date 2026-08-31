@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.host_execution.compose import (
     ComposeStack,
     ComposeStackError,
@@ -96,9 +97,10 @@ class HostSanityPhase:
         repository_lock: RepositoryLockFactory,
         command_runner: CommandRunner | None = None,
         timeout_seconds: float = 600,
+        cancel: CancellationToken | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        paths = RepoPaths.discover(self.repository_root)
+        paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if paths.root != self.repository_root:
             raise SanityPhaseError("sanity phase must use the primary checkout")
         if plan.repository_root.resolve() != self.repository_root:
@@ -114,8 +116,10 @@ class HostSanityPhase:
         self._repository_lock = repository_lock
         self._run = command_runner or subprocess.run
         self._timeout_seconds = timeout_seconds
-        self._git = SafeGit(self.repository_root)
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
+        self._git = SafeGit(self.repository_root, cancel=cancel)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._git
+        )
 
     def run(
         self,
@@ -295,7 +299,7 @@ class HostSanityPhase:
                     )
                 if not commands:
                     raise SanityPhaseError("sanity command catalog is empty")
-                if not SafeGit(worktree).is_clean():
+                if not self._git.for_worktree(worktree).is_clean():
                     raise SanityPhaseError(
                         "sanity commands changed tracked or untracked task files"
                     )
@@ -451,9 +455,10 @@ class HostSanityPhase:
             raise SanityPhaseError("merge tip belongs to another project base")
         return runtime, worktree
 
-    @staticmethod
-    def _verify_tip(runtime: TaskRuntime, worktree: Path, tip: MergeTip) -> None:
-        git = SafeGit(worktree)
+    def _verify_tip(
+        self, runtime: TaskRuntime, worktree: Path, tip: MergeTip
+    ) -> None:
+        git = self._git.for_worktree(worktree)
         if git.current_branch() != runtime.branch:
             raise SanityPhaseError("merged worktree is on the wrong branch")
         if git.head_sha() != tip.commit_sha:

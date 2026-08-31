@@ -842,8 +842,8 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
     operation_id = uuid4()
     invoked: list[tuple] = []
 
-    def invoke(*args):
-        invoked.append(args)
+    def invoke(*args, **kwargs):
+        invoked.append((args, kwargs))
         return HostExecutionResult(
             preflight=HostPreflightPlan(
                 repository_root=paths.root,
@@ -908,6 +908,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
     assert len(invoked) == 1
     assert len(requests) == 1
     assert "Approve this estimate" in requests[0].message
+    invoked_args, invoked_kwargs = invoked[0]
     (
         invoked_paths,
         invoked_store,
@@ -915,7 +916,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         repository_id,
         borg_id,
         generation_id,
-    ) = invoked[0]
+    ) = invoked_args
     assert invoked_paths == paths
     assert isinstance(invoked_store, SqliteStore)
     assert invoked_config.repository_id == borg.repository_id
@@ -924,6 +925,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         borg.id,
         current.generation.id,
     )
+    assert invoked_kwargs == {"cancel": None, "progress": None}
     assert executed["status"] == "completed"
     assert executed["data"]["operation_id"] == str(operation_id)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+from contextlib import contextmanager
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,10 +15,11 @@ import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
-from betterborg_cli.agent_runtime import MockAdapter
-from betterborg_cli.cli import cli
+from betterborg_cli.agent_runtime import CancellationToken, MockAdapter
+from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
 from betterborg_cli.planning import TaskPublisher
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
@@ -271,13 +274,23 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
         return load_config(observed_paths)
 
     def invoke_host(
-        _paths, store, _config, _repository_id, borg_id, generation_id
+        _paths,
+        store,
+        _config,
+        _repository_id,
+        borg_id,
+        generation_id,
+        *,
+        cancel,
+        progress,
     ):
         # Host execution owns run acquisition, so observing the immutable row
         # here proves the gate commits before any claim can occur.
         decision = store.get_current_execution_decision(borg_id)
         assert decision is not None
         assert decision.generation_id == generation_id
+        assert cancel is not None
+        assert progress is not None
         calls.append(decision)
         return _execution_result()
 
@@ -297,8 +310,13 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
         input="y\n",
     )
     assert approved.exit_code == 0, approved.output
-    assert approved.output.startswith("DUMMY DATA")
+    assert approved.output.startswith("running Estimate and decision")
+    assert "DUMMY DATA" in approved.output
+    assert "completed Estimate and decision — approved" in approved.output
     assert "Recorded execution estimate approved" in approved.output
+    assert approved.output.index("summary:") < approved.output.index(
+        "Execution operation"
+    )
     assert len(calls) == 1
     assert config_calls == [committed_git_repo]
     assert calls[0].decision == "approved"
@@ -355,7 +373,7 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(
@@ -372,6 +390,118 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     assert decision.decision == "bypassed"
     assert decision.source == "auto_execute"
     assert decision.snapshot["generation_id"] == str(fixture.generation.id)
+
+
+def test_execute_declines_under_suspended_progress_without_invoking_host(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository, paths, borg, _approval, _fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name="declined-execution",
+        )
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: pytest.fail(
+            "declined execution must not invoke the host"
+        ),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", "declined-execution"],
+        input="n\n",
+    )
+
+    assert result.exit_code == 1
+    assert "completed Estimate and decision — declined" in result.output
+    assert result.output.index("[y/N]: n") < result.output.index(
+        "completed Estimate and decision — declined"
+    )
+    assert result.output.index("completed Estimate and decision — declined") < (
+        result.output.index("summary:")
+    )
+    assert "Aborted!" in result.output
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert store.get_current_execution_decision(borg.id) is None
+
+
+def test_execute_threads_one_control_context_and_suspends_confirmation(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "execution-control"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+
+    class TrackingProgress(RunProgress):
+        suspended = False
+        suspension_count = 0
+
+        @contextmanager
+        def suspend(self):
+            self.suspension_count += 1
+            self.suspended = True
+            try:
+                with super().suspend() as progress:
+                    yield progress
+            finally:
+                self.suspended = False
+
+    token = CancellationToken()
+    progress = TrackingProgress(stream=StringIO())
+    run = CliRunContext(token, progress)
+    discovered_tokens: list[CancellationToken | None] = []
+    host_contexts: list[tuple[CancellationToken | None, RunProgress | None]] = []
+    discover = cli_module.RepoPaths.discover
+
+    def observed_discover(*args, **kwargs):
+        discovered_tokens.append(kwargs.get("cancel"))
+        return discover(*args, **kwargs)
+
+    def confirm(*_args, **_kwargs):
+        assert progress.suspended
+        return True
+
+    def invoke_host(*_args, cancel=None, progress=None):
+        host_contexts.append((cancel, progress))
+        return _execution_result()
+
+    monkeypatch.setattr(cli_module.RepoPaths, "discover", observed_discover)
+    monkeypatch.setattr(cli_module.click, "confirm", confirm)
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke_host)
+
+    result = cli_runner.invoke(cli, ["execute", name], obj=run)
+
+    assert result.exit_code == 0, result.output
+    assert discovered_tokens
+    assert all(observed is token for observed in discovered_tokens)
+    assert host_contexts == [(token, progress)]
+    assert progress.suspension_count == 1
+    assert progress.closed
+    estimate = progress.stages["estimate-decision"]
+    assert estimate.state is StageState.COMPLETED
+    assert estimate.result == "approved"
+    preflight = progress.stages["preflight"]
+    assert preflight.state is StageState.COMPLETED
+    assert preflight.result == "ready"
 
 
 def test_execute_without_push_succeeds_without_a_remote(
@@ -393,7 +523,7 @@ def test_execute_without_push_succeeds_without_a_remote(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute"])
@@ -402,6 +532,44 @@ def test_execute_without_push_succeeds_without_a_remote(
     assert ": completed" in result.output
     assert "Pushed" not in result.output
     assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_failure_after_preflight_does_not_reclassify_preflight(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "post-preflight-failure"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    progress = RunProgress(stream=StringIO())
+
+    def fail_after_preflight(*_args, progress=None, **_kwargs):
+        assert progress is not None
+        progress.complete("preflight", "ready")
+        raise RuntimeError("task setup failed")
+
+    monkeypatch.setattr(
+        cli_module, "_invoke_host_execution", fail_after_preflight
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute"],
+        obj=CliRunContext(CancellationToken(), progress),
+    )
+
+    assert result.exit_code == 1
+    assert "task setup failed" in result.output
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].result == "ready"
 
 
 def test_push_option_publishes_completed_project_branch_non_force(
@@ -424,14 +592,20 @@ def test_push_option_publishes_completed_project_branch_non_force(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--push"], input="y\n")
 
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
+    assert "completed Push project branch — Pushed project/push-success" in (
+        result.output
+    )
     assert f"Pushed project/{name} to origin." in result.output
+    assert result.output.index("summary:") < result.output.index(
+        "Execution operation"
+    )
     assert _remote_project_sha(remote, name) == local_sha
 
 
@@ -454,7 +628,7 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(
@@ -463,8 +637,15 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
 
     assert result.exit_code == 1
     assert ": completed" in result.output
+    assert "failed Push project branch" in result.output
     assert "Local execution completed, but push" in result.output
     assert "origin" in result.output
+    assert result.output.index("summary:") < result.output.index(
+        "Execution operation"
+    )
+    assert result.output.index("Execution operation") < result.output.rindex(
+        "Local execution completed, but push"
+    )
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
@@ -527,7 +708,7 @@ def test_push_denies_remote_rewind_instead_of_forcing_project_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(
@@ -582,7 +763,7 @@ def test_push_credential_failure_preserves_local_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(
@@ -617,7 +798,7 @@ def test_push_and_pr_wait_for_local_execution_to_complete(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: active,
+        lambda *_args, **_kwargs: active,
     )
 
     result = cli_runner.invoke(
@@ -658,7 +839,7 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -666,6 +847,9 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
     assert "Pushed" not in result.output
+    assert "completed Open rollup pull request — Opened rollup pull request" in (
+        result.output
+    )
     assert "Opened rollup pull request" in result.output
     assert args_path.read_text(encoding="utf-8").splitlines() == [
         "pr",
@@ -710,7 +894,7 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(
@@ -719,8 +903,13 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     )
 
     assert result.exit_code == 0, result.output
+    assert "completed Push project branch" in result.output
+    assert "completed Open rollup pull request" in result.output
     assert result.output.index("Pushed project/") < result.output.index(
         "Opened rollup pull request"
+    )
+    assert result.output.index("summary:") < result.output.index(
+        "Execution operation"
     )
     assert args_path.exists()
     assert _remote_project_sha(remote, name) == local_sha
@@ -745,7 +934,7 @@ def test_pr_missing_remote_preserves_completed_local_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -777,7 +966,7 @@ def test_pr_rejects_unsupported_remote_without_invoking_gh(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -811,7 +1000,7 @@ def test_pr_missing_gh_preserves_completed_local_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -845,7 +1034,7 @@ def test_pr_authentication_failure_preserves_completed_local_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -881,7 +1070,7 @@ def test_pr_creation_failure_preserves_completed_local_branch(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -921,7 +1110,7 @@ def test_pr_rejects_external_prd_symlink_without_uploading_host_file(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(),
+        lambda *_args, **_kwargs: _execution_result(),
     )
 
     result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
@@ -968,7 +1157,13 @@ def test_concurrent_decision_insert_reaches_active_host_execution(
     host_calls = []
 
     def invoke_host(
-        _paths, store, _config, _repository_id, borg_id, generation_id
+        _paths,
+        store,
+        _config,
+        _repository_id,
+        borg_id,
+        generation_id,
+        **_kwargs,
     ):
         host_calls.append((borg_id, generation_id))
         assert store.get_current_execution_decision(borg_id) == winner[0]
@@ -1018,7 +1213,7 @@ def test_execute_exits_nonzero_for_unsuccessful_host_execution(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: _execution_result(status),
+        lambda *_args, **_kwargs: _execution_result(status),
     )
 
     result = cli_runner.invoke(
@@ -1051,7 +1246,9 @@ def test_task_digest_drift_blocks_before_decision_or_host_execution(
     monkeypatch.setattr(
         cli_module,
         "_invoke_host_execution",
-        lambda *_args: pytest.fail("host execution must not run after digest drift"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "host execution must not run after digest drift"
+        ),
     )
 
     result = cli_runner.invoke(
@@ -1094,6 +1291,7 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     calls: list[tuple[object, ...]] = []
 
     def run(service, borg_id, generation_id, analyzer_plan, **kwargs):
+        assert progress.stages["preflight"].state is StageState.COMPLETED
         assert type(service) is cli_module.HostExecutionService
         assert type(service._runtime) is cli_module.HostTaskRuntime
         assert type(service._runtime._coding) is cli_module.HostCodingPhase
@@ -1105,6 +1303,10 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
 
     monkeypatch.setattr(cli_module, "select_agent", select)
     monkeypatch.setattr(cli_module.HostExecutionService, "run", run)
+    cancel = CancellationToken()
+    progress = RunProgress(enabled=False)
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         analysis = store.get_prior_ready_analysis(repository.id)
         assert analysis is not None
@@ -1130,10 +1332,12 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
             paths,
             store,
             config,
-            repository.id,
-            borg.id,
-            fixture.generation.id,
-        )
+                repository.id,
+                borg.id,
+                fixture.generation.id,
+                cancel=cancel,
+                progress=progress,
+            )
 
     assert isinstance(result, HostExecutionResult)
     assert len(adapters) == 3
@@ -1147,11 +1351,15 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     for requirement in execution_trust:
         requirement(managed_worktree_paths)
     assert observed_trust_paths == [paths.root] * 3
-    assert calls == [
-        (
-            borg.id,
-            fixture.generation.id,
-            analyzer_plan,
-            {"secret_values": {"EXECUTE_TOKEN": "owner-secret"}},
-        )
-    ]
+    assert len(calls) == 1
+    observed_borg, observed_generation, observed_plan, observed_kwargs = calls[0]
+    assert observed_borg == borg.id
+    assert observed_generation == fixture.generation.id
+    assert observed_plan == analyzer_plan
+    assert observed_kwargs["secret_values"] == {
+        "EXECUTE_TOKEN": "owner-secret"
+    }
+    assert observed_kwargs["cancel"] is cancel
+    assert isinstance(
+        observed_kwargs["validated_preflight"], HostPreflightPlan
+    )

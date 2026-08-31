@@ -27,6 +27,7 @@ from betterborg_cli.cli import cli
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_analysis import analyzer as analyzer_module
+from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
 from betterborg_cli.repo_analysis import prompts_manager as prompts_manager_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
@@ -170,6 +171,12 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
         "borg create theme-ci --prd "
         ".borg/prds/improvements/theme-ci.md\n"
     ) in first.output
+    prompts_complete = "completed Generate role prompts — 3 prompts"
+    drafts_started = "running Draft improvement PRDs"
+    drafts_complete = "completed Draft improvement PRDs — 1 PRD"
+    assert first.output.count(drafts_complete) == 1
+    assert first.output.index(prompts_complete) < first.output.index(drafts_started)
+    assert first.output.index(drafts_started) < first.output.index(drafts_complete)
 
     second = cli_runner.invoke(cli, ["init", "--yes"])
 
@@ -866,6 +873,69 @@ def test_prompt_cancellation_after_durable_fanout_starts_no_later_init_work(
 
     assert len(adapter.calls) == 4
     assert list(paths.improvement_prds_dir.glob("*.md")) == []
+
+
+def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    adapter, selected = _adapter(committed_git_repo)
+    cancel = CancellationToken()
+    progress_stream = StringIO()
+    progress = RunProgress(stream=progress_stream)
+    published: list[Path] = []
+    publish = improvement_prds_module.publish_repository_text
+
+    def publish_then_cancel(
+        path: Path,
+        body: str,
+        *,
+        root: Path,
+        overwrite: bool,
+    ) -> None:
+        publish(path, body, root=root, overwrite=overwrite)
+        published.append(path)
+        cancel.cancel()
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(committed_git_repo.parent / "state"))
+    monkeypatch.setattr(cli_module, "CancellationToken", lambda: cancel)
+    monkeypatch.setattr(cli_module, "RunProgress", lambda **_kwargs: progress)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: selected)
+    monkeypatch.setattr(
+        improvement_prds_module,
+        "publish_repository_text",
+        publish_then_cancel,
+    )
+
+    exit_code = cli_module.main(["init", "--yes"], prog_name="borg")
+
+    assert exit_code == 130
+    assert published == [paths.improvement_prds_dir / "theme-ci.md"]
+    assert paths.improvement_prds_dir.joinpath("theme-ci.md").read_text(
+        encoding="utf-8"
+    ).startswith("# Make validation visible\n")
+    assert progress.stages["prompts"].state is StageState.COMPLETED
+    assert progress.stages["improvement-prds"].state is StageState.STOPPED
+    assert progress.stages["improvement-prds"].result == "interrupted"
+    assert progress.closed
+    output = progress_stream.getvalue()
+    assert output.index("completed Generate role prompts — 3 prompts") < output.index(
+        "running Draft improvement PRDs"
+    )
+    assert "stopped Draft improvement PRDs — interrupted" in output
+    assert "failed Draft improvement PRDs" not in output
+    assert "completed Draft improvement PRDs" not in output
+    assert len(adapter.calls) == 4
+    config = load_repository_config(paths)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert store.list_operations(config.repository_id) == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == ""
 
 
 def test_incomplete_initialization_seeds_retained_analysis_without_restart(

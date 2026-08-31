@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime.base import CancellationToken
@@ -16,7 +16,7 @@ from betterborg_cli.execution_estimate import (
     estimate_generation,
     phase_billing_from_config,
 )
-from betterborg_cli.host_execution import HostExecutionResult
+from betterborg_cli.host_execution import HostExecutionResult, HostPreflightBlock
 from betterborg_cli.planning import (
     SupervisorLoop,
     TaskPublication,
@@ -25,6 +25,7 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     validate_plan,
 )
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig
 from betterborg_cli.repository_files import (
@@ -44,10 +45,24 @@ from betterborg_cli.store import (
 )
 
 PlanningAgentFactory = Callable[[], Any]
-HostInvoker = Callable[
-    [RepoPaths, SqliteStore, RepositoryConfig, UUID, UUID, UUID],
-    HostExecutionResult,
-]
+_EXECUTION_PREFLIGHT_STAGE_KEY = "preflight"
+
+
+class HostInvoker(Protocol):
+    """Invoke host execution with the command's shared control context."""
+
+    def __call__(
+        self,
+        paths: RepoPaths,
+        store: SqliteStore,
+        config: RepositoryConfig,
+        repository_id: UUID,
+        borg_id: UUID,
+        generation_id: UUID,
+        *,
+        cancel: CancellationToken | None,
+        progress: RunProgress | None,
+    ) -> HostExecutionResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +105,7 @@ def approve_plan_workflow(
     planning_agent: PlanningAgentFactory,
     on_bound: Callable[[], None] | None = None,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -119,9 +135,14 @@ def approve_plan_workflow(
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
                 cancel=cancel,
+                progress=progress,
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication
+            if borg.state is BorgState.READY_TO_EXECUTE and publication is None:
+                raise RuntimeError(
+                    "Supervisor reached ready state without durable task publication"
+                )
 
         if borg.state is BorgState.READY_TO_EXECUTE:
             if publication is None:
@@ -150,6 +171,7 @@ def execute_workflow(
     decide: Callable[[dict[str, Any]], ExecutionDecisionRequest | None],
     invoke_host: HostInvoker,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -236,14 +258,42 @@ def execute_workflow(
             raise RuntimeError(
                 "current generation has an unsupported execution decision"
             )
-        host_result = invoke_host(
-            paths,
-            store,
-            config,
-            repository.id,
-            borg.id,
-            generation.id,
-        )
+        if progress is not None:
+            progress.declare(
+                StageSpec(_EXECUTION_PREFLIGHT_STAGE_KEY, "Preflight")
+            )
+            progress.start(_EXECUTION_PREFLIGHT_STAGE_KEY)
+        try:
+            host_result = invoke_host(
+                paths,
+                store,
+                config,
+                repository.id,
+                borg.id,
+                generation.id,
+                cancel=cancel,
+                progress=progress,
+            )
+        except BaseException as error:
+            if _preflight_is_running(progress):
+                assert progress is not None
+                detail = str(error).strip() or type(error).__name__
+                if isinstance(error, KeyboardInterrupt) or (
+                    cancel is not None and cancel.is_set()
+                ):
+                    progress.stop(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+                else:
+                    progress.fail(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+            raise
+        if _preflight_is_running(progress):
+            assert progress is not None
+            if isinstance(host_result.preflight, HostPreflightBlock):
+                progress.fail(
+                    _EXECUTION_PREFLIGHT_STAGE_KEY,
+                    host_result.preflight.reason,
+                )
+            else:
+                progress.complete(_EXECUTION_PREFLIGHT_STAGE_KEY, "ready")
 
     return ExecutionWorkflowResult(
         borg,
@@ -254,6 +304,14 @@ def execute_workflow(
         decision,
         host_result,
         event,
+    )
+
+
+def _preflight_is_running(progress: RunProgress | None) -> bool:
+    return (
+        progress is not None
+        and progress.stages[_EXECUTION_PREFLIGHT_STAGE_KEY].state
+        is StageState.RUNNING
     )
 
 
