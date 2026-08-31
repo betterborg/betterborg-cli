@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 from contextlib import contextmanager
 from dataclasses import replace
@@ -11,11 +13,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+import click
 import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
-from betterborg_cli.agent_runtime import CancellationToken, MockAdapter
+from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_captured
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
 from betterborg_cli.planning import TaskPublisher
@@ -646,6 +649,156 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
     assert result.output.index("Execution operation") < result.output.rindex(
         "Local execution completed, but push"
     )
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_push_timeout_keeps_existing_error_and_local_branch(
+    committed_git_repo: Path,
+) -> None:
+    name = "push-timeout"
+    local_sha = _create_project_branch(committed_git_repo, name)
+    observed_timeouts: list[float | None] = []
+
+    def runner(command, **kwargs):
+        if tuple(command[1:2]) == ("push",):
+            observed_timeouts.append(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return run_captured(command, **kwargs)
+
+    git = cli_module.SafeGit(committed_git_repo, command_runner=runner)
+
+    with pytest.raises(click.ClickException, match="timed out after 60 seconds"):
+        cli_module._push_project_base(git, name)
+
+    assert observed_timeouts == [60]
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_push_interrupt_reaps_tree_stops_stage_and_preserves_core_report(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    real_process_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "push-interrupt"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    _trust(cli_runner=CliRunner(), root=committed_git_repo, monkeypatch=monkeypatch)
+    operation_id = uuid4()
+    resistant = real_process_harness.resistant_argv("execute-push")
+    source = r'''
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
+
+from betterborg_cli import cli as cli_module
+from betterborg_cli.agent_runtime import run_captured
+from betterborg_cli.host_execution import HostPreflightPlan
+from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.store import ExecutionRunStatus
+
+repository = Path(sys.argv[1])
+marker_root = Path(sys.argv[2])
+resistant = tuple(json.loads(sys.argv[3]))
+operation_id = UUID(sys.argv[4])
+name = sys.argv[5]
+actual_safe_git = cli_module.SafeGit
+
+
+class FastProgress(RunProgress):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+
+    def refresh(self):
+        super().refresh()
+        stage = self.stages.get("push-project")
+        if (
+            stage is not None
+            and stage.state is StageState.RUNNING
+            and stage.activity is not None
+        ):
+            (marker_root / "push-heartbeat").write_text(
+                "refreshed", encoding="utf-8"
+            )
+
+
+def runner(command, **kwargs):
+    if tuple(command[1:2]) == ("push",):
+        (marker_root / "push-token").write_text(
+            "bound" if kwargs.get("cancel") is not None else "missing",
+            encoding="utf-8",
+        )
+        return run_captured(resistant, **kwargs)
+    return run_captured(command, **kwargs)
+
+
+def safe_git(cwd, **kwargs):
+    (marker_root / "push-activity").write_text(
+        "bound" if kwargs.get("activity") is not None else "missing",
+        encoding="utf-8",
+    )
+    return actual_safe_git(cwd, command_runner=runner, **kwargs)
+
+
+preflight = HostPreflightPlan(
+    repository_root=repository,
+    commands=(),
+    prepare_commands=(),
+    materialize_commands=(),
+    environment_files=(),
+    executables=(),
+    required_secret_names=(),
+    compose_files=(),
+    services=(),
+)
+cli_module.RunProgress = FastProgress
+cli_module.SafeGit = safe_git
+cli_module._invoke_host_execution = lambda *_args, **_kwargs: SimpleNamespace(
+    preflight=preflight,
+    active_operation_id=None,
+    operation_id=operation_id,
+    status=ExecutionRunStatus.COMPLETED,
+)
+raise SystemExit(
+    cli_module.main(["execute", name, "--auto-execute", "--push"])
+)
+'''
+    process = real_process_harness.launch_python(
+        source,
+        str(committed_git_repo),
+        str(real_process_harness.root),
+        json.dumps(resistant),
+        str(operation_id),
+        name,
+        name="execute-push",
+    )
+    real_process_harness.wait_for_marker("execute-push.child.pid")
+    real_process_harness.wait_for_marker("push-heartbeat")
+    real_process_harness.signal(process, signal.SIGINT)
+
+    assert real_process_harness.wait_for_exit(process) == 130
+    stdout, stderr = process.communicate()
+    output = stdout + stderr
+    real_process_harness.assert_tree_absent("execute-push")
+    assert real_process_harness.wait_for_marker("push-token") == "bound"
+    assert real_process_harness.wait_for_marker("push-activity") == "bound"
+    assert output.count("running Push project branch") >= 2
+    assert "command: git push origin refs/heads/project/push-interrupt" in output
+    assert "stopped Push project branch" in output
+    assert "failed Push project branch" not in output
+    assert "summary:" in output
+    report = f"Execution operation {operation_id}: completed"
+    assert report in output
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
