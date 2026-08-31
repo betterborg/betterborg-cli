@@ -12,7 +12,7 @@ from typing import TypeAlias
 from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.agent_runtime.selection import SelectedAgent
-from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
     ImprovementPrd,
@@ -37,6 +37,7 @@ from betterborg_cli.store import Operation, Repository, RepositoryAnalysis, Sqli
 
 _INITIALIZED_OPERATION = "repository.initialized"
 _PROMPTS_STAGE_KEY = "prompts"
+_IMPROVEMENT_PRDS_STAGE_KEY = "improvement-prds"
 
 AnalysisAgent: TypeAlias = AgentAdapter | SelectedAgent
 AgentFactory: TypeAlias = Callable[[RepositoryConfig], AnalysisAgent]
@@ -100,6 +101,9 @@ class RepositoryService:
                     ),
                 )
             )
+            progress.declare(
+                StageSpec(_IMPROVEMENT_PRDS_STAGE_KEY, "Draft improvement PRDs")
+            )
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
@@ -143,11 +147,8 @@ class RepositoryService:
         _require_complete_prompts(prompt_runs)
         self._raise_if_cancelled()
 
-        improvement_prds = generate_improvement_prds(
-            analysis,
-            self.paths,
-            _suggested_borg_names(analysis),
-        )
+        improvement_prds = self._generate_improvement_prds(analysis)
+        self._raise_if_cancelled()
         self.store.append_operation(
             Operation(
                 repository_id=repository.id,
@@ -206,11 +207,7 @@ class RepositoryService:
         _require_complete_prompts(prompt_runs)
         self._raise_if_cancelled()
 
-        improvement_prds = generate_improvement_prds(
-            analysis,
-            self.paths,
-            _suggested_borg_names(analysis),
-        )
+        improvement_prds = self._generate_improvement_prds(analysis)
         return RepositoryReanalysis(
             repository=repository,
             analysis=analysis,
@@ -357,6 +354,48 @@ class RepositoryService:
     def _raise_if_cancelled(self) -> None:
         if self.cancel is not None and self.cancel.is_set():
             raise KeyboardInterrupt
+
+    def _generate_improvement_prds(
+        self,
+        analysis: RepositoryAnalysis,
+    ) -> tuple[ImprovementPrd, ...]:
+        self._raise_if_cancelled()
+        if self.progress is not None:
+            if self.cancel is not None and not self.cancel.start_if_active(
+                lambda: self.progress.start(_IMPROVEMENT_PRDS_STAGE_KEY)
+            ):
+                raise KeyboardInterrupt
+            if self.cancel is None:
+                self.progress.start(_IMPROVEMENT_PRDS_STAGE_KEY)
+        try:
+            documents = generate_improvement_prds(
+                analysis,
+                self.paths,
+                _suggested_borg_names(analysis),
+                cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_IMPROVEMENT_PRDS_STAGE_KEY,
+            )
+        except BaseException as error:
+            if (
+                self.progress is not None
+                and self.progress.stages[_IMPROVEMENT_PRDS_STAGE_KEY].state
+                is StageState.RUNNING
+            ):
+                if isinstance(error, KeyboardInterrupt) or (
+                    self.cancel is not None and self.cancel.is_set()
+                ):
+                    self.progress.stop(_IMPROVEMENT_PRDS_STAGE_KEY, "interrupted")
+                else:
+                    self.progress.fail(_IMPROVEMENT_PRDS_STAGE_KEY, str(error))
+            raise
+        if self.progress is not None:
+            noun = "PRD" if len(documents) == 1 else "PRDs"
+            self.progress.complete(
+                _IMPROVEMENT_PRDS_STAGE_KEY,
+                f"{len(documents)} {noun}",
+            )
+        return documents
 
 
 def _default_branch(

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.structured import validate_structured_result
+from betterborg_cli.progress import RunProgress
 from betterborg_cli.repo_analysis.scoring import (
     RECOMMENDATION_SCHEMA,
     RankedRecommendationTheme,
@@ -73,6 +75,9 @@ def generate_improvement_prds(
     suggested_borg_names: Mapping[str, str],
     *,
     store: SqliteStore | None = None,
+    cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
+    stage_key: str = "improvement-prds",
 ) -> tuple[ImprovementPrd, ...]:
     """Write one deterministic improvement PRD for every persisted theme.
 
@@ -133,7 +138,11 @@ def generate_improvement_prds(
         )
         for key, ranked in keyed_themes
     )
+    _raise_if_cancelled(cancel)
     for document in documents:
+        if progress is not None:
+            progress.update(stage_key, f"drafting {document.path.name}")
+        _raise_if_cancelled(cancel)
         try:
             publish_repository_text(
                 document.path,
@@ -146,11 +155,14 @@ def generate_improvement_prds(
                 "improvement PRD directory escapes repository: "
                 f"{paths.improvement_prds_dir}"
             ) from error
+        _raise_if_cancelled(cancel)
     _remove_obsolete_prds(
         paths.improvement_prds_dir,
         {document.path.name for document in documents},
         root=paths.root,
+        cancel=cancel,
     )
+    _raise_if_cancelled(cancel)
     return documents
 
 
@@ -159,6 +171,7 @@ def _remove_obsolete_prds(
     current_names: set[str],
     *,
     root: Path,
+    cancel: CancellationToken | None = None,
 ) -> None:
     """Remove generated Markdown that is absent from the refreshed theme set."""
     if not directory.exists():
@@ -169,12 +182,19 @@ def _remove_obsolete_prds(
             f"improvement PRD directory escapes repository: {directory}"
         )
     for entry in resolved_directory.iterdir():
+        _raise_if_cancelled(cancel)
         if (
             entry.name not in current_names
             and entry.suffix.casefold() == ".md"
             and (entry.is_file() or entry.is_symlink())
         ):
             entry.unlink()
+        _raise_if_cancelled(cancel)
+
+
+def _raise_if_cancelled(cancel: CancellationToken | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
 
 
 def _ranked_themes(payload: Mapping[str, Any]) -> list[RankedRecommendationTheme]:
