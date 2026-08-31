@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
@@ -37,6 +38,7 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
@@ -71,7 +73,11 @@ class CodingFixture:
     claim: TaskClaim
 
     def context(
-        self, store: SqliteStore, *, cancel: CancellationToken | None = None
+        self,
+        store: SqliteStore,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: Callable[[AgentActivity], None] | None = None,
     ) -> ScheduledTaskContext:
         return ScheduledTaskContext(
             store=store,
@@ -79,6 +85,7 @@ class CodingFixture:
             owner_token=self.owner_token,
             cancel=cancel or CancellationToken(),
             clock=utcnow,
+            activity=activity,
         )
 
 
@@ -415,7 +422,12 @@ def _review_payload(
     }
 
 
-def _fixing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
+def _fixing_response(
+    task: TaskRecord,
+    *,
+    usage: AgentUsage | None = None,
+    activities: tuple[AgentActivity, ...] = (),
+):
     def commit(spec):
         feature = spec.cwd / "feature.txt"
         feature.write_text(feature.read_text() + "fixed\n", encoding="utf-8")
@@ -425,6 +437,7 @@ def _fixing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
             payload=_completed_payload(task),
             usage=usage,
             billing_mode=spec.billing_mode,
+            activities=activities,
         )
 
     return MockResponse(dynamic=commit)
@@ -497,6 +510,41 @@ def test_coding_runs_from_digest_verified_inputs_and_persists_billing(
     assert transcript.parent.name == "adapter-artifacts"
     assert not transcript.stat().st_mode & stat.S_IWUSR
     assert _git(fixture.repository, "status", "--porcelain") == ""
+
+
+def test_coding_binds_labelled_provider_activity_to_the_task(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    received: list[AgentActivity] = []
+    response = _committing_response(fixture.task)
+    assert response.dynamic is not None
+    commit = response.dynamic
+
+    def commit_with_activity(spec):  # noqa: ANN001
+        generated = commit(spec)
+        assert isinstance(generated, MockResponse)
+        return MockResponse(
+            payload=generated.payload,
+            artifacts=generated.artifacts,
+            activities=(
+                AgentActivity(AgentActivityKind.READING, "task.md"),
+            ),
+        )
+
+    adapter = MockAdapter().queue(MockResponse(dynamic=commit_with_activity))
+    with SqliteStore.open(fixture.database) as store:
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store, activity=received.append))
+
+    assert status is TaskRuntimeStatus.REVIEW
+    assert adapter.calls[0].activity_sink is not None
+    assert received == [
+        AgentActivity(AgentActivityKind.READING, "coding: task.md")
+    ]
 
 
 def test_coding_blocks_and_preserves_work_when_agent_makes_no_commit(
@@ -723,6 +771,7 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
 ) -> None:
     fixture = _coding_fixture(tmp_path)
     finding = "feature.txt must include the reviewed fix"
+    received: list[AgentActivity] = []
     review = (
         MockAdapter()
         .queue(
@@ -734,6 +783,9 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
                 ),
                 usage=AgentUsage(tokens_input=50),
                 billing_mode=BillingMode.SUBSCRIPTION,
+                activities=(
+                    AgentActivity(AgentActivityKind.READING, "feature.txt"),
+                ),
             )
         )
         .queue(
@@ -748,6 +800,9 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
         _fixing_response(
             fixture.task,
             usage=AgentUsage(cost_usd=0.25, tokens_input=100, tokens_output=20),
+            activities=(
+                AgentActivity(AgentActivityKind.WRITING, "feature.txt"),
+            ),
         )
     )
 
@@ -765,7 +820,7 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
                 review_billing_mode=BillingMode.SUBSCRIPTION,
                 fix_billing_mode=BillingMode.API,
             ),
-        ).run(fixture.context(store))
+        ).run(fixture.context(store, activity=received.append))
         runtime = store.get_task_runtime(fixture.task.id)
         attempts = store.list_agent_attempts(fixture.task.id)
         projection = store.list_task_runtime(fixture.borg.id)
@@ -779,6 +834,12 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
         ("review", 1),
     ]
     assert attempts[1].result["findings"] == [finding]
+    assert review.calls[0].activity_sink is not None
+    assert fix.calls[0].activity_sink is not None
+    assert received == [
+        AgentActivity(AgentActivityKind.READING, "review: feature.txt"),
+        AgentActivity(AgentActivityKind.WRITING, "fix: feature.txt"),
+    ]
     assert finding in fix.calls[0].user_prompt
     assert _git(Path(runtime.worktree_path), "log", "-1", "--pretty=%s") == (
         "fix review finding"

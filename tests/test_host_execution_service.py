@@ -1020,13 +1020,15 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
 
     class ActivityCoding(_Coding):
         def run(self, context, *, environment=None) -> TaskRuntimeStatus:
-            assert context.agent_activity_sink is not None
-            context.agent_activity_sink(
-                AgentActivity(
-                    AgentActivityKind.READING,
-                    f"agent {token} {escaped} {encoded}",
+            for agent_label in ("coding", "review", "fix", "merge"):
+                activity_sink = context.activity_sink(agent_label)
+                assert activity_sink is not None
+                activity_sink(
+                    AgentActivity(
+                        AgentActivityKind.READING,
+                        f"agent {token} {escaped} {encoded}",
+                    )
                 )
-            )
             return super().run(context, environment=environment)
 
     child_key = str(records[0].id)
@@ -1136,7 +1138,10 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
         assert encoded not in service_stream.getvalue()
         assert [activity.detail for activity in received] == [
             "local [REDACTED] [REDACTED] [REDACTED]",
-            "agent [REDACTED] [REDACTED] [REDACTED]",
+            "coding: agent [REDACTED] [REDACTED] [REDACTED]",
+            "review: agent [REDACTED] [REDACTED] [REDACTED]",
+            "fix: agent [REDACTED] [REDACTED] [REDACTED]",
+            "merge: agent [REDACTED] [REDACTED] [REDACTED]",
         ]
     finally:
         store.close()
