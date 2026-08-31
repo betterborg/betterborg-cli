@@ -527,7 +527,6 @@ class RunProgress:
         with self._lock:
             record = self._stage(stage_key)
             self._require_open()
-            self._require_not_cancelling("seed a retained stage")
             self._require_pending(record, f"stage {stage_key!r}")
             duration = _validate_duration(duration_seconds)
             self._require_terminal_children(record)

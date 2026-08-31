@@ -310,7 +310,9 @@ class HostTaskScheduler:
             except ExecutionOwnershipError:
                 token.cancel()
                 self._drain(active)
-                self._reconcile_interrupted_progress(generation_id)
+                self._reconcile_interrupted_progress(
+                    acquisition.run_id, generation_id
+                )
                 raise
 
     def _seed_progress(self, run_id: UUID, generation_id: UUID) -> None:
@@ -378,17 +380,35 @@ class HostTaskScheduler:
         if self._activity is not None:
             self._activity(task_id, activity)
 
-    def _reconcile_interrupted_progress(self, generation_id: UUID) -> None:
-        """Close started display rows from post-interruption durable state."""
+    def _reconcile_interrupted_progress(
+        self, run_id: UUID, generation_id: UUID
+    ) -> None:
+        """Project post-interruption durable state into declared display rows."""
         if self._progress is None:
             return
+        run = self._store.get_execution_run(run_id)
+        if run is None:
+            raise KeyError(f"execution run {run_id} not found")
+        durations = {
+            row.task_id: row.duration_seconds
+            for row in self._store.list_task_runtime(run.borg_id)
+            if row.generation_id == generation_id
+        }
         for runtime in self._store.list_task_runtimes(generation_id):
             stage = self._progress.stages.get(str(runtime.task_id))
-            if stage is None or stage.state is not StageState.RUNNING:
+            if stage is None:
                 continue
             if runtime.status in _TERMINAL_TASK_STATUSES:
-                self._transition_progress(runtime)
-            else:
+                if stage.state is StageState.RUNNING:
+                    self._transition_progress(runtime)
+                elif stage.state is StageState.PENDING:
+                    result = self._progress_result(runtime)
+                    duration = durations.get(runtime.task_id)
+                    if runtime.status is TaskRuntimeStatus.DONE:
+                        self._progress.seed_completed(stage.key, result, duration)
+                    else:
+                        self._progress.seed_failed(stage.key, result, duration)
+            elif stage.state is StageState.RUNNING:
                 self._progress.stop(stage.key, "execution cancelled")
 
     @staticmethod
@@ -504,7 +524,7 @@ class HostTaskScheduler:
                 now=self._clock(),
             )
         finally:
-            self._reconcile_interrupted_progress(generation_id)
+            self._reconcile_interrupted_progress(run_id, generation_id)
 
     def _interrupt_after_keyboard_interrupt(
         self,

@@ -147,10 +147,16 @@ def test_parent_seeding_rejects_invalid_or_touched_records() -> None:
     with pytest.raises(ProgressError, match="must be pending"):
         terminal.seed_failed("stage", "replacement")
 
-    cancelled = RunProgress([StageSpec("stage", "Stage")], stream=StringIO())
-    cancelled.begin_cancellation()
-    with pytest.raises(ProgressError, match="after cancellation"):
-        cancelled.seed_completed("stage", "retained")
+
+
+def test_parent_seeding_allows_durable_reconciliation_during_cancellation() -> None:
+    progress = RunProgress([StageSpec("stage", "Stage")], stream=StringIO())
+    progress.begin_cancellation()
+
+    retained = progress.seed_completed("stage", "retained")
+
+    assert retained.state is StageState.COMPLETED
+    assert retained.retained is True
 
 
 @pytest.mark.parametrize("seed_method", ["seed_completed", "seed_failed"])

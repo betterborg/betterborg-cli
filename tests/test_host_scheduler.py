@@ -579,6 +579,133 @@ def test_scheduler_sigint_durably_interrupts_before_keyboard_interrupt_escapes(
         )
 
 
+@pytest.mark.parametrize(
+    ("durable_status", "expected_stage_state", "expected_result"),
+    [
+        (TaskRuntimeStatus.DONE, StageState.COMPLETED, "done"),
+        (
+            TaskRuntimeStatus.FAILED,
+            StageState.FAILED,
+            "failed: durable failure",
+        ),
+        (
+            TaskRuntimeStatus.BLOCKED,
+            StageState.FAILED,
+            "blocked: durable block",
+        ),
+    ],
+)
+def test_scheduler_interrupt_reconciles_terminal_stage_during_seeding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_status: TaskRuntimeStatus,
+    expected_stage_state: StageState,
+    expected_result: str,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("retained",),
+        dependencies=(),
+    )
+    clock = FakeClock()
+
+    with SqliteStore.open(database) as store:
+
+        def complete_with_duration(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            store.append_agent_attempt(
+                AgentAttempt(
+                    run_id=context.claim.run_id,
+                    claim_id=context.claim.id,
+                    task_id=context.claim.task_id,
+                    phase="coding",
+                    attempt_number=1,
+                    adapter="test",
+                    model="test-model",
+                    billing_mode=BillingMode.SUBSCRIPTION,
+                    status=AgentStatus.COMPLETED,
+                    log_path="artifacts/retained.log",
+                    duration_seconds=4.25,
+                    started_at=clock(),
+                    finished_at=clock(),
+                ),
+                context.owner_token,
+                context.claim.claim_token,
+                now=clock(),
+            )
+            reason = {
+                TaskRuntimeStatus.DONE: None,
+                TaskRuntimeStatus.FAILED: "durable failure",
+                TaskRuntimeStatus.BLOCKED: "durable block",
+            }[durable_status]
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                durable_status,
+                state_reason=reason,
+            )
+            return durable_status
+
+        completed = HostTaskScheduler(
+            store,
+            complete_with_duration,
+            clock=clock,
+        ).run(borg.id, generation.id)
+        progress = RunProgress(stream=StringIO(), enabled=False)
+        seed_method_name = (
+            "seed_completed"
+            if durable_status is TaskRuntimeStatus.DONE
+            else "seed_failed"
+        )
+        original_seed = getattr(progress, seed_method_name)
+        interrupted = False
+
+        def interrupt_first_seed(
+            stage_key: str,
+            result: object,
+            duration_seconds: float | None = None,
+        ) -> object:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_seed(stage_key, result, duration_seconds)
+
+        monkeypatch.setattr(progress, seed_method_name, interrupt_first_seed)
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("retained work must not be claimed")
+
+        with pytest.raises(KeyboardInterrupt):
+            HostTaskScheduler(
+                store,
+                unexpected_behavior,
+                clock=clock,
+                progress=progress,
+            ).run(borg.id, generation.id)
+
+        interrupted_run = next(
+            run
+            for run in store.list_execution_runs(borg.id)
+            if run.id != completed.operation_id
+        )
+        assert interrupted_run.status is ExecutionRunStatus.CANCELLED
+        runtime = store.get_task_runtime(records["retained"].id)
+        assert runtime is not None
+        assert runtime.status is durable_status
+        stage = progress.stages[str(records["retained"].id)]
+        assert (stage.state, stage.result, stage.duration_seconds) == (
+            expected_stage_state,
+            expected_result,
+            4.25,
+        )
+        assert stage.retained is True
+        assert progress.cancelling is True
+        assert store.list_task_claims(interrupted_run.id) == []
+
+
 def test_scheduler_cancels_inflight_behavior_when_run_lease_expires(
     tmp_path: Path,
 ) -> None:
