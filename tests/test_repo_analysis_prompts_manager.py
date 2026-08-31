@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
-from threading import Barrier, Thread
+from threading import Barrier, Lock, Thread
 from typing import Any
 
 import pytest
@@ -460,6 +462,172 @@ def test_cancellation_before_prompt_publication_stops_without_retaining(
     assert parent.state is StageState.STOPPED
     assert parent.children["coding"].state is StageState.STOPPED
     assert not (git_repo / ".borg/prompts/coding.system.md").exists()
+
+
+def test_cancellation_between_prompt_parent_and_child_start_stops_parent(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                tuple(
+                    ChildSpec(role, f"{role.title()} prompt")
+                    for role in PROMPT_ROLES
+                ),
+            )
+        ],
+        stream=StringIO(),
+    )
+    adapter, selected = _selected_adapter(
+        git_repo,
+        {
+            role: f"# {role.title()} agent\n\nComplete role guidance."
+            for role in PROMPT_ROLES
+        },
+    )
+    original_start_child = progress.start_child
+    cancellation_lock = Lock()
+    cancellation_started = False
+
+    def cancel_before_child_start(stage_key: str, child_key: str):
+        nonlocal cancellation_started
+        with cancellation_lock:
+            if not cancellation_started:
+                cancellation_started = True
+                cancel.cancel()
+                progress.begin_cancellation()
+        return original_start_child(stage_key, child_key)
+
+    monkeypatch.setattr(progress, "start_child", cancel_before_child_start)
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                cancel=cancel,
+                progress=progress,
+            )
+
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    assert adapter.calls == []
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.STOPPED
+    assert all(
+        child.state is StageState.PENDING for child in parent.children.values()
+    )
+    progress.close()
+    assert progress.closed
+
+
+def test_main_thread_interrupt_while_waiting_for_prompt_child_stops_parent(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                tuple(
+                    ChildSpec(role, f"{role.title()} prompt")
+                    for role in PROMPT_ROLES
+                ),
+            )
+        ],
+        stream=StringIO(),
+    )
+    adapter = MockAdapter(name="openai")
+    for role in PROMPT_ROLES:
+        adapter.queue(
+            MockResponse(
+                payload={
+                    "body_md": f"# {role.title()} agent\n\nComplete role guidance."
+                },
+                delay_seconds=10,
+            )
+        )
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+    )
+
+    class InterruptingFuture:
+        def __init__(self, future: Any, *, interrupt: bool) -> None:
+            self.future = future
+            self.interrupt = interrupt
+
+        def result(self) -> Any:
+            if self.interrupt:
+                assert adapter.wait_for_response_consumption(timeout=2)
+                cancel.cancel()
+                progress.begin_cancellation()
+                raise KeyboardInterrupt
+            return self.future.result()
+
+    class InterruptingExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self.executor = ThreadPoolExecutor(max_workers=max_workers)
+            self.submissions = 0
+
+        def __enter__(self) -> InterruptingExecutor:
+            self.executor.__enter__()
+            return self
+
+        def __exit__(self, *exc_info: object) -> bool | None:
+            return self.executor.__exit__(*exc_info)
+
+        def submit(
+            self,
+            function: Callable[..., Any],
+            *args: Any,
+        ) -> InterruptingFuture:
+            future = self.executor.submit(function, *args)
+            self.submissions += 1
+            return InterruptingFuture(future, interrupt=self.submissions == 1)
+
+    monkeypatch.setattr(prompts_manager, "ThreadPoolExecutor", InterruptingExecutor)
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                cancel=cancel,
+                progress=progress,
+            )
+
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.STOPPED
+    assert all(
+        child.state in {StageState.PENDING, StageState.STOPPED}
+        for child in parent.children.values()
+    )
+    progress.close()
+    assert progress.closed
 
 
 @pytest.mark.parametrize("symlink_path", [Path(".borg"), Path(".borg/prompts")])

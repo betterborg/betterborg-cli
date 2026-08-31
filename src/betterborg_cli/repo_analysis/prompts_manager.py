@@ -245,16 +245,29 @@ def generate_role_prompts(
 
     outcomes: list[PromptGeneration] = []
     errors: list[BaseException] = []
-    with ThreadPoolExecutor(max_workers=len(selected_roles)) as executor:
-        futures = [executor.submit(generate, role) for role in selected_roles]
-        for future in futures:
-            try:
-                outcomes.append(future.result())
-            except BaseException as error:
-                errors.append(error)
-
-    _terminalize_prompt_parent(progress, stage_key, selected_roles, outcomes, errors)
+    try:
+        with ThreadPoolExecutor(max_workers=len(selected_roles)) as executor:
+            futures = [executor.submit(generate, role) for role in selected_roles]
+            for future in futures:
+                try:
+                    outcomes.append(future.result())
+                except BaseException as error:
+                    errors.append(error)
+    except BaseException as error:
+        errors.append(error)
+        raise
+    finally:
+        _terminalize_prompt_parent(
+            progress,
+            stage_key,
+            selected_roles,
+            outcomes,
+            errors,
+            cancel,
+        )
     if errors:
+        if any(_is_interruption(error, cancel) for error in errors):
+            raise KeyboardInterrupt
         raise errors[0]
     if cancel is not None and cancel.is_set() and any(not run.ok for run in outcomes):
         raise KeyboardInterrupt
@@ -387,6 +400,9 @@ def _terminalize_prompt_child(
 ) -> None:
     if progress is None:
         return
+    child = progress.stages[stage_key].children[role]
+    if child.state is not StageState.RUNNING:
+        return
     if interrupted:
         progress.stop_child(stage_key, role, "interrupted")
     else:
@@ -399,6 +415,7 @@ def _terminalize_prompt_parent(
     selected_roles: tuple[str, ...],
     outcomes: list[PromptGeneration],
     errors: list[BaseException],
+    cancel: CancellationToken | None,
 ) -> None:
     if progress is None:
         return
@@ -406,7 +423,11 @@ def _terminalize_prompt_parent(
     if parent.state is not StageState.RUNNING:
         return
     children = [parent.children[role] for role in selected_roles]
-    if any(child.state is StageState.STOPPED for child in children):
+    if any(child.state is StageState.RUNNING for child in children):
+        return
+    if any(child.state is StageState.STOPPED for child in children) or any(
+        _is_interruption(error, cancel) for error in errors
+    ):
         progress.stop(stage_key, "interrupted")
     elif errors or any(not outcome.ok for outcome in outcomes):
         progress.fail(stage_key, "prompt generation incomplete")
