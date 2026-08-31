@@ -86,7 +86,7 @@ def require_ready_worktree(
         for entry in primary_git.worktree_list()
     ):
         raise HostAgentPhaseError(
-            "claimed task path is not its registered BetterBorg worktree"
+            "claimed task path is not its registered Betterborg worktree"
         )
     materializations = [
         attempt

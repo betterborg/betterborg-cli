@@ -185,7 +185,7 @@ def require_workspace_trust(
         )
 
     consequence = (
-        f"Trust workspace {identity.repository_path}? BetterBorg's host-capable "
+        f"Trust workspace {identity.repository_path}? Betterborg's host-capable "
         "agents may read and modify files and execute commands on this machine."
     )
     if not confirm(consequence):

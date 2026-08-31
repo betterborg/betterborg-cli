@@ -1,4 +1,4 @@
-"""Shared fixtures for BetterBorg CLI tests."""
+"""Shared fixtures for Betterborg CLI tests."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def git_repo(tmp_path: Path) -> Path:
     """Create an initialized temporary Git repository."""
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "user.name", "BetterBorg Tests"],
+        ["git", "-C", str(tmp_path), "config", "user.name", "Betterborg Tests"],
         check=True,
     )
     subprocess.run(

@@ -149,6 +149,6 @@ def test_license_attribution_and_reference_guidance_are_present() -> None:
     guidance = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
     assert "MIT License" in license_text
-    assert "Copyright 2026 BetterBorg" in notice_text
+    assert "Copyright 2026 Betterborg" in notice_text
     assert "read-only reference" in guidance
     assert "Never edit" in guidance

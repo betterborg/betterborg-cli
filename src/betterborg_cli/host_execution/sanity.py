@@ -230,7 +230,7 @@ class HostSanityPhase:
                 if not self._advance_was_attested(context, tip):
                     raise SanityPhaseError(
                         "project base is already at the merge tip without a durable "
-                        "BetterBorg advancement attestation"
+                        "Betterborg advancement attestation"
                     )
                 if worktree.exists():
                     if not worktree.is_dir():

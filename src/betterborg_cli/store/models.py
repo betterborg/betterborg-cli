@@ -1,4 +1,4 @@
-"""Domain records persisted in the local BetterBorg store."""
+"""Domain records persisted in the local Betterborg store."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def _validate_utc(value: datetime) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Repository:
-    """One Git repository managed by this local BetterBorg store."""
+    """One Git repository managed by this local Betterborg store."""
 
     root: Path
     id: UUID = field(default_factory=uuid4)

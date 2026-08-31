@@ -175,7 +175,7 @@ def initialize_git_fixture(
     """
     repository.mkdir(parents=True)
     (repository / "README.md").write_text(
-        "# BetterBorg release fixture\n", encoding="utf-8"
+        "# Betterborg release fixture\n", encoding="utf-8"
     )
     commands = (
         ["git", "init", "--initial-branch=main", "."],
@@ -243,7 +243,7 @@ def verify_cli_initialization(
             time.sleep(retry_delay)
     else:
         fail_with_output(
-            f"exact-version {method} check did not observe BetterBorg {version}",
+            f"exact-version {method} check did not observe Betterborg {version}",
             captures[-1],
             credential,
         )

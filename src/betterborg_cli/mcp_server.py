@@ -1,4 +1,4 @@
-"""Typed MCP stdio tools backed by BetterBorg's existing workflow services."""
+"""Typed MCP stdio tools backed by Betterborg's existing workflow services."""
 
 from __future__ import annotations
 
@@ -438,9 +438,9 @@ class ProgressStream(ProtocolModel):
 
 
 server = FastMCP(
-    "BetterBorg",
+    "Betterborg",
     instructions=(
-        "Operate the BetterBorg workflow in the Git repository where the server "
+        "Operate the Betterborg workflow in the Git repository where the server "
         "was started. Results preserve durable status, artifacts, and next actions."
     ),
 )

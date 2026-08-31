@@ -1,4 +1,4 @@
-"""Typed, non-secret configuration tracked with a BetterBorg repository."""
+"""Typed, non-secret configuration tracked with a Betterborg repository."""
 
 from __future__ import annotations
 

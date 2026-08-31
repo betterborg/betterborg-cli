@@ -1,4 +1,4 @@
-"""Shared contracts for invoking BetterBorg agent adapters."""
+"""Shared contracts for invoking Betterborg agent adapters."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Detached planning worktrees populated with durable BetterBorg context."""
+"""Detached planning worktrees populated with durable Betterborg context."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def materialize_planning_worktree(
 ) -> Iterator[Path]:
     """Yield an ephemeral detached worktree with current planning evidence.
 
-    Git supplies only committed source. BetterBorg-owned context is rebuilt from
+    Git supplies only committed source. Betterborg-owned context is rebuilt from
     the durable store and the confirmed PRD, while additional uncommitted files
     cross the checkout boundary only when the caller names a dirty ``.borg``
     document explicitly.

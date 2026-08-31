@@ -376,12 +376,12 @@ def main() -> int:
         print(f"final release verification failed: {error}", file=sys.stderr)
         return 1
     if not result.complete:
-        print(f"BetterBorg {arguments.version} publication is partial. Next steps:")
+        print(f"Betterborg {arguments.version} publication is partial. Next steps:")
         for step in result.remaining:
             print(f"- {step}")
         return 2
     print(
-        f"verified synchronized BetterBorg {arguments.version} across PyPI, "
+        f"verified synchronized Betterborg {arguments.version} across PyPI, "
         "GitHub, npm, curl, uvx, and npx"
     )
     return 0

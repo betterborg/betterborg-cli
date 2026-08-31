@@ -174,7 +174,7 @@ def main() -> int:
     except PublicInstallationError as error:
         print(f"public installation verification failed: {error}", file=sys.stderr)
         return 1
-    print(f"verified curl, uvx, and npx for BetterBorg {arguments.version}")
+    print(f"verified curl, uvx, and npx for Betterborg {arguments.version}")
     return 0
 
 

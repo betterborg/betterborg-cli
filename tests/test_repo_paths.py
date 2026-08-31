@@ -1,4 +1,4 @@
-"""Filesystem contracts for repository-local BetterBorg data."""
+"""Filesystem contracts for repository-local Betterborg data."""
 
 import subprocess
 from pathlib import Path

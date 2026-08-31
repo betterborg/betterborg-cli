@@ -1,4 +1,4 @@
-name: Release BetterBorg
+name: Release Betterborg
 
 on:
   workflow_dispatch:

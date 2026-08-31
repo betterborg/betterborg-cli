@@ -1,9 +1,9 @@
 ---
 name: orchestrate
-description: Use BetterBorg to analyze, plan, and execute substantial repository work
+description: Use Betterborg to analyze, plan, and execute substantial repository work
 ---
 
-# Orchestrate with BetterBorg
+# Orchestrate with Betterborg
 
 Use the Borg MCP server for repository work that benefits from a durable PRD,
 reviewed plan, executable task graph, or supervised execution.

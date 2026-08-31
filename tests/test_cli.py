@@ -66,7 +66,7 @@ def test_help_lists_bootstrap_commands(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(cli, ["--help"])
 
     assert result.exit_code == 0
-    assert "Work with BetterBorg" in result.output
+    assert "Work with Betterborg" in result.output
     assert "create" in result.output
     assert "init" in result.output
     assert "trust" in result.output

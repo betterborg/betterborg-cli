@@ -135,7 +135,7 @@ detect_target() {
             ;;
         *)
             unsupported \
-                "No standalone BetterBorg release supports $detected_system/$detected_architecture."
+                "No standalone Betterborg release supports $detected_system/$detected_architecture."
             ;;
     esac
 
@@ -144,7 +144,7 @@ detect_target() {
         arm64|aarch64) TARGET_ARCH=arm64 ;;
         *)
             unsupported \
-                "No standalone BetterBorg release supports $detected_system/$detected_architecture."
+                "No standalone Betterborg release supports $detected_system/$detected_architecture."
             ;;
     esac
     TARGET="borg-$TARGET_OS-$TARGET_ARCH"
@@ -152,7 +152,7 @@ detect_target() {
 
 detect_target
 
-command -v curl >/dev/null 2>&1 || fail 'curl is required to download BetterBorg.'
+command -v curl >/dev/null 2>&1 || fail 'curl is required to download Betterborg.'
 [ -n "$INSTALL_HOME" ] || fail 'HOME must be set for a persistent user installation.'
 
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/betterborg-install.XXXXXXXX") || \
@@ -195,7 +195,7 @@ esac
 
 VERSIONED_RELEASE_URL="$REPOSITORY_RELEASES_URL/download/v$VERSION"
 download "$VERSIONED_RELEASE_URL/$TARGET" "$ARTIFACT" || \
-    fail "could not download $TARGET for BetterBorg $VERSION."
+    fail "could not download $TARGET for Betterborg $VERSION."
 ACTUAL_SHA256=$(sha256 "$ARTIFACT")
 [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || \
     fail "downloaded $TARGET failed SHA-256 verification; nothing was installed."
@@ -228,7 +228,7 @@ fi
 [ "$INSTALLED_VERSION" = "borg $VERSION" ] || \
     fail "the persistent executable at $INSTALL_PATH failed version verification."
 
-printf 'Installed BetterBorg %s at %s.\n' "$VERSION" "$INSTALL_PATH"
+printf 'Installed Betterborg %s at %s.\n' "$VERSION" "$INSTALL_PATH"
 case ":${PATH:-}:" in
     *":$INSTALL_DIRECTORY:"*) ;;
     *)
@@ -244,4 +244,4 @@ if ! PATH="$INSTALL_DIRECTORY${PATH:+:$PATH}" \
     fail 'the CLI was installed, but host plugin activation did not complete.'
 fi
 
-printf '%s\n' 'BetterBorg CLI verification and plugin activation completed.'
+printf '%s\n' 'Betterborg CLI verification and plugin activation completed.'

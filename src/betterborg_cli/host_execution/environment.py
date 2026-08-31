@@ -882,7 +882,7 @@ class HostEnvironmentManager:
             for entry in self._git.worktree_list()
         ):
             raise EnvironmentMaterializationError(
-                "claimed task path is not its registered BetterBorg worktree: "
+                "claimed task path is not its registered Betterborg worktree: "
                 f"{worktree}"
             )
 

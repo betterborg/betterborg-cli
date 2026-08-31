@@ -1,4 +1,4 @@
-"""Owned Codex plugin installation for BetterBorg."""
+"""Owned Codex plugin installation for Betterborg."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ MARKETPLACE_NAME = "betterborg"
 PLUGIN_NAME = "borg"
 PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 NEW_THREAD_GUIDANCE = (
-    "Start a new Codex thread to load the BetterBorg plugin, its skill, and "
+    "Start a new Codex thread to load the Betterborg plugin, its skill, and "
     "its MCP tools."
 )
 
@@ -104,7 +104,7 @@ def install_codex_plugin(
     mcp_verifier: McpVerifier | None = None,
     preflight: PluginActivationPreflight | None = None,
 ) -> CodexPluginInstallation:
-    """Install and verify BetterBorg's user-scoped Codex plugin.
+    """Install and verify Betterborg's user-scoped Codex plugin.
 
     Codex's supported plugin commands own marketplace and install state. This
     function owns only its stable materialized marketplace bundle and never
@@ -166,7 +166,7 @@ def install_codex_plugin(
         ):
             raise PluginCollisionError(
                 f"Codex marketplace {MARKETPLACE_NAME!r} is already registered "
-                "from a source BetterBorg does not own; it was left untouched."
+                "from a source Betterborg does not own; it was left untouched."
             )
         plugins = json_plugin_command(
             (str(Path(codex)), "plugin", "list", "--available", "--json"),
@@ -177,7 +177,7 @@ def install_codex_plugin(
         if registered is None and before.installed and not owned_bundle_before:
             raise PluginCollisionError(
                 f"Codex reports an orphaned {PLUGIN_ID} installation without an "
-                "owned BetterBorg marketplace bundle; it was left untouched."
+                "owned Betterborg marketplace bundle; it was left untouched."
             )
         change = materialize_bundle(
             source,
@@ -273,7 +273,7 @@ def install_codex_plugin(
         ):
             raise PluginCommandError(
                 f"Codex did not report marketplace {MARKETPLACE_NAME!r} from "
-                "the owned BetterBorg bundle."
+                "the owned Betterborg bundle."
             )
         verified = _plugin_state(
             json_plugin_command(

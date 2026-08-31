@@ -37,7 +37,7 @@ PROMPT_ROLES = ("coding", "review", "merge")
 
 PROMPT_MANAGER_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "BetterBorg repository prompt",
+    "title": "Betterborg repository prompt",
     "type": "object",
     "additionalProperties": False,
     "required": ["body_md"],

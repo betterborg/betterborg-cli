@@ -1,4 +1,4 @@
-"""Typed orchestration for installing BetterBorg host plugins."""
+"""Typed orchestration for installing Betterborg host plugins."""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ class PluginInstaller:
 
         preflight = self._preflight()
         if not preflight.ready:
-            detail = preflight.reason or "Persistent BetterBorg CLI setup is required."
+            detail = preflight.reason or "Persistent Betterborg CLI setup is required."
             return PluginInstallation(
                 tuple(
                     PluginHostInstallation(
@@ -123,7 +123,7 @@ class PluginInstaller:
         if status in {"installed", "unchanged"}:
             normalized = PluginInstallStatus.COMPLETED
             action = "Installed" if status == "installed" else "Already installed"
-            detail = f"{action} the BetterBorg plugin."
+            detail = f"{action} the Betterborg plugin."
         elif status == "deferred":
             normalized = PluginInstallStatus.DEFERRED
             detail = (

@@ -1,6 +1,6 @@
 # @betterborg/cli
 
-BetterBorg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them — each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
+Betterborg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them — each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
 
 > [!NOTE]
 > Pre-alpha. Interfaces may change between releases.
@@ -73,4 +73,4 @@ File a [GitHub issue](https://github.com/betterborg/betterborg-cli/issues).
 
 ## License
 
-Copyright 2026 BetterBorg. Licensed under the [MIT License](https://github.com/betterborg/betterborg-cli/blob/main/LICENSE). See [NOTICE](https://github.com/betterborg/betterborg-cli/blob/main/NOTICE) for attribution.
+Copyright 2026 Betterborg. Licensed under the [MIT License](https://github.com/betterborg/betterborg-cli/blob/main/LICENSE). See [NOTICE](https://github.com/betterborg/betterborg-cli/blob/main/NOTICE) for attribution.

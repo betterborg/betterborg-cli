@@ -1,4 +1,4 @@
-# BetterBorg command bootstrap
+# Betterborg command bootstrap
 
 `borg --help` is the authoritative command index. These are the commands needed
 to get a new checkout ready without hiding trust or provider decisions.

@@ -1,4 +1,4 @@
-"""Durable local state for BetterBorg workflows."""
+"""Durable local state for Betterborg workflows."""
 
 from betterborg_cli.store.models import (
     AgentAttempt,

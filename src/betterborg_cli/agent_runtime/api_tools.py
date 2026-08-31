@@ -131,7 +131,7 @@ _TOOL_DEFINITIONS = {
     ),
     "apply_patch": ApiToolDefinition(
         name="apply_patch",
-        description="Apply a BetterBorg patch to files inside the run directory.",
+        description="Apply a Betterborg patch to files inside the run directory.",
         parameters=_object_schema(
             {"patch": {"type": "string"}}, required=("patch",)
         ),

@@ -59,7 +59,7 @@ JSON object.
 
 @dataclass(slots=True)
 class ClaudeAdapter(NativeCliAdapter):
-    """Run Claude Code in autonomous print mode for a BetterBorg role."""
+    """Run Claude Code in autonomous print mode for a Betterborg role."""
 
     role: ApiAgentRole | str
     binary: str = "claude"

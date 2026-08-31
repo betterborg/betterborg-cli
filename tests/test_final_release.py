@@ -366,7 +366,7 @@ def test_cli_exit_status_zero_means_complete(
     _deny_public_access(monkeypatch)
 
     assert _run_main(monkeypatch, registry, fixture, github) == 0
-    assert "verified synchronized BetterBorg" in capsys.readouterr().out
+    assert "verified synchronized Betterborg" in capsys.readouterr().out
 
 
 def test_cli_exit_status_two_needs_only_available_pypi_inputs(

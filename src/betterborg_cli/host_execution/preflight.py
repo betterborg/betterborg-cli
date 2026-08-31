@@ -395,7 +395,7 @@ class HostPreflight:
                         evidence=evidence,
                         guidance=(
                             f"Install {name!r} on the host or update the analyzer "
-                            "command/toolchain evidence; BetterBorg will not install "
+                            "command/toolchain evidence; Betterborg will not install "
                             "runtimes during preflight."
                         ),
                     )
@@ -578,7 +578,7 @@ class HostPreflight:
                         requirement=f"required secret is not configured: {name}",
                         evidence=_evidence(record, "analyzer required_secrets"),
                         guidance=(
-                            f"Configure secret {name!r} in BetterBorg repository "
+                            f"Configure secret {name!r} in Betterborg repository "
                             "secret storage, then retry preflight."
                         ),
                     )
@@ -777,7 +777,7 @@ class HostPreflight:
                             ),
                             guidance=(
                                 "Install Docker and its Compose plugin on the host, "
-                                "then retry; BetterBorg will not install them."
+                                "then retry; Betterborg will not install them."
                             ),
                         )
                     )

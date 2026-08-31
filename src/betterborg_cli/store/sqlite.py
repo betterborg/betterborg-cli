@@ -3440,7 +3440,7 @@ class SqliteStore:
             if applied_versions != known_versions[: len(applied_versions)]:
                 raise RuntimeError(
                     "database migration history is newer than or incompatible "
-                    "with this BetterBorg CLI"
+                    "with this Betterborg CLI"
                 )
             for version, sql in migrations[len(applied_versions) :]:
                 self._apply_migration(version, sql)

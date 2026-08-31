@@ -1,4 +1,4 @@
-# Install BetterBorg CLI
+# Install Betterborg CLI
 
 ## Persistent install
 

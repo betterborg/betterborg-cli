@@ -10,7 +10,7 @@ disabled.
 
 ## One-time protected setup
 
-Only a BetterBorg release maintainer who is authorized as both a PyPI project
+Only a Betterborg release maintainer who is authorized as both a PyPI project
 owner and a required reviewer of the GitHub `pypi` environment may approve a
 release. Configure that environment with required reviewers, prevent
 self-review and administrator bypass, and limit deployment branches to
@@ -71,7 +71,7 @@ different commit under the reviewed tag's version.
 
 ## Run or resume the merged workflow
 
-1. After `.github/workflows/release.yml` is merged, open **Release BetterBorg** in
+1. After `.github/workflows/release.yml` is merged, open **Release Betterborg** in
    GitHub Actions, choose **Run workflow**, select `main`, enter the exact
    reviewed version, leave `publish` disabled, and require every dry-run job to
    pass. The run builds the wheel, sdist, npm tarball, four binaries, manifest,
@@ -204,7 +204,7 @@ and cannot create a GitHub Release.
 ## Authorize and verify the binary publication
 
 The binary publication is authorized only through the reviewed workflow run.
-Two authorized BetterBorg release maintainers must participate: a dispatching
+Two authorized Betterborg release maintainers must participate: a dispatching
 operator who is allowed to run Actions on `betterborg/betterborg-cli`, and a
 different required reviewer for the protected `pypi` environment. Prevent
 self-review remains enabled, so the dispatching operator must not approve
@@ -218,7 +218,7 @@ grant repository contents read and attestations read, but no write permission.
 Do not use an administrator bypass or a personal token with release-write
 scope for verification.
 
-To start the binary path, the dispatching operator runs **Release BetterBorg**
+To start the binary path, the dispatching operator runs **Release Betterborg**
 for that exact reviewed version with `publish` enabled. The different required
 reviewer independently checks the run SHA, tag, version, inputs, and trusted
 publisher identity, then approves the protected environment. To resume an
@@ -304,7 +304,7 @@ supply `ANTHROPIC_API_KEY`, a PyPI password, a PyPI token, or an npm token.
 Each curl, uvx, and npx init child receives exactly one provider variable,
 `OPENAI_API_KEY`, and puts HOME, cache, data, and state inside its own
 disposable fixture. The verification captures stdout and stderr and recursively
-scans each fixture, including Git and BetterBorg state, for raw, URL-encoded,
+scans each fixture, including Git and Betterborg state, for raw, URL-encoded,
 standard-base64, and URL-safe-base64 forms of the credential. GitHub log
 masking is defense in depth; it is not the redaction assertion.
 

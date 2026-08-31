@@ -371,13 +371,13 @@ def test_foreign_bundle_path_collision_is_left_untouched(tmp_path: Path) -> None
     bundle = tmp_path / "data/betterborg/codex/marketplace"
     bundle.mkdir(parents=True)
     marker = bundle / "foreign.txt"
-    marker.write_text("not BetterBorg\n", encoding="utf-8")
+    marker.write_text("not Betterborg\n", encoding="utf-8")
 
     result, spawns = _install(tmp_path, fake)
 
     assert result.status is CodexPluginStatus.COLLISION
     assert "ownership metadata" in (result.reason or "")
-    assert marker.read_text() == "not BetterBorg\n"
+    assert marker.read_text() == "not Betterborg\n"
     assert ("plugin", "marketplace", "add", str(bundle), "--json") not in fake.calls
     assert spawns == []
 

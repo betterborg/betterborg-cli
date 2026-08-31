@@ -1,9 +1,9 @@
 {
   "name": "borg",
-  "description": "Plan and execute repository work with BetterBorg",
+  "description": "Plan and execute repository work with Betterborg",
   "version": "0.1.0",
   "author": {
-    "name": "BetterBorg"
+    "name": "Betterborg"
   },
   "homepage": "https://github.com/betterborg/betterborg-cli",
   "repository": "https://github.com/betterborg/betterborg-cli",

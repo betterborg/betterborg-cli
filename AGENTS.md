@@ -1,10 +1,10 @@
 # Repository guidance
 
-This is the public BetterBorg CLI repository. Keep implementation, tests,
+This is the public Betterborg CLI repository. Keep implementation, tests,
 documentation, generated metadata, and commits for the public CLI in this
 checkout.
 
-The private BetterBorg repository may be consulted only as read-only reference
+The private Betterborg repository may be consulted only as read-only reference
 material. Never edit files, create commits or branches, run formatters that
 write files, or generate artifacts in a reference checkout. Do not copy
 credentials, private paths, cloud-only imports, proprietary code, or other

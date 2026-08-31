@@ -1,4 +1,4 @@
-"""Owned Claude Code plugin installation for BetterBorg."""
+"""Owned Claude Code plugin installation for Betterborg."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ PLUGIN_NAME = "borg"
 PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 RELOAD_GUIDANCE = (
     "Run `/reload-plugins` in any open Claude Code session (or start a new "
-    "session) to load the BetterBorg plugin and its MCP tools."
+    "session) to load the Betterborg plugin and its MCP tools."
 )
 
 _MINIMUM_SAFE_CLAUDE_VERSION = (2, 1, 212)
@@ -109,7 +109,7 @@ def install_claude_plugin(
     mcp_verifier: McpVerifier | None = None,
     preflight: PluginActivationPreflight | None = None,
 ) -> ClaudePluginInstallation:
-    """Install and verify BetterBorg's user-scoped Claude Code plugin.
+    """Install and verify Betterborg's user-scoped Claude Code plugin.
 
     Claude's supported CLI owns marketplace and plugin configuration. This
     function owns only its materialized marketplace bundle and never edits a
@@ -198,7 +198,7 @@ def install_claude_plugin(
         ):
             raise PluginCollisionError(
                 f"Claude marketplace {MARKETPLACE_NAME!r} is already registered "
-                "from a source BetterBorg does not own; it was left untouched."
+                "from a source Betterborg does not own; it was left untouched."
             )
         plugins = json_plugin_command(
             (str(Path(claude)), "plugin", "list", "--json"),

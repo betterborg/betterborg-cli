@@ -70,7 +70,7 @@ def extract_structured_result_file(
 def validate_structured_result(
     payload: Mapping[str, Any], schema: Mapping[str, Any]
 ) -> None:
-    """Validate the JSON Schema features used by BetterBorg result contracts.
+    """Validate the JSON Schema features used by Betterborg result contracts.
 
     The runtime intentionally supports the deterministic validation keywords its
     own schemas use, avoiding a large runtime dependency for the CLI core.
