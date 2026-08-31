@@ -702,14 +702,26 @@ def test_supervisor_publication_cancellation_retains_approval_and_resumes(
         resumed_progress.close()
 
 
-def test_supervisor_interrupt_during_active_turn_cancels_attempt(
+@pytest.mark.parametrize(
+    "interrupt_point",
+    [
+        "agent",
+        "structured_validation",
+        "after_turn",
+        "findings",
+        "before_completion",
+    ],
+)
+def test_supervisor_interrupt_before_attempt_completion_cancels_attempt(
     committed_git_repo: Path,
+    interrupt_point: str,
+    monkeypatch: pytest.MonkeyPatch,
     persist_planning_context,
 ) -> None:
     plan = _plan()
     database = committed_git_repo.parent / "supervisor-turn-interrupt.sqlite3"
 
-    def interrupt_turn(_spec) -> None:
+    def interrupt_turn(*_args) -> None:
         raise KeyboardInterrupt
 
     with SqliteStore.open(database) as store:
@@ -726,20 +738,51 @@ def test_supervisor_interrupt_during_active_turn_cancels_attempt(
             ),
             approved_plan=plan,
         ).run()
-        supervisor = MockAdapter(name="openai").queue(
+        response = (
             MockResponse(dynamic=interrupt_turn)
+            if interrupt_point == "agent"
+            else MockResponse(dynamic=_review_response("approve"))
         )
+        supervisor = MockAdapter(name="openai").queue(response)
         progress = RunProgress(stream=StringIO())
+        loop = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+            progress=progress,
+        )
+
+        if interrupt_point == "structured_validation":
+            monkeypatch.setattr(
+                "betterborg_cli.planning.turns.validate_structured_result",
+                interrupt_turn,
+            )
+        elif interrupt_point == "after_turn":
+            original_run = loop._turns.run
+
+            def interrupt_after_turn(**kwargs):
+                original_run(**kwargs)
+                raise KeyboardInterrupt
+
+            monkeypatch.setattr(loop._turns, "run", interrupt_after_turn)
+        elif interrupt_point == "findings":
+            monkeypatch.setattr(loop, "_findings", interrupt_turn)
+        elif interrupt_point == "before_completion":
+            original_complete = store.complete_planning_attempt
+
+            def interrupt_completion(attempt_id, **kwargs):
+                if kwargs["status"] is PlanningAttemptStatus.COMPLETED:
+                    raise KeyboardInterrupt
+                return original_complete(attempt_id, **kwargs)
+
+            monkeypatch.setattr(
+                store, "complete_planning_attempt", interrupt_completion
+            )
 
         with pytest.raises(KeyboardInterrupt):
-            SupervisorLoop(
-                repository,
-                initial.borg,
-                store,
-                supervisor,
-                approved_plan=plan,
-                progress=progress,
-            ).run()
+            loop.run()
 
         attempts = [
             attempt
@@ -749,6 +792,7 @@ def test_supervisor_interrupt_during_active_turn_cancels_attempt(
         assert len(attempts) == 1
         assert attempts[0].status is PlanningAttemptStatus.CANCELLED
         assert attempts[0].summary == "Supervisor run cancelled"
+        assert len(supervisor.calls) == 1
         assert progress.stages["supervisor"].state is StageState.STOPPED
         progress.close()
 

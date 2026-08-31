@@ -237,6 +237,8 @@ class SupervisorLoop:
             SupervisorCancelled,
             KeyboardInterrupt,
         ) as error:
+            if isinstance(error, KeyboardInterrupt):
+                self._cancel_interrupted_review()
             approval_retained = (
                 isinstance(error, KeyboardInterrupt)
                 and self._approved_publication_is_pending(self._approval())
@@ -732,6 +734,18 @@ class SupervisorLoop:
             (attempt.result or {}).get("decision") == "approve"
             for attempt in self._completed_reviews(approval)
         )
+
+    def _cancel_interrupted_review(self) -> None:
+        running = next(
+            (
+                attempt
+                for attempt in reversed(self._turns.attempts(_SUPERVISOR_PHASE))
+                if attempt.status is PlanningAttemptStatus.RUNNING
+            ),
+            None,
+        )
+        if running is not None:
+            self._turns.cancel_attempt(running)
 
     def _finish_progress(self, result: str, *, stopped: bool) -> None:
         if self.progress is None:

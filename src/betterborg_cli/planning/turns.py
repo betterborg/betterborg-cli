@@ -218,68 +218,85 @@ class DurablePlanningTurns:
         result_path = self.result_path(attempt)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with self.materialized_worktree(current_plan=current_plan) as worktree:
-                result = self.agent.run(
-                    AgentRunSpec(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        schema=schema,
-                        cwd=worktree,
-                        model=self.model,
-                        allowed_tools=READ_ONLY_API_TOOLS,
-                        log_path=result_path.with_suffix(".log"),
-                        result_path=result_path,
-                        activity_sink=(
-                            self._record_activity if self.progress is not None else None
+            try:
+                with self.materialized_worktree(
+                    current_plan=current_plan
+                ) as worktree:
+                    result = self.agent.run(
+                        AgentRunSpec(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            schema=schema,
+                            cwd=worktree,
+                            model=self.model,
+                            allowed_tools=READ_ONLY_API_TOOLS,
+                            log_path=result_path.with_suffix(".log"),
+                            result_path=result_path,
+                            activity_sink=(
+                                self._record_activity
+                                if self.progress is not None
+                                else None
+                            ),
                         ),
-                    ),
-                    cancel=self.cancel,
-                )
-        except KeyboardInterrupt:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.CANCELLED,
-                summary=f"{self.role} run cancelled",
-            )
-            raise
-        except Exception as error:
-            raise self.error_factory(
-                f"{self.role} {label} turn crashed: {error}"
-            ) from error
+                        cancel=self.cancel,
+                    )
+            except Exception as error:
+                raise self.error_factory(
+                    f"{self.role} {label} turn crashed: {error}"
+                ) from error
 
-        if result.status is AgentStatus.CANCELLED:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.CANCELLED,
-                summary=result.error,
-            )
-            raise self.cancelled_error_factory(
-                result.error or f"{self.role} run cancelled"
-            )
-        if result.status is not AgentStatus.COMPLETED or result.payload is None:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.FAILED,
-                result=result.payload,
-                summary=result.error,
-            )
-            raise self.error_factory(
-                result.error
-                or f"{self.role} {label} returned {result.status.value}"
-            )
-        try:
-            validate_structured_result(result.payload, schema)
-        except StructuredResultError as error:
-            self.store.complete_planning_attempt(
-                attempt.id,
-                status=PlanningAttemptStatus.FAILED,
-                result=result.payload,
-                summary=f"invalid structured result: {error}",
-            )
-            raise self.error_factory(
-                f"{self.role} {label} returned an invalid structured result: {error}"
-            ) from error
+            if result.status is AgentStatus.CANCELLED:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.CANCELLED,
+                    summary=result.error,
+                )
+                raise self.cancelled_error_factory(
+                    result.error or f"{self.role} run cancelled"
+                )
+            if result.status is not AgentStatus.COMPLETED or result.payload is None:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=result.payload,
+                    summary=result.error,
+                )
+                raise self.error_factory(
+                    result.error
+                    or f"{self.role} {label} returned {result.status.value}"
+                )
+            try:
+                validate_structured_result(result.payload, schema)
+            except StructuredResultError as error:
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=result.payload,
+                    summary=f"invalid structured result: {error}",
+                )
+                raise self.error_factory(
+                    f"{self.role} {label} returned an invalid structured result: "
+                    f"{error}"
+                ) from error
+        except KeyboardInterrupt:
+            self.cancel_attempt(attempt)
+            raise
         return attempt, result.payload
+
+    def cancel_attempt(self, attempt: PlanningAttempt) -> PlanningAttempt:
+        """Cancel an interrupted attempt unless it already reached a terminal state."""
+        current = next(
+            item
+            for item in self.store.list_planning_attempts(self.borg_id)
+            if item.id == attempt.id
+        )
+        if current.status is not PlanningAttemptStatus.RUNNING:
+            return current
+        return self.store.complete_planning_attempt(
+            current.id,
+            status=PlanningAttemptStatus.CANCELLED,
+            summary=f"{self.role} run cancelled",
+        )
 
     def attempts(self, phase: str) -> list[PlanningAttempt]:
         """Return the durable attempt history for one planning phase."""
