@@ -233,6 +233,7 @@ class HostCodingPhase:
             env={**self._config.environment, **(environment or {})},
             effort=self._config.effort,
             billing_mode=self._config.billing_mode,
+            activity_sink=context.activity_sink("coding"),
         )
         result: AgentResult
         operational_error: BaseException | None = None

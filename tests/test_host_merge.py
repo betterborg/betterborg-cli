@@ -33,6 +33,7 @@ from betterborg_cli.host_execution import (
     UnsafeGitError,
 )
 from betterborg_cli.host_execution._locking import path_lock
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
 
 
@@ -456,6 +457,7 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
         fixture, "feature.txt", "project version\n"
     )
     repository_lock = RecordingLock()
+    received: list[AgentActivity] = []
 
     def resolve(spec):
         assert not repository_lock.locked()
@@ -467,12 +469,17 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
         )
         _git(spec.cwd, "add", "feature.txt")
         _git(spec.cwd, "commit", "--quiet", "-m", "resolve project merge")
-        return MockResponse(payload=_completed_payload(fixture.task))
+        return MockResponse(
+            payload=_completed_payload(fixture.task),
+            activities=(
+                AgentActivity(AgentActivityKind.WRITING, "feature.txt"),
+            ),
+        )
 
     adapter = MockAdapter().queue(MockResponse(dynamic=resolve))
     with SqliteStore.open(fixture.database) as store:
         result = _phase(fixture, adapter, repository_lock).run(
-            fixture.context(store)
+            fixture.context(store, activity=received.append)
         )
         attempts = store.list_agent_attempts(fixture.task.id)
         runtime = store.get_task_runtime(fixture.task.id)
@@ -480,6 +487,10 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
     assert result.status is TaskRuntimeStatus.MERGING
     assert result.tip is not None and result.tip.agent_used
     assert len(adapter.calls) == 1
+    assert adapter.calls[0].activity_sink is not None
+    assert received == [
+        AgentActivity(AgentActivityKind.WRITING, "merge: feature.txt")
+    ]
     assert [attempt.phase for attempt in attempts] == [
         "coding",
         "review",
