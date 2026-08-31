@@ -200,6 +200,11 @@ class MultiprocessUrlRequest:
             if receiver is not None:
                 receiver.close()
             if process is not None and process.pid is not None:
+                # A force signal may immediately follow cancellation. Give its
+                # registered reaper one poll interval to take ownership before
+                # this ordinary cleanup starts joining the same process.
+                if self.cancel is not None and self.cancel.is_set():
+                    self.cancel.wait_for_force(_IPC_POLL_SECONDS)
                 deadline = (
                     self.cancel.force_deadline
                     if self.cancel is not None and self.cancel.is_set()
@@ -395,7 +400,12 @@ def _kill_process(process: BaseProcess) -> None:
 def _force_process(process: BaseProcess) -> None:
     """Kill and reap a request child before force delivery is complete."""
     _kill_process(process)
-    process.join(CancellationToken.DEFAULT_GRACE_SECONDS)
+    deadline = time.monotonic() + CancellationToken.DEFAULT_GRACE_SECONDS
+    while process.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        process.join(min(_IPC_POLL_SECONDS, remaining))
     if process.is_alive():
         raise TimeoutError(f"URL request worker {process.pid} could not be joined")
 
