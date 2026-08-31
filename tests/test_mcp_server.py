@@ -49,6 +49,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.run_control import DEFAULT_FORCE_GRACE_SECONDS
 from betterborg_cli.store import (
     AgentAttempt,
     Borg,
@@ -587,6 +588,7 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
     request_teardown: list[float] = []
     request_finished: list[float] = []
     session_closed: list[float] = []
+    cancellation_requested: list[float] = []
     protocol_errors: list[McpError] = []
     original_run_cancellable = mcp_server._run_cancellable
 
@@ -623,6 +625,7 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
                     real_process_harness.wait_for_marker,
                     f"{request_name}.dns-gate",
                 )
+                cancellation_requested.append(time.monotonic())
                 await session.send_notification(
                     mcp_types.CancelledNotification(
                         params=mcp_types.CancelledNotificationParams(
@@ -631,7 +634,7 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
                         )
                     )
                 )
-                with anyio.fail_after(4):
+                with anyio.fail_after(DEFAULT_FORCE_GRACE_SECONDS + 0.5):
                     await call_finished.wait()
         session_closed.append(time.monotonic())
 
@@ -656,12 +659,17 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
     assert len(protocol_errors) == 1
     assert str(protocol_errors[0]) == "Request cancelled"
     assert (
-        joined_at
+        cancellation_requested[0]
+        <= joined_at
         <= adapter_finished_at
         <= worker_finished_at
         <= request_teardown[0]
         <= request_finished[0]
         <= session_closed[0]
+    )
+    assert (
+        joined_at - cancellation_requested[0]
+        <= DEFAULT_FORCE_GRACE_SECONDS + 0.1
     )
     real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
     (root / f"release-{request_name}").write_text("released", encoding="utf-8")
@@ -1988,6 +1996,61 @@ def test_create_elicits_prd_question_and_final_confirmation(
     assert "# Portable CLI" in requests[1].message
     assert "Create Borg 'portable-cli'" in requests[1].message
     assert requests[1].requestedSchema["properties"]["approved"]["default"] is False
+
+
+def test_stdio_stdout_contains_only_protocol_json() -> None:
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+
+    process = subprocess.Popen(
+        [str(Path(sys.executable).with_name("borg")), "mcp"],
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    responses = []
+    try:
+        process.stdin.write(json.dumps(messages[0]) + "\n")
+        process.stdin.flush()
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        assert ready, "MCP server did not answer initialize"
+        responses.append(json.loads(process.stdout.readline()))
+
+        process.stdin.write(json.dumps(messages[1]) + "\n")
+        process.stdin.write(json.dumps(messages[2]) + "\n")
+        process.stdin.flush()
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        assert ready, "MCP server did not answer tools/list"
+        responses.append(json.loads(process.stdout.readline()))
+        process.stdin.close()
+        returncode = process.wait(timeout=5)
+        stderr = process.stderr.read()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    assert returncode == 0, stderr
+    assert [response["id"] for response in responses] == [1, 2]
+    assert all(response["jsonrpc"] == "2.0" for response in responses)
+    assert "Processing request" not in "\n".join(map(json.dumps, responses))
+    assert "Processing request" in stderr
 
 
 def test_stdio_stdout_contains_only_protocol_json_for_api_backed_tool(
