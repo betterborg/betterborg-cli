@@ -42,6 +42,7 @@ class HostWorktreeManager:
         *,
         source_branch: str,
         cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.worktree_root = Path(worktree_root).resolve()
@@ -50,7 +51,9 @@ class HostWorktreeManager:
         ):
             raise WorktreeError("task worktrees must be siblings of the checkout")
         self.source_branch = source_branch
-        self._git = SafeGit(self.repo_root, cancel=cancel)
+        if git is not None and git.cwd != self.repo_root:
+            raise WorktreeError("worktree manager Git binding must match repository")
+        self._git = git or SafeGit(self.repo_root, cancel=cancel)
         self._guard = PrimaryCheckoutGuard(self.repo_root, git=self._git)
 
     def ensure_project_base(self, project_name: str) -> str:

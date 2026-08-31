@@ -6,6 +6,7 @@ import hashlib
 import os
 import subprocess
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
     MockAdapter,
     MockResponse,
+    run_captured,
 )
 from betterborg_cli.host_execution import (
     EnvironmentMaterializationError,
@@ -49,6 +51,7 @@ from betterborg_cli.host_execution import (
     HostTaskRuntime,
     HostWorktreeManager,
     MergeTip,
+    SafeGit,
 )
 from betterborg_cli.planning import (
     approved_plan_digest,
@@ -485,6 +488,8 @@ def _concrete_host_fixture(
     review_delay_seconds: float = 0,
     dependency_chain: bool = False,
     prerequisite_at_later_position: bool = False,
+    cancel: CancellationToken | None = None,
+    git_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
@@ -650,7 +655,17 @@ def _concrete_host_fixture(
         ),
         compose_networks=("default",),
     )
-    environment = HostEnvironmentManager(repository_root, clock=clock)
+    git = SafeGit(
+        repository_root,
+        cancel=cancel,
+        command_runner=git_runner or run_captured,
+    )
+    environment = HostEnvironmentManager(
+        repository_root,
+        clock=clock,
+        cancel=cancel,
+        git=git,
+    )
     compose_runner = FakeComposeRunner()
     compose = HostComposeManager(
         repository_root,
@@ -661,6 +676,8 @@ def _concrete_host_fixture(
         repository_root,
         tmp_path / "concrete-worktrees",
         source_branch="main",
+        cancel=cancel,
+        git=git,
     )
     coding = MockAdapter()
     for position, _ in enumerate(tasks):
@@ -694,17 +711,23 @@ def _concrete_host_fixture(
             repository_root,
             coding,
             config=HostCodingConfig(model="coding-model"),
+            cancel=cancel,
+            git=git,
         ),
         review_fix=HostReviewFixPhase(
             repository_root,
             review,
             config=HostReviewFixConfig(review_model="review-model"),
+            cancel=cancel,
+            git=git,
         ),
         merge=HostMergePhase(
             repository_root,
             merge,
             config=HostMergeConfig(model="merge-model"),
             repository_lock=lambda: repository_lock,
+            cancel=cancel,
+            git=git,
         ),
         sanity=HostSanityPhase(
             repository_root,
@@ -713,6 +736,8 @@ def _concrete_host_fixture(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=lambda: repository_lock,
+            cancel=cancel,
+            git=git,
         ),
     )
     service = HostExecutionService(
@@ -743,6 +768,56 @@ def _concrete_host_fixture(
         worktrees,
         clock,
     )
+
+
+def test_service_setup_reuses_bound_git_and_reaps_cancelled_guard(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    armed = threading.Event()
+    resistant = real_process_harness.resistant_argv("service-guard-git")
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(command, **kwargs):  # noqa: ANN001, ANN003
+        arguments = tuple(command)
+        if armed.is_set() and arguments[1:3] == (
+            "status",
+            "--porcelain=v1",
+        ):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        git_runner=runner,
+    )
+    try:
+        armed.set()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker("service-guard-git.child.pid")
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-guard-git")
+        assert observed_tokens == [cancel]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status
+            is TaskRuntimeStatus.PENDING
+            for task in fixture.tasks
+        )
+    finally:
+        fixture.store.close()
 
 
 def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> None:

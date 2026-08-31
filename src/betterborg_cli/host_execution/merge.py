@@ -132,6 +132,7 @@ class HostMergePhase:
         config: HostMergeConfig,
         repository_lock: RepositoryLockFactory,
         cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
@@ -144,7 +145,9 @@ class HostMergePhase:
         self._adapter = adapter
         self._config = config
         self._repository_lock = repository_lock
-        self._primary_git = SafeGit(self.repository_root, cancel=cancel)
+        if git is not None and git.cwd != self.repository_root:
+            raise MergePhaseError("merge phase Git binding must match repository")
+        self._primary_git = git or SafeGit(self.repository_root, cancel=cancel)
         self._guard = PrimaryCheckoutGuard(
             self.repository_root, git=self._primary_git
         )

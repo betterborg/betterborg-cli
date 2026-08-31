@@ -98,6 +98,7 @@ class HostSanityPhase:
         command_runner: CommandRunner | None = None,
         timeout_seconds: float = 600,
         cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         paths = RepoPaths.discover(self.repository_root, cancel=cancel)
@@ -116,7 +117,9 @@ class HostSanityPhase:
         self._repository_lock = repository_lock
         self._run = command_runner or subprocess.run
         self._timeout_seconds = timeout_seconds
-        self._git = SafeGit(self.repository_root, cancel=cancel)
+        if git is not None and git.cwd != self.repository_root:
+            raise SanityPhaseError("sanity phase Git binding must match repository")
+        self._git = git or SafeGit(self.repository_root, cancel=cancel)
         self._guard = PrimaryCheckoutGuard(
             self.repository_root, git=self._git
         )

@@ -257,6 +257,7 @@ class HostEnvironmentManager:
         command_runner: CommandRunner | None = None,
         clock: Clock = utcnow,
         cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
@@ -275,7 +276,11 @@ class HostEnvironmentManager:
         self.preparation_root = Path(
             preparation_root or default_preparation_root
         ).resolve()
-        self._git = SafeGit(self.repository_root, cancel=cancel)
+        if git is not None and git.cwd != self.repository_root:
+            raise EnvironmentMaterializationError(
+                "environment manager Git binding must match repository"
+            )
+        self._git = git or SafeGit(self.repository_root, cancel=cancel)
         self._validate_managed_paths()
         self._environment = dict(os.environ if environment is None else environment)
         self._run = command_runner or subprocess.run

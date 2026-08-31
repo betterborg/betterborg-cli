@@ -1198,13 +1198,15 @@ def _invoke_host_execution(
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
-    environment = HostEnvironmentManager(paths.root, cancel=cancel)
+    git = SafeGit(paths.root, cancel=cancel)
+    environment = HostEnvironmentManager(paths.root, cancel=cancel, git=git)
     compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
         source_branch=config.default_branch,
         cancel=cancel,
+        git=git,
     )
     repository_lock = RLock()
 
@@ -1224,6 +1226,7 @@ def _invoke_host_execution(
                 effort=config.agents.coding.effort,
             ),
             cancel=cancel,
+            git=git,
         ),
         review_fix=HostReviewFixPhase(
             paths.root,
@@ -1239,6 +1242,7 @@ def _invoke_host_execution(
                 fix_effort=config.agents.review.effort,
             ),
             cancel=cancel,
+            git=git,
         ),
         merge=HostMergePhase(
             paths.root,
@@ -1250,6 +1254,7 @@ def _invoke_host_execution(
             ),
             repository_lock=locked_repository,
             cancel=cancel,
+            git=git,
         ),
         sanity=HostSanityPhase(
             paths.root,
@@ -1259,6 +1264,7 @@ def _invoke_host_execution(
             worktree_manager=worktrees,
             repository_lock=locked_repository,
             cancel=cancel,
+            git=git,
         ),
     )
     service = HostExecutionService(

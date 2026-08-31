@@ -32,7 +32,6 @@ from betterborg_cli.host_execution import (
     SafeGit,
     ScheduledTaskContext,
 )
-from betterborg_cli.host_execution._agent_phase import require_ready_worktree
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
@@ -354,7 +353,7 @@ def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
     return MockResponse(dynamic=commit)
 
 
-def test_ready_worktree_helper_reuses_cancellable_git_binding(
+def test_coding_phase_ready_worktree_reuses_cancellable_git_binding(
     tmp_path: Path,
     real_process_harness,
 ) -> None:
@@ -376,13 +375,17 @@ def test_ready_worktree_helper_reuses_cancellable_git_binding(
             cancel=cancel,
             command_runner=runner,
         )
+        phase = HostCodingPhase(
+            fixture.repository,
+            MockAdapter(),
+            config=HostCodingConfig(model="coding-model"),
+            cancel=cancel,
+            git=git,
+        )
         with ThreadPoolExecutor(max_workers=1) as executor:
             result = executor.submit(
-                require_ready_worktree,
-                fixture.repository,
-                git,
+                phase._require_ready_worktree,  # noqa: SLF001
                 context,
-                expected_statuses={TaskRuntimeStatus.CODING},
             )
             real_process_harness.wait_for_marker("ready-worktree-git.child.pid")
             cancel.cancel()

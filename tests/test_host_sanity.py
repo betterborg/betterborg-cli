@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
@@ -20,7 +21,7 @@ from test_host_merge import (
     _phase as merge_phase,
 )
 
-from betterborg_cli.agent_runtime import MockAdapter
+from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_captured
 from betterborg_cli.host_execution import (
     HostCommand,
     HostComposeManager,
@@ -31,6 +32,7 @@ from betterborg_cli.host_execution import (
     HostSecret,
     HostService,
     HostWorktreeManager,
+    SafeGit,
     WorktreeError,
 )
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
@@ -135,6 +137,9 @@ def _sanity_phase(
     repository_lock: RecordingLock,
     compose,  # noqa: ANN001
     runner,  # noqa: ANN001
+    *,
+    cancel: CancellationToken | None = None,
+    git: SafeGit | None = None,
 ) -> HostSanityPhase:
     return HostSanityPhase(
         fixture.repository,
@@ -145,16 +150,86 @@ def _sanity_phase(
                 "PATH": os.environ["PATH"],
                 "UNDECLARED_HOST": "no",
             },
+            cancel=cancel,
+            git=git,
         ),
         compose_manager=compose,
         worktree_manager=HostWorktreeManager(
             fixture.repository,
             fixture.repository.parent / "worktrees",
             source_branch="main",
+            cancel=cancel,
+            git=git,
         ),
         repository_lock=repository_lock,
         command_runner=runner,
+        cancel=cancel,
+        git=git,
     )
+
+
+def test_sanity_attestation_reuses_bound_git_and_reaps_cancelled_probe(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _plan(fixture)
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("sanity-attestation-git")
+    observed_tokens: list[CancellationToken | None] = []
+    activities = []
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+    assert runtime is not None and runtime.worktree_path is not None
+    worktree = Path(runtime.worktree_path).resolve()
+
+    def git_runner(command, **kwargs):  # noqa: ANN001, ANN003
+        arguments = tuple(command)
+        if (
+            Path(kwargs["cwd"]).resolve() == worktree
+            and arguments[-3:] == ("rev-parse", "--abbrev-ref", "HEAD")
+        ):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    git = SafeGit(
+        fixture.repository,
+        cancel=cancel,
+        command_runner=git_runner,
+        activity=activities.append,
+    )
+
+    def command_runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _sanity_phase(
+            fixture,
+            plan,
+            repository_lock,
+            compose,
+            command_runner,
+            cancel=cancel,
+            git=git,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                phase.run,
+                fixture.context(store, cancel=cancel),
+                tip,
+            )
+            real_process_harness.wait_for_marker(
+                "sanity-attestation-git.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+    real_process_harness.assert_tree_absent("sanity-attestation-git")
+    assert observed_tokens == [cancel]
+    assert any("rev-parse --abbrev-ref HEAD" in item.detail for item in activities)
 
 
 def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(

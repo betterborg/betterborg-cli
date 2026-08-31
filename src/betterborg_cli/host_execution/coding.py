@@ -119,6 +119,7 @@ class HostCodingPhase:
         *,
         config: HostCodingConfig,
         cancel: CancellationToken | None = None,
+        git: SafeGit | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
@@ -128,7 +129,9 @@ class HostCodingPhase:
             )
         self._adapter = adapter
         self._config = config
-        self._primary_git = SafeGit(self.repository_root, cancel=cancel)
+        if git is not None and git.cwd != self.repository_root:
+            raise CodingPhaseError("coding phase Git binding must match repository")
+        self._primary_git = git or SafeGit(self.repository_root, cancel=cancel)
         self._guard = PrimaryCheckoutGuard(
             self.repository_root, git=self._primary_git
         )
