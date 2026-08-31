@@ -428,12 +428,18 @@ def test_cancellation_before_prompt_publication_stops_without_retaining(
     )
     adapter = MockAdapter(name="openai")
 
-    def interrupt(_spec):
+    def complete_after_cancellation(_spec):
         cancel.cancel()
         progress.begin_cancellation()
-        raise KeyboardInterrupt
+        return MockResponse(
+            payload={
+                "body_md": (
+                    "# Coding agent\n\nComplete repository-specific guidance."
+                )
+            }
+        )
 
-    adapter.queue(MockResponse(dynamic=interrupt))
+    adapter.queue(MockResponse(dynamic=complete_after_cancellation))
     selected = SelectedAgent(
         role=ApiAgentRole.ANALYSIS,
         adapter=adapter,
@@ -462,6 +468,119 @@ def test_cancellation_before_prompt_publication_stops_without_retaining(
     assert parent.state is StageState.STOPPED
     assert parent.children["coding"].state is StageState.STOPPED
     assert not (git_repo / ".borg/prompts/coding.system.md").exists()
+
+
+def test_cancellation_after_prompt_metadata_insert_rolls_back_publication(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                (ChildSpec("coding", "Coding prompt"),),
+            )
+        ],
+        stream=StringIO(),
+    )
+    _adapter, selected = _selected_adapter(
+        git_repo,
+        {"coding": "# Coding agent\n\nComplete repository-specific guidance."},
+    )
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+        append_generated_prompt = store.append_generated_prompt
+
+        def append_then_cancel(**kwargs):
+            prompt = append_generated_prompt(**kwargs)
+            cancel.cancel()
+            progress.begin_cancellation()
+            return prompt
+
+        monkeypatch.setattr(store, "append_generated_prompt", append_then_cancel)
+
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+                cancel=cancel,
+                progress=progress,
+            )
+
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.STOPPED
+    assert parent.children["coding"].state is StageState.STOPPED
+    stable_path = git_repo / ".borg/prompts/coding.system.md"
+    assert not stable_path.exists()
+    assert list(stable_path.parent.glob(".coding.system.md.*.tmp")) == []
+
+
+def test_cancellation_after_prompt_file_replace_rolls_back_publication(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Repository(root=git_repo)
+    cancel = CancellationToken()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                (ChildSpec("coding", "Coding prompt"),),
+            )
+        ],
+        stream=StringIO(),
+    )
+    _adapter, selected = _selected_adapter(
+        git_repo,
+        {"coding": "# Coding agent\n\nComplete repository-specific guidance."},
+    )
+    stable_path = git_repo / ".borg/prompts/coding.system.md"
+    replace = prompts_manager.os.replace
+
+    def replace_then_cancel(source: Path, destination: Path) -> None:
+        replace(source, destination)
+        if Path(destination) == stable_path and Path(source).suffix == ".tmp":
+            cancel.cancel()
+            progress.begin_cancellation()
+
+    monkeypatch.setattr(prompts_manager.os, "replace", replace_then_cancel)
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        analysis = _append_analysis(store, repository, score=3)
+
+        with pytest.raises(KeyboardInterrupt):
+            generate_role_prompts(
+                repository,
+                analysis,
+                store,
+                selected,
+                artifact_dir=git_repo / "artifacts",
+                roles=("coding",),
+                cancel=cancel,
+                progress=progress,
+            )
+
+        assert store.get_latest_generated_prompts(repository.id) == {}
+
+    parent = progress.stages["prompts"]
+    assert parent.state is StageState.STOPPED
+    assert parent.children["coding"].state is StageState.STOPPED
+    assert not stable_path.exists()
+    assert list(stable_path.parent.glob(".coding.system.md.*.tmp")) == []
+    assert list(stable_path.parent.glob(".coding.system.md.*.bak")) == []
 
 
 def test_cancellation_between_prompt_parent_and_child_start_stops_parent(

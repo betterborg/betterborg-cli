@@ -315,6 +315,7 @@ def _generate_one_role(
             path=prompt_path,
             error=f"adapter crashed: {error}",
         )
+    _raise_if_cancelled(cancel)
     if result.status is not AgentStatus.COMPLETED or result.payload is None:
         return PromptGeneration(
             role=role,
@@ -334,13 +335,16 @@ def _generate_one_role(
             repository.root,
         ) as publish:
             with store.transaction():
+                _raise_if_cancelled(cancel)
                 prompt = store.append_generated_prompt(
                     repository_id=repository.id,
                     analysis_id=analysis.id,
                     role=role,
                     body_md=body_md,
                 )
+                _raise_if_cancelled(cancel)
                 publish()
+                _raise_if_cancelled(cancel)
     except Exception as error:
         return PromptGeneration(
             role=role,
