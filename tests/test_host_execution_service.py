@@ -524,6 +524,7 @@ def _concrete_host_fixture(
     environment_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     environment_activity: Callable[[AgentActivity], None] | None = None,
     compose_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    sanity_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     activity: Callable[[UUID, AgentActivity], None] | None = None,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
@@ -773,6 +774,7 @@ def _concrete_host_fixture(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=lambda: repository_lock,
+            command_runner=sanity_runner,
             cancel=cancel,
             git=git,
         ),
@@ -1717,6 +1719,69 @@ def test_concrete_sanity_restarts_compose_after_merged_descriptor_change(
                 text=True,
             ).stdout
             == "services:\n  healthy:\n    image: fixture-after-coding\n"
+        )
+        assert fixture.compose.active == set()
+    finally:
+        fixture.store.close()
+
+
+def test_cancellation_during_concrete_sanity_command_reaps_process_tree(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("service-sanity-command")
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities: list[tuple[UUID, AgentActivity]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        invocations.append((tuple(argv), dict(kwargs)))
+        return run_captured(resistant, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        sanity_runner=runner,
+        activity=lambda task_id, item: activities.append((task_id, item)),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker(
+                "service-sanity-command.child.pid"
+            )
+            cancel.cancel()
+            result = running.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-sanity-command")
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert len(invocations) == 1
+        command, kwargs = invocations[0]
+        assert command == ("git", "status", "--short")
+        assert kwargs["cancel"] is cancel
+        assert kwargs["timeout"] == 600
+        task = fixture.tasks[0]
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.PENDING
+        assert runtime.resume_phase == TaskRuntimeStatus.MERGING.value
+        sanity_activities = [
+            item
+            for task_id, item in activities
+            if task_id == task.id and item.detail.startswith("sanity:")
+        ]
+        assert sanity_activities == [
+            AgentActivity(AgentActivityKind.COMMAND, "sanity: git status --short")
+        ]
+        repository = fixture.store.get_repository(fixture.borg.repository_id)
+        assert repository is not None
+        assert _git(repository.root, "rev-parse", f"project/{fixture.borg.name}") != (
+            _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
         )
         assert fixture.compose.active == set()
     finally:
