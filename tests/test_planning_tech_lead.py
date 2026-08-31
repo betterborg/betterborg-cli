@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -11,11 +12,13 @@ import pytest
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     ArchitectCancelled,
+    ArchitectError,
     ArchitectLoop,
     TechLeadError,
     TechLeadLoop,
 )
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -323,6 +326,105 @@ def test_third_change_request_blocks_with_durable_resumable_history(
             3,
         ]
         assert loop.run() == result
+        assert len(reviewer.calls) == 3
+
+
+def test_two_revision_children_reconstruct_once_from_durable_attempt_ids(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    plans = [
+        planning_plan_response(summary="Initial plan."),
+        planning_plan_response(summary="First revision."),
+        planning_plan_response(summary="Second revision."),
+    ]
+    architect = MockAdapter(name="openai")
+    architect.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    architect.queue(MockResponse(payload=plans[0]))
+    architect.queue(MockResponse(payload=plans[1]))
+    architect.queue(MockResponse(raise_error=RuntimeError("revision interrupted")))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(payload=tech_lead_change_request_response("First finding."))
+    )
+    reviewer.queue(
+        MockResponse(payload=tech_lead_change_request_response("Second finding."))
+    )
+    database = committed_git_repo.parent / "tech-lead-progress-resume.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-progress-resume"
+        )
+        interrupted_progress = RunProgress(stream=StringIO())
+        handoff = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            architect,
+            io=_io(),
+            progress=interrupted_progress,
+        ).run()
+        with pytest.raises(ArchitectError, match="revision interrupted"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+                progress=interrupted_progress,
+            ).run()
+
+        reviews = [
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "tech_review"
+        ]
+        keys = [f"architect-revision:{item.id}" for item in reviews]
+        assert len(keys) == 2
+        assert len(set(keys)) == 2
+        interrupted_children = interrupted_progress.stages["tech-lead"].children
+        assert interrupted_children[keys[0]].state is StageState.COMPLETED
+        assert interrupted_children[keys[1]].state is StageState.FAILED
+        assert interrupted_progress.stages["tech-lead"].state is StageState.FAILED
+
+        architect.queue(MockResponse(payload=plans[2]))
+        reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+        resumed_progress = RunProgress(
+            stream=StringIO(), attempt_history_limit=1
+        )
+        result = TechLeadLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            progress=resumed_progress,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        architect_record = resumed_progress.stages["architect"]
+        assert architect_record.state is StageState.COMPLETED
+        assert architect_record.retained is True
+        assert architect_record.started_at is None
+        children = resumed_progress.stages["tech-lead"].children
+        assert list(children) == keys
+        assert children[keys[0]].state is StageState.COMPLETED
+        assert children[keys[0]].retained is True
+        assert children[keys[0]].started_at is None
+        assert children[keys[1]].state is StageState.COMPLETED
+        assert children[keys[1]].retained is False
+        assert children[keys[1]].started_at is not None
+        assert resumed_progress.stages["tech-lead"].state is StageState.COMPLETED
+        bounded = resumed_progress.child_render_state("tech-lead")
+        assert [item.key for item in bounded.children] == [keys[1]]
+        assert bounded.earlier_attempt_count == 1
+        assert len(architect.calls) == 5
         assert len(reviewer.calls) == 3
 
 

@@ -2,12 +2,14 @@
 
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from click.testing import CliRunner
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.cli import cli
+from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.store import (
@@ -270,19 +272,29 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     (repository.root / "CHANGELOG.md").write_text("# Changes\n", encoding="utf-8")
     monkeypatch.chdir(repository.root)
 
-    markdown_result = cli_runner.invoke(cli, ["plan", "show", "show-plan"])
+    markdown_progress = _SuspensionRecorder()
+    markdown_result = cli_runner.invoke(
+        cli,
+        ["plan", "show", "show-plan"],
+        obj=CliRunContext(CancellationToken(), markdown_progress),
+    )
 
     assert markdown_result.exit_code == 0, markdown_result.output
     assert markdown_result.output == render_plan_markdown(plan)
+    assert markdown_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
 
+    json_progress = _SuspensionRecorder()
     json_result = cli_runner.invoke(
-        cli, ["plan", "show", "show-plan", "--json"]
+        cli,
+        ["plan", "show", "show-plan", "--json"],
+        obj=CliRunContext(CancellationToken(), json_progress),
     )
 
     assert json_result.exit_code == 0, json_result.output
     assert json.loads(json_result.output) == plan
+    assert json_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
 
@@ -564,3 +576,13 @@ def _planning_snapshot(store: SqliteStore, borg_id):
         store.list_planning_findings(borg_id),
         store.list_plan_change_requests(borg_id),
     )
+
+
+class _SuspensionRecorder:
+    def __init__(self) -> None:
+        self.entries = 0
+
+    @contextmanager
+    def suspend(self):
+        self.entries += 1
+        yield self

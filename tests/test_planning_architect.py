@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from betterborg_cli.agent_runtime import ApiAgentRole, CodexAdapter, select_agen
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.store import (
@@ -21,6 +24,23 @@ from betterborg_cli.store import (
     PlanningQuestion,
     SqliteStore,
 )
+
+
+class _TrackingProgress(RunProgress):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.output_suspended = False
+        self.suspension_count = 0
+
+    @contextmanager
+    def suspend(self):
+        self.suspension_count += 1
+        with super().suspend():
+            self.output_suspended = True
+            try:
+                yield self
+            finally:
+                self.output_suspended = False
 
 
 def test_answers_product_questions_inline_and_persists_plan(
@@ -94,6 +114,55 @@ def test_answers_product_questions_inline_and_persists_plan(
             attempt.status is PlanningAttemptStatus.COMPLETED for attempt in attempts
         )
         assert attempts[-1].result == _plan()
+
+
+def test_clarification_output_is_suspended_and_stops_active_architect(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which users are in scope?",
+                        "why": "The answer bounds the workflow.",
+                    }
+                ],
+            }
+        )
+    )
+    progress = _TrackingProgress(stream=StringIO())
+    output_states: list[bool] = []
+    database = committed_git_repo.parent / "architect-progress-prompt.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "progress-prompt"
+        )
+        with pytest.raises(ArchitectCancelled, match="awaiting answers"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=InteractiveIO(
+                    prompt=lambda _message: output_states.append(
+                        progress.output_suspended
+                    ),
+                    confirm=lambda _message, _default: False,
+                    write=lambda _message: output_states.append(
+                        progress.output_suspended
+                    ),
+                ),
+                progress=progress,
+            ).run()
+
+    assert output_states == [True, True]
+    assert progress.suspension_count == 1
+    assert progress.stages["architect"].state is StageState.STOPPED
 
 
 def test_selected_codex_agent_runs_architect_in_read_only_sandbox(

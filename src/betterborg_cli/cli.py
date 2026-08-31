@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -84,6 +85,7 @@ from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
     PlanChangeRequest,
+    PlanningAttemptStatus,
     SqliteStore,
     TaskGenerationStatus,
     TaskRecord,
@@ -560,10 +562,15 @@ def show_plan(name: str, json_output: bool) -> None:
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
-    if json_output:
-        click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
-    else:
-        click.echo(render_plan_markdown(stored_plan), nl=False)
+    run = click.get_current_context().find_root().obj
+    suspension = (
+        run.progress.suspend() if isinstance(run, CliRunContext) else nullcontext()
+    )
+    with suspension:
+        if json_output:
+            click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
+        else:
+            click.echo(render_plan_markdown(stored_plan), nl=False)
 
 
 @cli.group()
@@ -1502,7 +1509,17 @@ def _continue_planning(
                     interactive=_stdin_is_interactive(),
                 )
                 planning_io = io or _interactive_io()
-                if borg.state is BorgState.DRAFT:
+                context = click.get_current_context(silent=True)
+                run = context.find_root().obj if context is not None else None
+                progress = run.progress if isinstance(run, CliRunContext) else None
+                if borg.state is BorgState.DRAFT or (
+                    borg.state
+                    in {
+                        BorgState.ARCHITECT_WORKING,
+                        BorgState.ARCHITECT_AWAITING_ANSWERS,
+                    }
+                    and not _awaiting_architect_revision(store, borg)
+                ):
                     borg = ArchitectLoop(
                         repository,
                         borg,
@@ -1510,6 +1527,7 @@ def _continue_planning(
                         agent,
                         io=planning_io,
                         cancel=cancel,
+                        progress=progress,
                     ).run().borg
                 borg = TechLeadLoop(
                     repository,
@@ -1519,6 +1537,7 @@ def _continue_planning(
                     architect_agent=agent,
                     io=planning_io,
                     cancel=cancel,
+                    progress=progress,
                 ).run().borg
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
@@ -1539,6 +1558,28 @@ def _continue_planning(
             ) from error
         raise click.ClickException(str(error)) from error
     return borg
+
+
+def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
+    """Return whether the current Architect state follows a Tech Lead rejection."""
+    attempts = store.list_planning_attempts(borg.id)
+    changes = store.list_plan_change_requests(borg.id)
+    if changes:
+        attempts = [
+            item for item in attempts if item.started_at >= changes[-1].created_at
+        ]
+    latest = next(
+        (
+            item
+            for item in reversed(attempts)
+            if item.phase == "tech_review"
+            and item.status is PlanningAttemptStatus.COMPLETED
+        ),
+        None,
+    )
+    return latest is not None and (
+        latest.result or {}
+    ).get("decision") == "request_changes"
 
 
 def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
