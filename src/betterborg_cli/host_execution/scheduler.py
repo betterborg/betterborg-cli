@@ -167,6 +167,7 @@ class HostTaskScheduler:
         clock: Callable[[], datetime] = _utcnow,
         activity: TaskActivitySink | None = None,
         progress: RunProgress | None = None,
+        interruption_cleanup: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._behavior = behavior
@@ -174,6 +175,7 @@ class HostTaskScheduler:
         self._clock = clock
         self._activity = activity
         self._progress = progress
+        self._interruption_cleanup = interruption_cleanup
 
     def run(
         self,
@@ -309,10 +311,14 @@ class HostTaskScheduler:
                 raise
             except ExecutionOwnershipError:
                 token.cancel()
-                self._drain(active)
-                self._reconcile_interrupted_progress(
-                    acquisition.run_id, generation_id
-                )
+                try:
+                    self._drain(active)
+                    if self._interruption_cleanup is not None:
+                        self._interruption_cleanup()
+                finally:
+                    self._reconcile_interrupted_progress(
+                        acquisition.run_id, generation_id
+                    )
                 raise
 
     def _seed_progress(self, run_id: UUID, generation_id: UUID) -> None:
@@ -523,6 +529,8 @@ class HostTaskScheduler:
                 reason="execution cancelled",
                 now=self._clock(),
             )
+            if self._interruption_cleanup is not None:
+                self._interruption_cleanup()
         finally:
             self._reconcile_interrupted_progress(run_id, generation_id)
 

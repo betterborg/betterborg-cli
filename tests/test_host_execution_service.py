@@ -32,6 +32,7 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.host_execution import (
+    ComposeCleanupResult,
     EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
@@ -70,6 +71,7 @@ from betterborg_cli.progress import (
     RunProgress,
     StageRecord,
     StageSpec,
+    StageState,
 )
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
@@ -3244,5 +3246,137 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
         assert retained.started_at is None
         assert resumed_stage.retained is False
         assert resumed_stage.started_at is not None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cleanup_succeeds", [True, False])
+def test_cancelled_service_reconciles_compose_cleanup_before_result(
+    tmp_path: Path,
+    cleanup_succeeds: bool,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    cancel = CancellationToken()
+    started = threading.Event()
+    clock = FakeClock()
+    progress = RunProgress(stream=StringIO(), enabled=False)
+
+    @dataclass
+    class ComposeRuntime:
+        plan: HostPreflightPlan
+
+        def with_secret_values(self, secret_values):  # noqa: ANN001
+            return self
+
+        def __call__(self, context) -> TaskRuntimeStatus:  # noqa: ANN001
+            store.add_compose_resource(
+                ComposeResource(
+                    run_id=context.claim.run_id,
+                    claim_id=context.claim.id,
+                    task_id=context.claim.task_id,
+                    project_name="cancelled-task",
+                    resource_type="project",
+                    resource_name="cancelled-task",
+                    created_at=clock(),
+                ),
+                context.owner_token,
+                context.claim.claim_token,
+                now=clock(),
+            )
+            started.set()
+            assert context.cancel.wait(timeout=2)
+            return TaskRuntimeStatus.DONE
+
+    class CleanupCompose(_Compose):
+        def cleanup_stale_projects(self, cleanup_store, resources):  # noqa: ANN001
+            self.calls.append("stale-cleanup")
+            assert resources
+            assert progress.stages[str(records[0].id)].state is StageState.RUNNING
+            outcomes = []
+            for resource in resources:
+                command = ("docker", "compose", "down")
+                if cleanup_succeeds:
+                    cleanup_store.confirm_compose_project_cleanup(
+                        resource.run_id,
+                        resource.task_id,
+                        resource.project_name,
+                        command=command,
+                        now=clock(),
+                    )
+                    outcomes.append(
+                        ComposeCleanupResult(
+                            resource.run_id,
+                            resource.task_id,
+                            resource.project_name,
+                            command,
+                            True,
+                        )
+                    )
+                else:
+                    error = "cleanup command failed"
+                    assert cleanup_store.record_compose_cleanup_failure(
+                        resource.run_id,
+                        resource.task_id,
+                        resource.project_name,
+                        command=command,
+                        error=error,
+                        now=clock(),
+                    )
+                    outcomes.append(
+                        ComposeCleanupResult(
+                            resource.run_id,
+                            resource.task_id,
+                            resource.project_name,
+                            command,
+                            False,
+                            error,
+                        )
+                    )
+            return tuple(outcomes)
+
+    try:
+        service = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            ComposeRuntime(plan),
+            worktree_manager=_Worktrees(calls),
+            compose_manager=CleanupCompose(calls),
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            clock=clock,
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                service.run,
+                borg.id,
+                generation.id,
+                {},
+                cancel=cancel,
+            )
+            assert started.wait(timeout=2)
+            cancel.cancel()
+            result = running.result(timeout=2)
+
+        runtime = store.get_task_runtime(records[0].id)
+        assert runtime is not None
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert len(result.cleanup) == 1
+        assert calls.count("stale-cleanup") == 1
+        stage = progress.stages[str(records[0].id)]
+        if cleanup_succeeds:
+            assert runtime.status is TaskRuntimeStatus.PENDING
+            assert result.scheduler is not None
+            assert result.scheduler.pending == 1
+            assert result.scheduler.blocked == 0
+            assert stage.state is StageState.STOPPED
+        else:
+            assert runtime.status is TaskRuntimeStatus.BLOCKED
+            assert result.scheduler is not None
+            assert result.scheduler.pending == 0
+            assert result.scheduler.blocked == 1
+            assert stage.state is StageState.FAILED
+            assert runtime.state_reason in str(stage.result)
     finally:
         store.close()

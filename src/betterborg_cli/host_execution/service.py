@@ -590,6 +590,7 @@ class HostExecutionService:
                 else None
             ),
             progress=self._progress,
+            interruption_cleanup=lambda: cleanup.extend(self._cleanup_stale()),
             **({"clock": self._clock} if self._clock is not None else {}),
         )
 
@@ -598,7 +599,11 @@ class HostExecutionService:
             acquisition,
             cancel=cancel,
         )
-        cleanup.extend(self._cleanup_stale())
+        # Cancelled runs already clean stale projects inside the scheduler's
+        # interruption fence.  Retrying a failed teardown here could mutate a
+        # cleanup-blocked task after progress and counts were finalized.
+        if scheduled.status is not ExecutionRunStatus.CANCELLED:
+            cleanup.extend(self._cleanup_stale())
         return HostExecutionResult(validated, scheduled, tuple(cleanup))
 
     def _run_claimed_task(
