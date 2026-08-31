@@ -56,8 +56,9 @@ Agent-backed terminal commands (`init`, `analyze`, `create`, the planning
 commands, and `execute`) report their work as stages. Progress goes to stderr;
 the command's result continues to go to stdout. On an interactive terminal,
 running stages are live, transient rows that are updated in place. Completed,
-failed, and stopped stages become permanent lines, followed by a summary. For
-example, an analysis can display a live row like this while the agent is
+failed, and stopped stages become permanent lines. Commands that close a full
+run, including `execute` and reconciled interruptions, also print a summary.
+For example, an analysis can display a live row like this while the agent is
 working:
 
 ```text
@@ -69,7 +70,6 @@ output such as:
 
 ```text
 completed Analyze repository — score 4.20/5 (18.7s)
-summary: 4 completed, 0 failed, 0 stopped — 0 retained
 ```
 
 Durations and results naturally vary by repository. Long labels and activity
@@ -157,6 +157,9 @@ What is retained depends on the command:
   state.
 
 Unfinished agent requests, HTTP requests, and local processes are never
-resumable in place. Except for the `borg create` name restriction above, re-run
-the command you invoked. It starts a new invocation and uses only the
-command-specific durable state listed above.
+resumable in place. After an interrupted `borg plan change NAME`, run
+`borg plan start NAME`: the change request has already been saved, so submitting
+another change is rejected. Except for that recovery command and the
+`borg create` name restriction above, re-run the command you invoked. Every
+retry starts a new invocation and uses only the command-specific durable state
+listed above.
