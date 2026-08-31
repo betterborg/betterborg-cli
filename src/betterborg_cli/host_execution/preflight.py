@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -13,6 +14,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.workspace_trust import (
     TrustStore,
@@ -113,6 +117,7 @@ class HostPreflightPlan:
 
 HostPreflightResult = HostPreflightPlan | HostPreflightBlock
 AnalyzerPlanLoader = Callable[[], Mapping[str, Any]]
+ActivitySink = Callable[[AgentActivity], None]
 
 
 class HostPreflight:
@@ -130,14 +135,37 @@ class HostPreflight:
         trust_store: TrustStore | None = None,
         environment: Mapping[str, str] | None = None,
         executable_finder: Callable[[str, str | None], str | None] | None = None,
-        command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        cancel: CancellationToken | None = None,
+        command_runner: Callable[
+            ..., subprocess.CompletedProcess[str]
+        ] = run_captured,
+        activity: ActivitySink | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._cancel = cancel
+        self._run = command_runner
+        self._activity = activity
+        self._report_command(
+            [
+                "git",
+                "-C",
+                str(self.repository_root),
+                "rev-parse",
+                "--show-toplevel",
+            ]
+        )
+        try:
+            self._paths = RepoPaths.discover(
+                self.repository_root,
+                cancel=cancel,
+                command_runner=command_runner,
+            )
+        except BaseException as error:
+            self._raise_if_cancelled(error)
+            raise
         self._trust_store = trust_store
         self._environment = dict(os.environ if environment is None else environment)
         self._find_executable = executable_finder or _which
-        self._run = command_runner or subprocess.run
 
     def validate(
         self,
@@ -147,9 +175,24 @@ class HostPreflight:
         external_urls: Mapping[str, str] | None = None,
     ) -> HostPreflightResult:
         """Return a complete plan or every actionable reason it is blocked."""
+        self._report_command(
+            [
+                "git",
+                "-C",
+                str(self._paths.root),
+                "rev-parse",
+                "--git-common-dir",
+            ]
+        )
         try:
-            require_workspace_trust(self._paths, store=self._trust_store)
+            require_workspace_trust(
+                self._paths,
+                store=self._trust_store,
+                cancel=self._cancel,
+                command_runner=self._run,
+            )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
+            self._raise_if_cancelled(error)
             return HostPreflightBlock(
                 (
                     HostPreflightFailure(
@@ -871,17 +914,19 @@ class HostPreflight:
             _evidence(service, name) for name, service in selected
         )
         try:
+            self._report_command(command)
             result = self._run(
                 command,
                 cwd=self.repository_root,
                 env=self._probe_environment(),
                 check=False,
-                capture_output=True,
-                text=True,
                 timeout=30,
+                cancel=self._cancel,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
+            self._raise_if_cancelled(error)
             result = None
+        self._raise_if_cancelled()
         if result is None or result.returncode != 0:
             failures.append(
                 HostPreflightFailure(
@@ -1108,35 +1153,60 @@ class HostPreflight:
         else:
             arguments = ("--version",)
         try:
+            command = [str(path), *arguments]
+            self._report_command(command)
             result = self._run(
-                [str(path), *arguments],
+                command,
                 cwd=self.repository_root,
                 env=self._probe_environment(),
                 check=False,
-                capture_output=True,
-                text=True,
                 timeout=10,
+                cancel=self._cancel,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
+            self._raise_if_cancelled(error)
             return None
+        self._raise_if_cancelled()
         output = f"{result.stdout}\n{result.stderr}".strip()
         return output if result.returncode == 0 and output else None
 
     def _compose_version_output(self, docker: Path) -> str | None:
+        command = [str(docker), "compose", "version"]
         try:
+            self._report_command(command)
             result = self._run(
-                [str(docker), "compose", "version"],
+                command,
                 cwd=self.repository_root,
                 env=self._probe_environment(),
                 check=False,
-                capture_output=True,
-                text=True,
                 timeout=10,
+                cancel=self._cancel,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
+            self._raise_if_cancelled(error)
             return None
+        self._raise_if_cancelled()
         output = f"{result.stdout}\n{result.stderr}".strip()
         return output if result.returncode == 0 and output else None
+
+    def _report_command(self, command: Sequence[str]) -> None:
+        """Publish the current secret-free probe without affecting validation."""
+        if self._activity is None:
+            return
+        try:
+            self._activity(
+                AgentActivity(AgentActivityKind.COMMAND, shlex.join(command))
+            )
+        except Exception:
+            return
+
+    def _raise_if_cancelled(self, cause: BaseException | None = None) -> None:
+        """Keep cancellation distinct from ordinary host validation failures."""
+        if self._cancel is None or not self._cancel.is_set():
+            return
+        if cause is None:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt from cause
 
     def _probe_environment(self) -> dict[str, str]:
         """Keep arbitrary host secrets out of repository-controlled probes."""

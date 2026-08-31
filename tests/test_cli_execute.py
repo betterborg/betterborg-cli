@@ -499,6 +499,9 @@ def test_execute_threads_one_control_context_and_suspends_confirmation(
     estimate = progress.stages["estimate-decision"]
     assert estimate.state is StageState.COMPLETED
     assert estimate.result == "approved"
+    preflight = progress.stages["preflight"]
+    assert preflight.state is StageState.COMPLETED
+    assert preflight.result == "ready"
 
 
 def test_execute_without_push_succeeds_without_a_remote(

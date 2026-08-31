@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import shlex
+import signal
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
     HostPreflight,
@@ -15,6 +18,7 @@ from betterborg_cli.host_execution import (
     HostPreflightPlan,
     service_url_environment,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_analysis import DIMENSIONS, run_analyzer
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
@@ -128,6 +132,286 @@ def _base_plan() -> dict[str, object]:
             },
         ],
     }
+
+
+def _complete_probe_plan(repository: Path) -> dict[str, object]:
+    """Prepare one plan that reaches every direct preflight probe."""
+    (repository / "package").mkdir(exist_ok=True)
+    (repository / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
+    (repository / "compose.yml").write_text(
+        "services:\n  postgres:\n    image: postgres:16\n",
+        encoding="utf-8",
+    )
+    return _base_plan()
+
+
+def _probe_name(command: list[str] | tuple[str, ...]) -> str | None:
+    """Identify the five ordered direct probes covered by cancellation tests."""
+    argv = tuple(command)
+    if argv[-1:] == ("--show-toplevel",):
+        return "root"
+    if argv[-1:] == ("--git-common-dir",):
+        return "identity"
+    if argv[-2:] == ("compose", "version"):
+        return "compose-version"
+    if argv[-3:] == ("config", "--format", "json"):
+        return "topology"
+    if argv[-1:] == ("--version",):
+        return "executable-version"
+    return None
+
+
+def test_all_direct_probes_share_token_runner_and_command_activity(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "all-probe-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _compose_executable(binary_dir)
+    plan = _complete_probe_plan(committed_git_repo)
+    store = _trust_store(committed_git_repo)
+    require_workspace_trust(
+        RepoPaths.discover(committed_git_repo), store=store, explicit=True
+    )
+    cancel = CancellationToken()
+    calls: list[tuple[tuple[str, ...], CancellationToken | None]] = []
+    activities: list[AgentActivity] = []
+
+    def runner(command, **kwargs):
+        calls.append((tuple(command), kwargs.get("cancel")))
+        return run_captured(command, **kwargs)
+
+    result = HostPreflight(
+        committed_git_repo,
+        trust_store=store,
+        environment={"PATH": str(binary_dir)},
+        cancel=cancel,
+        command_runner=runner,
+        activity=activities.append,
+    ).validate(
+        plan,
+        available_secret_names={"PACKAGE_TOKEN"},
+        external_urls={"SEARCH_URL": "https://search.example.test/api"},
+    )
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [_probe_name(command) for command, _token in calls] == [
+        "root",
+        "identity",
+        "executable-version",
+        "compose-version",
+        "topology",
+    ]
+    assert all(observed is cancel for _command, observed in calls)
+    assert [activity.kind for activity in activities] == [
+        AgentActivityKind.COMMAND
+    ] * 5
+    assert [activity.detail for activity in activities] == [
+        shlex.join(command) for command, _token in calls
+    ]
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["root", "identity", "executable-version", "compose-version", "topology"],
+)
+def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
+    committed_git_repo: Path,
+    real_process_harness,
+    target: str,
+) -> None:
+    binary_dir = committed_git_repo.parent / f"{target}-cancel-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _compose_executable(binary_dir)
+    _complete_probe_plan(committed_git_repo)
+    store = _trust_store(committed_git_repo)
+    require_workspace_trust(
+        RepoPaths.discover(committed_git_repo), store=store, explicit=True
+    )
+    resistant = real_process_harness.resistant_argv(target)
+    source = r'''
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
+from betterborg_cli.host_execution import HostPreflight
+from betterborg_cli.run_control import RunControl
+from betterborg_cli.workspace_trust import TrustStore
+
+tests_root = Path(sys.argv[1])
+repository = Path(sys.argv[2])
+trust_path = Path(sys.argv[3])
+binary_dir = Path(sys.argv[4])
+marker_root = Path(sys.argv[5])
+target = sys.argv[6]
+resistant = tuple(json.loads(sys.argv[7]))
+sys.path.insert(0, str(tests_root))
+
+from test_host_preflight import _base_plan, _probe_name
+
+
+def append_marker(name: str, value: str) -> None:
+    path = marker_root / name
+    previous = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(previous + value + "\n", encoding="utf-8")
+
+
+def runner(command, **kwargs):
+    name = _probe_name(command)
+    if name is not None:
+        append_marker(f"{target}.probes", name)
+    return run_captured(resistant if name == target else command, **kwargs)
+
+
+def activity(current) -> None:
+    append_marker(f"{target}.activities", current.detail or current.kind.value)
+
+
+cancel = CancellationToken()
+control = RunControl(cancel).install()
+try:
+    with control.protected():
+        HostPreflight(
+            repository,
+            trust_store=TrustStore(trust_path),
+            environment={"PATH": str(binary_dir)},
+            cancel=cancel,
+            command_runner=runner,
+            activity=activity,
+        ).validate(
+            _base_plan(),
+            available_secret_names={"PACKAGE_TOKEN"},
+            external_urls={"SEARCH_URL": "https://search.example.test/api"},
+        )
+except KeyboardInterrupt:
+    (marker_root / f"{target}.interrupted").write_text("yes", encoding="utf-8")
+    raise SystemExit(130) from None
+finally:
+    control.close()
+'''
+    process = real_process_harness.launch_python(
+        source,
+        str(Path(__file__).parent),
+        str(committed_git_repo),
+        str(store.path),
+        str(binary_dir),
+        str(real_process_harness.root),
+        target,
+        json.dumps(resistant),
+        name=f"{target}-preflight",
+    )
+    real_process_harness.wait_for_marker(f"{target}.child.pid")
+    real_process_harness.signal(process, signal.SIGINT)
+    assert real_process_harness.wait_for_exit(process) == 130
+    real_process_harness.assert_tree_absent(target)
+    probes = real_process_harness.wait_for_marker(f"{target}.probes").splitlines()
+    assert probes == [
+        "root",
+        "identity",
+        "executable-version",
+        "compose-version",
+        "topology",
+    ][: probes.index(target) + 1]
+    activities = real_process_harness.wait_for_marker(
+        f"{target}.activities"
+    ).splitlines()
+    assert len(activities) == len(probes)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["root", "identity", "executable-version", "compose-version", "topology"],
+)
+def test_cancelled_probe_result_propagates_interruption(
+    committed_git_repo: Path,
+    target: str,
+) -> None:
+    binary_dir = committed_git_repo.parent / f"{target}-interrupt-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _compose_executable(binary_dir)
+    plan = _complete_probe_plan(committed_git_repo)
+    store = _trust_store(committed_git_repo)
+    require_workspace_trust(
+        RepoPaths.discover(committed_git_repo), store=store, explicit=True
+    )
+    cancel = CancellationToken()
+    probes: list[str] = []
+
+    def runner(command, **kwargs):
+        name = _probe_name(command)
+        if name is not None:
+            probes.append(name)
+        if name == target:
+            cancel.cancel()
+            return subprocess.CompletedProcess(command, -1, "", "")
+        return run_captured(command, **kwargs)
+
+    with pytest.raises(KeyboardInterrupt):
+        HostPreflight(
+            committed_git_repo,
+            trust_store=store,
+            environment={"PATH": str(binary_dir)},
+            cancel=cancel,
+            command_runner=runner,
+        ).validate(
+            plan,
+            available_secret_names={"PACKAGE_TOKEN"},
+            external_urls={"SEARCH_URL": "https://search.example.test/api"},
+        )
+
+    assert probes[-1] == target
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "nonzero"])
+def test_ordinary_probe_failures_remain_host_blocks(
+    committed_git_repo: Path,
+    outcome: str,
+) -> None:
+    binary_dir = committed_git_repo.parent / f"ordinary-{outcome}-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    (committed_git_repo / "runtime.version").write_text(
+        "3.11.9\n", encoding="utf-8"
+    )
+    store = _trust_store(committed_git_repo)
+    require_workspace_trust(
+        RepoPaths.discover(committed_git_repo), store=store, explicit=True
+    )
+
+    def runner(command, **kwargs):
+        if _probe_name(command) == "executable-version":
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return subprocess.CompletedProcess(command, 7, "", "probe failed")
+        return run_captured(command, **kwargs)
+
+    result = HostPreflight(
+        committed_git_repo,
+        trust_store=store,
+        environment={"PATH": str(binary_dir)},
+        command_runner=runner,
+    ).validate(
+        {
+            "environment": {
+                "files": ["runtime.version"],
+                "toolchains": [
+                    {
+                        "name": "example-runtime",
+                        "version": "3.11.9",
+                        "source": "runtime.version",
+                    }
+                ],
+            }
+        }
+    )
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "host executable 'example-runtime' must satisfy" in result.reason
 
 
 def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(

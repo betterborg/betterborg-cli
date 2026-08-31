@@ -1154,7 +1154,15 @@ def _invoke_host_execution(
     if analysis is None:
         raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
     analyzer_plan = analysis.analysis_json
-    preflight = HostPreflight(paths.root)
+    preflight = HostPreflight(
+        paths.root,
+        cancel=cancel,
+        activity=(
+            (lambda activity: progress.activity("preflight", activity))
+            if progress is not None
+            else None
+        ),
+    )
     validated = preflight.validate(
         analyzer_plan,
         available_secret_names=os.environ.keys(),

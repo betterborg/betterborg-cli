@@ -2559,6 +2559,33 @@ def test_preflight_block_prevents_run_acquisition(tmp_path: Path) -> None:
         store.close()
 
 
+def test_cancelled_preflight_propagates_before_run_acquisition(tmp_path: Path) -> None:
+    store, borg, generation, _ = _store_fixture(tmp_path)
+    calls: list[str] = []
+    cancel = CancellationToken()
+
+    class CancelledPreflight:
+        def validate(self, *args, **kwargs):
+            calls.append("preflight")
+            cancel.cancel()
+            raise KeyboardInterrupt
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            HostExecutionService(
+                store,
+                CancelledPreflight(),
+                _ConcurrentRuntime(_plan(tmp_path)),
+                worktree_manager=_Worktrees(calls),
+                compose_manager=_Compose(calls),
+            ).run(borg.id, generation.id, {}, cancel=cancel)
+
+        assert store.list_execution_runs(borg.id) == []
+        assert calls == ["preflight"]
+    finally:
+        store.close()
+
+
 def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
     tmp_path: Path,
 ) -> None:
