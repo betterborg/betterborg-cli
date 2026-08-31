@@ -890,6 +890,7 @@ class McpInteractiveIO(InteractiveIO):
         request_id = self._active_elicitation_request_id
         acknowledged: anyio.Event | None = None
         response_router: _CancelledElicitationResponses | None = None
+        notification_sent = False
         try:
             if request_id is not None:
                 session = self._context.session
@@ -900,29 +901,37 @@ class McpInteractiveIO(InteractiveIO):
                     session._betterborg_elicitation_responses = response_router
                     session.add_response_router(response_router)
                 acknowledged = response_router.register(request_id)
-                await session.send_notification(
-                    mcp_types.ServerNotification(
-                        mcp_types.CancelledNotification(
-                            params=mcp_types.CancelledNotificationParams(
-                                requestId=request_id,
-                                reason="Parent request cancelled",
+                try:
+                    await session.send_notification(
+                        mcp_types.ServerNotification(
+                            mcp_types.CancelledNotification(
+                                params=mcp_types.CancelledNotificationParams(
+                                    requestId=request_id,
+                                    reason="Parent request cancelled",
+                                )
                             )
-                        )
-                    ),
-                    related_request_id=self._context.request_id,
-                )
-                force_deadline = (
-                    self._cancel.force_deadline
-                    if self._cancel is not None
-                    else None
-                )
-                timeout = (
-                    max(0.0, force_deadline - time.monotonic())
-                    if force_deadline is not None
-                    else 0.0
-                )
-                with anyio.move_on_after(timeout):
-                    await acknowledged.wait()
+                        ),
+                        related_request_id=self._context.request_id,
+                    )
+                except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+                    # A disconnected peer cannot acknowledge its nested request.
+                    # Local cancellation must still release the worker so the
+                    # parent request can reach its completion/result fence.
+                    response_router.discard(request_id)
+                else:
+                    notification_sent = True
+                    force_deadline = (
+                        self._cancel.force_deadline
+                        if self._cancel is not None
+                        else None
+                    )
+                    timeout = (
+                        max(0.0, force_deadline - time.monotonic())
+                        if force_deadline is not None
+                        else 0.0
+                    )
+                    with anyio.move_on_after(timeout):
+                        await acknowledged.wait()
         finally:
             # Do not depend on the peer acknowledging cancellation before the
             # synchronous workflow can unwind. Protocol-capable clients cancel
@@ -937,6 +946,7 @@ class McpInteractiveIO(InteractiveIO):
                 acknowledged is not None
                 and acknowledged.is_set()
                 and response_router is not None
+                and notification_sent
             ):
                 response_router.discard(request_id)
             if self._active_elicitation is scope:

@@ -19,6 +19,7 @@ import pytest
 from conftest import blocked_dns_url_request_worker
 from mcp import types as mcp_types
 from mcp.client.session import ClientSession
+from mcp.server.session import ServerSession
 from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from test_adapter_harness import (
@@ -820,6 +821,110 @@ def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
     )
     assert len(received_tokens) == 1
     assert received_tokens[0].is_set() is True
+
+
+def test_disconnected_elicitation_cancellation_still_fences_worker(
+    monkeypatch,
+) -> None:
+    order: list[str] = []
+    worker_unwinding = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+    notification_failed = threading.Event()
+    protocol_errors: list[McpError] = []
+
+    def blocked_create(_name, _source, io, *, cancel):
+        try:
+            io.prompt("Wait for an answer")
+        finally:
+            worker_unwinding.set()
+            assert release_worker.wait(timeout=2.0)
+            order.append("worker-finished")
+            worker_finished.set()
+        raise AssertionError("cancelled elicitation fabricated a tool result")
+
+    monkeypatch.setattr(mcp_server, "_create", blocked_create)
+
+    received_request = ClientSession._received_request
+
+    async def dispatch_request(self, responder) -> None:
+        async def handle_request() -> None:
+            await received_request(self, responder)
+
+        self._task_group.start_soon(handle_request)
+
+    monkeypatch.setattr(ClientSession, "_received_request", dispatch_request)
+
+    original_send_notification = ServerSession.send_notification
+
+    async def fail_nested_cancellation(
+        self,
+        notification,
+        related_request_id=None,
+    ) -> None:
+        if isinstance(notification.root, mcp_types.CancelledNotification):
+            notification_failed.set()
+            raise anyio.BrokenResourceError
+        await original_send_notification(
+            self,
+            notification,
+            related_request_id=related_request_id,
+        )
+
+    monkeypatch.setattr(ServerSession, "send_notification", fail_nested_cancellation)
+
+    async def run() -> None:
+        elicitation_started = anyio.Event()
+        call_finished = anyio.Event()
+
+        async def elicit(_context, _params):
+            elicitation_started.set()
+            await anyio.sleep_forever()
+
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+            elicitation_callback=elicit,
+        ) as session:
+            request_id = session._request_id
+
+            async def call() -> None:
+                try:
+                    await session.call_tool("create", {"name": "cancel-me"})
+                except McpError as error:
+                    protocol_errors.append(error)
+                finally:
+                    order.append("request-finished")
+                    call_finished.set()
+
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(call)
+                await elicitation_started.wait()
+                await session.send_notification(
+                    mcp_types.CancelledNotification(
+                        params=mcp_types.CancelledNotificationParams(
+                            requestId=request_id,
+                            reason="test cancellation",
+                        )
+                    )
+                )
+                with anyio.fail_after(0.5):
+                    while not notification_failed.is_set():
+                        await anyio.sleep(0.01)
+                    while not worker_unwinding.is_set():
+                        await anyio.sleep(0.01)
+                assert call_finished.is_set() is False
+                release_worker.set()
+                with anyio.fail_after(DEFAULT_FORCE_GRACE_SECONDS + 0.5):
+                    await call_finished.wait()
+                assert worker_finished.is_set()
+                assert len((await session.list_tools()).tools) > 0
+
+    anyio.run(run)
+
+    assert len(protocol_errors) == 1
+    assert str(protocol_errors[0]) == "Request cancelled"
+    assert order == ["worker-finished", "request-finished"]
 
 
 def test_cancelled_execute_is_durable_before_request_returns(
