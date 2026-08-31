@@ -153,12 +153,12 @@ def main(
                 obj=run,
             )
         except click.ClickException as error:
-            if _caused_by_interruption(error):
+            if control.interruption_requested or _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
             error.show()
             return error.exit_code
         except click.Abort as error:
-            if _caused_by_interruption(error):
+            if control.interruption_requested or _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
             click.echo("Aborted!", err=True)
             return 1
@@ -385,6 +385,8 @@ def initialize_repository(
                     cancel=cancel,
                     progress=progress,
                 ).run()
+    except click.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
@@ -534,6 +536,8 @@ def create_borg(
                 cancel=cancel,
                 progress=progress,
             ).create(name, source)
+    except click.Abort:
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 

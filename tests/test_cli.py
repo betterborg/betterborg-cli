@@ -827,6 +827,88 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
         assert store.list_operations(repository.id) == []
 
 
+@pytest.mark.parametrize(
+    ("confirmation_number", "name"),
+    [(1, "interrupt-editor-review"), (2, "interrupt-final-approval")],
+    ids=["editor-confirmation", "final-confirmation"],
+)
+def test_main_sigint_during_prd_confirmation_stops_without_publishing(
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    confirmation_number: int,
+    name: str,
+) -> None:
+    repository, paths = initialized_cli_repository
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# Interrupted draft\n\nNever publish this.",
+            }
+        )
+    )
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=io.StringIO(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    prompts = 0
+
+    def interrupt_at_confirmation(_prompt: str) -> str:
+        nonlocal prompts
+        prompts += 1
+        if prompts == confirmation_number:
+            os.kill(os.getpid(), signal.SIGINT)
+        return "n"
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(click.termui, "visible_prompt_func", interrupt_at_confirmation)
+    monkeypatch.setattr(
+        cli_module,
+        "_edit_markdown",
+        lambda _body: pytest.fail("interrupted work must not launch the editor"),
+    )
+
+    exit_code = cli_module.main(
+        ["create", name, "--yes"],
+        prog_name="borg",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert prompts == confirmation_number
+    assert len(reporters) == 1
+    assert reporters[0].stages["requirements"].state is StageState.STOPPED
+    assert reporters[0].stages["requirements"].result == "interrupted"
+    assert reporters[0].closed
+    assert captured.err == ""
+    assert "Error:" not in captured.out
+    assert "Aborted!" not in captured.out
+    assert "borg plan start" not in captured.out
+    assert "draft saved" not in captured.out
+    assert not paths.tracked_dir.joinpath("prds", f"{name}.md").exists()
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, name)
+        assert borg is not None
+        session = store.get_prd_session_for_borg(borg.id)
+        assert session is not None
+        assert [turn.role for turn in store.list_prd_turns(session.id)] == [
+            "user",
+            "assistant",
+        ]
+
+
 def test_version_does_not_initialize_repository(
     cli_runner: CliRunner, tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:

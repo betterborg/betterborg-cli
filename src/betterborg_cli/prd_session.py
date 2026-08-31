@@ -358,7 +358,7 @@ class PrdSession:
             if self.progress is not None:
                 record = self.progress.stages[_REQUIREMENTS_STAGE_KEY]
                 if record.state is StageState.RUNNING:
-                    if self._cancelled() or isinstance(error, KeyboardInterrupt):
+                    if _is_interruption(error, self.cancel):
                         self.progress.stop(_REQUIREMENTS_STAGE_KEY, "interrupted")
                     else:
                         self.progress.fail(
@@ -549,3 +549,17 @@ def _confirmed_prd_matches(path: Path, body: str, *, root: Path) -> bool:
         return read_repository_text(path, root=root) == body
     except (OSError, UnicodeError, RepositoryPathError):
         return False
+
+
+def _is_interruption(
+    error: BaseException,
+    cancel: CancellationToken | None,
+) -> bool:
+    if isinstance(error, KeyboardInterrupt) or (
+        cancel is not None and cancel.is_set()
+    ):
+        return True
+    cause = error.__cause__
+    if cause is None:
+        cause = error.__context__
+    return isinstance(cause, KeyboardInterrupt)
