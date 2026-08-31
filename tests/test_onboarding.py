@@ -229,6 +229,49 @@ def test_token_cancellation_during_menu_starts_no_selected_door(
     assert creator.calls == []
 
 
+@pytest.mark.parametrize(
+    "answers_before_name",
+    [("1", "1"), ("2", "incoming.md"), ("3",)],
+    ids=["fix-repo", "improve-prd", "brainstorm"],
+)
+def test_token_cancellation_during_name_prompt_starts_no_prd_session(
+    onboarding_context,
+    answers_before_name: tuple[str, ...],
+) -> None:
+    repository, store = onboarding_context
+    cancel = CancellationToken()
+    creator = RecordingCreator()
+    answers = iter(answers_before_name)
+
+    def cancel_while_naming(message: str) -> str:
+        if message.startswith("Borg name"):
+            cancel.cancel()
+            return "cancelled-name"
+        return next(answers)
+
+    result = OnboardingDispatcher(
+        repository,
+        store,
+        InteractiveIO(
+            prompt=cancel_while_naming,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        creator,
+        _documents(repository.root),
+        cancel=cancel,
+    ).run()
+
+    assert result is None
+    assert creator.calls == []
+    with store.locked_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM borgs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM prd_sessions").fetchone()[0]
+            == 0
+        )
+
+
 @pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
 def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
     onboarding_context,

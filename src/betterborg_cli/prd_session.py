@@ -196,9 +196,23 @@ class PrdSession:
         being prompted.
         """
         validate_borg_name(name)
-        initial_markdown = _read_source(source) if source is not None else None
         relative_prd_path = Path(".borg") / "prds" / f"{name}.md"
         prd_path = self.repository.root / relative_prd_path
+        borg = Borg(repository_id=self.repository.id, name=name)
+        session = StoredPrdSession(
+            repository_id=self.repository.id,
+            borg_id=borg.id,
+            prd_path=relative_prd_path,
+        )
+        base_result = {
+            "borg": borg,
+            "session": session,
+            "prd_path": prd_path,
+        }
+        if self._cancelled():
+            return PrdSessionResult(**base_result, confirmed=False)
+
+        initial_markdown = _read_source(source) if source is not None else None
         if source is not None and source.resolve() == prd_path.resolve():
             raise ValueError("source PRD cannot also be the confirmed output path")
         if self.store.get_borg_by_name(self.repository.id, name) is not None:
@@ -206,12 +220,6 @@ class PrdSession:
         if prd_path.exists() or prd_path.is_symlink():
             raise FileExistsError(f"confirmed Borg PRD already exists: {prd_path}")
 
-        borg = Borg(repository_id=self.repository.id, name=name)
-        session = StoredPrdSession(
-            repository_id=self.repository.id,
-            borg_id=borg.id,
-            prd_path=relative_prd_path,
-        )
         with self.store.transaction():
             self.store.add_borg(borg)
             self.store.add_prd_session(session)
@@ -221,12 +229,7 @@ class PrdSession:
                 content=initial_markdown or _BRAINSTORM_OPENING,
             )
 
-        base_result = {
-            "borg": borg,
-            "session": session,
-            "prd_path": prd_path,
-        }
-        if self.cancel is not None and self.cancel.is_set():
+        if self._cancelled():
             return PrdSessionResult(**base_result, confirmed=False)
 
         if self.progress is not None:
@@ -287,9 +290,13 @@ class PrdSession:
                 assert self.io is not None
                 with self._suspend_output():
                     self.io.write(body_md)
-                    if self.editor is not None and self.io.confirm(
-                        "Review and edit this PRD in your editor?", default=False
-                    ):
+                    edit_requested = False
+                    if not self._cancelled() and self.editor is not None:
+                        edit_requested = self.io.confirm(
+                            "Review and edit this PRD in your editor?",
+                            default=False,
+                        )
+                    if edit_requested and not self._cancelled():
                         edited = self.editor(body_md)
                         if edited is not None:
                             body_md = _normalize_draft(edited)
@@ -298,10 +305,9 @@ class PrdSession:
                                 role="user",
                                 content=body_md,
                             )
-                            self.io.write(body_md)
-                    if self._cancelled():
-                        confirmed = False
-                    else:
+                            if not self._cancelled():
+                                self.io.write(body_md)
+                    if not self._cancelled():
                         confirmed = self.io.confirm(
                             f"Create Borg {name!r} with this PRD?", default=False
                         )

@@ -139,7 +139,7 @@ class OnboardingDispatcher:
         document = self.improvement_prds[selection - 1]
         with self._suspend_output():
             name = self._prompt_name(document.suggested_borg_name)
-        if name is None:
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name, document.path)
 
@@ -148,6 +148,8 @@ class OnboardingDispatcher:
             return None
         with self._suspend_output():
             answer = self.io.prompt("Local Markdown PRD path (or q to cancel)")
+        if self._cancelled():
+            return None
         if answer is None or answer.casefold() == "q":
             return None
         source = Path(answer)
@@ -155,7 +157,7 @@ class OnboardingDispatcher:
             source = self.repository.root / source
         with self._suspend_output():
             name = self._prompt_name(source.stem)
-        if name is None:
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name, source)
 
@@ -164,7 +166,7 @@ class OnboardingDispatcher:
             return None
         with self._suspend_output():
             name = self._prompt_name()
-        if name is None:
+        if name is None or self._cancelled():
             return None
         return self.creator.create(name)
 
@@ -174,6 +176,8 @@ class OnboardingDispatcher:
                 return None
             suffix = f" [{suggested}]" if suggested else ""
             answer = self.io.prompt(f"Borg name{suffix} (or q to cancel)")
+            if self._cancelled():
+                return None
             if answer is None or answer.casefold() == "q":
                 return None
             name = suggested if not answer and suggested is not None else answer
@@ -204,6 +208,8 @@ class OnboardingDispatcher:
             if self._cancelled():
                 return None
             answer = self.io.prompt(message)
+            if self._cancelled():
+                return None
             if answer is None or answer.casefold() == "q":
                 return None
             if not answer and default is not None:

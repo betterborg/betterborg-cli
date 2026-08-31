@@ -243,6 +243,88 @@ def test_cancellation_keeps_a_recorded_answer_and_starts_no_later_turn(
     assert not result.prd_path.exists()
 
 
+def test_cancellation_before_run_creates_no_session_records(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    adapter = _responses(
+        {"questions": [], "prd_markdown": "# Must not run\n"}
+    )
+    progress = RunProgress(stream=StringIO())
+    session = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("cancelled work must not prompt"),
+            confirm=lambda _message, _default: pytest.fail(
+                "cancelled work must not confirm"
+            ),
+            write=lambda _message: pytest.fail("cancelled work must not render"),
+        ),
+        cancel=cancel,
+        progress=progress,
+    )
+    cancel.cancel()
+
+    result = session.run("NeverStarted")
+
+    assert result.cancelled
+    assert adapter.calls == []
+    assert progress.stages["requirements"].state is StageState.PENDING
+    with store.locked_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM borgs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM prd_sessions").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM prd_turns").fetchone()[0]
+            == 0
+        )
+
+
+def test_cancellation_during_editor_confirmation_does_not_launch_editor(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    cancel = CancellationToken()
+    adapter = _responses(
+        {"questions": [], "prd_markdown": "# Draft\n\nReview this."}
+    )
+    confirmations: list[str] = []
+
+    def cancel_editor_confirmation(message: str, _default: bool) -> bool:
+        confirmations.append(message)
+        cancel.cancel()
+        return True
+
+    progress = RunProgress(stream=StringIO())
+    result = PrdSession(
+        repository,
+        store,
+        adapter,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("draft needs no answers"),
+            confirm=cancel_editor_confirmation,
+            write=lambda _message: None,
+        ),
+        editor=lambda _body: pytest.fail("cancelled work must not launch editor"),
+        cancel=cancel,
+        progress=progress,
+    ).run("CancelledEditor")
+
+    assert result.cancelled
+    assert confirmations == ["Review and edit this PRD in your editor?"]
+    assert progress.stages["requirements"].state is StageState.STOPPED
+    assert [turn.role for turn in store.list_prd_turns(result.session.id)] == [
+        "user",
+        "assistant",
+    ]
+    assert not result.prd_path.exists()
+
+
 @pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
 def test_draft_editor_and_confirmations_suspend_renderer_heartbeats(
     repository_store,

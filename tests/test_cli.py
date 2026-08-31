@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import pytest
@@ -369,6 +370,153 @@ def test_main_preserves_click_exception_formatting(
     assert exit_code == 1
     assert captured.out == ""
     assert captured.err == "Error: ordinary failure\n"
+
+
+@pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
+def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    class TTYStream(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+
+    stream = TTYStream()
+    clock = FakeClock()
+    progress = RunProgress(
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=5,
+    )
+    run = cli_module.CliRunContext(cli_module.CancellationToken(), progress)
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": ["Who needs this first?"],
+                "prd_markdown": None,
+            }
+        )
+    ).queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# CLI draft\n\nReady for review.",
+            }
+        ),
+    )
+    snapshots: list[tuple[str, str, str]] = []
+
+    def cross_heartbeat(boundary: str) -> None:
+        before = stream.getvalue()
+        clock.now += 10
+        progress.refresh()
+        snapshots.append((boundary, before, stream.getvalue()))
+
+    class StubRepositoryService:
+        def __init__(
+            self,
+            paths: RepoPaths,
+            store: SqliteStore,
+            _agent_factory,
+            *,
+            cancel=None,
+            progress: RunProgress | None = None,
+        ) -> None:
+            assert cancel is run.cancellation
+            assert progress is run.progress
+            self.paths = paths
+            self.store = store
+            self.progress = progress
+
+        def initialize(self):
+            repository = Repository(root=self.paths.root)
+            self.store.add_repository(repository)
+            self.paths.tracked_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.tracked_dir.joinpath("config.toml").write_text(
+                "version = 1\n\n"
+                "[repository]\n"
+                f'id = "{repository.id}"\n'
+                'default_branch = "main"\n',
+                encoding="utf-8",
+            )
+            assert self.progress is not None
+            self.progress.declare(StageSpec("active", "Active work"))
+            self.progress.start("active")
+            return SimpleNamespace(
+                repository=repository,
+                analysis=SimpleNamespace(overall_score=3.0),
+                initialized=True,
+                improvement_prds=(),
+            )
+
+    original_echo = click.echo
+    original_prompt = click.prompt
+    original_confirm = click.confirm
+
+    def echo(message=None, *args, **kwargs):
+        cross_heartbeat(f"output:{message}")
+        return original_echo(message, *args, **kwargs)
+
+    def prompt(*args, **kwargs):
+        cross_heartbeat("prompt")
+        return original_prompt(*args, **kwargs)
+
+    def confirm(*args, **kwargs):
+        cross_heartbeat("confirmation")
+        return original_confirm(*args, **kwargs)
+
+    def edit(_body: str) -> str:
+        cross_heartbeat("editor")
+        return "# Edited CLI draft\n\nApproved requirements."
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    monkeypatch.setattr(cli_module.click, "prompt", prompt)
+    monkeypatch.setattr(cli_module.click, "confirm", confirm)
+    monkeypatch.setattr(cli_module, "_edit_markdown", edit)
+
+    result = cli_runner.invoke(
+        cli,
+        ["init", "--yes"],
+        input="3\ncli-suspended\nMaintainers\ny\ny\n",
+        obj=run,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert any(
+        boundary.startswith("output:Initialized repository")
+        for boundary, *_ in snapshots
+    )
+    assert any(boundary == "prompt" for boundary, *_ in snapshots)
+    assert any(boundary == "confirmation" for boundary, *_ in snapshots)
+    assert any(boundary == "editor" for boundary, *_ in snapshots)
+    assert snapshots and all(before == after for _, before, after in snapshots)
+    assert committed_git_repo.joinpath(
+        ".borg/prds/cli-suspended.md"
+    ).read_text(encoding="utf-8") == (
+        "# Edited CLI draft\n\nApproved requirements.\n"
+    )
 
 
 def test_main_surfaces_reconciliation_failure_after_interrupt(
