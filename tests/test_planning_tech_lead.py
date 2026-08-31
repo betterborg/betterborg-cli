@@ -8,6 +8,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from planning_progress_test_support import BoundaryInterruptProgress
 
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
@@ -19,7 +20,12 @@ from betterborg_cli.planning import (
     TechLeadLoop,
 )
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.progress import ChildRecord, RunProgress, StageState
+from betterborg_cli.progress import (
+    ChildRecord,
+    RunProgress,
+    StageRecord,
+    StageState,
+)
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -44,6 +50,130 @@ class _SeedOrderProgress(RunProgress):
         return super().seed_child_completed(
             stage_key, child_key, result, duration_seconds
         )
+
+
+class _LifecycleProgress(RunProgress):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.events: list[tuple[str, str]] = []
+
+    def start(self, stage_key: str) -> StageRecord:
+        record = super().start(stage_key)
+        self.events.append(("start", stage_key))
+        return record
+
+    def seed_completed(
+        self,
+        stage_key: str,
+        result: object,
+        duration_seconds: float | None = None,
+    ) -> StageRecord:
+        record = super().seed_completed(stage_key, result, duration_seconds)
+        self.events.append(("seed", stage_key))
+        return record
+
+    def complete(
+        self, stage_key: str, result: object | None = None
+    ) -> StageRecord:
+        record = super().complete(stage_key, result)
+        self.events.append(("complete", stage_key))
+        return record
+
+
+def test_fresh_progress_finishes_architect_before_tech_lead_starts(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+) -> None:
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    progress = _LifecycleProgress(stream=StringIO())
+    database = committed_git_repo.parent / "fresh-role-progress.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "fresh-role-progress"
+        )
+        handoff = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            architect,
+            io=_io(),
+            progress=progress,
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            io=_io(),
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert progress.events == [
+            ("start", "architect"),
+            ("complete", "architect"),
+            ("start", "tech-lead"),
+            ("complete", "tech-lead"),
+        ]
+        progress.close()
+
+
+def test_retained_architect_uses_durable_duration_without_starting(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+) -> None:
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    database = committed_git_repo.parent / "retained-role-progress.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "retained-role-progress"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        durable_duration = (
+            handoff.attempt.finished_at - handoff.attempt.started_at
+        ).total_seconds()
+        progress = _LifecycleProgress(stream=StringIO())
+
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            io=_io(),
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        architect_record = progress.stages["architect"]
+        assert architect_record.retained is True
+        assert architect_record.started_at is None
+        assert architect_record.duration_seconds == pytest.approx(durable_duration)
+        assert progress.events == [
+            ("seed", "architect"),
+            ("start", "tech-lead"),
+            ("complete", "tech-lead"),
+        ]
+        progress.close()
 
 
 def test_findings_drive_bounded_revision_then_exact_approval_transition(
@@ -126,6 +256,117 @@ def test_findings_drive_bounded_revision_then_exact_approval_transition(
         assert [(item.round, item.message) for item in findings] == [
             (1, "Define rollback behavior.")
         ]
+
+
+@pytest.mark.parametrize(
+    ("interrupt_at", "expected_state", "expected_calls"),
+    [
+        pytest.param("after-start", StageState.STOPPED, 0, id="start"),
+        pytest.param("before-complete", StageState.COMPLETED, 1, id="complete"),
+    ],
+)
+def test_tech_lead_progress_boundary_interrupt_reconciles_durable_state(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    interrupt_at: str,
+    expected_state: StageState,
+    expected_calls: int,
+) -> None:
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    progress = BoundaryInterruptProgress(interrupt_at, stream=StringIO())
+    database = committed_git_repo.parent / f"tech-lead-{interrupt_at}.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"tech-lead-{interrupt_at}"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        with pytest.raises(KeyboardInterrupt, match="interrupted"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                io=_io(),
+                progress=progress,
+            ).run()
+
+        assert len(reviewer.calls) == expected_calls
+        assert progress.stages["tech-lead"].state is expected_state
+        if interrupt_at == "before-complete":
+            assert store.get_borg(borg.id).state is BorgState.PLAN_APPROVAL_PENDING
+            review = store.list_planning_attempts(borg.id)[-1]
+            assert review.status is PlanningAttemptStatus.COMPLETED
+        else:
+            assert store.get_borg(borg.id).state is BorgState.TECH_REVIEW_WORKING
+        progress.close()
+
+
+def test_completed_revision_child_is_not_stopped_by_completion_interrupt(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    architect.queue(
+        MockResponse(payload=planning_plan_response(summary="Durable revision."))
+    )
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Revise the rollout plan.")
+        )
+    )
+    progress = BoundaryInterruptProgress(
+        "before-complete-child", stream=StringIO()
+    )
+    database = committed_git_repo.parent / "revision-completion-interrupt.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "revision-completion-interrupt"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        with pytest.raises(KeyboardInterrupt, match="complete-child"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+                progress=progress,
+            ).run()
+
+        review = next(
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "tech_review"
+        )
+        child = progress.stages["tech-lead"].children[
+            f"architect-revision:{review.id}"
+        ]
+        assert child.state is StageState.COMPLETED
+        assert progress.stages["tech-lead"].state is StageState.STOPPED
+        assert store.get_borg(borg.id).state is BorgState.TECH_REVIEW_WORKING
+        progress.close()
 
 
 def test_recovers_completed_provider_review_without_duplicate_turn(

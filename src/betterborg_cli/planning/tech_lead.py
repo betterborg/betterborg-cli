@@ -180,33 +180,33 @@ class TechLeadLoop:
 
     def run(self) -> TechLeadResult:
         """Continue reviewing and revising until approved or review-capped."""
-        self._seed_architect_progress()
-        self._declare_revision_progress()
-        terminal = self._terminal_result()
-        if terminal is not None:
-            self._seed_revision_progress()
-            self._seed_tech_lead_progress(terminal.attempt)
-            return terminal
-
-        if self.progress is not None:
-            self._seed_revision_progress()
-            self.progress.start("tech-lead")
         try:
+            self._seed_architect_progress()
+            self._declare_revision_progress()
+            terminal = self._terminal_result()
+            if terminal is not None:
+                self._seed_revision_progress()
+                self._seed_tech_lead_progress(terminal.attempt)
+                return terminal
+
+            if self.progress is not None:
+                self._seed_revision_progress()
+                self.progress.start("tech-lead")
             result = self._run()
+            if self.progress is not None:
+                self.progress.complete(
+                    "tech-lead", result.attempt.summary or "review complete"
+                )
+            return result
         except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
-            self._finish_progress(str(error), stopped=True)
+            self._reconcile_progress(str(error), stopped=True)
             raise
         except Exception as error:
-            self._finish_progress(
+            self._reconcile_progress(
                 str(error),
                 stopped=self.cancel is not None and self.cancel.is_set(),
             )
             raise
-        if self.progress is not None:
-            self.progress.complete(
-                "tech-lead", result.attempt.summary or "review complete"
-            )
-        return result
 
     def _run(self) -> TechLeadResult:
         """Execute the active Tech Lead parent through all revision cycles."""
@@ -556,7 +556,22 @@ class TechLeadLoop:
                 self.progress.stop_child("tech-lead", child.key, result)
             else:
                 self.progress.fail_child("tech-lead", child.key, result)
-        if stopped:
-            self.progress.stop("tech-lead", result)
+        if self.progress.stages["tech-lead"].state is StageState.RUNNING:
+            if stopped:
+                self.progress.stop("tech-lead", result)
+            else:
+                self.progress.fail("tech-lead", result)
+
+    def _reconcile_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["tech-lead"]
+        if record.state is not StageState.RUNNING:
+            return
+        terminal = self._terminal_result()
+        if terminal is not None:
+            self.progress.complete(
+                "tech-lead", terminal.attempt.summary or "review complete"
+            )
         else:
-            self.progress.fail("tech-lead", result)
+            self._finish_progress(result, stopped=stopped)

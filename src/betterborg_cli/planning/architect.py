@@ -298,29 +298,29 @@ class ArchitectLoop:
 
     def run(self) -> ArchitectResult:
         """Continue from durable history until a plan is ready for Tech Lead review."""
-        completed_plan = self._completed_plan()
-        if completed_plan is not None:
-            self._seed_progress(completed_plan)
-            return ArchitectResult(
-                borg=self._turns.current_borg(),
-                plan=completed_plan.result or {},
-                attempt=completed_plan,
-            )
-
-        self._start_progress()
         try:
+            completed_plan = self._completed_plan()
+            if completed_plan is not None:
+                self._seed_progress(completed_plan)
+                return ArchitectResult(
+                    borg=self._turns.current_borg(),
+                    plan=completed_plan.result or {},
+                    attempt=completed_plan,
+                )
+
+            self._start_progress()
             result = self._run()
+            self._complete_progress(result.attempt)
+            return result
         except (ArchitectCancelled, KeyboardInterrupt) as error:
-            self._stop_progress(str(error))
+            self._reconcile_progress(str(error), stopped=True)
             raise
         except Exception as error:
-            if self.cancel is not None and self.cancel.is_set():
-                self._stop_progress(str(error))
-            else:
-                self._fail_progress(str(error))
+            self._reconcile_progress(
+                str(error),
+                stopped=self.cancel is not None and self.cancel.is_set(),
+            )
             raise
-        self._complete_progress(result.attempt)
-        return result
 
     def _run(self) -> ArchitectResult:
         """Execute fresh Architect work after its progress record starts."""
@@ -601,6 +601,24 @@ class ArchitectLoop:
                 self.child_key,
                 planning_attempt_result(attempt, default="plan ready"),
             )
+
+    def _reconcile_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        record = (
+            self.progress.stages[self.stage_key]
+            if self.child_key is None
+            else self.progress.stages[self.stage_key].children[self.child_key]
+        )
+        if record.state is not StageState.RUNNING:
+            return
+        completed_plan = self._completed_plan()
+        if completed_plan is not None:
+            self._complete_progress(completed_plan)
+        elif stopped:
+            self._stop_progress(result)
+        else:
+            self._fail_progress(result)
 
     def _fail_progress(self, result: str) -> None:
         if self.progress is None:

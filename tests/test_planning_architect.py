@@ -9,6 +9,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from planning_progress_test_support import BoundaryInterruptProgress
 
 from betterborg_cli.agent_runtime import ApiAgentRole, CodexAdapter, select_agent
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
@@ -163,6 +164,53 @@ def test_clarification_output_is_suspended_and_stops_active_architect(
     assert output_states == [True, True]
     assert progress.suspension_count == 1
     assert progress.stages["architect"].state is StageState.STOPPED
+
+
+@pytest.mark.parametrize(
+    ("interrupt_at", "expected_state", "expected_calls"),
+    [
+        pytest.param("after-start", StageState.STOPPED, 0, id="start"),
+        pytest.param("before-complete", StageState.COMPLETED, 2, id="complete"),
+    ],
+)
+def test_architect_progress_boundary_interrupt_reconciles_durable_state(
+    committed_git_repo: Path,
+    persist_planning_context,
+    interrupt_at: str,
+    expected_state: StageState,
+    expected_calls: int,
+) -> None:
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+    progress = BoundaryInterruptProgress(interrupt_at, stream=StringIO())
+    database = committed_git_repo.parent / f"architect-{interrupt_at}.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"architect-{interrupt_at}"
+        )
+        with pytest.raises(KeyboardInterrupt, match="interrupted"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                progress=progress,
+            ).run()
+
+        assert len(adapter.calls) == expected_calls
+        assert progress.stages["architect"].state is expected_state
+        if interrupt_at == "before-complete":
+            assert store.get_borg(borg.id).state is BorgState.TECH_REVIEW_WORKING
+            assert store.list_planning_attempts(borg.id)[-1].status is (
+                PlanningAttemptStatus.COMPLETED
+            )
+        else:
+            assert store.get_borg(borg.id).state is BorgState.DRAFT
+        progress.close()
 
 
 def test_selected_codex_agent_runs_architect_in_read_only_sandbox(
