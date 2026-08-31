@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11%2B-brightgreen?style=flat-square)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
-Betterborg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them — each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
+Betterborg is an AI engineering team for substantial software projects, not a chat window that makes an isolated edit. You give it a task or a PRD; agents investigate your real code, write a reviewed technical plan, decompose it into a dependency graph of tasks, and implement them, each in its own isolated Git worktree. You approve the plan before anything is decomposed, and the estimate before anything runs. It works locally, on your own Claude Code or Codex subscription.
 
 > [!NOTE]
 > Pre-alpha. Interfaces may change between releases.
@@ -42,7 +42,7 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
     borg init                      # register and analyze the repository
     borg create my-feature         # or: borg create my-feature --prd spec.md
     borg plan start my-feature     # agents plan, review, and iterate
-    borg plan approve my-feature   # your gate — nothing is decomposed before this
+    borg plan approve my-feature   # your gate: nothing is decomposed before this
     borg task estimate my-feature  # P50/P80 work and cost
     borg execute my-feature        # approve the estimate, then run
     ```
@@ -66,9 +66,9 @@ Keep provider keys in your shell or a secret manager, never in `.borg/config.tom
 
 ## Documentation
 
-- [Installation guide](docs/installation.md) — version pinning, WSL2, providers, recovery
-- [Command guide](docs/commands.md) — bootstrap and initialization
-- [Release runbook](docs/releasing.md) — for maintainers
+- [Installation guide](docs/installation.md): version pinning, WSL2, providers, recovery
+- [Command guide](docs/commands.md): bootstrap and initialization
+- [Release runbook](docs/releasing.md): for maintainers
 
 ## Reporting bugs
 

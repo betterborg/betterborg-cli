@@ -11,7 +11,7 @@ borg version
 
 The distribution is named `betterborg`; it installs the `borg` console command.
 Requires Python 3.11 or newer. Any tool that installs a Python console script
-works — `pipx install betterborg` and `uv tool install betterborg` both produce
+works: `pipx install betterborg` and `uv tool install betterborg` both produce
 the same persistent command.
 
 A persistent install is required for host plugin activation. Activate the
