@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +28,7 @@ from betterborg_cli.progress import (
     RunProgress,
     StageState,
 )
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     AgentAttempt,
     Borg,
@@ -520,6 +523,59 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
         )
         assert runs_by_id[resumed.operation_id].status is (
             ExecutionRunStatus.COMPLETED
+        )
+
+
+def test_scheduler_sigint_durably_interrupts_before_keyboard_interrupt_escapes(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+    started = threading.Event()
+    progress = RunProgress(stream=StringIO(), enabled=False)
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            assert context.cancel.wait(timeout=2)
+            return context.runtime.status
+
+        def interrupt() -> None:
+            assert started.wait(timeout=2)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = threading.Thread(target=interrupt)
+        control = RunControl(cancel, progress=progress)
+        with control:
+            interrupter.start()
+            with pytest.raises(KeyboardInterrupt):
+                HostTaskScheduler(
+                    store,
+                    behavior,
+                    config=HostSchedulerConfig(poll_interval_seconds=0.005),
+                    progress=progress,
+                ).run(borg.id, generation.id, cancel=cancel)
+        interrupter.join(timeout=2)
+
+        assert not interrupter.is_alive()
+        assert control.wait_for_cancellation(timeout=2)
+        run = store.list_execution_runs(borg.id)[0]
+        assert run.status is ExecutionRunStatus.CANCELLED
+        runtime = store.get_task_runtime(records["task"].id)
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
+        assert progress.stages[str(records["task"].id)].state is StageState.STOPPED
+        claims = store.list_task_claims(run.id)
+        assert len(claims) == 1
+        assert claims[0].released_at is not None
+        assert any(
+            event.kind == "run.interrupted"
+            for event in store.list_execution_events(run.id)
         )
 
 

@@ -1084,16 +1084,11 @@ class HostMergePhase:
     ) -> HostMergeResult:
         if status not in {TaskRuntimeStatus.BLOCKED, TaskRuntimeStatus.FAILED}:
             raise MergePhaseError(f"invalid terminal merge status: {status.value}")
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=TaskRuntimeStatus.MERGING,
-            new_status=status,
+        context.transition(
+            TaskRuntimeStatus.MERGING,
+            status,
             resume_phase="merging",
             state_reason=reason,
-            now=context.clock(),
         )
         return HostMergeResult(status, reason)
 

@@ -268,8 +268,10 @@ class HostTaskRuntime:
                 context.owner_token,
                 secret_values=self._secret_values,
                 activity=context.activity,
+                task_transition=context.transition,
             )
         except EnvironmentMaterializationError:
+            context.reconcile_progress()
             return self._durable_status(context)
         if context.cancel.is_set():
             return self._durable_status(context)
@@ -333,6 +335,7 @@ class HostTaskRuntime:
                         ).status
                         stack = None
         except ComposeStackError:
+            context.reconcile_progress()
             return self._durable_status(context)
         except EnvironmentMaterializationError as error:
             runtime = context.runtime

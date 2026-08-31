@@ -68,6 +68,7 @@ from betterborg_cli.progress import (
     AgentActivityKind,
     ChildSpec,
     RunProgress,
+    StageRecord,
     StageSpec,
 )
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
@@ -194,14 +195,27 @@ class _Environment:
 
     def materialize_claimed_task(self, store, plan, claim, owner_token, **kwargs):
         self.calls.append("environment")
-        store.transition_task_runtime(
-            claim.run_id,
-            owner_token,
-            claim.id,
-            claim.claim_token,
-            expected_status=TaskRuntimeStatus.CLAIMED,
-            new_status=TaskRuntimeStatus.CODING,
-        )
+        transition = kwargs.get("task_transition")
+        if transition is None:
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.CLAIMED,
+                new_status=TaskRuntimeStatus.ENVIRONMENT,
+            )
+            store.transition_task_runtime(
+                claim.run_id,
+                owner_token,
+                claim.id,
+                claim.claim_token,
+                expected_status=TaskRuntimeStatus.ENVIRONMENT,
+                new_status=TaskRuntimeStatus.CODING,
+            )
+        else:
+            transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.ENVIRONMENT)
+            transition(TaskRuntimeStatus.ENVIRONMENT, TaskRuntimeStatus.CODING)
         return SimpleNamespace(environment={"CACHE": "prepared"})
 
 
@@ -902,6 +916,26 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
         merge=_Merge(calls),
         sanity=_Sanity(calls),
     )
+    displayed_transitions: list[tuple[str | None, str]] = []
+    displayed_completions: list[str] = []
+
+    class RecordingProgress(RunProgress):
+        def update(self, stage_key: str, detail: str | None) -> StageRecord:
+            record = super().update(stage_key, detail)
+            runtime_row = store.get_task_runtime(records[0].id)
+            assert runtime_row is not None
+            displayed_transitions.append((detail, runtime_row.status.value))
+            return record
+
+        def complete(
+            self, stage_key: str, result: object | None = None
+        ) -> StageRecord:
+            runtime_row = store.get_task_runtime(records[0].id)
+            assert runtime_row is not None
+            displayed_completions.append(runtime_row.status.value)
+            return super().complete(stage_key, result)
+
+    progress = RecordingProgress(stream=StringIO(), enabled=False)
     try:
         result = HostExecutionService(
             store,
@@ -910,10 +944,19 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             worktree_manager=_Worktrees(calls),
             compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
         ).run(borg.id, generation.id, {})
 
         assert result.status is ExecutionRunStatus.COMPLETED
         assert store.get_task_runtime(records[0].id).status is TaskRuntimeStatus.DONE
+        assert displayed_transitions == [
+            ("environment", "claimed"),
+            ("environment", "environment"),
+            ("coding", "coding"),
+            ("review", "review"),
+            ("merging", "merging"),
+        ]
+        assert displayed_completions == ["done"]
         assert calls == [
             "preflight",
             "worktrees",

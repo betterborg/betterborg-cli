@@ -120,6 +120,13 @@ class ScheduledTaskContext:
             self._transitioned(runtime)
         return runtime
 
+    def reconcile_progress(self) -> TaskRuntime:
+        """Reflect the latest durable row after a lower-level transition."""
+        runtime = self.runtime
+        if self._transitioned is not None:
+            self._transitioned(runtime)
+        return runtime
+
 
 class HostTaskBehavior(Protocol):
     """Temporary task-runtime seam used until concrete phases are assembled."""
@@ -205,10 +212,22 @@ class HostTaskScheduler:
         if owner_token is None:  # Defensive narrowing of the acquisition contract.
             raise RuntimeError("acquired execution run has no owner token")
 
-        self._seed_progress(acquisition.run_id, generation_id)
-
         active: dict[Future[TaskRuntimeStatus | None], TaskClaim] = {}
         next_heartbeat = started_at + self._config.heartbeat_interval
+        try:
+            self._seed_progress(acquisition.run_id, generation_id)
+        except KeyboardInterrupt as error:
+            self._interrupt_after_keyboard_interrupt(
+                error,
+                token,
+                active,
+                acquisition.run_id,
+                generation_id,
+                owner_token,
+                next_heartbeat,
+            )
+            raise
+
         with ThreadPoolExecutor(
             max_workers=self._config.jobs,
             thread_name_prefix="betterborg-task",
@@ -217,21 +236,14 @@ class HostTaskScheduler:
                 while True:
                     now = self._clock()
                     if token.is_set():
-                        if self._progress is not None:
-                            self._progress.begin_cancellation()
-                        self._drain_cancelled(
+                        self._interrupt(
+                            token,
                             active,
                             acquisition.run_id,
+                            generation_id,
                             owner_token,
                             next_heartbeat,
                         )
-                        self._store.interrupt_execution_run(
-                            acquisition.run_id,
-                            owner_token,
-                            reason="execution cancelled",
-                            now=self._clock(),
-                        )
-                        self._reconcile_interrupted_progress(generation_id)
                         return self._result(
                             acquisition.run_id, generation_id, acquired=True
                         )
@@ -284,6 +296,17 @@ class HostTaskScheduler:
                         timeout=self._config.poll_interval_seconds,
                         return_when=FIRST_COMPLETED,
                     )
+            except KeyboardInterrupt as error:
+                self._interrupt_after_keyboard_interrupt(
+                    error,
+                    token,
+                    active,
+                    acquisition.run_id,
+                    generation_id,
+                    owner_token,
+                    next_heartbeat,
+                )
+                raise
             except ExecutionOwnershipError:
                 token.cancel()
                 self._drain(active)
@@ -458,6 +481,55 @@ class HostTaskScheduler:
                     now=now,
                 )
                 next_heartbeat = now + self._config.heartbeat_interval
+
+    def _interrupt(
+        self,
+        token: CancellationToken,
+        active: dict[Future[TaskRuntimeStatus | None], TaskClaim],
+        run_id: UUID,
+        generation_id: UUID,
+        owner_token: str,
+        next_heartbeat: datetime,
+    ) -> None:
+        """Fence active work before durably interrupting and reconciling a run."""
+        token.cancel()
+        if self._progress is not None:
+            self._progress.begin_cancellation()
+        try:
+            self._drain_cancelled(active, run_id, owner_token, next_heartbeat)
+            self._store.interrupt_execution_run(
+                run_id,
+                owner_token,
+                reason="execution cancelled",
+                now=self._clock(),
+            )
+        finally:
+            self._reconcile_interrupted_progress(generation_id)
+
+    def _interrupt_after_keyboard_interrupt(
+        self,
+        error: KeyboardInterrupt,
+        token: CancellationToken,
+        active: dict[Future[TaskRuntimeStatus | None], TaskClaim],
+        run_id: UUID,
+        generation_id: UUID,
+        owner_token: str,
+        next_heartbeat: datetime,
+    ) -> None:
+        """Preserve the user interrupt while recording cancellation failures."""
+        try:
+            self._interrupt(
+                token,
+                active,
+                run_id,
+                generation_id,
+                owner_token,
+                next_heartbeat,
+            )
+        except BaseException as interruption_error:
+            error.add_note(
+                f"execution interruption reconciliation failed: {interruption_error}"
+            )
 
     def _finish(
         self,

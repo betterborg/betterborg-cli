@@ -438,15 +438,10 @@ class HostCodingPhase:
     ) -> TaskRuntimeStatus:
         if status is TaskRuntimeStatus.CODING:
             return status
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=TaskRuntimeStatus.CODING,
-            new_status=status,
+        context.transition(
+            TaskRuntimeStatus.CODING,
+            status,
             state_reason=reason,
-            now=context.clock(),
         )
         return status
 
@@ -462,15 +457,10 @@ class HostCodingPhase:
             TaskRuntimeStatus.CODING,
         }:
             raise CodingPhaseError(reason)
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=runtime.status,
-            new_status=TaskRuntimeStatus.BLOCKED,
+        context.transition(
+            runtime.status,
+            TaskRuntimeStatus.BLOCKED,
             state_reason=reason,
-            now=context.clock(),
         )
         return TaskRuntimeStatus.BLOCKED
 

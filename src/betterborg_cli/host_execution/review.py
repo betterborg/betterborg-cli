@@ -793,17 +793,12 @@ class HostReviewFixPhase:
         expected_status: TaskRuntimeStatus,
         outcome: _PhaseOutcome,
     ) -> TaskRuntimeStatus:
-        context.store.transition_task_runtime(
-            context.claim.run_id,
-            context.owner_token,
-            context.claim.id,
-            context.claim.claim_token,
-            expected_status=expected_status,
-            new_status=outcome.status,
+        context.transition(
+            expected_status,
+            outcome.status,
             resume_phase=outcome.resume_phase,
             review_round=outcome.review_round,
             state_reason=outcome.reason,
-            now=context.clock(),
         )
         return outcome.status
 

@@ -33,6 +33,7 @@ from betterborg_cli.store import (
     ExecutionAttemptStatus,
     SqliteStore,
     TaskClaim,
+    TaskRuntime,
     TaskRuntimeStatus,
 )
 from betterborg_cli.store.models import utcnow
@@ -371,6 +372,7 @@ class HostEnvironmentManager:
         *,
         secret_values: Mapping[str, str] | None = None,
         activity: ActivitySink | None = None,
+        task_transition: Callable[..., TaskRuntime] | None = None,
     ) -> EnvironmentMaterialization:
         """Move one claimed task through environment setup into coding.
 
@@ -397,15 +399,14 @@ class HostEnvironmentManager:
             and claim.resume_phase != TaskRuntimeStatus.ENVIRONMENT.value
         )
         if runtime.status is TaskRuntimeStatus.CLAIMED:
-            runtime = store.transition_task_runtime(
-                claim.run_id,
+            runtime = self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=TaskRuntimeStatus.CLAIMED,
                 new_status=TaskRuntimeStatus.ENVIRONMENT,
                 resume_phase=claim.resume_phase,
-                now=self._clock(),
+                task_transition=task_transition,
             )
         elif runtime.status not in {
             TaskRuntimeStatus.ENVIRONMENT,
@@ -457,19 +458,24 @@ class HostEnvironmentManager:
             )
         except BaseException as error:
             self._raise_if_cancelled(error)
-            self._block_environment_task(store, claim, owner_token, error)
+            self._block_environment_task(
+                store,
+                claim,
+                owner_token,
+                error,
+                task_transition=task_transition,
+            )
             raise
 
         if not preserving_active_phase:
-            store.transition_task_runtime(
-                claim.run_id,
+            self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=TaskRuntimeStatus.ENVIRONMENT,
                 new_status=TaskRuntimeStatus.CODING,
                 resume_phase=(claim.resume_phase if reclaimed_agent_work else None),
-                now=self._clock(),
+                task_transition=task_transition,
             )
         return EnvironmentMaterialization(
             fingerprint=fingerprint,
@@ -997,6 +1003,8 @@ class HostEnvironmentManager:
         claim: TaskClaim,
         owner_token: str,
         error: BaseException,
+        *,
+        task_transition: Callable[..., TaskRuntime] | None = None,
     ) -> None:
         runtime = store.get_task_runtime(claim.task_id)
         if runtime is None or runtime.status not in {
@@ -1007,20 +1015,44 @@ class HostEnvironmentManager:
             return
         reason = str(error) or error.__class__.__name__
         try:
-            store.transition_task_runtime(
-                claim.run_id,
+            self._transition_claimed_task(
+                store,
+                claim,
                 owner_token,
-                claim.id,
-                claim.claim_token,
                 expected_status=runtime.status,
                 new_status=TaskRuntimeStatus.BLOCKED,
                 state_reason=reason,
-                now=self._clock(),
+                task_transition=task_transition,
             )
         except BaseException as transition_error:
             error.add_note(
                 f"task could not be durably blocked: {transition_error}"
             )
+
+    def _transition_claimed_task(
+        self,
+        store: SqliteStore,
+        claim: TaskClaim,
+        owner_token: str,
+        *,
+        expected_status: TaskRuntimeStatus,
+        new_status: TaskRuntimeStatus,
+        task_transition: Callable[..., TaskRuntime] | None,
+        **changes: object,
+    ) -> TaskRuntime:
+        """Use the scheduler-owned transition seam when one is available."""
+        if task_transition is not None:
+            return task_transition(expected_status, new_status, **changes)
+        return store.transition_task_runtime(
+            claim.run_id,
+            owner_token,
+            claim.id,
+            claim.claim_token,
+            expected_status=expected_status,
+            new_status=new_status,
+            now=self._clock(),
+            **changes,
+        )
 
 
 def _command_payload(commands: Sequence[HostCommand]) -> list[dict[str, object]]:

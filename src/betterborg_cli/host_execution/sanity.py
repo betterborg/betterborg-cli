@@ -273,6 +273,7 @@ class HostSanityPhase:
                     context.claim,
                     context.owner_token,
                     secret_values=secret_values,
+                    task_transition=context.transition,
                 )
                 sanity_stack = self._compose_manager.start_claimed_sanity_stack(
                     context.store,
@@ -555,6 +556,8 @@ class HostSanityPhase:
                 resume_phase="merging",
                 state_reason=reason,
             )
+        else:
+            context.reconcile_progress()
         return HostSanityResult(TaskRuntimeStatus.BLOCKED, reason, commands=commands)
 
 
