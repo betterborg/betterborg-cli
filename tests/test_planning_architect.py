@@ -69,7 +69,7 @@ def test_answers_product_questions_inline_and_persists_plan(
     def plan_after_answer(spec):
         questions = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/questions.json"
+                spec.cwd / ".betterborg/state/planning/context/questions.json"
             ).read_text(encoding="utf-8")
         )
         assert questions[0]["answers"] == [
@@ -310,7 +310,7 @@ def test_answers_final_question_round_before_forcing_plan(
     def plan_after_final_answer(spec):
         questions = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/questions.json"
+                spec.cwd / ".betterborg/state/planning/context/questions.json"
             ).read_text(encoding="utf-8")
         )
         assert [item["answers"] for item in questions] == [
@@ -495,7 +495,7 @@ def test_plan_open_questions_are_answered_inline_before_replanning(
     def replan_after_answer(spec):
         manifest = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/manifest.json"
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
             ).read_text(encoding="utf-8")
         )
         current_plan_path = manifest["current_plan"]
@@ -505,7 +505,7 @@ def test_plan_open_questions_are_answered_inline_before_replanning(
         ) == ambiguous_plan
         questions = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/questions.json"
+                spec.cwd / ".betterborg/state/planning/context/questions.json"
             ).read_text(encoding="utf-8")
         )
         assert questions[-1]["answers"] == [

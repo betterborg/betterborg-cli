@@ -642,7 +642,7 @@ def planning_cli_repository(persist_planning_context):
         with SqliteStore.open(fixture_database) as store:
             repository, _borg = persist_planning_context(root, store, name)
         paths.state_dir.mkdir(parents=True)
-        shutil.copyfile(fixture_database, paths.state_dir / "borg.sqlite3")
+        shutil.copyfile(fixture_database, paths.state_dir / "betterborg.sqlite3")
         return repository, paths
 
     return create
@@ -695,8 +695,8 @@ def configure_interactive_cli(monkeypatch: MonkeyPatch):
 
 
 def _write_repository_config(root: Path, repository: Repository) -> None:
-    (root / ".borg").mkdir()
-    (root / ".borg/config.toml").write_text(
+    (root / ".betterborg").mkdir()
+    (root / ".betterborg/config.toml").write_text(
         "version = 1\n\n"
         "[repository]\n"
         f'id = "{repository.id}"\n'
@@ -760,7 +760,7 @@ def _add_approved_task_generation(
             {
                 "digest": digest,
                 "path": (
-                    f".borg/tasks/{borg.name}/{generation_id}/"
+                    f".betterborg/tasks/{borg.name}/{generation_id}/"
                     f"{record.stage}/{record.stem}.md"
                 ),
                 "position": record.position,
@@ -851,7 +851,7 @@ def _persist_planning_context(
     repository = Repository(root=root)
     borg = Borg(repository_id=repository.id, name=name)
     _write_repository_config(root, repository)
-    prd_path = Path(".borg/prds") / f"{name}.md"
+    prd_path = Path(".betterborg/prds") / f"{name}.md"
     (root / prd_path).parent.mkdir(parents=True)
     (root / prd_path).write_text(f"# {name}\n", encoding="utf-8")
     store.add_repository(repository)

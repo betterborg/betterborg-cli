@@ -72,7 +72,7 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert "Plan approval pending" in result.output
     assert "betterborg plan show inline-plan" in result.output
     assert len(adapter.calls) == 4
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "inline-plan")
         assert borg is not None
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING
@@ -119,7 +119,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     assert interrupted.exit_code == 1
     assert "was interrupted" in interrupted.output
     assert "betterborg plan start resume-plan" in interrupted.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-plan")
         assert borg is not None
         assert borg.state is BorgState.ARCHITECT_AWAITING_ANSWERS
@@ -133,7 +133,7 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     assert resumed.exit_code == 0, resumed.output
     assert "Plan approval pending" in resumed.output
     assert len(adapter.calls) == 4
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-plan")
         assert borg is not None
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING
@@ -179,7 +179,7 @@ def test_plan_start_reports_review_cap_as_blocked(
     assert "Planning blocked" in result.output
     assert "betterborg plan show blocked-plan" in result.output
     assert len(adapter.calls) == 7
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-plan")
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
@@ -203,7 +203,7 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
         }
     )
     validate_plan(plan, repository.root)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "show-plan")
         assert borg is not None
         plan_attempt = PlanningAttempt(
@@ -282,7 +282,7 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     assert markdown_result.exit_code == 0, markdown_result.output
     assert markdown_result.output == render_plan_markdown(plan)
     assert markdown_progress.entries == 1
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
 
     json_progress = _SuspensionRecorder()
@@ -295,7 +295,7 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     assert json_result.exit_code == 0, json_result.output
     assert json.loads(json_result.output) == plan
     assert json_progress.entries == 1
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
 
 
@@ -352,7 +352,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     started = cli_runner.invoke(cli, ["plan", "start", "change-plan", "--yes"])
 
     assert started.exit_code == 0, started.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "change-plan")
         assert borg is not None
         before_attempts = store.list_planning_attempts(borg.id)
@@ -362,7 +362,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     def requested_revision(spec):
         manifest = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/manifest.json"
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
             ).read_text(encoding="utf-8")
         )
         current_plan = json.loads(
@@ -400,7 +400,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     assert changed.exit_code == 0, changed.output
     assert "Plan approval pending" in changed.output
     assert "betterborg plan show change-plan" in changed.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "change-plan")
         assert borg is not None
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING
@@ -430,7 +430,7 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
 
     assert shown.exit_code == 0, shown.output
     assert json.loads(shown.output) == final_plan
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_planning_attempts(borg.id) == attempts
         assert store.list_planning_findings(borg.id) == findings
         assert store.list_plan_change_requests(borg.id) == requests
@@ -464,7 +464,7 @@ def test_plan_change_rejects_empty_note_without_mutating_gate(
     )
     started = cli_runner.invoke(cli, ["plan", "start", "empty-change", "--yes"])
     assert started.exit_code == 0, started.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "empty-change")
         assert borg is not None
         before = _planning_snapshot(store, borg.id)
@@ -478,7 +478,7 @@ def test_plan_change_rejects_empty_note_without_mutating_gate(
     assert result.exit_code == 1
     assert "plan change note must not be empty" in result.output
     assert len(adapter.calls) == 3
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
 
 
@@ -530,7 +530,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
     assert "could not continue" in failed.output
     assert "planning provider unavailable" in failed.output
     assert "betterborg plan start resume-change" in failed.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-change")
         assert borg is not None
         assert borg.state is BorgState.ARCHITECT_WORKING
@@ -548,7 +548,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
 
     assert resumed.exit_code == 0, resumed.output
     assert "Plan approval pending" in resumed.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-change")
         assert borg is not None
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING

@@ -121,7 +121,9 @@ def _scheduler_fixture(
         )
         for task_ref, dependency_ref in dependencies
     ]
-    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+    durable_root = (
+        repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
+    )
 
     with SqliteStore.open(database) as store:
         store.add_repository(repository)

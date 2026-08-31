@@ -98,7 +98,7 @@ def require_ready_worktree(
     ]
     if not materializations:
         raise HostAgentPhaseError("claimed task environment is not materialized")
-    marker = worktree / ".borg/state/environment-materialization"
+    marker = worktree / ".betterborg/state/environment-materialization"
     try:
         fingerprint = marker.read_text(encoding="utf-8").strip()
     except OSError as error:

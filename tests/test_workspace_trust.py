@@ -185,8 +185,8 @@ def test_rejected_interactive_trust_is_not_persisted(git_repo: Path) -> None:
 def test_noninteractive_rejection_happens_before_repository_context_load(
     git_repo: Path,
 ) -> None:
-    config = git_repo / ".borg" / "config.json"
-    prompt = git_repo / ".borg" / "agent-prompt.md"
+    config = git_repo / ".betterborg" / "config.json"
+    prompt = git_repo / ".betterborg" / "agent-prompt.md"
     config.parent.mkdir()
     config.write_text('{"unsafe": true}\n', encoding="utf-8")
     prompt.write_text("repository-controlled prompt\n", encoding="utf-8")
@@ -221,6 +221,6 @@ def test_trust_path_inside_repository_is_rejected(git_repo: Path) -> None:
     with pytest.raises(RuntimeError, match="stored outside the repository"):
         require_workspace_trust(
             RepoPaths.discover(git_repo),
-            store=TrustStore(git_repo / ".borg" / "state" / "trust.json"),
+            store=TrustStore(git_repo / ".betterborg" / "state" / "trust.json"),
             explicit=True,
         )

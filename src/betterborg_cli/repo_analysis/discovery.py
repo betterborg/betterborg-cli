@@ -104,7 +104,7 @@ _REPOSITORY_WRAPPER_BASENAMES = frozenset(
 _SKIPPED_DIR_NAMES = {
     ".betterborg-analysis",
     ".betterborg-task",
-    ".borg",
+    ".betterborg",
     ".git",
     ".hg",
     ".mypy_cache",

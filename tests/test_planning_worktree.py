@@ -48,19 +48,19 @@ def test_materializes_detached_planning_context_without_touching_primary(
     repository = Repository(root=committed_git_repo)
     borg = Borg(repository_id=repository.id, name="safe-planning")
     write_repository_config(committed_git_repo, repository)
-    prd_path = Path(".borg/prds/safe-planning.md")
+    prd_path = Path(".betterborg/prds/safe-planning.md")
     (committed_git_repo / prd_path).parent.mkdir(parents=True)
     (committed_git_repo / prd_path).write_text(
         "# Confirmed PRD\n\nKeep the primary checkout unchanged.\n",
         encoding="utf-8",
     )
-    deliberate_path = Path(".borg/notes/operator-context.md")
+    deliberate_path = Path(".betterborg/notes/operator-context.md")
     (committed_git_repo / deliberate_path).parent.mkdir(parents=True)
     (committed_git_repo / deliberate_path).write_text(
         "# Operator context\n\nThis untracked Borg document is deliberate.\n",
         encoding="utf-8",
     )
-    (committed_git_repo / ".borg/notes/not-supplied.md").write_text(
+    (committed_git_repo / ".betterborg/notes/not-supplied.md").write_text(
         "must stay out of the planning worktree\n", encoding="utf-8"
     )
     (committed_git_repo / "unrelated.py").write_text(
@@ -148,28 +148,29 @@ def test_materializes_detached_planning_context_without_touching_primary(
             assert detached.returncode == 1
             assert (worktree / "README.md").is_file()
             assert not (worktree / "unrelated.py").exists()
-            assert not (worktree / ".borg/notes/not-supplied.md").exists()
+            assert not (worktree / ".betterborg/notes/not-supplied.md").exists()
             assert (worktree / deliberate_path).read_text(encoding="utf-8") == (
                 committed_git_repo / deliberate_path
             ).read_text(encoding="utf-8")
             assert (
                 worktree / prd_path
             ).read_text(encoding="utf-8") == primary_prd_before
-            assert (worktree / ".borg/config.toml").read_text(encoding="utf-8") == (
-                committed_git_repo / ".borg/config.toml"
+            tracked = worktree / ".betterborg/config.toml"
+            assert tracked.read_text(encoding="utf-8") == (
+                committed_git_repo / ".betterborg/config.toml"
             ).read_text(encoding="utf-8")
-            assert (worktree / ".borg/score.md").read_text(encoding="utf-8") == (
+            assert (worktree / ".betterborg/score.md").read_text(encoding="utf-8") == (
                 render_markdown_report(build_machine_report(analysis, packages))
             )
             for role, prompt in prompts.items():
                 assert (
-                    worktree / f".borg/prompts/{role}.system.md"
+                    worktree / f".betterborg/prompts/{role}.system.md"
                 ).read_text(encoding="utf-8") == prompt.body_md
-            assert (worktree / ".borg/plans/safe-planning.md").read_text(
+            assert (worktree / ".betterborg/plans/safe-planning.md").read_text(
                 encoding="utf-8"
             ) == current_plan
 
-            context = worktree / ".borg/state/planning/context"
+            context = worktree / ".betterborg/state/planning/context"
             identity = _json(context / "repository.json")
             assert identity["repository"]["id"] == str(repository.id)
             assert identity["repository"]["head_sha"] == _git(
@@ -187,7 +188,7 @@ def test_materializes_detached_planning_context_without_touching_primary(
             assert findings[0]["message"] == finding.message
             manifest = _json(context / "manifest.json")
             assert manifest["confirmed_prd"] == prd_path.as_posix()
-            assert manifest["current_plan"] == ".borg/plans/safe-planning.md"
+            assert manifest["current_plan"] == ".betterborg/plans/safe-planning.md"
             assert manifest["dirty_borg_documents"] == [deliberate_path.as_posix()]
             assert set(manifest["prompts"]) == {"coding", "review", "merge"}
 
@@ -222,7 +223,7 @@ def test_rejects_dirty_source_outside_borg_documents(
 
         with pytest.raises(
             PlanningWorktreeError,
-            match=r"repository-relative \.borg file",
+            match=r"repository-relative \.betterborg file",
         ):
             with materialize_planning_worktree(
                 repository,
@@ -350,7 +351,7 @@ def test_cancellation_reaps_each_planning_worktree_git_process(
     database = committed_git_repo.parent / f"planning-{blocked_operation}.db"
     cancel = CancellationToken()
     errors: list[BaseException] = []
-    document = Path(".borg/notes/cancel.md")
+    document = Path(".betterborg/notes/cancel.md")
     with SqliteStore.open(database) as store:
         repository, borg = persist_planning_context(
             committed_git_repo,
@@ -683,7 +684,7 @@ def test_records_token_aware_planning_git_command_inventory(
     database = committed_git_repo.parent / "planning-command-inventory.db"
     cancel = CancellationToken()
     calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
-    document = Path(".borg/notes/inventory.md")
+    document = Path(".betterborg/notes/inventory.md")
 
     def runner(
         command: list[str], **kwargs: Any

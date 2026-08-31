@@ -570,7 +570,7 @@ class ProjectManagerLoop:
     def _user_prompt(feedback: str | None) -> str:
         prompt = (
             "Read the approved plan named by current_plan in "
-            ".borg/state/planning/context/manifest.json. Emit one complete "
+            ".betterborg/state/planning/context/manifest.json. Emit one complete "
             "project-wide task batch covering every approved phase and required "
             "_betterborg_plan_refs element."
         )
@@ -721,7 +721,7 @@ class ProjectManagerLoop:
                 {
                     "digest": digest,
                     "path": (
-                        f".borg/tasks/{self._turns.current_borg().name}/"
+                        f".betterborg/tasks/{self._turns.current_borg().name}/"
                         f"{generation_id}/{record.stage}/{record.stem}.md"
                     ),
                     "position": position,

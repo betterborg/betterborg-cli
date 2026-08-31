@@ -34,7 +34,7 @@ from betterborg_cli.store import (
     SqliteStore,
 )
 
-_CONTEXT_DIR = Path(".borg/state/planning/context")
+_CONTEXT_DIR = Path(".betterborg/state/planning/context")
 _MANIFEST_PATH = _CONTEXT_DIR / "manifest.json"
 _REPOSITORY_PATH = _CONTEXT_DIR / "repository.json"
 _ANALYSIS_PATH = _CONTEXT_DIR / "analysis.json"
@@ -63,7 +63,7 @@ def materialize_planning_worktree(
 
     Git supplies only committed source. Betterborg-owned context is rebuilt from
     the durable store and the confirmed PRD, while additional uncommitted files
-    cross the checkout boundary only when the caller names a dirty ``.borg``
+    cross the checkout boundary only when the caller names a dirty ``.betterborg``
     document explicitly.
     """
     paths = _validate_inputs(
@@ -211,12 +211,12 @@ def _materialize_context(
     prompts = store.get_latest_generated_prompts(repository.id)
 
     plan_path = (
-        Path(".borg/plans") / f"{session.prd_path.stem}.md"
+        Path(".betterborg/plans") / f"{session.prd_path.stem}.md"
         if current_plan is not None
         else None
     )
     reserved = {
-        Path(".borg") / CONFIG_FILENAME,
+        Path(".betterborg") / CONFIG_FILENAME,
         paths.score_report.relative_to(paths.root),
         session.prd_path,
         _MANIFEST_PATH,
@@ -241,10 +241,10 @@ def _materialize_context(
 
     _publish(
         destination,
-        Path(".borg") / CONFIG_FILENAME,
+        Path(".betterborg") / CONFIG_FILENAME,
         _read_owned_text(
             paths.root,
-            Path(".borg") / CONFIG_FILENAME,
+            Path(".betterborg") / CONFIG_FILENAME,
             "repository identity",
         ),
     )
@@ -388,10 +388,10 @@ def _borg_relative_path(path: Path, repository_root: Path) -> Path:
         or ".." in candidate.parts
         or PureWindowsPath(str(candidate)).is_absolute()
         or not candidate.parts
-        or candidate.parts[0] != ".borg"
+        or candidate.parts[0] != ".betterborg"
     ):
         raise PlanningWorktreeError(
-            f"dirty document must be a repository-relative .borg file: {path}"
+            f"dirty document must be a repository-relative .betterborg file: {path}"
         )
     return candidate
 

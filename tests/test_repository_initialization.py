@@ -169,7 +169,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert selections == 1
     assert (
         "betterborg create theme-ci --prd "
-        ".borg/prds/improvements/theme-ci.md\n"
+        ".betterborg/prds/improvements/theme-ci.md\n"
     ) in first.output
     prompts_complete = "completed Generate role prompts — 3 prompts"
     drafts_started = "running Draft improvement PRDs"
@@ -191,7 +191,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert len(adapter.calls) == 4
     assert selections == 1
 
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         analyses = store.list_analyses(config.repository_id)
         operations = store.list_operations(config.repository_id)
         assert len(analyses) == 1
@@ -201,7 +201,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
         assert store.get_repository(config.repository_id).root == git_repo
         assert store.get_borg_by_name(config.repository_id, "theme-ci") is None
 
-    with sqlite3.connect(paths.state_dir / "borg.sqlite3") as connection:
+    with sqlite3.connect(paths.state_dir / "betterborg.sqlite3") as connection:
         repository_count = connection.execute(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
@@ -336,7 +336,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     expected = {
         "create_commands": [
             "betterborg create theme-ci --prd "
-            ".borg/prds/improvements/theme-ci.md"
+            ".betterborg/prds/improvements/theme-ci.md"
         ],
         "initialized": True,
         "repository_id": str(load_repository_config(paths).repository_id),
@@ -348,7 +348,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     ) + "\n"
     assert selected_interactivity == [False]
     assert paths.improvement_prds_dir.joinpath("theme-ci.md").is_file()
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert (
             store.get_borg_by_name(
                 load_repository_config(paths).repository_id, "theme-ci"
@@ -437,12 +437,12 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     confirmed_path = paths.tracked_dir / "prds" / "Confirmed.md"
     confirmed_body = "# Confirmed\n\nKeep this approved product requirement.\n"
     confirmed_path.write_text(confirmed_body, encoding="utf-8")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = Borg(repository_id=config.repository_id, name="Confirmed")
         session = PrdSession(
             repository_id=config.repository_id,
             borg_id=borg.id,
-            prd_path=Path(".borg/prds/Confirmed.md"),
+            prd_path=Path(".betterborg/prds/Confirmed.md"),
         )
         store.add_borg(borg)
         store.add_prd_session(session)
@@ -479,7 +479,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     assert selections == 2
     assert len(adapter.calls) == 8
 
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         analyses = store.list_analyses(config.repository_id)
         assert len(analyses) == 2
         assert analyses[1].prior_analysis_id == analyses[0].id
@@ -499,7 +499,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         assert store.get_borg(borg.id) == borg
         assert store.get_prd_session(session.id) == session
 
-    with sqlite3.connect(paths.state_dir / "borg.sqlite3") as connection:
+    with sqlite3.connect(paths.state_dir / "betterborg.sqlite3") as connection:
         repository_count = connection.execute(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
@@ -567,7 +567,7 @@ def test_analyze_reports_the_predecessor_linked_during_persistence(
         payload = _analysis_payload(score=4)
         package_payload = payload["packages"][0]
         assert isinstance(package_payload, dict)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as other_store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as other_store:
             prior = other_store.get_prior_ready_analysis(config.repository_id)
             assert prior is not None
             analysis = RepositoryAnalysis(
@@ -616,7 +616,7 @@ def test_analyze_reports_the_predecessor_linked_during_persistence(
     assert payload["score"] == 2
     assert payload["previous_score"] == 4
     assert payload["delta"] == -2
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         current = next(
             analysis
             for analysis in store.list_analyses(config.repository_id)
@@ -805,7 +805,7 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     assert adapter.calls == []
 
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_analyses(config.repository_id) == []
         assert store.list_operations(config.repository_id) == []
 
@@ -931,7 +931,7 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
     assert "completed Draft improvement PRDs" not in output
     assert len(adapter.calls) == 4
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_operations(config.repository_id) == []
     captured = capsys.readouterr()
     assert captured.out == ""

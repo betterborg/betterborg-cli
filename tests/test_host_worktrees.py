@@ -325,25 +325,25 @@ def test_primary_guard_protect_rejects_dirty_phase_entry(
 def test_primary_guard_detects_rename_into_ignored_state_directory(
     committed_git_repo: Path,
 ) -> None:
-    state_directory = committed_git_repo / ".borg/state"
+    state_directory = committed_git_repo / ".betterborg/state"
     state_directory.mkdir(parents=True)
-    _git(committed_git_repo, "mv", "README.md", ".borg/state/README.md")
+    _git(committed_git_repo, "mv", "README.md", ".betterborg/state/README.md")
 
     with pytest.raises(
         PrimaryCheckoutContaminationError, match="before it started"
     ) as caught:
         PrimaryCheckoutGuard(committed_git_repo).assert_clean()
 
-    assert "README.md -> .borg/state/README.md" in str(caught.value)
+    assert "README.md -> .betterborg/state/README.md" in str(caught.value)
 
 
 def test_primary_guard_detects_tracked_change_in_ignored_state_directory(
     committed_git_repo: Path,
 ) -> None:
-    tracked = committed_git_repo / ".borg/state/tracked.txt"
+    tracked = committed_git_repo / ".betterborg/state/tracked.txt"
     tracked.parent.mkdir(parents=True)
     tracked.write_text("original\n", encoding="utf-8")
-    _git(committed_git_repo, "add", "--force", ".borg/state/tracked.txt")
+    _git(committed_git_repo, "add", "--force", ".betterborg/state/tracked.txt")
     _git(committed_git_repo, "commit", "-m", "track managed state fixture")
     guard = PrimaryCheckoutGuard(committed_git_repo)
     guard.before_phase("07-host/task", "coding")
@@ -450,7 +450,7 @@ def test_allocates_persists_reuses_and_cleans_task_worktree(
         )
         generation, task = fixture.generation, fixture.task
         durable_root = (
-            committed_git_repo / ".borg/tasks" / borg.name / str(generation.id)
+            committed_git_repo / ".betterborg/tasks" / borg.name / str(generation.id)
         )
         task_path = durable_root / task.stage / f"{task.stem}.md"
         task_path.parent.mkdir(parents=True)
@@ -459,7 +459,7 @@ def test_allocates_persists_reuses_and_cleans_task_worktree(
             generation.id, durable_root=durable_root
         )
 
-    _git(committed_git_repo, "add", ".borg")
+    _git(committed_git_repo, "add", ".betterborg")
     _git(committed_git_repo, "commit", "-m", "add task")
 
     now = utcnow()

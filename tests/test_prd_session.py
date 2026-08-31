@@ -52,7 +52,7 @@ def _io(
 def repository_store(committed_git_repo: Path):
     repository = Repository(root=committed_git_repo)
     with SqliteStore.open(
-        committed_git_repo / ".borg/state/borg.sqlite3"
+        committed_git_repo / ".betterborg/state/betterborg.sqlite3"
     ) as store:
         store.add_repository(repository)
         yield repository, store
@@ -88,7 +88,7 @@ def test_empty_brainstorm_asks_material_questions_and_confirms(
 
     assert result.confirmed
     assert not result.cancelled
-    assert result.prd_path == repository.root / ".borg/prds/Guide.md"
+    assert result.prd_path == repository.root / ".betterborg/prds/Guide.md"
     assert result.prd_path.read_text(encoding="utf-8") == (
         "# Guided setup\n\nHelp new maintainers configure a repo.\n"
     )
@@ -378,7 +378,7 @@ def test_draft_editor_and_confirmations_suspend_renderer_heartbeats(
 
 @pytest.mark.parametrize(
     "relative_source",
-    [Path("incoming.md"), Path(".borg/prds/improvements/theme-ci.md")],
+    [Path("incoming.md"), Path(".betterborg/prds/improvements/theme-ci.md")],
     ids=["standalone-markdown", "generated-theme"],
 )
 def test_markdown_doors_share_editing_and_preserve_their_input(
@@ -722,7 +722,7 @@ def test_confirmed_prd_does_not_overwrite_a_racing_destination(
     repository_store,
 ) -> None:
     repository, store = repository_store
-    destination = repository.root / ".borg/prds/Race.md"
+    destination = repository.root / ".betterborg/prds/Race.md"
 
     def create_destination(body: str) -> str:
         destination.parent.mkdir(parents=True, exist_ok=True)

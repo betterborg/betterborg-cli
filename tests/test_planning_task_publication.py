@@ -120,7 +120,7 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
 
         expected = (
             committed_git_repo
-            / ".borg/tasks/durable-tasks"
+            / ".betterborg/tasks/durable-tasks"
             / str(generation.id)
             / "01-foundation/01-publish.md"
         )
@@ -130,14 +130,14 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
             _task_body("01-publish")
         )
         assert store.get_current_task_generation(borg.id) == publication.generation
-        assert not (committed_git_repo / ".borg/state/task-staging").is_symlink()
+        assert not (committed_git_repo / ".betterborg/state/task-staging").is_symlink()
         ignored = subprocess.run(
             [
                 "git",
                 "-C",
                 str(committed_git_repo),
                 "check-ignore",
-                ".borg/state/task-staging/probe",
+                ".betterborg/state/task-staging/probe",
             ],
             check=False,
         )
@@ -331,7 +331,7 @@ def test_cooperative_publication_cancellation_never_exposes_partial_markdown(
         assert store.get_current_task_generation(borg.id) is None
         destination = (
             committed_git_repo
-            / ".borg/tasks/durable-tasks"
+            / ".betterborg/tasks/durable-tasks"
             / str(generation.id)
         )
         if checkpoint == "during_staging":
@@ -409,7 +409,7 @@ def test_reopens_and_resumes_every_publication_boundary(
         assert resumed.generation.status is TaskGenerationStatus.CURRENT
         assert reopened.get_current_task_generation(borg.id) == resumed.generation
         assert [item.task.stem for item in resumed.files] == ["02-replacement"]
-        generation_root = committed_git_repo / ".borg/tasks/durable-tasks"
+        generation_root = committed_git_repo / ".betterborg/tasks/durable-tasks"
         assert [path.name for path in generation_root.iterdir()] == [
             str(replacement.id)
         ]

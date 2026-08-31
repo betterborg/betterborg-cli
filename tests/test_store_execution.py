@@ -74,7 +74,7 @@ def _execution_fixture(tmp_path: Path, approved_task_generation):
         )
         generation, task = fixture.generation, fixture.task
         durable_root = (
-            repository.root / ".borg/tasks" / borg.name / str(generation.id)
+            repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
         )
         task_path = durable_root / task.stage / f"{task.stem}.md"
         task_path.parent.mkdir(parents=True)
@@ -133,7 +133,9 @@ def _dependency_execution_fixture(tmp_path: Path):
         task_id=consumer.id,
         depends_on_task_id=foundation.id,
     )
-    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+    durable_root = (
+        repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
+    )
 
     with SqliteStore.open(database) as store:
         store.add_repository(repository)

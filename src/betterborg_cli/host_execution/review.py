@@ -157,7 +157,7 @@ class HostReviewFixPhase:
             or self.artifact_root.is_relative_to(self._paths.state_dir)
         ):
             raise ReviewFixPhaseError(
-                "repository-local review artifacts must be under .borg/state"
+                "repository-local review artifacts must be under .betterborg/state"
             )
 
     def run(

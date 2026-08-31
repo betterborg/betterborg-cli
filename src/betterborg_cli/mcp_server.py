@@ -756,7 +756,7 @@ def _operation_progress(
     after_event_id: UUID | None = None,
 ) -> ProgressStream:
     paths = _paths(trusted=False)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         operation = store.get_execution_run(operation_id)
         if operation is None:
             raise ValueError(f"execution operation {operation_id} does not exist")
@@ -1113,7 +1113,7 @@ def _initialize(
     cancel: CancellationToken | None = None,
 ) -> InitializeResult:
     paths = _paths(trusted=True, io=io, cancel=cancel)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         result = RepositoryService(
             paths,
             store,
@@ -1192,7 +1192,7 @@ def _analyze(
     cancel: CancellationToken | None = None,
 ) -> AnalyzeResult:
     paths = _paths(trusted=True, io=io, cancel=cancel)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         result = RepositoryService(
             paths,
             store,
@@ -1238,7 +1238,7 @@ def _create(
     source_path = Path(source) if source is not None else None
     if source_path is not None and not source_path.is_absolute():
         source_path = paths.root / source_path
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
             raise ValueError(
@@ -1308,7 +1308,7 @@ async def create(
 
 def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, Any]]]:
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
             raise ValueError(
@@ -1390,7 +1390,7 @@ def _plan(
     if action == "approve":
         assert io is not None
         borg, _questions = _planning_state(paths, name)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             attempt = validated_current_plan_attempt(paths, store, borg)
         plan_document = PlanDocument.model_validate(attempt.result)
         io.write(json.dumps(attempt.result, indent=2, sort_keys=True))
@@ -1428,7 +1428,7 @@ def _plan(
 
     if action == "show":
         config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
                 raise ValueError(

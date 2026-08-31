@@ -345,7 +345,7 @@ def initialize_repository(
     json_output: bool,
 ) -> None:
     """Register and analyze the current Git repository."""
-    database = paths.state_dir / "borg.sqlite3"
+    database = paths.state_dir / "betterborg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
@@ -450,7 +450,7 @@ def analyze_repository(
     json_output: bool,
 ) -> None:
     """Re-analyze an initialized Git repository and refresh its outputs."""
-    database = paths.state_dir / "borg.sqlite3"
+    database = paths.state_dir / "betterborg.sqlite3"
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
@@ -530,7 +530,7 @@ def create_borg(
     progress = _repository_progress(False)
     try:
         config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
                 raise ValueError(
@@ -605,7 +605,7 @@ def show_plan(name: str, json_output: bool) -> None:
     try:
         paths = RepoPaths.discover()
         config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
                 raise ValueError(
@@ -725,7 +725,7 @@ def estimate_tasks(name: str, json_output: bool) -> None:
     try:
         paths, publication = _current_task_publication(name)
         config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             generation = store.get_task_generation(publication.generation.id)
             if (
                 generation is None
@@ -1564,7 +1564,7 @@ def _current_task_publication(
     """Load and verify the sole current generation without reconciling state."""
     paths = RepoPaths.discover()
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
             raise ValueError(
@@ -1586,7 +1586,7 @@ def _current_task_runtime(
 ) -> list[TaskRuntimeRow]:
     """Load runtime rows and guard against a concurrent generation change."""
     config = load_repository_config(paths)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = store.get_repository(config.repository_id)
         if repository is None:
             raise ValueError(
@@ -1813,7 +1813,7 @@ def _continue_planning(
     resumable = False
     try:
         config = load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
             if repository is None:
                 raise ValueError(

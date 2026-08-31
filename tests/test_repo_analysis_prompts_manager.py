@@ -146,7 +146,7 @@ def test_generates_all_role_metadata_at_stable_paths(git_repo: Path) -> None:
         latest = store.get_latest_generated_prompts(repository.id)
         assert set(latest) == set(PROMPT_ROLES)
         for run in runs:
-            assert run.path == git_repo / ".borg" / "prompts" / (
+            assert run.path == git_repo / ".betterborg" / "prompts" / (
                 f"{run.role}.system.md"
             )
             assert run.path.read_text(encoding="utf-8") == bodies[run.role]
@@ -226,7 +226,7 @@ def test_role_children_run_concurrently_and_reconcile_durable_activity(
         assert all(run.ok for run in runs)
         latest = store.get_latest_generated_prompts(repository.id)
         assert all(
-            (git_repo / f".borg/prompts/{role}.system.md").read_text()
+            (git_repo / f".betterborg/prompts/{role}.system.md").read_text()
             == latest[role].body_md
             for role in PROMPT_ROLES
         )
@@ -466,7 +466,7 @@ def test_cancellation_before_prompt_publication_stops_without_retaining(
     parent = progress.stages["prompts"]
     assert parent.state is StageState.STOPPED
     assert parent.children["coding"].state is StageState.STOPPED
-    assert not (git_repo / ".borg/prompts/coding.system.md").exists()
+    assert not (git_repo / ".betterborg/prompts/coding.system.md").exists()
 
 
 def test_cancellation_after_prompt_metadata_insert_rolls_back_publication(
@@ -520,7 +520,7 @@ def test_cancellation_after_prompt_metadata_insert_rolls_back_publication(
     parent = progress.stages["prompts"]
     assert parent.state is StageState.STOPPED
     assert parent.children["coding"].state is StageState.STOPPED
-    stable_path = git_repo / ".borg/prompts/coding.system.md"
+    stable_path = git_repo / ".betterborg/prompts/coding.system.md"
     assert not stable_path.exists()
     assert list(stable_path.parent.glob(".coding.system.md.*.tmp")) == []
 
@@ -545,7 +545,7 @@ def test_cancellation_after_prompt_file_replace_rolls_back_publication(
         git_repo,
         {"coding": "# Coding agent\n\nComplete repository-specific guidance."},
     )
-    stable_path = git_repo / ".borg/prompts/coding.system.md"
+    stable_path = git_repo / ".betterborg/prompts/coding.system.md"
     replace = prompts_manager.os.replace
 
     def replace_then_cancel(source: Path, destination: Path) -> None:
@@ -766,7 +766,9 @@ def test_main_thread_interrupt_while_waiting_for_prompt_child_stops_parent(
     assert progress.closed
 
 
-@pytest.mark.parametrize("symlink_path", [Path(".borg"), Path(".borg/prompts")])
+@pytest.mark.parametrize(
+    "symlink_path", [Path(".betterborg"), Path(".betterborg/prompts")]
+)
 def test_stable_prompt_directory_cannot_escape_repository_through_symlink(
     git_repo: Path,
     symlink_path: Path,
@@ -872,7 +874,7 @@ def test_partial_failure_preserves_score_then_reanalysis_refreshes_prompts(
             "coding",
             "merge",
         }
-        assert not (git_repo / ".borg/prompts/review.system.md").exists()
+        assert not (git_repo / ".betterborg/prompts/review.system.md").exists()
 
         second_analysis = _append_analysis(
             store,
@@ -906,7 +908,8 @@ def test_partial_failure_preserves_score_then_reanalysis_refreshes_prompts(
             prompt.analysis_id == second_analysis.id for prompt in latest.values()
         )
         for role, body in second_bodies.items():
-            assert (git_repo / f".borg/prompts/{role}.system.md").read_text() == body
+            prompt = git_repo / f".betterborg/prompts/{role}.system.md"
+            assert prompt.read_text() == body
 
     second_calls = {
         spec.result_path.stem.rsplit(".", 1)[-1]: spec
@@ -969,7 +972,7 @@ def test_stable_publish_failure_does_not_commit_prompt_metadata(
                 roles=("coding",),
             )[0]
 
-        stable_path = git_repo / ".borg/prompts/coding.system.md"
+        stable_path = git_repo / ".betterborg/prompts/coding.system.md"
         assert not failed_run.ok
         assert failed_run.error == (
             "prompt could not be recorded: stable publish unavailable"
@@ -1067,7 +1070,7 @@ def test_metadata_commit_failure_restores_prior_stable_prompt(
                 roles=("coding",),
             )[0]
 
-        stable_path = git_repo / ".borg/prompts/coding.system.md"
+        stable_path = git_repo / ".betterborg/prompts/coding.system.md"
         assert not failed_run.ok
         assert failed_run.error == (
             "prompt could not be recorded: metadata commit unavailable"

@@ -822,7 +822,7 @@ def test_revalidates_architect_handoff_before_invoking_tech_lead(
 
 def _current_plan(spec) -> dict:
     manifest = json.loads(
-        (spec.cwd / ".borg/state/planning/context/manifest.json").read_text(
+        (spec.cwd / ".betterborg/state/planning/context/manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -832,7 +832,7 @@ def _current_plan(spec) -> dict:
 def _findings(spec) -> list[dict]:
     return json.loads(
         (
-            spec.cwd / ".borg/state/planning/context/findings.json"
+            spec.cwd / ".betterborg/state/planning/context/findings.json"
         ).read_text(encoding="utf-8")
     )
 

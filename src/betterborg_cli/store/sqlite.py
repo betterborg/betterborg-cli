@@ -1097,7 +1097,7 @@ class SqliteStore:
         if repository is None:
             raise ValueError("task generation repository not found")
         expected_root = (
-            repository.root / ".borg" / "tasks" / borg.name / str(generation.id)
+            repository.root / ".betterborg" / "tasks" / borg.name / str(generation.id)
         )
         if durable_root != expected_root:
             raise ValueError("durable task generation path does not match SQLite")

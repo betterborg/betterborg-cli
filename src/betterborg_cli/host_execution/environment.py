@@ -964,7 +964,7 @@ class HostEnvironmentManager:
         return self.cache_root / fingerprint.removeprefix("sha256:")
 
     def _materialization_marker(self, worktree: Path) -> Path:
-        marker = worktree / ".borg/state/environment-materialization"
+        marker = worktree / ".betterborg/state/environment-materialization"
         parent = marker.parent.resolve()
         if not parent.is_relative_to(worktree.resolve()):
             raise EnvironmentMaterializationError(
@@ -988,7 +988,7 @@ class HostEnvironmentManager:
             or self.cache_root.is_relative_to(self._paths.state_dir)
         ):
             raise EnvironmentMaterializationError(
-                "repository-local caches must be under ignored .borg/state"
+                "repository-local caches must be under ignored .betterborg/state"
             )
         if self.cache_root.is_relative_to(
             self.repository_root

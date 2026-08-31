@@ -194,7 +194,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
         {
             "digest": record.digest,
             "path": (
-                f".borg/tasks/{borg.name}/{generation_id}/"
+                f".betterborg/tasks/{borg.name}/{generation_id}/"
                 f"{record.stage}/{record.stem}.md"
             ),
             "position": record.position,
@@ -241,7 +241,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
         overall_score=4,
     )
     durable_root = (
-        repository_root / ".borg/tasks" / borg.name / str(generation.id)
+        repository_root / ".betterborg/tasks" / borg.name / str(generation.id)
     )
 
     with SqliteStore.open(database) as store:
@@ -348,7 +348,7 @@ def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
         (spec.cwd / "feature.txt").write_text("implemented\n", encoding="utf-8")
         _git(spec.cwd, "add", "feature.txt")
         _git(spec.cwd, "commit", "--quiet", "-m", "add feature")
-        transcript = spec.cwd / ".borg/state/provider-transcript.txt"
+        transcript = spec.cwd / ".betterborg/state/provider-transcript.txt"
         transcript.write_text("immutable transcript\n", encoding="utf-8")
         return MockResponse(
             payload=_completed_payload(task),
@@ -583,7 +583,7 @@ def test_digest_drift_blocks_before_invocation(
         assert runtime is not None and runtime.worktree_path is not None
         task_path = (
             Path(runtime.worktree_path)
-            / ".borg/tasks"
+            / ".betterborg/tasks"
             / fixture.borg.name
             / str(fixture.generation.id)
             / fixture.task.stage
@@ -612,7 +612,7 @@ def test_missing_materialization_marker_blocks_before_invocation(
         assert runtime is not None and runtime.worktree_path is not None
         marker = (
             Path(runtime.worktree_path)
-            / ".borg/state/environment-materialization"
+            / ".betterborg/state/environment-materialization"
         )
         marker.unlink()
         adapter = MockAdapter().queue(_committing_response(fixture.task))

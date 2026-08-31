@@ -341,7 +341,8 @@ class SupervisorLoop:
                 system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
                 user_prompt=(
                     "Read the complete approved plan and task-review context from "
-                    ".borg/state/planning/context/manifest.json. Review task batch "
+                    ".betterborg/state/planning/context/manifest.json. "
+                    "Review task batch "
                     f"{batch.id} in round {review_round} of "
                     f"{SUPERVISOR_ROUND_CAP}."
                 ),

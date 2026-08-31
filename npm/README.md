@@ -59,7 +59,7 @@ If none of those resolve, the launcher exits with what it tried and how to fix i
 
 Step 3 additionally needs Python 3.11+, which `uv` will provide.
 
-Keep provider keys in your shell or a secret manager, never in `.borg/config.toml` or any tracked file.
+Keep provider keys in your shell or a secret manager, never in `.betterborg/config.toml` or any tracked file.
 
 ## Documentation
 

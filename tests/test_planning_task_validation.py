@@ -208,7 +208,7 @@ def _approve_plan(
 
 def _planning_context(spec) -> dict:
     manifest = json.loads(
-        (spec.cwd / ".borg/state/planning/context/manifest.json").read_text(
+        (spec.cwd / ".betterborg/state/planning/context/manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -256,7 +256,7 @@ def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
     def complete_batch(spec):
         manifest = json.loads(
             (
-                spec.cwd / ".borg/state/planning/context/manifest.json"
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
             ).read_text(encoding="utf-8")
         )
         annotated_plan = json.loads(
@@ -542,7 +542,7 @@ def test_supervisor_restart_reconciles_current_publication_after_commit(
         ).run()
         stale = (
             committed_git_repo
-            / ".borg/tasks/supervisor-reconcile"
+            / ".betterborg/tasks/supervisor-reconcile"
             / str(uuid4())
         )
         stale.mkdir(parents=True)

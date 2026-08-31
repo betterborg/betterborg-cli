@@ -233,10 +233,10 @@ def test_bundled_plugins_are_thin_registrations_of_the_same_mcp_server() -> None
     codex = resources.files("betterborg_cli.codex_plugin_bundle") / "marketplace"
     claude_mcp = json.loads(
         (claude / "plugins/borg/.mcp.json").read_text(encoding="utf-8")
-    )["mcpServers"]["borg"]
+    )["mcpServers"]["betterborg"]
     codex_mcp = json.loads(
         (codex / "plugins/borg/.mcp.json").read_text(encoding="utf-8")
-    )["borg"]
+    )["betterborg"]
 
     assert claude_mcp == codex_mcp == {"command": "betterborg", "args": ["mcp"]}
     for bundle in (claude, codex):

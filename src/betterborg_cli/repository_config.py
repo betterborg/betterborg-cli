@@ -57,7 +57,7 @@ class ExecutionLimits:
 
 @dataclass(frozen=True)
 class RepositoryConfig:
-    """Validated contents of tracked ``.borg/config.toml``."""
+    """Validated contents of tracked ``.betterborg/config.toml``."""
 
     version: int
     repository_id: UUID

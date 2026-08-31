@@ -44,7 +44,7 @@ def _seed_approval_pending(
     plan: dict,
 ):
     repository, paths = planning_cli_repository(root, name)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, name)
         assert borg is not None
         attempt = PlanningAttempt(
@@ -164,7 +164,7 @@ def test_approved_plan_trackability_uses_run_token(
 
     def approve() -> None:
         try:
-            with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+            with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
                 borg = store.get_borg_by_name(repository.id, "approval-trackability")
                 assert borg is not None
                 workflow_service_module.bind_plan_approval(
@@ -189,7 +189,7 @@ def test_approved_plan_trackability_uses_run_token(
     assert [command[3:5] for command in commands] == [
         ("check-ignore", "--quiet")
     ]
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "approval-trackability")
         assert borg is not None
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING
@@ -238,8 +238,8 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
 
     assert result.exit_code == 0, result.output
     assert "Borg 'approved-plan' is ready to execute." in result.output
-    assert ".borg/plans/approved-plan.md" in result.output
-    assert ".borg/tasks/approved-plan/" in result.output
+    assert ".betterborg/plans/approved-plan.md" in result.output
+    assert ".betterborg/tasks/approved-plan/" in result.output
     project_manager_line = result.output.index("completed Project Manager")
     supervisor_line = result.output.index("completed Supervisor")
     assert project_manager_line < supervisor_line
@@ -275,9 +275,9 @@ Extend the existing repository conventions and verify public behavior.
 
 - `README.md` — It owns repository guidance.
 """
-    plan_path = repository.root / ".borg/plans/approved-plan.md"
+    plan_path = repository.root / ".betterborg/plans/approved-plan.md"
     assert plan_path.read_text(encoding="utf-8") == approved_markdown
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "approved-plan")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
@@ -287,7 +287,7 @@ Extend the existing repository conventions and verify public behavior.
         assert approval.attempt_id == plan_attempt.id
         assert approval.plan_digest == approved_plan_digest(plan)
         assert approval.manifest["plan"] == plan
-        assert approval.manifest["plan_path"] == ".borg/plans/approved-plan.md"
+        assert approval.manifest["plan_path"] == ".betterborg/plans/approved-plan.md"
         assert approval.manifest["plan.md"] == "sha256:" + hashlib.sha256(
             approved_markdown.encode("utf-8")
         ).hexdigest()
@@ -332,7 +332,7 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
 
     assert interrupted.exit_code == 1
     assert "betterborg plan approve resume-approval" in interrupted.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None
         assert borg.state is BorgState.SUPERVISOR_WORKING
@@ -352,7 +352,7 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
         "completed Supervisor"
     )
     assert len(adapter.calls) == 3
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
@@ -399,7 +399,7 @@ def test_plan_approve_resumes_publication_before_becoming_ready(
 
     assert interrupted.exit_code == 1
     assert "betterborg plan approve resume-publication" in interrupted.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-publication")
         assert borg is not None
         assert borg.state is BorgState.SUPERVISOR_WORKING
@@ -418,7 +418,7 @@ def test_plan_approve_resumes_publication_before_becoming_ready(
     assert resumed.exit_code == 0, resumed.output
     assert "ready to execute" in resumed.output
     assert len(adapter.calls) == 2
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-publication")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
@@ -512,7 +512,7 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
     assert "was interrupted" in interrupted.output
     assert "approval retained; task publication pending" in interrupted.output
     assert len(adapter.calls) == 2
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "cancel-publication")
         assert borg is not None
         assert borg.state is BorgState.SUPERVISOR_WORKING
@@ -539,7 +539,7 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
     assert "ready to execute" in resumed.output
     assert "completed Supervisor" in resumed.output
     assert len(adapter.calls) == 2
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "cancel-publication")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
@@ -595,7 +595,7 @@ def test_plan_approve_post_commit_cancellation_keeps_ready_outcome(
     assert "completed Supervisor" in result.output
     assert "stopped Supervisor" not in result.output
     assert len(adapter.calls) == 2
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "post-commit-cancel")
         assert borg is not None
         assert borg.state is BorgState.READY_TO_EXECUTE
@@ -648,7 +648,7 @@ def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(
     assert result.exit_code == 0, result.output
     assert "Task decomposition blocked" in result.output
     assert "approval pending" not in result.output.casefold()
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-tasks")
         assert borg is not None
         assert borg.state is BorgState.BLOCKED

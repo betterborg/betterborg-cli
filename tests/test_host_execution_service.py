@@ -138,7 +138,9 @@ def _store_fixture(
                 manifest={"task.md": digest},
             )
         )
-    durable_root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+    durable_root = (
+        repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
+    )
     store = SqliteStore.open(tmp_path / "execution.sqlite3")
     store.add_repository(repository)
     store.add_borg(borg)
@@ -610,7 +612,7 @@ def _concrete_host_fixture(
             {
                 "digest": task.digest,
                 "path": (
-                    f".borg/tasks/{borg.name}/{generation_id}/"
+                    f".betterborg/tasks/{borg.name}/{generation_id}/"
                     f"{task.stage}/{task.stem}.md"
                 ),
                 "position": task.position,
@@ -659,7 +661,9 @@ def _concrete_host_fixture(
     store.append_plan_approval(approval)
     store.append_task_batch(batch)
     store.add_task_generation(generation, tasks, dependencies)
-    durable_root = repository_root / ".borg/tasks" / borg.name / str(generation.id)
+    durable_root = (
+        repository_root / ".betterborg/tasks" / borg.name / str(generation.id)
+    )
     for task in tasks:
         path = durable_root / task.stage / f"{task.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)

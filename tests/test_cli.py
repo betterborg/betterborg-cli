@@ -51,7 +51,7 @@ def initialized_cli_repository(
         ),
         encoding="utf-8",
     )
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         store.add_repository(repository)
     yield repository, paths
 
@@ -572,7 +572,7 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     assert any(boundary == "editor" for boundary, *_ in snapshots)
     assert snapshots and all(before == after for _, before, after in snapshots)
     assert committed_git_repo.joinpath(
-        ".borg/prds/cli-suspended.md"
+        ".betterborg/prds/cli-suspended.md"
     ).read_text(encoding="utf-8") == (
         "# Edited CLI draft\n\nApproved requirements.\n"
     )
@@ -729,7 +729,7 @@ def test_create_without_prd_runs_brainstorm_and_prints_plan_handoff(
     )
     assert output == ["# Release guide\n\nHelp maintainers ship safely.\n"]
     assert result.output.endswith("betterborg plan start release-guide\n")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_borg_by_name(repository.id, "release-guide") is not None
         assert store.list_operations(repository.id) == []
 
@@ -786,7 +786,7 @@ def test_create_with_prd_propagates_and_preserves_exact_input(
         "# Reviewed PRD\n\nHuman-approved requirements.\n"
     )
     assert result.output.endswith("betterborg plan start improve-docs\n")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "improve-docs")
         assert borg is not None
         with store.locked_connection() as connection:
@@ -835,7 +835,7 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
     assert "betterborg plan start" not in result.output
     assert "draft saved without a confirmed PRD" in result.output
     assert not paths.tracked_dir.joinpath("prds/wait-for-approval.md").exists()
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert (
             store.get_borg_by_name(repository.id, "wait-for-approval") is not None
         )
@@ -913,7 +913,7 @@ def test_main_sigint_during_prd_confirmation_stops_without_publishing(
     assert "betterborg plan start" not in captured.out
     assert "draft saved" not in captured.out
     assert not paths.tracked_dir.joinpath("prds", f"{name}.md").exists()
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, name)
         assert borg is not None
         session = store.get_prd_session_for_borg(borg.id)

@@ -146,7 +146,7 @@ What is retained depends on the command:
 
 - `betterborg create` stores the Borg name, its PRD session, and each completed
   conversation turn as soon as the session begins. After exit 130, check
-  `.borg/prds/NAME.md`. If it is absent, interruption happened before
+  `.betterborg/prds/NAME.md`. If it is absent, interruption happened before
   publication; the current CLI cannot resume the stored session and rejects
   another `betterborg create` using the same name, so retry with a different Borg
   name. If it exists, cancellation raced with atomic publication and

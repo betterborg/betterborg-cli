@@ -50,7 +50,7 @@ def _write_durable_tree(
     generation: TaskGeneration,
     tasks: list[TaskRecord],
 ) -> Path:
-    root = repository.root / ".borg/tasks" / borg.name / str(generation.id)
+    root = repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
     for task in tasks:
         path = root / task.stage / f"{task.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -232,7 +232,7 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
         store.add_task_generation(generation, [first, second], [dependency])
         assert not hasattr(store, "promote_task_generation")
         missing_root = (
-            repository.root / ".borg/tasks" / borg.name / str(generation.id)
+            repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
         )
         with pytest.raises(ValueError, match="tree is missing"):
             store._promote_published_task_generation(

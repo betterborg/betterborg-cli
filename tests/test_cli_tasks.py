@@ -51,7 +51,7 @@ def _multiple_generations(
     approved_task_generation,
 ):
     repository, paths = planning_cli_repository(root, "inspect-tasks")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "inspect-tasks")
         assert borg is not None
         borg = store.compare_and_set_borg_state(
@@ -92,7 +92,7 @@ def _multiple_generations(
             round_number=3,
             task_ref="T-3",
         )
-    return paths.state_dir / "borg.sqlite3", superseded, current, preparing
+    return paths.state_dir / "betterborg.sqlite3", superseded, current, preparing
 
 
 def test_task_list_exposes_only_current_and_does_not_reconcile_other_trees(
@@ -107,7 +107,7 @@ def test_task_list_exposes_only_current_and_does_not_reconcile_other_trees(
     )
     stale_tree = (
         committed_git_repo
-        / ".borg/tasks/inspect-tasks"
+        / ".betterborg/tasks/inspect-tasks"
         / str(superseded.generation.id)
     )
     stale_tree.mkdir()

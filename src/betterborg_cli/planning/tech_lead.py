@@ -306,7 +306,7 @@ class TechLeadLoop:
             schema=TECH_LEAD_REVIEW_SCHEMA,
             system_prompt=_TECH_LEAD_SYSTEM_PROMPT,
             user_prompt=(
-                "Read .borg/state/planning/context/manifest.json and all "
+                "Read .betterborg/state/planning/context/manifest.json and all "
                 "referenced evidence. Review the complete current plan. "
                 f"This is Tech Lead review round {review_round} of "
                 f"{TECH_REVIEW_ROUND_CAP}."

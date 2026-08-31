@@ -13,7 +13,7 @@ from betterborg_cli.repository_files import publish_repository_text
 
 MANAGED_IGNORE_BEGIN = "# >>> Betterborg managed ignores >>>"
 MANAGED_IGNORE_END = "# <<< Betterborg managed ignores <<<"
-MANAGED_IGNORE_RULE = ".borg/state/"
+MANAGED_IGNORE_RULE = ".betterborg/state/"
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ class RepoPaths:
             raise ValueError(f"not inside a Git repository: {candidate}") from error
 
         root = Path(result.stdout.strip()).resolve()
-        tracked_dir = root / ".borg"
+        tracked_dir = root / ".betterborg"
         state_dir = tracked_dir / "state"
         return cls(
             root=root,

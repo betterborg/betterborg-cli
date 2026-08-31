@@ -49,11 +49,11 @@ def test_discover_uses_nearest_git_root(git_repo: Path) -> None:
     paths = RepoPaths.discover(child)
 
     assert paths.root == nested_repo
-    assert paths.tracked_dir == nested_repo / ".borg"
-    assert paths.state_dir == nested_repo / ".borg" / "state"
-    assert paths.artifacts_dir == nested_repo / ".borg" / "state" / "artifacts"
+    assert paths.tracked_dir == nested_repo / ".betterborg"
+    assert paths.state_dir == nested_repo / ".betterborg" / "state"
+    assert paths.artifacts_dir == nested_repo / ".betterborg" / "state" / "artifacts"
     assert paths.improvement_prds_dir == (
-        nested_repo / ".borg" / "prds" / "improvements"
+        nested_repo / ".betterborg" / "prds" / "improvements"
     )
 
 
@@ -121,7 +121,7 @@ def test_managed_ignore_keeps_documents_trackable_and_ignores_state(
     paths = RepoPaths.discover(git_repo)
     ensure_managed_gitignore(paths)
     document = paths.tracked_dir / "project.md"
-    state = paths.state_dir / "borg.sqlite3"
+    state = paths.state_dir / "betterborg.sqlite3"
     artifact = paths.artifacts_dir / "result.json"
     for candidate in (document, state, artifact):
         candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -138,8 +138,8 @@ def test_managed_ignore_keeps_documents_trackable_and_ignores_state(
         check=False,
     )
 
-    assert "?? .borg/project.md" in status.stdout
-    assert ".borg/state" not in status.stdout
+    assert "?? .betterborg/project.md" in status.stdout
+    assert ".betterborg/state" not in status.stdout
     assert tracked.returncode == 1
     for ignored_path in (state, artifact):
         ignored = subprocess.run(
@@ -178,7 +178,7 @@ def test_managed_ignore_update_is_idempotent_and_preserves_existing_rules(
     assert first_update.startswith("dist/\n*.log\n\n")
     assert first_update.count(MANAGED_IGNORE_BEGIN) == 1
     assert first_update.count(MANAGED_IGNORE_END) == 1
-    assert first_update.count(".borg/state/\n") == 1
+    assert first_update.count(".betterborg/state/\n") == 1
 
 
 @pytest.mark.parametrize("interrupt_after_replacement", [False, True])
@@ -192,7 +192,7 @@ def test_managed_ignore_interruption_preserves_prior_or_complete_canonical_bytes
     canonical = (
         "dist/\n*.log\n\n"
         f"{MANAGED_IGNORE_BEGIN}\n"
-        ".borg/state/\n"
+        ".betterborg/state/\n"
         f"{MANAGED_IGNORE_END}\n"
     )
     paths.gitignore.write_text(prior, encoding="utf-8")

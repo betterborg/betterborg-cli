@@ -165,7 +165,7 @@ def test_fresh_activation_materializes_registers_enables_and_spawns_mcp(
     assert json.loads(marketplace.read_text())["name"] == "betterborg"
     mcp_config = result.bundle_path / "plugins/borg/.mcp.json"
     assert json.loads(mcp_config.read_text()) == {
-        "mcpServers": {"borg": {"command": "betterborg", "args": ["mcp"]}}
+        "mcpServers": {"betterborg": {"command": "betterborg", "args": ["mcp"]}}
     }
     assert fake.installed is True
     assert fake.enabled is True

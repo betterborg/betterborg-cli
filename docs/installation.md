@@ -106,7 +106,7 @@ betterborg init --yes
 ```
 
 `ANTHROPIC_API_KEY` is the supported alternative. Never write a provider key
-to `.borg/config.toml`, a PRD, shell output, or any tracked file; use the shell
+to `.betterborg/config.toml`, a PRD, shell output, or any tracked file; use the shell
 environment or a secret manager.
 
 Provider API agents use contained file tools that reject absolute paths,

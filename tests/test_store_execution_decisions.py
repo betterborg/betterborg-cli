@@ -66,7 +66,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
     committed_git_repo: Path,
     approved_task_generation,
 ) -> None:
-    database = committed_git_repo.parent / "state" / "borg.sqlite3"
+    database = committed_git_repo.parent / "state" / "betterborg.sqlite3"
     repository = Repository(root=committed_git_repo)
     borg = Borg(
         repository_id=repository.id,
@@ -208,7 +208,7 @@ def test_decision_digests_must_match_the_current_generation(
         manifest={},
     )
 
-    with SqliteStore.open(committed_git_repo.parent / "borg.sqlite3") as store:
+    with SqliteStore.open(committed_git_repo.parent / "betterborg.sqlite3") as store:
         store.add_repository(repository)
         store.add_borg(borg)
         store.append_plan_approval(approval)

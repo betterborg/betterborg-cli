@@ -62,7 +62,7 @@ Plugin activation needs a persistent install, so it is skipped under `npx`.
 - Python 3.11+, on macOS or Linux. On Windows, use a WSL2 shell.
 - One agent transport: a `claude` or `codex` CLI on `PATH` and **already logged in**, or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` exported in your shell.
 
-Keep provider keys in your shell or a secret manager, never in `.borg/config.toml` or any tracked file.
+Keep provider keys in your shell or a secret manager, never in `.betterborg/config.toml` or any tracked file.
 
 ## Documentation
 

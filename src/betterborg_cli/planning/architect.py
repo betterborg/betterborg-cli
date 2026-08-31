@@ -367,7 +367,7 @@ class ArchitectLoop:
                 schema=ARCHITECT_QUESTIONS_SCHEMA,
                 system_prompt=_QUESTIONS_SYSTEM_PROMPT,
                 user_prompt=(
-                    "Inspect .borg/state/planning/context/manifest.json and its "
+                    "Inspect .betterborg/state/planning/context/manifest.json and its "
                     "referenced evidence. This is Architect question round "
                     f"{question_round} "
                     f"of {ARCHITECT_QUESTION_ROUND_CAP}."
@@ -417,7 +417,7 @@ class ArchitectLoop:
                 schema=ARCHITECT_PLAN_SCHEMA,
                 system_prompt=_PLAN_SYSTEM_PROMPT,
                 user_prompt=(
-                    "Read .borg/state/planning/context/manifest.json and every "
+                    "Read .betterborg/state/planning/context/manifest.json and every "
                     "relevant referenced context file, then emit the implementation "
                     "plan. Resolve every answered product question and leave "
                     "open_questions empty unless a genuine uncertainty remains."

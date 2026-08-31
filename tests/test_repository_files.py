@@ -23,7 +23,7 @@ from betterborg_cli.repository_files import (
 def test_git_trackability_normalizes_relative_and_absolute_paths(
     committed_git_repo: Path,
 ) -> None:
-    relative = Path(".borg/plans/visible.md")
+    relative = Path(".betterborg/plans/visible.md")
     absolute = committed_git_repo / relative
 
     require_git_trackable(relative, root=committed_git_repo)
@@ -108,13 +108,13 @@ def test_git_trackability_reports_ignored_repository_path(
     committed_git_repo: Path,
 ) -> None:
     (committed_git_repo / ".gitignore").write_text(
-        ".borg/state/\n", encoding="utf-8"
+        ".betterborg/state/\n", encoding="utf-8"
     )
-    ignored = committed_git_repo / ".borg/state/ignored.md"
+    ignored = committed_git_repo / ".betterborg/state/ignored.md"
 
     with pytest.raises(
         RepositoryGitVisibilityError,
-        match=r"repository path is ignored by Git: \.borg/state/ignored\.md",
+        match=r"repository path is ignored by Git: \.betterborg/state/ignored\.md",
     ):
         require_git_trackable(ignored, root=committed_git_repo)
 

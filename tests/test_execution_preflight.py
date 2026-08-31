@@ -172,7 +172,7 @@ def execution_preflight_fixture(tmp_path: Path):
         )
         durable_root = (
             repository
-            / ".borg/tasks"
+            / ".betterborg/tasks"
             / borg.name
             / str(generation.id)
         )
@@ -217,7 +217,7 @@ def execution_preflight_fixture(tmp_path: Path):
         return ExecutionPreflightFixture(
             repository=repository,
             database=database,
-            cache_root=repository / ".borg/state/environment-cache",
+            cache_root=repository / ".betterborg/state/environment-cache",
             preparation_root=tmp_path / f"preparation-{uuid4().hex}",
             worktree_paths=tuple(spec.path for spec in specs),
             task_ids=tuple(task.id for task in tasks),
@@ -866,7 +866,7 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
                     # lacks that table, so the only safe runtime behavior here
                     # is to reject startup without widening the binding.
                     overrides = sorted(
-                        (fixture.repository / ".borg/state/compose").glob(
+                        (fixture.repository / ".betterborg/state/compose").glob(
                             "*/compose.override.yml"
                         )
                     )

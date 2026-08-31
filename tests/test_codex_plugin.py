@@ -173,7 +173,7 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
     assert manifest["mcpServers"] == "./.mcp.json"
     assert manifest["skills"] == "./skills/"
     mcp = json.loads(expected.joinpath("plugins/borg/.mcp.json").read_text())
-    assert mcp == {"borg": {"command": "betterborg", "args": ["mcp"]}}
+    assert mcp == {"betterborg": {"command": "betterborg", "args": ["mcp"]}}
     assert (
         "plugin",
         "marketplace",

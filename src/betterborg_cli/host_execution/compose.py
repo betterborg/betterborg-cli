@@ -484,7 +484,9 @@ class HostComposeManager:
             owned_volumes,
             owned_images,
         )
-        override_directory = self.repository_root / ".borg/state/compose" / project_name
+        override_directory = (
+            self.repository_root / ".betterborg/state/compose" / project_name
+        )
         cleanup = override_directory / "compose.cleanup.json"
         override = override_directory / "compose.override.yml"
         cleanup_model = _cleanup_compose_model(

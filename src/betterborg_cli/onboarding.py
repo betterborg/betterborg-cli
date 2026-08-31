@@ -186,7 +186,7 @@ class OnboardingDispatcher:
             except ValueError as error:
                 self.io.write(f"Invalid Borg name: {error}")
                 continue
-            destination = self.repository.root / ".borg" / "prds" / f"{name}.md"
+            destination = self.repository.root / ".betterborg" / "prds" / f"{name}.md"
             if (
                 self.store.get_borg_by_name(self.repository.id, name) is not None
                 or destination.exists()

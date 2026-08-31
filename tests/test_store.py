@@ -12,7 +12,7 @@ from betterborg_cli.store import Borg, Operation, PrdSession, Repository, Sqlite
 def test_store_reopens_without_reapplying_migration_and_preserves_rows(
     tmp_path: Path,
 ) -> None:
-    database = tmp_path / "state" / "borg.sqlite3"
+    database = tmp_path / "state" / "betterborg.sqlite3"
     repository = Repository(root=tmp_path / "repo")
     operation = Operation(
         repository_id=repository.id,
@@ -67,7 +67,7 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
 
 
 def test_reentrant_transaction_rolls_back_as_one_unit(tmp_path: Path) -> None:
-    database = tmp_path / "borg.sqlite3"
+    database = tmp_path / "betterborg.sqlite3"
     repository = Repository(root=tmp_path / "repo")
 
     with SqliteStore.open(database) as store:
@@ -90,7 +90,7 @@ def test_commit_failure_rolls_back_and_leaves_store_usable(tmp_path: Path) -> No
         kind="test.orphaned",
     )
 
-    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+    with SqliteStore.open(tmp_path / "betterborg.sqlite3") as store:
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             with store.transaction() as connection:
                 connection.execute("PRAGMA defer_foreign_keys = ON")
@@ -108,7 +108,7 @@ def test_operation_ledger_rejects_mutation_deletion_and_replacement(
     repository = Repository(root=tmp_path / "repo")
     operation = Operation(repository_id=repository.id, kind="test.completed")
 
-    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+    with SqliteStore.open(tmp_path / "betterborg.sqlite3") as store:
         store.add_repository(repository)
         store.append_operation(operation)
 
@@ -151,13 +151,13 @@ def test_operation_ledger_rejects_mutation_deletion_and_replacement(
 
 
 def test_borg_and_prd_session_history_survive_reopen(tmp_path: Path) -> None:
-    database = tmp_path / "state" / "borg.sqlite3"
+    database = tmp_path / "state" / "betterborg.sqlite3"
     repository = Repository(root=tmp_path / "repo")
     borg = Borg(repository_id=repository.id, name="Ada")
     session = PrdSession(
         repository_id=repository.id,
         borg_id=borg.id,
-        prd_path=Path(".borg/prds/first-product.md"),
+        prd_path=Path(".betterborg/prds/first-product.md"),
     )
 
     with SqliteStore.open(database) as store:
@@ -206,7 +206,7 @@ def test_borg_and_prd_session_history_survive_reopen(tmp_path: Path) -> None:
 def test_borg_names_are_unique_within_a_repository(tmp_path: Path) -> None:
     repository = Repository(root=tmp_path / "repo")
 
-    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+    with SqliteStore.open(tmp_path / "betterborg.sqlite3") as store:
         store.add_repository(repository)
         store.add_borg(Borg(repository_id=repository.id, name="Ada"))
 
@@ -223,10 +223,10 @@ def test_prd_turns_reject_mutation_deletion_and_replacement(
     session = PrdSession(
         repository_id=repository.id,
         borg_id=borg.id,
-        prd_path=Path(".borg/prds/product.md"),
+        prd_path=Path(".betterborg/prds/product.md"),
     )
 
-    with SqliteStore.open(tmp_path / "borg.sqlite3") as store:
+    with SqliteStore.open(tmp_path / "betterborg.sqlite3") as store:
         store.add_repository(repository)
         store.add_borg(borg)
         store.add_prd_session(session)

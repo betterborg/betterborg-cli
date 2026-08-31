@@ -285,7 +285,7 @@ class TaskPublisher:
                 {
                     "digest": digest,
                     "path": (
-                        f".borg/tasks/{borg.name}/{generation.id}/"
+                        f".betterborg/tasks/{borg.name}/{generation.id}/"
                         f"{record.stage}/{record.stem}.md"
                     ),
                     "position": record.position,

@@ -160,7 +160,7 @@ class HostMergePhase:
             or self.artifact_root.is_relative_to(self._paths.state_dir)
         ):
             raise MergePhaseError(
-                "repository-local merge artifacts must be under .borg/state"
+                "repository-local merge artifacts must be under .betterborg/state"
             )
 
     def run(

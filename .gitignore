@@ -9,5 +9,5 @@ build/
 dist/
 
 # >>> Betterborg managed ignores >>>
-.borg/state/
+.betterborg/state/
 # <<< Betterborg managed ignores <<<

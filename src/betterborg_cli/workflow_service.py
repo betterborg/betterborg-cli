@@ -108,7 +108,7 @@ def approve_plan_workflow(
     progress: RunProgress | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = _repository(store, config)
         borg = _borg(store, repository, name)
         approval, plan_path = bind_plan_approval(
@@ -174,7 +174,7 @@ def execute_workflow(
     progress: RunProgress | None = None,
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = _repository(store, config)
         borg = _borg(store, repository, name)
         if borg.state is not BorgState.READY_TO_EXECUTE:
@@ -328,7 +328,7 @@ def bind_plan_approval(
     digest = approved_plan_digest(current_plan)
     body = render_plan_markdown(current_plan)
     body_digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-    relative_path = Path(".borg/plans") / f"{borg.name}.md"
+    relative_path = Path(".betterborg/plans") / f"{borg.name}.md"
     plan_path = paths.root / relative_path
 
     approvals = store.list_plan_approvals(borg.id)

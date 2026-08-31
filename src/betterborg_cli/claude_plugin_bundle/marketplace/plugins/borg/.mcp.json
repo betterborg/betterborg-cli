@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "borg": {
+    "betterborg": {
       "command": "betterborg",
       "args": ["mcp"]
     }

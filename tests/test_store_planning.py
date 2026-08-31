@@ -31,7 +31,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         round=1,
         adapter="mock",
         model="test-model",
-        request={"prd_path": ".borg/prds/DurablePlanner.md"},
+        request={"prd_path": ".betterborg/prds/DurablePlanner.md"},
     )
     question = PlanningQuestion(
         borg_id=borg.id,

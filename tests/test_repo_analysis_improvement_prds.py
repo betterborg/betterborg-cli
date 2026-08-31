@@ -309,7 +309,11 @@ def test_dimension_changes_aggregate_same_dimension_and_overlap_effects(
 
 @pytest.mark.parametrize(
     "symlink_path",
-    [Path(".borg"), Path(".borg/prds"), Path(".borg/prds/improvements")],
+    [
+        Path(".betterborg"),
+        Path(".betterborg/prds"),
+        Path(".betterborg/prds/improvements"),
+    ],
 )
 def test_improvement_prd_directory_cannot_escape_repository_through_symlink(
     git_repo: Path,
@@ -426,7 +430,7 @@ def test_store_validation_does_not_create_a_borg_or_start_a_prd_session(
 ) -> None:
     repository = Repository(root=git_repo, id=analysis.repository_id)
     existing = Borg(repository_id=repository.id, name="Sentinel")
-    database = git_repo / ".borg" / "state" / "borg.sqlite3"
+    database = git_repo / ".betterborg" / "state" / "betterborg.sqlite3"
     paths = RepoPaths.discover(git_repo)
 
     with SqliteStore.open(database) as store:

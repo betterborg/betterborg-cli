@@ -34,7 +34,7 @@ def _io(answers: Iterator[str | None], output: list[str]) -> InteractiveIO:
 
 
 def _documents(root: Path) -> tuple[ImprovementPrd, ...]:
-    directory = root / ".borg/prds/improvements"
+    directory = root / ".betterborg/prds/improvements"
     return (
         ImprovementPrd(
             theme_key="checks",
@@ -61,7 +61,7 @@ def _documents(root: Path) -> tuple[ImprovementPrd, ...]:
 def onboarding_context(committed_git_repo: Path):
     repository = Repository(root=committed_git_repo)
     with SqliteStore.open(
-        committed_git_repo / ".borg/state/borg.sqlite3"
+        committed_git_repo / ".betterborg/state/betterborg.sqlite3"
     ) as store:
         store.add_repository(repository)
         yield repository, store
@@ -98,7 +98,7 @@ def test_fix_door_lists_every_ranked_theme_and_dispatches_exact_source(
         (
             expected_name,
             repository.root
-            / ".borg"
+            / ".betterborg"
             / "prds"
             / "improvements"
             / expected_filename,
@@ -318,14 +318,14 @@ def test_machine_handoff_commands_are_exact_and_mutation_free(
             "create",
             "sentinel",
             "--prd",
-            ".borg/prds/improvements/checks.md",
+            ".betterborg/prds/improvements/checks.md",
         ),
         (
             "betterborg",
             "create",
             "scribe",
             "--prd",
-            ".borg/prds/improvements/docs.md",
+            ".betterborg/prds/improvements/docs.md",
         ),
     )
     with store.locked_connection() as connection:

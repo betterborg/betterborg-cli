@@ -64,11 +64,11 @@ def _seed_executable_generation(
     else:
         paths = cli_module.RepoPaths.discover(root)
         config = cli_module.load_repository_config(paths)
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             repository = store.get_repository(config.repository_id)
         assert repository is not None
 
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, name)
         assert borg is not None
         if borg.state is not BorgState.READY_TO_EXECUTE:
@@ -354,7 +354,7 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
     assert calls[2].generation_id == second.generation.id
     assert calls[2].id != calls[0].id
 
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_execution_decision(borg.id, first.generation.id) == calls[0]
         assert store.get_current_execution_decision(borg.id) == calls[2]
 
@@ -388,7 +388,7 @@ def test_auto_execute_records_bypass_without_skipping_workspace_trust(
     assert result.exit_code == 0, result.output
     assert "Approve this estimate" not in result.output
     assert "Recorded execution estimate bypassed" in result.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         decision = store.get_current_execution_decision(borg.id)
     assert decision is not None
     assert decision.generation_id == fixture.generation.id
@@ -436,7 +436,7 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
         result.output.index("summary:")
     )
     assert "Aborted!" in result.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_current_execution_decision(borg.id) is None
 
 
@@ -1532,7 +1532,7 @@ def test_pr_rejects_external_prd_symlink_without_uploading_host_file(
     args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
     outside = committed_git_repo.parent / f"{name}-host-secret.md"
     outside.write_text("host secret must not be uploaded\n", encoding="utf-8")
-    prd_path = committed_git_repo / ".borg/prds" / f"{name}.md"
+    prd_path = committed_git_repo / ".betterborg/prds" / f"{name}.md"
     prd_path.unlink()
     prd_path.symlink_to(outside)
     _trust(cli_runner, committed_git_repo, monkeypatch)
@@ -1577,7 +1577,7 @@ def test_concurrent_decision_insert_reaches_active_host_execution(
             id=uuid4(),
             source="concurrent_invocation",
         )
-        with SqliteStore.open(paths.state_dir / "borg.sqlite3") as contender:
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as contender:
             original_append(contender, concurrent_decision)
         winner.append(concurrent_decision)
         original_append(store, decision)
@@ -1616,7 +1616,7 @@ def test_concurrent_decision_insert_reaches_active_host_execution(
     assert "decision recorded by a concurrent invocation" in result.output
     assert f"Execution already active: {active_operation_id}" in result.output
     assert host_calls == [(borg.id, fixture.generation.id)]
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_current_execution_decision(borg.id) == winner[0]
 
 
@@ -1686,7 +1686,7 @@ def test_task_digest_drift_blocks_before_decision_or_host_execution(
 
     assert result.exit_code == 1
     assert "digest drifted" in result.output
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_current_execution_decision(borg.id) is None
 
 
@@ -1736,7 +1736,7 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     progress = RunProgress(enabled=False)
     progress.declare(StageSpec("preflight", "Preflight"))
     progress.start("preflight")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         analysis = store.get_prior_ready_analysis(repository.id)
         assert analysis is not None
         analyzer_plan = {

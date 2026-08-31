@@ -196,7 +196,7 @@ class PrdSession:
         being prompted.
         """
         validate_borg_name(name)
-        relative_prd_path = Path(".borg") / "prds" / f"{name}.md"
+        relative_prd_path = Path(".betterborg") / "prds" / f"{name}.md"
         prd_path = self.repository.root / relative_prd_path
         borg = Borg(repository_id=self.repository.id, name=name)
         session = StoredPrdSession(

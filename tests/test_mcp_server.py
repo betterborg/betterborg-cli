@@ -938,7 +938,7 @@ def test_cancelled_execute_is_durable_before_request_returns(
         committed_git_repo,
         "mcp-cancel-execute",
     )
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-cancel-execute")
         assert borg is not None
         borg = store.compare_and_set_borg_state(
@@ -1087,7 +1087,7 @@ def test_cancelled_execute_is_durable_before_request_returns(
     assert len(protocol_errors) == 1
     assert str(protocol_errors[0]) == "Request cancelled"
     real_process_harness.assert_tree_absent(process_name, timeout=0.1)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         operation = store.list_execution_runs(borg.id)[-1]
         retained = store.get_task_runtime(first_task.id)
         unfinished = store.get_task_runtime(active_task.id)
@@ -1102,7 +1102,7 @@ def test_cancelled_execute_is_durable_before_request_returns(
         assert all(claim.released_at is not None for claim in claims)
 
     time.sleep(0.05)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert [
             event.id for event in store.list_execution_events(operation.id)
         ] == event_ids
@@ -1186,7 +1186,7 @@ def _published_runtime(
     approved_task_generation,
 ):
     repository, paths = planning_cli_repository(root, "mcp-runtime")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-runtime")
         assert borg is not None
         borg = store.compare_and_set_borg_state(
@@ -1347,7 +1347,7 @@ def test_progress_resources_reconnect_and_resume_durable_execution_events(
         lambda *, trusted, io=None, cancel=None: paths,
     )
 
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         operation = store.list_execution_runs(borg.id)[0]
         attempt = next(
             item
@@ -1421,7 +1421,7 @@ def test_progress_resources_reconnect_and_resume_durable_execution_events(
         },
         created_at=started + timedelta(seconds=2),
     )
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         store.append_execution_event(completed)
 
     resumed = _read_resource(
@@ -1530,16 +1530,16 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
     assert calls == ["init", "analyze"]
     assert initialized["status"] == "already_initialized"
     assert initialized["artifacts"] == [
-        {"kind": "score", "path": ".borg/score.md"},
-        {"kind": "coding_prompt", "path": ".borg/prompts/coding.md"},
-        {"kind": "improvement_prd", "path": ".borg/prds/improvements/runtime.md"},
+        {"kind": "score", "path": ".betterborg/score.md"},
+        {"kind": "coding_prompt", "path": ".betterborg/prompts/coding.md"},
+        {"kind": "improvement_prd", "path": ".betterborg/prds/improvements/runtime.md"},
     ]
     assert initialized["next_actions"] == [
         {
             "tool": "create",
             "arguments": {
                 "name": "runtime-fix",
-                "source": ".borg/prds/improvements/runtime.md",
+                "source": ".betterborg/prds/improvements/runtime.md",
             },
         }
     ]
@@ -1608,7 +1608,7 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     assert create_calls == [("new-borg", paths.root / "source.md")]
     assert created["status"] == "confirmed"
     assert created["artifacts"] == [
-        {"kind": "prd", "path": ".borg/prds/new-borg.md"}
+        {"kind": "prd", "path": ".betterborg/prds/new-borg.md"}
     ]
     assert created["next_actions"] == [
         {"tool": "plan", "arguments": {"name": "new-borg", "action": "start"}}
@@ -1672,7 +1672,7 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     assert shown["data"]["plan"]["phases"][0]["name"] == "01-release-workflow"
     assert len(requests) == 1
     assert "Which platforms are required?" in requests[0].message
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-start")
         assert borg is not None
         questions = store.list_planning_questions(borg.id)
@@ -1737,7 +1737,7 @@ def test_plan_change_validates_note_and_preserves_service_history(
     assert changed["status"] == BorgState.PLAN_APPROVAL_PENDING.value
     assert shown["data"]["plan"]["summary"] == "Revised MCP plan."
     assert shown["data"]["plan"]["code_pointers"] == revised["code_pointers"]
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-change")
         assert borg is not None
         attempts = store.list_planning_attempts(borg.id)
@@ -1758,7 +1758,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
 ) -> None:
     plan = planning_plan_response()
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-plan")
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "mcp-plan")
         assert borg is not None
         attempt = PlanningAttempt(
@@ -1823,7 +1823,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
         "task_list",
         "execute",
     ]
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         stored = store.get_borg_by_name(repository.id, "mcp-plan")
         assert stored is not None
         generations = store.list_task_generations(stored.id)
@@ -1938,7 +1938,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
     assert invoked_kwargs["progress"] is None
     assert executed["status"] == "completed"
     assert executed["data"]["operation_id"] == str(operation_id)
-    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         decision = store.get_current_execution_decision(borg.id)
     assert decision is not None
     assert decision.source == "mcp_elicitation"
@@ -2135,7 +2135,7 @@ def test_init_elicits_onboarding_door_theme_and_name(
     assert result["status"] == "initialized"
     assert result["artifacts"][-1] == {
         "kind": "prd",
-        "path": ".borg/prds/repair-ci.md",
+        "path": ".betterborg/prds/repair-ci.md",
     }
     assert result["next_actions"] == [
         {"tool": "plan", "arguments": {"name": "repair-ci", "action": "start"}}
