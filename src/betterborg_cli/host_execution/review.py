@@ -397,6 +397,7 @@ class HostReviewFixPhase:
             env={**self._config.environment, **(environment or {})},
             effort=effort,
             billing_mode=billing_mode,
+            activity_sink=context.activity_sink(phase),
         )
         git = self._primary_git.for_worktree(worktree)
         before_status = git.run(

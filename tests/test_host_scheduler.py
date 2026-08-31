@@ -256,7 +256,7 @@ def test_scheduler_limits_jobs_renews_claims_and_reports_active_operation(
         assert {claim.run_id for claim in claims} == {run.id}
 
 
-def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> None:
+def test_scheduler_exposes_labelled_task_bound_activity_sinks(tmp_path: Path) -> None:
     database, borg, generation, records = _scheduler_fixture(
         tmp_path,
         task_refs=("task",),
@@ -272,11 +272,12 @@ def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> 
     with SqliteStore.open(database) as store:
 
         def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
-            assert context.activity is context.activity_sink
-            assert context.activity_sink is context.agent_activity_sink
             assert context.activity is not None
-            activity_sink: ActivitySink = context.activity
-            activity_sink(
+            assert context.activity is context.agent_activity_sink
+            activity_sink = context.activity_sink("coding")
+            assert activity_sink is not None
+            labelled_sink: ActivitySink = activity_sink
+            labelled_sink(
                 AgentActivity(AgentActivityKind.COMMAND, "bound activity")
             )
             assert "report" not in repr(context)
@@ -291,9 +292,29 @@ def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> 
     assert reported == [
         (
             records["task"].id,
-            AgentActivity(AgentActivityKind.COMMAND, "bound activity"),
+            AgentActivity(AgentActivityKind.COMMAND, "coding: bound activity"),
         )
     ]
+
+
+def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None:
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            with pytest.raises(ValueError, match="label must not be empty"):
+                context.activity_sink("  ")
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return TaskRuntimeStatus.DONE
+
+        result = HostTaskScheduler(store, behavior).run(borg.id, generation.id)
+
+    assert result.status is ExecutionRunStatus.COMPLETED
 
 
 def test_scheduler_seeds_durable_rerun_before_claiming_pending_work(

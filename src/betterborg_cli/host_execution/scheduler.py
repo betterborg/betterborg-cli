@@ -87,14 +87,25 @@ class ScheduledTaskContext:
         """Return this task's stable key in the shared progress renderer."""
         return str(self.claim.task_id)
 
-    @property
-    def activity_sink(self) -> ActivitySink | None:
-        """Return the task-bound, execution-redacting activity sink."""
-        return self.activity
+    def activity_sink(self, agent_label: str) -> ActivitySink | None:
+        """Return a labelled view of the task-bound redacting activity sink."""
+        label = agent_label.strip()
+        if not label:
+            raise ValueError("agent activity label must not be empty")
+        if self.activity is None:
+            return None
+
+        def emit(activity: AgentActivity) -> None:
+            detail = label
+            if activity.detail:
+                detail = f"{label}: {activity.detail}"
+            self.activity(AgentActivity(activity.kind, detail))
+
+        return emit
 
     @property
     def agent_activity_sink(self) -> ActivitySink | None:
-        """Return the same task-bound sink accepted by agent providers."""
+        """Return the legacy unlabelled task-bound provider sink."""
         return self.activity
 
     @property
