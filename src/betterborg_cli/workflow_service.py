@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime.base import CancellationToken
@@ -45,10 +45,23 @@ from betterborg_cli.store import (
 )
 
 PlanningAgentFactory = Callable[[], Any]
-HostInvoker = Callable[
-    [RepoPaths, SqliteStore, RepositoryConfig, UUID, UUID, UUID],
-    HostExecutionResult,
-]
+
+
+class HostInvoker(Protocol):
+    """Invoke host execution with the command's shared control context."""
+
+    def __call__(
+        self,
+        paths: RepoPaths,
+        store: SqliteStore,
+        config: RepositoryConfig,
+        repository_id: UUID,
+        borg_id: UUID,
+        generation_id: UUID,
+        *,
+        cancel: CancellationToken | None,
+        progress: RunProgress | None,
+    ) -> HostExecutionResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +170,7 @@ def execute_workflow(
     decide: Callable[[dict[str, Any]], ExecutionDecisionRequest | None],
     invoke_host: HostInvoker,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -250,6 +264,8 @@ def execute_workflow(
             repository.id,
             borg.id,
             generation.id,
+            cancel=cancel,
+            progress=progress,
         )
 
     return ExecutionWorkflowResult(
