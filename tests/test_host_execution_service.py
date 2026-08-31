@@ -58,6 +58,7 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
@@ -490,6 +491,8 @@ def _concrete_host_fixture(
     prerequisite_at_later_position: bool = False,
     cancel: CancellationToken | None = None,
     git_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    environment_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    environment_activity: Callable[[AgentActivity], None] | None = None,
 ) -> _ConcreteHostFixture:
     repository_root = tmp_path / "concrete-repository"
     repository_root.mkdir()
@@ -665,6 +668,8 @@ def _concrete_host_fixture(
         clock=clock,
         cancel=cancel,
         git=git,
+        command_runner=environment_runner,
+        activity=environment_activity,
     )
     compose_runner = FakeComposeRunner()
     compose = HostComposeManager(
@@ -816,6 +821,57 @@ def test_service_setup_reuses_bound_git_and_reaps_cancelled_guard(
             is TaskRuntimeStatus.PENDING
             for task in fixture.tasks
         )
+    finally:
+        fixture.store.close()
+
+
+def test_service_setup_reaps_cancelled_environment_command(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("service-environment")
+    observed_tokens: list[CancellationToken | None] = []
+    activities: list[AgentActivity] = []
+
+    def runner(_command, **kwargs):  # noqa: ANN001, ANN003
+        observed_tokens.append(kwargs.get("cancel"))
+        return run_captured(resistant, **kwargs)
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        cancel=cancel,
+        environment_runner=runner,
+        environment_activity=activities.append,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                fixture.service.run,
+                fixture.borg.id,
+                fixture.generation.id,
+                {},
+                cancel=cancel,
+            )
+            real_process_harness.wait_for_marker(
+                "service-environment.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        real_process_harness.assert_tree_absent("service-environment")
+        assert observed_tokens == [cancel]
+        assert activities == [
+            AgentActivity(AgentActivityKind.COMMAND, "git status --short")
+        ]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status
+            is TaskRuntimeStatus.PENDING
+            for task in fixture.tasks
+        )
+        attempts = fixture.store.list_environment_attempts(fixture.tasks[0].id)
+        assert attempts[-1].status is ExecutionAttemptStatus.FAILED
     finally:
         fixture.store.close()
 

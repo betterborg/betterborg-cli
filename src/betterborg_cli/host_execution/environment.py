@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -18,10 +19,12 @@ from urllib.parse import quote
 from uuid import UUID
 
 from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     EnvironmentAttempt,
@@ -73,6 +76,7 @@ class _PathSnapshot:
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+ActivitySink = Callable[[AgentActivity], None]
 Clock = Callable[[], datetime]
 
 
@@ -255,6 +259,7 @@ class HostEnvironmentManager:
         preparation_root: Path | None = None,
         environment: Mapping[str, str] | None = None,
         command_runner: CommandRunner | None = None,
+        activity: ActivitySink | None = None,
         clock: Clock = utcnow,
         cancel: CancellationToken | None = None,
         git: SafeGit | None = None,
@@ -283,7 +288,9 @@ class HostEnvironmentManager:
         self._git = git or SafeGit(self.repository_root, cancel=cancel)
         self._validate_managed_paths()
         self._environment = dict(os.environ if environment is None else environment)
-        self._run = command_runner or subprocess.run
+        self._run = command_runner or run_captured
+        self._activity = activity
+        self._cancel = cancel
         self._clock = clock
         self._guard = PrimaryCheckoutGuard(
             self.repository_root, git=self._git
@@ -438,6 +445,7 @@ class HostEnvironmentManager:
                 command_environments=command_environments,
             )
         except BaseException as error:
+            self._raise_if_cancelled(error)
             self._block_environment_task(store, claim, owner_token, error)
             raise
 
@@ -659,6 +667,7 @@ class HostEnvironmentManager:
                 duration_seconds=duration,
                 now=self._clock(),
             )
+            self._raise_if_cancelled(error)
             if isinstance(error, EnvironmentMaterializationError):
                 raise EnvironmentMaterializationError(redacted) from error
             raise EnvironmentMaterializationError(redacted) from error
@@ -718,19 +727,21 @@ class HostEnvironmentManager:
         for command in commands:
             cwd = command_cwd(worktree, command.cwd)
             environment, mask_values = command_environments[command.stage]
+            self._report_command(command.argv, mask_values)
             try:
                 completed = self._run(
                     list(command.argv),
                     cwd=cwd,
                     env=dict(environment),
                     check=False,
-                    capture_output=True,
-                    text=True,
+                    cancel=self._cancel,
                 )
             except (OSError, subprocess.SubprocessError) as error:
+                self._raise_if_cancelled(error)
                 raise EnvironmentMaterializationError(
                     f"unable to run {command.argv[0]!r}: {error}"
                 ) from error
+            self._raise_if_cancelled()
             stdout = redact_secrets(completed.stdout or "", mask_values)
             stderr = redact_secrets(completed.stderr or "", mask_values)
             results.append(
@@ -759,6 +770,28 @@ class HostEnvironmentManager:
                 f"command: {details}"
             )
         return results
+
+    def _report_command(
+        self, command: Sequence[str], mask_values: Sequence[str]
+    ) -> None:
+        """Publish one redacted environment command without affecting setup."""
+        if self._activity is None:
+            return
+        redacted = [redact_secrets(argument, mask_values) for argument in command]
+        try:
+            self._activity(
+                AgentActivity(AgentActivityKind.COMMAND, shlex.join(redacted))
+            )
+        except Exception:
+            return
+
+    def _raise_if_cancelled(self, cause: BaseException | None = None) -> None:
+        """Keep cancellation distinct from an environment setup failure."""
+        if self._cancel is None or not self._cancel.is_set():
+            return
+        if cause is None:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt from cause
 
     def _base_command_environment(
         self,

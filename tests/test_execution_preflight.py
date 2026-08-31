@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution import (
     ComposeStackError,
     EnvironmentMaterializationError,
@@ -34,6 +35,7 @@ from betterborg_cli.host_execution import (
     service_url_environment,
 )
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
+from betterborg_cli.progress import AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
@@ -687,6 +689,86 @@ def test_build_secret_is_redacted_outside_used_by_stage(
     assert json.dumps(token)[1:-1] not in persisted
     assert quote(token, safe="") not in persisted
     assert "[REDACTED]" in persisted
+
+
+def test_environment_command_reports_redacted_activity_and_reaps_on_cancel(
+    execution_preflight_fixture,
+    real_process_harness,
+) -> None:
+    fixture = execution_preflight_fixture()
+    cancel = CancellationToken()
+    token = 'token"with/slash space?x=1&y=2'
+    command = real_process_harness.resistant_argv("environment-command")
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="unused",
+        secrets=(
+            HostSecret(
+                name="PACKAGE_TOKEN",
+                scope="build",
+                used_by=("environment",),
+                evidence="fixture",
+            ),
+        ),
+    )
+    plan = replace(
+        plan,
+        materialize_commands=(
+            HostCommand(
+                stage="environment",
+                argv=(*command, token),
+                cwd=".",
+                evidence="fixture",
+            ),
+        ),
+    )
+    activities = []
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        observed_tokens.append(kwargs.get("cancel"))
+        return run_captured(argv, **kwargs)
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={"PATH": os.environ["PATH"]},
+        command_runner=runner,
+        activity=activities.append,
+        cancel=cancel,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                manager.materialize_claimed_task,
+                store,
+                plan,
+                claim,
+                fixture.owner_token,
+                secret_values={"PACKAGE_TOKEN": token},
+            )
+            real_process_harness.wait_for_marker(
+                "environment-command.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+        runtime = store.get_task_runtime(claim.task_id)
+
+    real_process_harness.assert_tree_absent("environment-command")
+    assert observed_tokens == [cancel]
+    assert len(activities) == 1
+    assert activities[0].kind is AgentActivityKind.COMMAND
+    assert activities[0].detail is not None
+    assert token not in activities[0].detail
+    assert json.dumps(token)[1:-1] not in activities[0].detail
+    assert quote(token, safe="") not in activities[0].detail
+    assert "[REDACTED]" in activities[0].detail
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.ENVIRONMENT
 
 
 def test_tracked_changes_are_rejected_and_task_work_is_preserved(
