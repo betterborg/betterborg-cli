@@ -143,10 +143,13 @@ completed Analyze repository — score 4.20/5 (—) [retained]
 What is retained depends on the command:
 
 - `borg create` stores the Borg name, its PRD session, and each completed
-  conversation turn as soon as the session begins. If interrupted, it does not
-  publish a confirmed PRD. The current CLI cannot resume that session and
-  rejects another `borg create` using the same name; retrying creation requires
-  a different Borg name.
+  conversation turn as soon as the session begins. After exit 130, check
+  `.borg/prds/NAME.md`. If it is absent, interruption happened before
+  publication; the current CLI cannot resume the stored session and rejects
+  another `borg create` using the same name, so retry with a different Borg
+  name. If it exists, cancellation raced with atomic publication and
+  reconciliation retained the confirmed PRD; do not create it again, and
+  continue with `borg plan start NAME`.
 - `borg init` reuses a completed repository analysis and any completed role
   prompts, then generates only missing initialization outputs.
 - `borg plan start`, `borg plan change`, and `borg plan approve` reuse completed
@@ -159,7 +162,6 @@ What is retained depends on the command:
 Unfinished agent requests, HTTP requests, and local processes are never
 resumable in place. After an interrupted `borg plan change NAME`, run
 `borg plan start NAME`: the change request has already been saved, so submitting
-another change is rejected. Except for that recovery command and the
-`borg create` name restriction above, re-run the command you invoked. Every
-retry starts a new invocation and uses only the command-specific durable state
-listed above.
+another change is rejected. Except for that recovery command and the two
+`borg create` outcomes above, re-run the command you invoked. Every retry starts
+a new invocation and uses only the command-specific durable state listed above.
