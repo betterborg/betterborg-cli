@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import click
 import pytest
 from click.testing import CliRunner
+from progress_test_support import FakeClock, TTYStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import __version__
@@ -300,6 +301,74 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     ]
 
 
+def test_json_init_reconciles_cancellation_on_run_control_reporter(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    stream = io.StringIO()
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class StubRepositoryService:
+        def __init__(
+            self,
+            paths: RepoPaths,
+            _store: SqliteStore,
+            _agent_factory,
+            *,
+            cancel: cli_module.CancellationToken,
+            progress: RunProgress,
+        ) -> None:
+            assert reporters == [progress]
+            self.paths = paths
+            self.cancel = cancel
+            self.progress = progress
+
+        def initialize(self):
+            self.progress.declare(StageSpec("work", "Structured work"))
+            self.progress.start("work")
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except KeyboardInterrupt:
+                deadline = time.monotonic() + 1
+                while not self.progress.cancelling and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                assert self.cancel.is_set()
+                self.progress.stop("work", "reconciled")
+            return SimpleNamespace(
+                repository=Repository(root=self.paths.root),
+                initialized=False,
+                improvement_prds=(),
+                analysis=SimpleNamespace(overall_score=3.0),
+            )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+
+    exit_code = cli_module.main(
+        ["init", "--yes", "--json"],
+        prog_name="borg",
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert len(reporters) == 1
+    assert reporters[0].stages["work"].state is StageState.STOPPED
+    assert reporters[0].closed
+    assert stream.getvalue() == ""
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_main_dispatches_sigint_with_socket_only_selector(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -379,22 +448,12 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     monkeypatch: MonkeyPatch,
     environment: dict[str, str],
 ) -> None:
-    class TTYStream(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
-    class FakeClock:
-        now = 0.0
-
-        def __call__(self) -> float:
-            return self.now
-
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
 
-    stream = TTYStream()
+    stream = TTYStringIO()
     clock = FakeClock()
     progress = RunProgress(
         stream=stream,

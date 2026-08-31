@@ -107,12 +107,13 @@ from betterborg_cli.workspace_trust import (
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class CliRunContext:
     """Cancellation and reporting state shared by one root command invocation."""
 
     cancellation: CancellationToken
     progress: RunProgress
+    progress_configured: bool = True
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -121,7 +122,11 @@ def cli(context: click.Context) -> None:
     """Work with BetterBorg from the command line."""
 
     if context.obj is None:
-        context.obj = CliRunContext(CancellationToken(), RunProgress())
+        context.obj = CliRunContext(
+            CancellationToken(),
+            RunProgress(enabled=False),
+            progress_configured=False,
+        )
 
 
 def main(
@@ -249,10 +254,13 @@ def _stdin_is_interactive() -> bool:
 
 
 def _repository_progress(machine_readable: bool) -> RunProgress | None:
-    if machine_readable:
-        return RunProgress(enabled=False)
     run = click.get_current_context().find_root().obj
-    return run.progress if isinstance(run, CliRunContext) else None
+    if not isinstance(run, CliRunContext):
+        return None
+    if not run.progress_configured:
+        run.progress = RunProgress(machine_readable=machine_readable)
+        run.progress_configured = True
+    return run.progress
 
 
 def _suspend_progress(

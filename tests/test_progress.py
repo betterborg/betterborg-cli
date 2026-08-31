@@ -9,6 +9,7 @@ from io import StringIO
 from typing import Any
 
 import pytest
+from progress_test_support import FakeClock, TTYStringIO
 from rich.cells import cell_len
 
 from betterborg_cli.progress import (
@@ -20,26 +21,6 @@ from betterborg_cli.progress import (
     StageSpec,
     StageState,
 )
-
-
-class FakeClock:
-    """A manually advanced monotonic clock."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-class TTYStringIO(StringIO):
-    """An in-memory stream that exercises Rich's interactive renderer."""
-
-    def isatty(self) -> bool:
-        return True
 
 
 def _terminal_text(value: str) -> str:

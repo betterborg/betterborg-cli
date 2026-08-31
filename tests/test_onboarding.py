@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from io import StringIO
 from pathlib import Path
 
 import pytest
+from progress_test_support import FakeClock, TTYStringIO
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.onboarding import OnboardingDispatcher, create_commands
@@ -23,19 +23,6 @@ class RecordingCreator:
     def create(self, name: str, source: Path | None = None):
         self.calls.append((name, source))
         return self.calls[-1]
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-class TTYStringIO(StringIO):
-    def isatty(self) -> bool:
-        return True
 
 
 def _io(answers: Iterator[str | None], output: list[str]) -> InteractiveIO:

@@ -7,6 +7,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from progress_test_support import FakeClock, TTYStringIO
 
 from betterborg_cli import prd_session as prd_session_module
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
@@ -22,19 +23,6 @@ from betterborg_cli.progress import (
 )
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-class TTYStringIO(StringIO):
-    def isatty(self) -> bool:
-        return True
 
 
 def _responses(*payloads: dict[str, object]) -> MockAdapter:
