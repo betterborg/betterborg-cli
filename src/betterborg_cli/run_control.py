@@ -225,6 +225,11 @@ class RunControl:
     ) -> None:
         self._interrupt_count += 1
         if self._interrupt_count == 1:
+            # ``set_wakeup_fd`` normally wakes the dispatcher for us. Queue an
+            # explicit nonblocking byte as well so a first press observed while
+            # a protected section is creating several resources cannot leave
+            # cancellation delivery dependent on that interpreter-level write.
+            self._wake_dispatcher(b"i")
             if self._protected_depth:
                 self._deferred_interrupt = True
                 return

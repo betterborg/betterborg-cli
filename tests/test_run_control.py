@@ -36,11 +36,21 @@ def _press_sigint() -> None:
     os.kill(os.getpid(), signal.SIGINT)
 
 
-def test_first_sigint_defers_protected_exception_and_application_locks() -> None:
+def test_first_sigint_defers_protected_exception_and_application_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     cancel = CancellationToken()
     progress = _LockedProgress()
     exits: list[int] = []
     control = RunControl(cancel, progress=progress, exit_function=exits.append)
+    wake_dispatcher = control._wake_dispatcher
+    wakeups: list[bytes] = []
+
+    def record_wakeup(payload: bytes) -> None:
+        wakeups.append(payload)
+        wake_dispatcher(payload)
+
+    monkeypatch.setattr(control, "_wake_dispatcher", record_wakeup)
     cancel._lock.acquire()
     progress.lock.acquire()
     section = control.protected()
@@ -48,6 +58,7 @@ def test_first_sigint_defers_protected_exception_and_application_locks() -> None
     section.__enter__()
     try:
         _press_sigint()
+        assert wakeups == [b"i"]
         assert not cancel.is_set()
         assert not progress.called.is_set()
     finally:
