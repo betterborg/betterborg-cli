@@ -145,6 +145,7 @@ class HostPreflight:
         self._cancel = cancel
         self._run = command_runner
         self._activity = activity
+        self._validated_result: HostPreflightResult | None = None
         self._report_command(
             [
                 "git",
@@ -193,16 +194,20 @@ class HostPreflight:
             )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             self._raise_if_cancelled(error)
-            return HostPreflightBlock(
-                (
-                    HostPreflightFailure(
-                        requirement="workspace trust is required before host preflight",
-                        evidence=str(error),
-                        guidance=(
-                            "Run 'borg trust --yes' for this exact workspace, "
-                            "then retry."
+            return self._record_validated_result(
+                HostPreflightBlock(
+                    (
+                        HostPreflightFailure(
+                            requirement=(
+                                "workspace trust is required before host preflight"
+                            ),
+                            evidence=str(error),
+                            guidance=(
+                                "Run 'borg trust --yes' for this exact workspace, "
+                                "then retry."
+                            ),
                         ),
-                    ),
+                    )
                 )
             )
 
@@ -235,26 +240,41 @@ class HostPreflight:
         )
 
         if failures:
-            return HostPreflightBlock(tuple(failures))
-        return HostPreflightPlan(
-            repository_root=self.repository_root,
-            commands=tuple(commands),
-            prepare_commands=tuple(prepare_commands),
-            materialize_commands=tuple(materialize_commands),
-            environment_files=tuple(environment_files),
-            executables=tuple(executables),
-            required_secret_names=tuple(
-                secret.name for secret in secret_requirements
-            ),
-            compose_files=tuple(compose_files),
-            services=tuple(services),
-            compose_profiles=tuple(compose_profiles),
-            compose_networks=tuple(compose_networks),
-            compose_volumes=tuple(compose_volumes),
-            compose_build_services=tuple(compose_build_services),
-            package_managers=tuple(_package_managers(plan)),
-            secret_requirements=tuple(secret_requirements),
+            return self._record_validated_result(
+                HostPreflightBlock(tuple(failures))
+            )
+        return self._record_validated_result(
+            HostPreflightPlan(
+                repository_root=self.repository_root,
+                commands=tuple(commands),
+                prepare_commands=tuple(prepare_commands),
+                materialize_commands=tuple(materialize_commands),
+                environment_files=tuple(environment_files),
+                executables=tuple(executables),
+                required_secret_names=tuple(
+                    secret.name for secret in secret_requirements
+                ),
+                compose_files=tuple(compose_files),
+                services=tuple(services),
+                compose_profiles=tuple(compose_profiles),
+                compose_networks=tuple(compose_networks),
+                compose_volumes=tuple(compose_volumes),
+                compose_build_services=tuple(compose_build_services),
+                package_managers=tuple(_package_managers(plan)),
+                secret_requirements=tuple(secret_requirements),
+            )
         )
+
+    @property
+    def validated_result(self) -> HostPreflightResult | None:
+        """Return the exact result most recently produced by this validator."""
+        return self._validated_result
+
+    def _record_validated_result(
+        self, result: HostPreflightResult
+    ) -> HostPreflightResult:
+        self._validated_result = result
+        return result
 
     def _commands(
         self,

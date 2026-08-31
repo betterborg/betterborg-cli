@@ -17,6 +17,7 @@ from types import MappingProxyType
 from urllib.parse import quote
 from uuid import UUID
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
@@ -255,9 +256,10 @@ class HostEnvironmentManager:
         environment: Mapping[str, str] | None = None,
         command_runner: CommandRunner | None = None,
         clock: Clock = utcnow,
+        cancel: CancellationToken | None = None,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
-        self._paths = RepoPaths.discover(self.repository_root)
+        self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise EnvironmentMaterializationError(
                 "environment manager must be bound to the Git worktree root"
@@ -273,12 +275,14 @@ class HostEnvironmentManager:
         self.preparation_root = Path(
             preparation_root or default_preparation_root
         ).resolve()
-        self._git = SafeGit(self.repository_root)
+        self._git = SafeGit(self.repository_root, cancel=cancel)
         self._validate_managed_paths()
         self._environment = dict(os.environ if environment is None else environment)
         self._run = command_runner or subprocess.run
         self._clock = clock
-        self._guard = PrimaryCheckoutGuard(self.repository_root)
+        self._guard = PrimaryCheckoutGuard(
+            self.repository_root, git=self._git
+        )
 
     def prepare_reusable_caches(
         self,
@@ -810,7 +814,7 @@ class HostEnvironmentManager:
         path = self.preparation_root / identity
         self.preparation_root.mkdir(parents=True, exist_ok=True)
         self._remove_stale_preparation_worktree(path)
-        source_sha = SafeGit(source_worktree).head_sha()
+        source_sha = self._git.for_worktree(source_worktree).head_sha()
         try:
             self._git.run(
                 ["worktree", "add", "--detach", str(path), source_sha]
@@ -858,7 +862,7 @@ class HostEnvironmentManager:
             )
 
     def _assert_no_tracked_changes(self, worktree: Path, when: str) -> None:
-        output = SafeGit(worktree).run(
+        output = self._git.for_worktree(worktree).run(
             ["status", "--porcelain=v1", "-z", "-uno"]
         ).stdout
         if output:
@@ -869,7 +873,7 @@ class HostEnvironmentManager:
             )
 
     def _tracked_state(self, worktree: Path) -> tuple[str, str, str]:
-        git = SafeGit(worktree)
+        git = self._git.for_worktree(worktree)
         status = git.run(["status", "--porcelain=v1", "-z", "-uno"]).stdout
         diff = git.run(["diff", "--binary", "HEAD", "--"]).stdout
         return git.head_sha(), status, diff
@@ -896,7 +900,7 @@ class HostEnvironmentManager:
             raise EnvironmentMaterializationError(
                 "checkout-local environment marker escapes task worktree"
             )
-        if not SafeGit(worktree).is_ignored(marker):
+        if not self._git.for_worktree(worktree).is_ignored(marker):
             raise EnvironmentMaterializationError(
                 "checkout-local environment marker is not ignored by Git"
             )

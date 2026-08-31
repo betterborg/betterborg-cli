@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
     MockAdapter,
     MockResponse,
+    run_captured,
 )
 from betterborg_cli.host_execution import (
     HostCodingConfig,
@@ -27,8 +29,10 @@ from betterborg_cli.host_execution import (
     HostReviewFixConfig,
     HostReviewFixPhase,
     HostWorktreeManager,
+    SafeGit,
     ScheduledTaskContext,
 )
+from betterborg_cli.host_execution._agent_phase import require_ready_worktree
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
@@ -348,6 +352,45 @@ def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
         )
 
     return MockResponse(dynamic=commit)
+
+
+def test_ready_worktree_helper_reuses_cancellable_git_binding(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("ready-worktree-git")
+    observed_tokens: list[CancellationToken | None] = []
+
+    def runner(command, **kwargs):
+        if tuple(command)[-3:] == ("rev-parse", "--abbrev-ref", "HEAD"):
+            observed_tokens.append(kwargs.get("cancel"))
+            return run_captured(resistant, **kwargs)
+        return run_captured(command, **kwargs)
+
+    with SqliteStore.open(fixture.database) as store:
+        context = fixture.context(store, cancel=cancel)
+        git = SafeGit(
+            fixture.repository,
+            cancel=cancel,
+            command_runner=runner,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                require_ready_worktree,
+                fixture.repository,
+                git,
+                context,
+                expected_statuses={TaskRuntimeStatus.CODING},
+            )
+            real_process_harness.wait_for_marker("ready-worktree-git.child.pid")
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+
+    real_process_harness.assert_tree_absent("ready-worktree-git")
+    assert observed_tokens == [cancel]
 
 
 def _review_payload(

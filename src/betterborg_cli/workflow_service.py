@@ -25,7 +25,7 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     validate_plan,
 )
-from betterborg_cli.progress import RunProgress, StageSpec
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig
 from betterborg_cli.repository_files import (
@@ -275,7 +275,8 @@ def execute_workflow(
                 progress=progress,
             )
         except BaseException as error:
-            if progress is not None:
+            if _preflight_is_running(progress):
+                assert progress is not None
                 detail = str(error).strip() or type(error).__name__
                 if isinstance(error, KeyboardInterrupt) or (
                     cancel is not None and cancel.is_set()
@@ -284,7 +285,8 @@ def execute_workflow(
                 else:
                     progress.fail(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
             raise
-        if progress is not None:
+        if _preflight_is_running(progress):
+            assert progress is not None
             if isinstance(host_result.preflight, HostPreflightBlock):
                 progress.fail(
                     _EXECUTION_PREFLIGHT_STAGE_KEY,
@@ -302,6 +304,14 @@ def execute_workflow(
         decision,
         host_result,
         event,
+    )
+
+
+def _preflight_is_running(progress: RunProgress | None) -> bool:
+    return (
+        progress is not None
+        and progress.stages[_EXECUTION_PREFLIGHT_STAGE_KEY].state
+        is StageState.RUNNING
     )
 
 

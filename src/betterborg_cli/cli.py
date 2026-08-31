@@ -42,6 +42,7 @@ from betterborg_cli.host_execution import (
     HostMergePhase,
     HostPreflight,
     HostPreflightBlock,
+    HostPreflightPlan,
     HostReviewFixConfig,
     HostReviewFixPhase,
     HostSanityPhase,
@@ -1154,19 +1155,24 @@ def _invoke_host_execution(
     if analysis is None:
         raise RuntimeError("repository has no completed analysis; run 'borg analyze'")
     analyzer_plan = analysis.analysis_json
-    preflight = HostPreflight(
-        paths.root,
-        cancel=cancel,
-        activity=(
-            (lambda activity: progress.activity("preflight", activity))
-            if progress is not None
-            else None
-        ),
-    )
-    validated = preflight.validate(
-        analyzer_plan,
-        available_secret_names=os.environ.keys(),
-    )
+    try:
+        preflight = HostPreflight(
+            paths.root,
+            cancel=cancel,
+            activity=(
+                (lambda activity: progress.activity("preflight", activity))
+                if progress is not None
+                else None
+            ),
+        )
+        validated = preflight.validate(
+            analyzer_plan,
+            available_secret_names=os.environ.keys(),
+        )
+    except BaseException as error:
+        _finish_execution_preflight(progress, cancel=cancel, error=error)
+        raise
+    _finish_execution_preflight(progress, cancel=cancel, result=validated)
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
@@ -1192,12 +1198,13 @@ def _invoke_host_execution(
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
-    environment = HostEnvironmentManager(paths.root)
+    environment = HostEnvironmentManager(paths.root, cancel=cancel)
     compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
         source_branch=config.default_branch,
+        cancel=cancel,
     )
     repository_lock = RLock()
 
@@ -1216,6 +1223,7 @@ def _invoke_host_execution(
                 billing_mode=_agent_billing_mode(coding_agent.name),
                 effort=config.agents.coding.effort,
             ),
+            cancel=cancel,
         ),
         review_fix=HostReviewFixPhase(
             paths.root,
@@ -1230,6 +1238,7 @@ def _invoke_host_execution(
                 review_effort=config.agents.review.effort,
                 fix_effort=config.agents.review.effort,
             ),
+            cancel=cancel,
         ),
         merge=HostMergePhase(
             paths.root,
@@ -1240,6 +1249,7 @@ def _invoke_host_execution(
                 effort=config.agents.merge.effort,
             ),
             repository_lock=locked_repository,
+            cancel=cancel,
         ),
         sanity=HostSanityPhase(
             paths.root,
@@ -1248,6 +1258,7 @@ def _invoke_host_execution(
             compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=locked_repository,
+            cancel=cancel,
         ),
     )
     service = HostExecutionService(
@@ -1269,7 +1280,35 @@ def _invoke_host_execution(
         analyzer_plan,
         secret_values=secrets,
         cancel=cancel,
+        validated_preflight=validated,
     )
+
+
+def _finish_execution_preflight(
+    progress: RunProgress | None,
+    *,
+    cancel: CancellationToken | None,
+    result: HostPreflightPlan | HostPreflightBlock | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """Close Preflight at validation, before acquisition or task setup."""
+    if progress is None:
+        return
+    stage = progress.stages.get("preflight")
+    if stage is None or stage.state is not StageState.RUNNING:
+        return
+    if error is not None:
+        detail = str(error).strip() or type(error).__name__
+        if isinstance(error, KeyboardInterrupt | click.Abort) or (
+            cancel is not None and cancel.is_set()
+        ):
+            progress.stop("preflight", detail)
+        else:
+            progress.fail("preflight", detail)
+    elif isinstance(result, HostPreflightBlock):
+        progress.fail("preflight", result.reason)
+    else:
+        progress.complete("preflight", "ready")
 
 
 def _execution_agent_trust_requirement(primary_paths: RepoPaths):

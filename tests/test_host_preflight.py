@@ -7,12 +7,15 @@ import shlex
 import signal
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
+    HostExecutionService,
     HostPreflight,
     HostPreflightBlock,
     HostPreflightPlan,
@@ -365,6 +368,69 @@ def test_cancelled_probe_result_propagates_interruption(
         )
 
     assert probes[-1] == target
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["root", "identity", "executable-version", "compose-version", "topology"],
+)
+def test_each_concrete_probe_cancels_before_run_or_claim_creation(
+    committed_git_repo: Path,
+    target: str,
+) -> None:
+    binary_dir = committed_git_repo.parent / f"{target}-boundary-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _compose_executable(binary_dir)
+    plan = _complete_probe_plan(committed_git_repo)
+    trust_store = _trust_store(committed_git_repo)
+    require_workspace_trust(
+        RepoPaths.discover(committed_git_repo),
+        store=trust_store,
+        explicit=True,
+    )
+    cancel = CancellationToken()
+
+    def runner(command, **kwargs):
+        if _probe_name(command) == target:
+            cancel.cancel()
+            return subprocess.CompletedProcess(command, -1, "", "")
+        return run_captured(command, **kwargs)
+
+    borg_id = uuid4()
+    generation_id = uuid4()
+    with SqliteStore.open(committed_git_repo / f"{target}-boundary.sqlite3") as store:
+        with pytest.raises(KeyboardInterrupt):
+            preflight = HostPreflight(
+                committed_git_repo,
+                trust_store=trust_store,
+                environment={"PATH": str(binary_dir)},
+                cancel=cancel,
+                command_runner=runner,
+            )
+            HostExecutionService(
+                store,
+                preflight,
+                SimpleNamespace(plan=None),
+                worktree_manager=SimpleNamespace(),
+                compose_manager=SimpleNamespace(),
+            ).run(
+                borg_id,
+                generation_id,
+                plan,
+                secret_values={"PACKAGE_TOKEN": "available"},
+                external_urls={
+                    "SEARCH_URL": "https://search.example.test/api"
+                },
+                cancel=cancel,
+            )
+
+        assert store.list_execution_runs(borg_id) == []
+        with store.locked_connection() as connection:
+            claim_count = connection.execute(
+                "SELECT COUNT(*) FROM task_claims"
+            ).fetchone()[0]
+        assert claim_count == 0
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "nonzero"])

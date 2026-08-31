@@ -19,7 +19,7 @@ from betterborg_cli.agent_runtime import CancellationToken, MockAdapter
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
 from betterborg_cli.planning import TaskPublisher
-from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
@@ -532,6 +532,44 @@ def test_execute_without_push_succeeds_without_a_remote(
     assert ": completed" in result.output
     assert "Pushed" not in result.output
     assert _project_branch_sha(committed_git_repo, name) == local_sha
+
+
+def test_failure_after_preflight_does_not_reclassify_preflight(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "post-preflight-failure"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    progress = RunProgress(stream=StringIO())
+
+    def fail_after_preflight(*_args, progress=None, **_kwargs):
+        assert progress is not None
+        progress.complete("preflight", "ready")
+        raise RuntimeError("task setup failed")
+
+    monkeypatch.setattr(
+        cli_module, "_invoke_host_execution", fail_after_preflight
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute"],
+        obj=CliRunContext(CancellationToken(), progress),
+    )
+
+    assert result.exit_code == 1
+    assert "task setup failed" in result.output
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].result == "ready"
 
 
 def test_push_option_publishes_completed_project_branch_non_force(
@@ -1253,6 +1291,7 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     calls: list[tuple[object, ...]] = []
 
     def run(service, borg_id, generation_id, analyzer_plan, **kwargs):
+        assert progress.stages["preflight"].state is StageState.COMPLETED
         assert type(service) is cli_module.HostExecutionService
         assert type(service._runtime) is cli_module.HostTaskRuntime
         assert type(service._runtime._coding) is cli_module.HostCodingPhase
@@ -1266,6 +1305,8 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     monkeypatch.setattr(cli_module.HostExecutionService, "run", run)
     cancel = CancellationToken()
     progress = RunProgress(enabled=False)
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         analysis = store.get_prior_ready_analysis(repository.id)
         assert analysis is not None
@@ -1310,14 +1351,15 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     for requirement in execution_trust:
         requirement(managed_worktree_paths)
     assert observed_trust_paths == [paths.root] * 3
-    assert calls == [
-        (
-            borg.id,
-            fixture.generation.id,
-            analyzer_plan,
-            {
-                "secret_values": {"EXECUTE_TOKEN": "owner-secret"},
-                "cancel": cancel,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    observed_borg, observed_generation, observed_plan, observed_kwargs = calls[0]
+    assert observed_borg == borg.id
+    assert observed_generation == fixture.generation.id
+    assert observed_plan == analyzer_plan
+    assert observed_kwargs["secret_values"] == {
+        "EXECUTE_TOKEN": "owner-secret"
+    }
+    assert observed_kwargs["cancel"] is cancel
+    assert isinstance(
+        observed_kwargs["validated_preflight"], HostPreflightPlan
+    )

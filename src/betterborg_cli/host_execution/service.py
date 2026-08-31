@@ -390,14 +390,21 @@ class HostExecutionService:
         secret_values: Mapping[str, str] | None = None,
         external_urls: Mapping[str, str] | None = None,
         cancel: CancellationToken | None = None,
+        validated_preflight: HostPreflightPlan | HostPreflightBlock | None = None,
     ) -> HostExecutionResult:
         """Validate, reconcile, acquire, prepare, and schedule host work."""
         secrets = dict(secret_values or {})
-        validated = self._preflight.validate(
-            analyzer_plan,
-            available_secret_names=secrets,
-            external_urls=external_urls,
-        )
+        validated = validated_preflight
+        if validated is None:
+            validated = self._preflight.validate(
+                analyzer_plan,
+                available_secret_names=secrets,
+                external_urls=external_urls,
+            )
+        elif self._preflight.validated_result is not validated:
+            raise HostExecutionError(
+                "prevalidated host plan was not produced by this preflight"
+            )
         if isinstance(validated, HostPreflightBlock):
             return HostExecutionResult(validated)
         if validated != self._runtime.plan:
