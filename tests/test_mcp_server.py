@@ -287,6 +287,93 @@ def test_run_cancellable_ignores_exhausted_default_thread_limiter() -> None:
     assert request_finished_before_rescue == [True]
 
 
+def test_run_cancellable_bounds_workflow_and_cleanup_threads(monkeypatch) -> None:
+    started_lock = threading.Lock()
+    started_count = 0
+    completed_count = 0
+    force_count = 0
+    workers_saturated = threading.Event()
+    cleanup_saturated = threading.Event()
+    release_cleanup = threading.Event()
+    worker_limit = mcp_server._MCP_MAX_WORKERS
+    request_count = worker_limit + 44
+
+    class TrackingCancellation:
+        def __init__(self) -> None:
+            self._cancelled = threading.Event()
+            self._forced = threading.Event()
+            self.force_deadline: float | None = None
+
+        def cancel(self) -> None:
+            self.force_deadline = time.monotonic() + 0.05
+            self._cancelled.set()
+
+        def force(self) -> None:
+            nonlocal force_count
+            with started_lock:
+                force_count += 1
+                if force_count == worker_limit:
+                    cleanup_saturated.set()
+            release_cleanup.wait(timeout=4)
+            self._forced.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self._cancelled.wait(timeout)
+
+        def wait_for_force(self, timeout: float | None = None) -> bool:
+            return self._forced.wait(timeout)
+
+    class TrackingRunControl:
+        def __init__(self) -> None:
+            self.cancellation = TrackingCancellation()
+
+    def workflow(*, cancel) -> None:
+        nonlocal started_count, completed_count
+        with started_lock:
+            started_count += 1
+            assert started_count <= worker_limit
+            if started_count == worker_limit:
+                workers_saturated.set()
+        assert cancel.wait(timeout=2)
+        assert cancel.wait_for_force(timeout=2)
+        with started_lock:
+            completed_count += 1
+
+    async def wait_for_event(event: threading.Event) -> None:
+        while not event.is_set():
+            await anyio.sleep(0.01)
+
+    async def run() -> None:
+        with anyio.fail_after(4):
+            with anyio.CancelScope() as scope:
+                async with anyio.create_task_group() as tasks:
+                    for _ in range(request_count):
+                        tasks.start_soon(mcp_server._run_cancellable, workflow)
+                    await wait_for_event(workers_saturated)
+                    await anyio.sleep(0.05)
+                    assert started_count == worker_limit
+                    scope.cancel()
+                    with anyio.CancelScope(shield=True):
+                        await wait_for_event(cleanup_saturated)
+                        worker_threads = [
+                            thread
+                            for thread in threading.enumerate()
+                            if thread.name == "AnyIO worker thread"
+                        ]
+                        assert len(worker_threads) <= mcp_server._MCP_THREAD_CAPACITY
+                        release_cleanup.set()
+
+    monkeypatch.setattr(mcp_server, "RunControl", TrackingRunControl)
+    try:
+        anyio.run(run)
+    finally:
+        release_cleanup.set()
+
+    assert started_count == worker_limit
+    assert force_count == worker_limit
+    assert completed_count == worker_limit
+
+
 def test_run_cancellable_reaps_resistant_local_descendants_before_return(
     real_process_harness,
 ) -> None:

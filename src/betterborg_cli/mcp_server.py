@@ -452,6 +452,13 @@ server = FastMCP(
 
 
 _MISSING = object()
+_MCP_MAX_WORKERS = 20
+_MCP_THREAD_CAPACITY = _MCP_MAX_WORKERS * 2
+# Keep one cleanup-thread slot available for every live workflow. The semaphore
+# remains held until the synchronous function actually exits, even when AnyIO
+# abandons its adapter wait during protocol cancellation.
+_MCP_WORKER_SLOTS = threading.BoundedSemaphore(_MCP_MAX_WORKERS)
+_MCP_THREAD_LIMITER = anyio.CapacityLimiter(_MCP_THREAD_CAPACITY)
 
 
 class _WorkerResult:
@@ -493,46 +500,72 @@ class _WorkerResult:
         return result
 
 
+async def _wait_for_thread_event(
+    event: threading.Event,
+    timeout: float | None = None,
+) -> bool:
+    """Wait for a thread fence without occupying another worker thread."""
+    with anyio.move_on_after(timeout):
+        while not event.is_set():
+            await anyio.sleep(0.01)
+    return event.is_set()
+
+
 async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
     """Run synchronous MCP work under cooperative cancellation and force cleanup."""
     control = RunControl()
     outcome = _WorkerResult()
     invocation_finished = anyio.Event()
-    # MCP work must remain startable when unrelated calls occupy AnyIO's default
-    # pool. The bridge is separate because it waits while the worker holds its
-    # own token, and reuses one token sequentially for startup, cleanup, and force.
-    worker_limiter = anyio.CapacityLimiter(1)
-    bridge_limiter = anyio.CapacityLimiter(1)
+    worker_slot_acquired = False
 
     def run() -> Any:
         outcome.started.set()
-        return outcome.run(lambda: function(*args, cancel=control.cancellation))
+        try:
+            return outcome.run(
+                lambda: function(*args, cancel=control.cancellation)
+            )
+        finally:
+            _MCP_WORKER_SLOTS.release()
 
     async def invoke() -> None:
         try:
             await anyio.to_thread.run_sync(
                 run,
                 abandon_on_cancel=True,
-                limiter=worker_limiter,
+                limiter=_MCP_THREAD_LIMITER,
             )
         except BaseException:
             # The result fence owns the synchronous exception. Cancellation of
             # this adapter task abandons only its wait, never the worker.
             pass
         finally:
+            if not outcome.started.is_set():
+                # Thread startup itself failed or was cancelled while waiting
+                # for the shared pool after this request reserved a worker slot.
+                _MCP_WORKER_SLOTS.release()
             invocation_finished.set()
 
     try:
+        # Polling the process-wide semaphore keeps queued requests cancellable
+        # without spending a thread on coordination. Its nonblocking first
+        # attempt also lets an already-cancelled request start and observe its
+        # token when capacity is immediately available.
+        while not worker_slot_acquired:
+            worker_slot_acquired = _MCP_WORKER_SLOTS.acquire(blocking=False)
+            if not worker_slot_acquired:
+                await anyio.sleep(0.01)
+
         # Guarantee that the AnyIO worker has started before exposing it to an
         # already-pending request cancellation. This also preserves
         # ``from_thread.run()`` support for MCP elicitation in the worker.
         with anyio.CancelScope(shield=True) as startup:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(invoke)
-                await anyio.to_thread.run_sync(
-                    outcome.started.wait,
-                    limiter=bridge_limiter,
-                )
+                while (
+                    not outcome.started.is_set()
+                    and not invocation_finished.is_set()
+                ):
+                    await anyio.sleep(0.01)
                 startup.shield = False
                 await invocation_finished.wait()
                 if not outcome.completed.is_set():
@@ -546,37 +579,34 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
         # that cleanup so the request cannot disappear before its worker does.
         with anyio.CancelScope(shield=True):
             control.cancellation.cancel()
-            deadline = control.cancellation.force_deadline
-            timeout = (
-                max(0.0, deadline - time.monotonic())
-                if deadline is not None
-                else 0.0
-            )
-            completed = await anyio.to_thread.run_sync(
-                outcome.completed.wait,
-                timeout,
-                limiter=bridge_limiter,
-            )
-            if not completed:
-                try:
-                    await anyio.to_thread.run_sync(
-                        control.cancellation.force,
-                        limiter=bridge_limiter,
-                    )
-                except BaseException:
-                    # A force callback failure must not replace protocol
-                    # cancellation or bypass the synchronous worker fence.
-                    pass
-                await anyio.to_thread.run_sync(
-                    outcome.completed.wait,
-                    limiter=bridge_limiter,
+            if outcome.started.is_set():
+                deadline = control.cancellation.force_deadline
+                timeout = (
+                    max(0.0, deadline - time.monotonic())
+                    if deadline is not None
+                    else 0.0
                 )
-            try:
-                outcome.acknowledge()
-            except BaseException:
-                # Protocol cancellation remains the request outcome. Reading
-                # the worker outcome is still required before re-raising it.
-                pass
+                completed = await _wait_for_thread_event(
+                    outcome.completed,
+                    timeout,
+                )
+                if not completed:
+                    try:
+                        await anyio.to_thread.run_sync(
+                            control.cancellation.force,
+                            limiter=_MCP_THREAD_LIMITER,
+                        )
+                    except BaseException:
+                        # A force callback failure must not replace protocol
+                        # cancellation or bypass the synchronous worker fence.
+                        pass
+                    await _wait_for_thread_event(outcome.completed)
+                try:
+                    outcome.acknowledge()
+                except BaseException:
+                    # Protocol cancellation remains the request outcome. Reading
+                    # the worker outcome is still required before re-raising it.
+                    pass
         raise
     return outcome.acknowledge()
 
