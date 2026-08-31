@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 from contextlib import contextmanager
@@ -1058,6 +1059,91 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert _remote_project_sha(remote, name) == local_sha
 
 
+def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel = CancellationToken()
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities = []
+    gh = "/test/bin/gh"
+
+    def runner(command, **kwargs):
+        argv = tuple(command)
+        calls.append((argv, kwargs))
+        if argv[0] == "git":
+            stdout = "https://github.com/acme/widgets.git\n"
+        elif argv[1:3] == ("repo", "view"):
+            stdout = "main\n"
+        elif argv[1:3] == ("pr", "create"):
+            stdout = "https://github.com/acme/widgets/pull/42\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: gh)
+
+    result = cli_module._open_rollup_pull_request(
+        committed_git_repo,
+        "runner-contract",
+        {"title": "Runner contract"},
+        None,
+        cancel=cancel,
+        command_runner=runner,
+        activity=activities.append,
+    )
+
+    assert result.endswith(": https://github.com/acme/widgets/pull/42")
+    assert [call[0] for call in calls] == [
+        (
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "remote",
+            "get-url",
+            "origin",
+        ),
+        (gh, "auth", "status", "--active", "--hostname", "github.com"),
+        (
+            gh,
+            "repo",
+            "view",
+            "acme/widgets",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ),
+        (
+            gh,
+            "pr",
+            "create",
+            "--repo",
+            "acme/widgets",
+            "--head",
+            "project/runner-contract",
+            "--base",
+            "main",
+            "--title",
+            "Runner contract",
+            "--body-file",
+            "-",
+        ),
+    ]
+    assert [call[1]["timeout"] for call in calls] == [10, 30, 30, 60]
+    assert all(call[1]["cancel"] is cancel for call in calls)
+    assert all(call[1]["check"] is False for call in calls)
+    assert "cwd" not in calls[0][1]
+    for _command, kwargs in calls[1:]:
+        assert kwargs["cwd"] == committed_git_repo
+        assert kwargs["env"]["GH_PROMPT_DISABLED"] == "1"
+    assert "input" not in calls[2][1]
+    assert calls[3][1]["input"].startswith("# Runner contract")
+    assert [activity.detail for activity in activities] == [
+        shlex.join(call[0]) for call in calls
+    ]
+
+
 def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -1099,6 +1185,163 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     )
     assert args_path.exists()
     assert _remote_project_sha(remote, name) == local_sha
+
+
+@pytest.mark.parametrize(
+    ("blocked_command", "command_text"),
+    [
+        ("remote", "git -C"),
+        ("auth", "auth status --active --hostname github.com"),
+        (
+            "repo",
+            "repo view acme/widgets --json defaultBranchRef --jq",
+        ),
+        ("create", "pr create --repo acme/widgets"),
+    ],
+)
+def test_pr_interrupt_reaps_each_command_stops_stage_and_preserves_core_report(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    real_process_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_command: str,
+    command_text: str,
+) -> None:
+    name = f"pr-interrupt-{blocked_command}"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    operation_id = uuid4()
+    process_name = f"execute-pr-{blocked_command}"
+    resistant = real_process_harness.resistant_argv(process_name)
+    source = r'''
+from __future__ import annotations
+
+import json
+import shlex
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
+
+from betterborg_cli import cli as cli_module
+from betterborg_cli.host_execution import HostPreflightPlan
+from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.store import ExecutionRunStatus
+
+repository = Path(sys.argv[1])
+marker_root = Path(sys.argv[2])
+resistant = tuple(json.loads(sys.argv[3]))
+operation_id = UUID(sys.argv[4])
+name = sys.argv[5]
+blocked_command = sys.argv[6]
+actual_run_captured = cli_module.run_captured
+
+
+class FastProgress(RunProgress):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+
+    def refresh(self):
+        super().refresh()
+        stage = self.stages.get("rollup-pr")
+        if (
+            stage is not None
+            and stage.state is StageState.RUNNING
+            and stage.activity is not None
+        ):
+            (marker_root / "pr-heartbeat").write_text(
+                "refreshed", encoding="utf-8"
+            )
+
+
+def command_kind(command):
+    if command[0] == "git":
+        return "remote"
+    if tuple(command[1:3]) == ("auth", "status"):
+        return "auth"
+    if tuple(command[1:3]) == ("repo", "view"):
+        return "repo"
+    if tuple(command[1:3]) == ("pr", "create"):
+        return "create"
+    return "other"
+
+
+def runner(command, **kwargs):
+    if command_kind(command) == blocked_command:
+        (marker_root / "pr-token").write_text(
+            "bound" if kwargs.get("cancel") is not None else "missing",
+            encoding="utf-8",
+        )
+        (marker_root / "pr-command").write_text(
+            shlex.join(command), encoding="utf-8"
+        )
+        return actual_run_captured(resistant, **kwargs)
+    return actual_run_captured(command, **kwargs)
+
+
+preflight = HostPreflightPlan(
+    repository_root=repository,
+    commands=(),
+    prepare_commands=(),
+    materialize_commands=(),
+    environment_files=(),
+    executables=(),
+    required_secret_names=(),
+    compose_files=(),
+    services=(),
+)
+cli_module.RunProgress = FastProgress
+cli_module.run_captured = runner
+cli_module._invoke_host_execution = lambda *_args, **_kwargs: SimpleNamespace(
+    preflight=preflight,
+    active_operation_id=None,
+    operation_id=operation_id,
+    status=ExecutionRunStatus.COMPLETED,
+)
+raise SystemExit(
+    cli_module.main(["execute", name, "--auto-execute", "--pr"])
+)
+'''
+    process = real_process_harness.launch_python(
+        source,
+        str(committed_git_repo),
+        str(real_process_harness.root),
+        json.dumps(resistant),
+        str(operation_id),
+        name,
+        blocked_command,
+        name=process_name,
+    )
+    real_process_harness.wait_for_marker(f"{process_name}.child.pid")
+    real_process_harness.wait_for_marker("pr-heartbeat")
+    real_process_harness.signal(process, signal.SIGINT)
+
+    assert real_process_harness.wait_for_exit(process) == 130
+    stdout, stderr = process.communicate()
+    output = stdout + stderr
+    real_process_harness.assert_tree_absent(process_name)
+    assert real_process_harness.wait_for_marker("pr-token") == "bound"
+    observed_command = real_process_harness.wait_for_marker("pr-command")
+    assert command_text in observed_command
+    assert output.count("running Open rollup pull request") >= 2
+    assert f"command: {observed_command}" in output
+    assert "stopped Open rollup pull request" in output
+    assert "failed Open rollup pull request" not in output
+    assert "summary:" in output
+    report = f"Execution operation {operation_id}: completed"
+    assert report in output
+    assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
 def test_pr_missing_remote_preserves_completed_local_branch(

@@ -23,7 +23,7 @@ from uuid import UUID
 import click
 
 from betterborg_cli import __version__
-from betterborg_cli.agent_runtime import BillingMode, CancellationToken
+from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
 from betterborg_cli.execution_estimate import (
@@ -79,7 +79,14 @@ from betterborg_cli.plugins import (
     PluginInstaller,
 )
 from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
-from betterborg_cli.progress import ProgressError, RunProgress, StageSpec, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ProgressError,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
 from betterborg_cli.repository_files import read_repository_text
@@ -946,8 +953,19 @@ def execute_borg(
                     "rollup-pr",
                     "Open rollup pull request",
                     lambda: _open_rollup_pull_request(
-                        paths.root, name, plan, prd_path
+                        paths.root,
+                        name,
+                        plan,
+                        prd_path,
+                        cancel=cancel,
+                        command_runner=run_captured,
+                        activity=(
+                            (lambda activity: progress.activity("rollup-pr", activity))
+                            if progress is not None
+                            else None
+                        ),
                     ),
+                    cancel=cancel,
                 )
         except BaseException as error:
             follow_up_error = error
@@ -1083,6 +1101,10 @@ def _open_rollup_pull_request(
     name: str,
     plan: dict[str, object] | None,
     prd_path: Path | None,
+    *,
+    cancel: CancellationToken | None,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+    activity: Callable[[AgentActivity], None] | None = None,
 ) -> str:
     """Open one authenticated GitHub PR after completed local execution."""
     branch = f"project/{name}"
@@ -1102,11 +1124,12 @@ def _open_rollup_pull_request(
         raise click.ClickException(f"{failure_prefix}: {error}") from error
 
     try:
-        remote = subprocess.run(
+        remote = _run_rollup_command(
             ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -1127,12 +1150,13 @@ def _open_rollup_pull_request(
         raise click.ClickException(f"{failure_prefix}: gh executable was not found")
     environment = {**os.environ, "GH_PROMPT_DISABLED": "1"}
     try:
-        auth = subprocess.run(
+        auth = _run_rollup_command(
             [gh, "auth", "status", "--active", "--hostname", "github.com"],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=30,
             env=environment,
         )
@@ -1145,7 +1169,7 @@ def _open_rollup_pull_request(
         )
 
     try:
-        default = subprocess.run(
+        default = _run_rollup_command(
             [
                 gh,
                 "repo",
@@ -1156,10 +1180,11 @@ def _open_rollup_pull_request(
                 "--jq",
                 ".defaultBranchRef.name",
             ],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
-            text=True,
             timeout=30,
             env=environment,
         )
@@ -1184,7 +1209,7 @@ def _open_rollup_pull_request(
         else name
     )
     try:
-        created = subprocess.run(
+        created = _run_rollup_command(
             [
                 gh,
                 "pr",
@@ -1200,11 +1225,12 @@ def _open_rollup_pull_request(
                 "--body-file",
                 "-",
             ],
+            command_runner=command_runner,
+            cancel=cancel,
+            activity=activity,
             cwd=repository_root,
             check=False,
-            capture_output=True,
             input=body,
-            text=True,
             timeout=60,
             env=environment,
         )
@@ -1217,6 +1243,31 @@ def _open_rollup_pull_request(
     url = created.stdout.strip()
     suffix = f": {url}" if url else "."
     return f"Opened rollup pull request for {branch}{suffix}"
+
+
+def _run_rollup_command(
+    command: Sequence[str],
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]],
+    cancel: CancellationToken | None,
+    activity: Callable[[AgentActivity], None] | None,
+    **kwargs: object,
+) -> subprocess.CompletedProcess[str]:
+    """Run one visible GitHub delivery command under cancellation control."""
+    if activity is not None:
+        try:
+            activity(AgentActivity(AgentActivityKind.COMMAND, shlex.join(command)))
+        except Exception:
+            pass
+    try:
+        result = command_runner(command, cancel=cancel, **kwargs)
+    except BaseException:
+        if cancel is not None and cancel.is_set():
+            raise KeyboardInterrupt from None
+        raise
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
+    return result
 
 
 def _github_repository(remote: str) -> str | None:
