@@ -17,6 +17,7 @@
   "files": [
     "LICENSE",
     "NOTICE",
+    "README.md",
     "bin",
     "lib"
   ],

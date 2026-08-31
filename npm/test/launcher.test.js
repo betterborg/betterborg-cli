@@ -51,7 +51,7 @@ test("package metadata exposes the public scoped borg command", () => {
   assert.match(metadata.version, /^\d+\.\d+\.\d+$/);
 });
 
-test("packed package includes the license and attribution notice", () => {
+test("packed package includes the readme, license, and attribution notice", () => {
   const packageRoot = path.resolve(__dirname, "..");
   const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
   // Node refuses to execFileSync a Windows .cmd shim without a shell.
@@ -67,6 +67,12 @@ test("packed package includes the license and attribution notice", () => {
   const [{ files }] = JSON.parse(output);
   const packedPaths = new Set(files.map((file) => file.path));
 
+  // A tarball without a readme publishes "ERROR: No README data found!".
+  assert.equal(packedPaths.has("README.md"), true);
+  assert.match(
+    fs.readFileSync(path.join(packageRoot, "README.md"), "utf8"),
+    /@betterborg\/cli/,
+  );
   assert.equal(packedPaths.has("LICENSE"), true);
   assert.equal(packedPaths.has("NOTICE"), true);
   assert.equal(
