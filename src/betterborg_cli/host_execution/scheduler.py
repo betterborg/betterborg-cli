@@ -566,8 +566,14 @@ class HostTaskScheduler:
     ) -> None:
         """Fence active work before durably interrupting and reconciling a run."""
         token.cancel()
+        progress_error: BaseException | None = None
         if self._progress is not None:
-            self._progress.begin_cancellation()
+            try:
+                self._progress.begin_cancellation()
+            except BaseException as error:
+                # Output is advisory: preserve its failure without letting it
+                # bypass durable cancellation and owned-resource cleanup.
+                progress_error = error
         try:
             self._drain_cancelled(active, run_id, owner_token, next_heartbeat)
             self._store.interrupt_execution_run(
@@ -579,7 +585,16 @@ class HostTaskScheduler:
             if self._interruption_cleanup is not None:
                 self._interruption_cleanup()
         finally:
-            self._reconcile_interrupted_progress(run_id, generation_id)
+            try:
+                self._reconcile_interrupted_progress(run_id, generation_id)
+            except BaseException as error:
+                if progress_error is None:
+                    raise
+                progress_error.add_note(
+                    f"execution progress reconciliation also failed: {error}"
+                )
+        if progress_error is not None:
+            raise progress_error
 
     def _interrupt_after_keyboard_interrupt(
         self,

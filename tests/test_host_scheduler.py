@@ -630,6 +630,48 @@ def test_scheduler_cancels_when_progress_stops_during_seeding(
         )
 
 
+def test_scheduler_durably_cancels_when_progress_output_fails(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+    cancel.cancel()
+
+    class FailingCancellationStream(StringIO):
+        def write(self, value: str) -> int:
+            if "stopping..." in value:
+                raise OSError("progress output unavailable")
+            return super().write(value)
+
+    progress = RunProgress(stream=FailingCancellationStream())
+
+    with SqliteStore.open(database) as store:
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("cancelled work must not be claimed")
+
+        with pytest.raises(OSError, match="progress output unavailable"):
+            HostTaskScheduler(
+                store,
+                unexpected_behavior,
+                progress=progress,
+            ).run(borg.id, generation.id, cancel=cancel)
+
+        run = store.list_execution_runs(borg.id)[0]
+        assert run.status is ExecutionRunStatus.CANCELLED
+        assert store.list_task_claims(run.id) == []
+        assert any(
+            event.kind == "run.interrupted"
+            for event in store.list_execution_events(run.id)
+        )
+
+
 def test_scheduler_sigint_durably_interrupts_before_keyboard_interrupt_escapes(
     tmp_path: Path,
 ) -> None:
