@@ -37,7 +37,7 @@ from betterborg_cli.plugin_installation import (
 )
 
 MARKETPLACE_NAME = "betterborg"
-PLUGIN_NAME = "borg"
+PLUGIN_NAME = "betterborg"
 PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 RELOAD_GUIDANCE = (
     "Run `/reload-plugins` in any open Claude Code session (or start a new "
@@ -212,7 +212,7 @@ def install_claude_plugin(
             digest,
             version,
             host_name="Claude",
-            manifest_path="plugins/borg/.claude-plugin/plugin.json",
+            manifest_path="plugins/betterborg/.claude-plugin/plugin.json",
             version_change_name="version bump",
         )
     except PluginCollisionError as error:
@@ -409,10 +409,10 @@ def _plugin_state(value: Any) -> _PluginState:
 def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     required = (
         ".claude-plugin/marketplace.json",
-        "plugins/borg/.claude-plugin/plugin.json",
-        "plugins/borg/.mcp.json",
-        "plugins/borg/commands/borg.md",
-        "plugins/borg/skills/orchestrate/SKILL.md",
+        "plugins/betterborg/.claude-plugin/plugin.json",
+        "plugins/betterborg/.mcp.json",
+        "plugins/betterborg/commands/betterborg.md",
+        "plugins/betterborg/skills/orchestrate/SKILL.md",
     )
     content: dict[str, bytes] = {}
     for relative in required:

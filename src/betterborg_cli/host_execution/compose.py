@@ -921,7 +921,7 @@ class HostComposeManager:
 def compose_project_name(claim: TaskClaim) -> str:
     """Return a stable run/task/claim-unique Docker Compose project name."""
     return (
-        f"borg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-"
+        f"betterborg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-"
         f"{claim.id.hex}"
     )
 

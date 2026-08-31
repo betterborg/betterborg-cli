@@ -37,7 +37,7 @@ from betterborg_cli.plugin_installation import (
 )
 
 MARKETPLACE_NAME = "betterborg"
-PLUGIN_NAME = "borg"
+PLUGIN_NAME = "betterborg"
 PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 NEW_THREAD_GUIDANCE = (
     "Start a new Codex thread to load the Betterborg plugin, its skill, and "
@@ -185,7 +185,7 @@ def install_codex_plugin(
             digest,
             version,
             host_name="Codex",
-            manifest_path="plugins/borg/.codex-plugin/plugin.json",
+            manifest_path="plugins/betterborg/.codex-plugin/plugin.json",
             version_change_name="cache-busting version change",
         )
     except PluginCollisionError as error:
@@ -389,9 +389,9 @@ def _plugin_state(value: Any) -> _PluginState:
 def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     required = (
         ".agents/plugins/marketplace.json",
-        "plugins/borg/.codex-plugin/plugin.json",
-        "plugins/borg/.mcp.json",
-        "plugins/borg/skills/orchestrate/SKILL.md",
+        "plugins/betterborg/.codex-plugin/plugin.json",
+        "plugins/betterborg/.mcp.json",
+        "plugins/betterborg/skills/orchestrate/SKILL.md",
     )
     content: dict[str, bytes] = {}
     for relative in required:
@@ -418,7 +418,7 @@ def _validate_and_digest_bundle(source: Any) -> tuple[str, str]:
     expected_entry = {
         "name": PLUGIN_NAME,
         "version": version,
-        "source": {"source": "local", "path": "./plugins/borg"},
+        "source": {"source": "local", "path": "./plugins/betterborg"},
         "policy": {
             "installation": "AVAILABLE",
             "authentication": "ON_INSTALL",

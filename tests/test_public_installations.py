@@ -148,7 +148,7 @@ def test_shared_smoke_rejects_credential_from_every_capture_location(
     with pytest.raises(protected_smoke.ProtectedSmokeError) as raised:
         protected_smoke.run_command(
             leaking_run,
-            ["borg", "version"],
+            ["betterborg", "version"],
             label="test command",
             captures=[],
             credential=CREDENTIAL,

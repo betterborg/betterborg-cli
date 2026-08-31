@@ -20,11 +20,11 @@ STABLE_VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 JSON_VERSION_SOURCES = (
     Path("npm/package.json"),
     Path(
-        "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
+        "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/betterborg/"
         ".claude-plugin/plugin.json"
     ),
     Path(
-        "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
+        "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/betterborg/"
         ".codex-plugin/plugin.json"
     ),
 )
@@ -74,7 +74,7 @@ def _marketplace_version(root: Path, relative_path: Path) -> str | None:
     matches = [
         plugin
         for plugin in plugins
-        if isinstance(plugin, dict) and plugin.get("name") == "borg"
+        if isinstance(plugin, dict) and plugin.get("name") == "betterborg"
     ]
     if len(matches) != 1:
         raise ValueError("must contain exactly one borg plugin entry")

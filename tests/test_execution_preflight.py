@@ -1112,7 +1112,7 @@ def test_expiry_during_compose_startup_serializes_cleanup_and_fences_ready(
         run = store.get_execution_run(fixture.run_id)
         assert run is not None
     project = (
-        f"borg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
+        f"betterborg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
     )
     runner.pause_up.add(project)
 
@@ -1582,7 +1582,7 @@ def test_unhealthy_compose_startup_blocks_and_tears_down_exact_project(
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
         expected_project = (
-            f"borg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
+            f"betterborg-{claim.run_id.hex[:6]}-{claim.task_id.hex[:6]}-{claim.id.hex}"
         )
         runner.fail_up.add(expected_project)
 

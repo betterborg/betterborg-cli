@@ -5,11 +5,11 @@
   },
   "plugins": [
     {
-      "name": "borg",
+      "name": "betterborg",
       "version": "0.1.0",
       "source": {
         "source": "local",
-        "path": "./plugins/borg"
+        "path": "./plugins/betterborg"
       },
       "policy": {
         "installation": "AVAILABLE",

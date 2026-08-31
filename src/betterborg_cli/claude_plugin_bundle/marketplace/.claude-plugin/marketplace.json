@@ -5,9 +5,9 @@
   },
   "plugins": [
     {
-      "name": "borg",
+      "name": "betterborg",
       "version": "0.1.0",
-      "source": "./plugins/borg",
+      "source": "./plugins/betterborg",
       "description": "Plan and execute repository work with Betterborg"
     }
   ]

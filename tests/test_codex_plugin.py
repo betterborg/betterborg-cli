@@ -56,7 +56,7 @@ class _FakeCodex:
                 installed.append(
                     {
                         "pluginId": PLUGIN_ID,
-                        "name": "borg",
+                        "name": "betterborg",
                         "marketplaceName": MARKETPLACE_NAME,
                         "version": self.installed_version,
                         "installed": True,
@@ -67,7 +67,7 @@ class _FakeCodex:
                 available.append(
                     {
                         "pluginId": PLUGIN_ID,
-                        "name": "borg",
+                        "name": "betterborg",
                         "marketplaceName": MARKETPLACE_NAME,
                         "version": self._available_version(),
                         "installed": False,
@@ -107,7 +107,7 @@ class _FakeCodex:
         assert self.marketplace_source is not None
         manifest = (
             Path(self.marketplace_source)
-            / "plugins/borg/.codex-plugin/plugin.json"
+            / "plugins/betterborg/.codex-plugin/plugin.json"
         )
         return json.loads(manifest.read_text(encoding="utf-8"))["version"]
 
@@ -162,17 +162,17 @@ def test_fresh_activation_materializes_registers_installs_and_discovers_mcp(
     assert marketplace["name"] == MARKETPLACE_NAME
     assert marketplace["plugins"][0]["source"] == {
         "source": "local",
-        "path": "./plugins/borg",
+        "path": "./plugins/betterborg",
     }
     manifest = json.loads(
         expected.joinpath(
-            "plugins/borg/.codex-plugin/plugin.json"
+            "plugins/betterborg/.codex-plugin/plugin.json"
         ).read_text()
     )
     assert marketplace["plugins"][0]["version"] == manifest["version"] == __version__
     assert manifest["mcpServers"] == "./.mcp.json"
     assert manifest["skills"] == "./skills/"
-    mcp = json.loads(expected.joinpath("plugins/borg/.mcp.json").read_text())
+    mcp = json.loads(expected.joinpath("plugins/betterborg/.mcp.json").read_text())
     assert mcp == {"betterborg": {"command": "betterborg", "args": ["mcp"]}}
     assert (
         "plugin",
@@ -254,7 +254,7 @@ def test_cachebuster_upgrade_remove_adds_and_retains_previous_bundle(
     assert result.previous_bundle is not None
     assert result.previous_bundle.is_dir()
     previous_manifest = result.previous_bundle / (
-        "plugins/borg/.codex-plugin/plugin.json"
+        "plugins/betterborg/.codex-plugin/plugin.json"
     )
     assert json.loads(previous_manifest.read_text())["version"] == __version__
     assert fake.installed_version == f"{__version__}+codex.next"
@@ -341,7 +341,7 @@ def test_failed_upgrade_restores_prior_bundle_and_host_state(
     assert result.status is CodexPluginStatus.FAILED
     assert "rolled back" in (result.reason or "")
     restored_manifest = first.bundle_path / (
-        "plugins/borg/.codex-plugin/plugin.json"
+        "plugins/betterborg/.codex-plugin/plugin.json"
     )
     assert json.loads(restored_manifest.read_text())["version"] == __version__
     assert fake.marketplace_source == str(first.bundle_path)
@@ -450,7 +450,7 @@ def _upgraded_bundle(tmp_path: Path, name: str, version: str) -> Path:
     source = resources.files("betterborg_cli.codex_plugin_bundle") / "marketplace"
     destination = tmp_path / name
     copy_resource(source, destination)
-    manifest = destination / "plugins/borg/.codex-plugin/plugin.json"
+    manifest = destination / "plugins/betterborg/.codex-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = version
     manifest.write_text(json.dumps(value), encoding="utf-8")

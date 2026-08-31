@@ -27,12 +27,12 @@ VERSION_SOURCES = (
     ("src/betterborg_cli/__init__.py", "python"),
     ("npm/package.json", "top-level"),
     (
-        "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
+        "src/betterborg_cli/claude_plugin_bundle/marketplace/plugins/betterborg/"
         ".claude-plugin/plugin.json",
         "top-level",
     ),
     (
-        "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
+        "src/betterborg_cli/codex_plugin_bundle/marketplace/plugins/betterborg/"
         ".codex-plugin/plugin.json",
         "top-level",
     ),
@@ -58,7 +58,7 @@ PACKAGE_ASSETS = (
         "marketplace.json"
     ),
     (
-        "betterborg_cli/claude_plugin_bundle/marketplace/plugins/borg/"
+        "betterborg_cli/claude_plugin_bundle/marketplace/plugins/betterborg/"
         ".claude-plugin/plugin.json"
     ),
     (
@@ -66,7 +66,7 @@ PACKAGE_ASSETS = (
         "marketplace.json"
     ),
     (
-        "betterborg_cli/codex_plugin_bundle/marketplace/plugins/borg/"
+        "betterborg_cli/codex_plugin_bundle/marketplace/plugins/betterborg/"
         ".codex-plugin/plugin.json"
     ),
 )

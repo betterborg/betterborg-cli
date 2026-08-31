@@ -113,7 +113,7 @@ class _FakeClaude:
         assert self.marketplace_source is not None
         manifest = (
             Path(self.marketplace_source)
-            / "plugins/borg/.claude-plugin/plugin.json"
+            / "plugins/betterborg/.claude-plugin/plugin.json"
         )
         return json.loads(manifest.read_text(encoding="utf-8"))["version"]
 
@@ -163,7 +163,7 @@ def test_fresh_activation_materializes_registers_enables_and_spawns_mcp(
     assert result.bundle_path == tmp_path / "data/betterborg/claude/marketplace"
     marketplace = result.bundle_path / ".claude-plugin/marketplace.json"
     assert json.loads(marketplace.read_text())["name"] == "betterborg"
-    mcp_config = result.bundle_path / "plugins/borg/.mcp.json"
+    mcp_config = result.bundle_path / "plugins/betterborg/.mcp.json"
     assert json.loads(mcp_config.read_text()) == {
         "mcpServers": {"betterborg": {"command": "betterborg", "args": ["mcp"]}}
     }
@@ -279,7 +279,7 @@ def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "upgraded-marketplace"
     copy_resource(source, upgraded)
-    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    manifest = upgraded / "plugins/betterborg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.3.0"
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -291,12 +291,16 @@ def test_owned_upgrade_updates_claude_and_retains_previous_bundle(
     assert result.status is ClaudePluginStatus.INSTALLED
     assert result.previous_bundle is not None
     assert result.previous_bundle.is_dir()
-    old_manifest = result.previous_bundle / "plugins/borg/.claude-plugin/plugin.json"
+    old_manifest = result.previous_bundle / (
+        "plugins/betterborg/.claude-plugin/plugin.json"
+    )
     assert (
         json.loads(old_manifest.read_text(encoding="utf-8"))["version"]
         == __version__
     )
-    current_manifest = result.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    current_manifest = result.bundle_path / (
+        "plugins/betterborg/.claude-plugin/plugin.json"
+    )
     assert json.loads(current_manifest.read_text(encoding="utf-8"))["version"] == (
         "0.3.0"
     )
@@ -309,12 +313,12 @@ def test_owned_bundle_change_requires_a_new_plugin_version(tmp_path: Path) -> No
     first, _ = _install(tmp_path, fake)
     assert first.bundle_path is not None
     original_command = first.bundle_path.joinpath(
-        "plugins/borg/commands/borg.md"
+        "plugins/betterborg/commands/betterborg.md"
     ).read_text(encoding="utf-8")
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     changed = tmp_path / "same-version-marketplace"
     copy_resource(source, changed)
-    command = changed / "plugins/borg/commands/borg.md"
+    command = changed / "plugins/betterborg/commands/betterborg.md"
     command.write_text(command.read_text() + "\nChanged content.\n")
     fake.calls.clear()
 
@@ -322,7 +326,9 @@ def test_owned_bundle_change_requires_a_new_plugin_version(tmp_path: Path) -> No
 
     assert result.status is ClaudePluginStatus.FAILED
     assert f"without a version bump from {__version__}" in (result.reason or "")
-    assert first.bundle_path.joinpath("plugins/borg/commands/borg.md").read_text(
+    assert first.bundle_path.joinpath(
+        "plugins/betterborg/commands/betterborg.md"
+    ).read_text(
         encoding="utf-8"
     ) == original_command
     assert ("plugin", "marketplace", "update", MARKETPLACE_NAME) not in fake.calls
@@ -339,7 +345,7 @@ def test_owned_upgrade_requires_claude_to_report_the_new_version(
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "uncached-upgrade-marketplace"
     copy_resource(source, upgraded)
-    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    manifest = upgraded / "plugins/betterborg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.3.0"
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -349,10 +355,12 @@ def test_owned_upgrade_requires_claude_to_report_the_new_version(
     result, spawns = _install(tmp_path, fake, bundle_source=upgraded)
 
     assert result.status is ClaudePluginStatus.FAILED
-    assert f"reported borg@betterborg at {__version__}, expected 0.3.0" in (
+    assert f"reported betterborg@betterborg at {__version__}, expected 0.3.0" in (
         result.reason or ""
     )
-    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    restored_manifest = first.bundle_path / (
+        "plugins/betterborg/.claude-plugin/plugin.json"
+    )
     assert (
         json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
         == __version__
@@ -369,7 +377,7 @@ def test_reinstall_repairs_materialized_bundle_contents(
     fake = _FakeClaude()
     first, _ = _install(tmp_path, fake)
     assert first.bundle_path is not None
-    command = first.bundle_path / "plugins/borg/commands/borg.md"
+    command = first.bundle_path / "plugins/betterborg/commands/betterborg.md"
     expected = command.read_text(encoding="utf-8")
     if damage == "changed":
         command.write_text("altered\n", encoding="utf-8")
@@ -433,9 +441,9 @@ def test_failed_owned_upgrade_restores_previous_bundle_and_plugin_state(
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "broken-upgrade"
     copy_resource(source, upgraded)
-    command = upgraded / "plugins/borg/commands/borg.md"
+    command = upgraded / "plugins/betterborg/commands/betterborg.md"
     command.write_text(command.read_text() + "\nUpgrade content.\n")
-    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    manifest = upgraded / "plugins/betterborg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.3.0"
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -462,7 +470,7 @@ def test_failed_upgrade_reports_no_op_plugin_rollback(tmp_path: Path) -> None:
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "rollback-no-op"
     copy_resource(source, upgraded)
-    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    manifest = upgraded / "plugins/betterborg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.3.0"
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -482,7 +490,9 @@ def test_failed_upgrade_reports_no_op_plugin_rollback(tmp_path: Path) -> None:
     assert "Rollback also failed" in (result.reason or "")
     assert "version='0.3.0'; expected" in (result.reason or "")
     assert f"version='{__version__}'" in (result.reason or "")
-    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    restored_manifest = first.bundle_path / (
+        "plugins/betterborg/.claude-plugin/plugin.json"
+    )
     assert (
         json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
         == __version__
@@ -502,7 +512,7 @@ def test_failed_bundle_promotion_immediately_restores_previous_bundle(
     source = resources.files("betterborg_cli.claude_plugin_bundle") / "marketplace"
     upgraded = tmp_path / "promotion-failure"
     copy_resource(source, upgraded)
-    manifest = upgraded / "plugins/borg/.claude-plugin/plugin.json"
+    manifest = upgraded / "plugins/betterborg/.claude-plugin/plugin.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
     value["version"] = "0.3.0"
     manifest.write_text(json.dumps(value), encoding="utf-8")
@@ -523,7 +533,9 @@ def test_failed_bundle_promotion_immediately_restores_previous_bundle(
     assert first.bundle_path.joinpath(".betterborg-owned.json").read_text() == (
         original_marker
     )
-    restored_manifest = first.bundle_path / "plugins/borg/.claude-plugin/plugin.json"
+    restored_manifest = first.bundle_path / (
+        "plugins/betterborg/.claude-plugin/plugin.json"
+    )
     assert (
         json.loads(restored_manifest.read_text(encoding="utf-8"))["version"]
         == __version__
