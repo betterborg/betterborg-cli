@@ -28,14 +28,14 @@ Install the latest release binary for Darwin or Linux without a Python
 toolchain:
 
 ```console
-curl --proto '=https' --tlsv1.2 -fsSL https://install.betterborg.ai | sh
+curl -fsSL https://install.betterborg.ai | sh
 ```
 
 `install.betterborg.ai` serves the installer from the latest GitHub Release.
 The canonical release URL works the same way:
 
 ```console
-curl --proto '=https' --tlsv1.2 -fsSL \
+curl -fsSL \
   https://github.com/betterborg/betterborg-cli/releases/latest/download/install.sh \
   | sh
 ```

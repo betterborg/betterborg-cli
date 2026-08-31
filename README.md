@@ -24,7 +24,7 @@ Betterborg is an AI engineering team for substantial software projects, not a ch
     `~/.local/bin/borg`, and then runs step 2 for you:
 
     ```bash
-    curl --proto '=https' --tlsv1.2 -fsSL https://install.betterborg.ai | sh
+    curl -fsSL https://install.betterborg.ai | sh
     ```
 
 2. Activate the agent-host integrations:
