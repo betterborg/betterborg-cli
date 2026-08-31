@@ -510,8 +510,7 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
     assert not canceller.is_alive()
     assert interrupted.exit_code == 1
     assert "was interrupted" in interrupted.output
-    assert "publishing approved tasks" in interrupted.output
-    assert "completed approval was retained" in interrupted.output
+    assert "approval retained; task publication pending" in interrupted.output
     assert len(adapter.calls) == 2
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "cancel-publication")
@@ -538,6 +537,7 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
 
     assert resumed.exit_code == 0, resumed.output
     assert "ready to execute" in resumed.output
+    assert "completed Supervisor" in resumed.output
     assert len(adapter.calls) == 2
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "cancel-publication")
@@ -592,6 +592,8 @@ def test_plan_approve_post_commit_cancellation_keeps_ready_outcome(
 
     assert result.exit_code == 0, result.output
     assert "ready to execute" in result.output
+    assert "completed Supervisor" in result.output
+    assert "stopped Supervisor" not in result.output
     assert len(adapter.calls) == 2
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "post-commit-cancel")

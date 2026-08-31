@@ -125,6 +125,10 @@ def approve_plan_workflow(
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication
+            if borg.state is BorgState.READY_TO_EXECUTE and publication is None:
+                raise RuntimeError(
+                    "Supervisor reached ready state without durable task publication"
+                )
 
         if borg.state is BorgState.READY_TO_EXECUTE:
             if publication is None:

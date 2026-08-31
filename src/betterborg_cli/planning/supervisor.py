@@ -58,6 +58,8 @@ from betterborg_cli.store import (
 
 SUPERVISOR_ROUND_CAP = 3
 _SUPERVISOR_PHASE = "supervisor_review"
+_PUBLICATION_DETAIL = "publishing approved tasks"
+_RETAINED_APPROVAL_RESULT = "approval retained; task publication pending"
 
 _NONBLANK_STRING: dict[str, Any] = {
     "type": "string",
@@ -213,10 +215,13 @@ class SupervisorLoop:
             plan = self._approved_plan(approval)
             self._seed_project_manager_progress(approval)
             self._declare_revision_progress(approval)
+            if self._approved_publication_is_pending(approval):
+                self._start_supervisor_progress(approval)
+                self._show_publication_progress()
             terminal = self._terminal_result(approval)
             if terminal is not None:
                 self._seed_revision_progress(approval)
-                self._seed_supervisor_progress(terminal.attempt)
+                self._complete_or_seed_supervisor_progress(terminal.attempt)
                 return terminal
 
             self._seed_revision_progress(approval)
@@ -232,7 +237,20 @@ class SupervisorLoop:
             SupervisorCancelled,
             KeyboardInterrupt,
         ) as error:
-            self._reconcile_progress(str(error), stopped=True)
+            approval_retained = (
+                isinstance(error, KeyboardInterrupt)
+                and self._approved_publication_is_pending(self._approval())
+            )
+            self._reconcile_progress(
+                _RETAINED_APPROVAL_RESULT if approval_retained else str(error),
+                stopped=True,
+                always_reconcile=True,
+            )
+            if (
+                approval_retained
+                and self._approved_publication_is_pending(self._approval())
+            ):
+                raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
             raise
         except Exception as error:
             self._reconcile_progress(
@@ -373,6 +391,7 @@ class SupervisorLoop:
 
             publication = None
             if decision == "approve":
+                self._show_publication_progress()
                 try:
                     publication = TaskPublisher(
                         self.repository,
@@ -381,10 +400,7 @@ class SupervisorLoop:
                     ).publish(generation.id)
                     generation = publication.generation
                 except TaskPublicationCancelled as error:
-                    raise SupervisorCancelled(
-                        "Supervisor stopped while publishing approved tasks; "
-                        "the completed approval was retained"
-                    ) from error
+                    raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
                 except TaskPublicationError as error:
                     raise SupervisorError(
                         f"approved task publication failed: {error}"
@@ -691,6 +707,32 @@ class SupervisorLoop:
                 planning_attempt_duration(attempt),
             )
 
+    def _complete_or_seed_supervisor_progress(
+        self, attempt: PlanningAttempt
+    ) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        result = planning_attempt_result(attempt, default="review complete")
+        if record.state is StageState.RUNNING:
+            self.progress.complete("supervisor", result)
+        elif record.state is StageState.PENDING:
+            self._seed_supervisor_progress(attempt)
+
+    def _show_publication_progress(self) -> None:
+        if self.progress is None:
+            return
+        record = self.progress.stages["supervisor"]
+        if record.state is StageState.RUNNING:
+            self.progress.update("supervisor", _PUBLICATION_DETAIL)
+
+    def _approved_publication_is_pending(self, approval: PlanApproval) -> bool:
+        borg = self._turns.current_borg()
+        return borg.state is BorgState.SUPERVISOR_WORKING and any(
+            (attempt.result or {}).get("decision") == "approve"
+            for attempt in self._completed_reviews(approval)
+        )
+
     def _finish_progress(self, result: str, *, stopped: bool) -> None:
         if self.progress is None:
             return
@@ -713,19 +755,38 @@ class SupervisorLoop:
             else:
                 self.progress.fail("supervisor", result)
 
-    def _reconcile_progress(self, result: str, *, stopped: bool) -> None:
-        if self.progress is None:
+    def _reconcile_progress(
+        self,
+        result: str,
+        *,
+        stopped: bool,
+        always_reconcile: bool = False,
+    ) -> None:
+        if self.progress is None and not always_reconcile:
             return
-        project_manager = self.progress.stages["project-manager"]
-        record = self.progress.stages["supervisor"]
+        project_manager = (
+            None
+            if self.progress is None
+            else self.progress.stages["project-manager"]
+        )
+        record = (
+            None if self.progress is None else self.progress.stages["supervisor"]
+        )
         if (
-            project_manager.state is not StageState.RUNNING
+            not always_reconcile
+            and project_manager is not None
+            and record is not None
+            and project_manager.state is not StageState.RUNNING
             and record.state is not StageState.RUNNING
         ):
             return
         approval = self._approval()
         initial_attempt = self._initial_pm_attempt(approval)
-        if project_manager.state is StageState.RUNNING and initial_attempt is not None:
+        if (
+            project_manager is not None
+            and project_manager.state is StageState.RUNNING
+            and initial_attempt is not None
+        ):
             self.progress.complete(
                 "project-manager",
                 planning_attempt_result(initial_attempt, default="task batch ready"),
@@ -734,6 +795,8 @@ class SupervisorLoop:
             terminal = self._terminal_result(approval)
         except (SupervisorCancelled, SupervisorError):
             terminal = None
+        if self.progress is None:
+            return
         if terminal is not None:
             self.progress.complete(
                 "supervisor", terminal.attempt.summary or "review complete"
@@ -848,24 +911,35 @@ class SupervisorLoop:
             BorgState.SUPERVISOR_WORKING,
             BorgState.READY_TO_EXECUTE,
         }:
-            try:
-                publication = TaskPublisher(
-                    self.repository,
-                    self.store,
-                    cancel=self.cancel,
-                ).reconcile(self.borg_id)
-                if publication is None or publication.generation.id != generation.id:
-                    return None
-                generation = publication.generation
-            except TaskPublicationCancelled as error:
-                raise SupervisorCancelled(
-                    "Supervisor stopped while publishing approved tasks; "
-                    "the completed approval was retained"
-                ) from error
-            except TaskPublicationError as error:
-                raise SupervisorError(
-                    f"approved task publication failed: {error}"
-                ) from error
+            current = self.store.get_current_task_generation(self.borg_id)
+            publication_is_durable = (
+                current is not None and current.id == generation.id
+            )
+            if (
+                publication_is_durable
+                and self.cancel is not None
+                and self.cancel.is_set()
+            ):
+                generation = current
+            else:
+                try:
+                    publication = TaskPublisher(
+                        self.repository,
+                        self.store,
+                        cancel=self.cancel,
+                    ).reconcile(self.borg_id)
+                    if (
+                        publication is None
+                        or publication.generation.id != generation.id
+                    ):
+                        return None
+                    generation = publication.generation
+                except TaskPublicationCancelled as error:
+                    raise SupervisorCancelled(_RETAINED_APPROVAL_RESULT) from error
+                except TaskPublicationError as error:
+                    raise SupervisorError(
+                        f"approved task publication failed: {error}"
+                    ) from error
             if borg.state is BorgState.SUPERVISOR_WORKING:
                 borg = self._turns.transition(borg, BorgState.READY_TO_EXECUTE)
         if (
