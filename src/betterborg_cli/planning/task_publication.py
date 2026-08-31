@@ -40,6 +40,10 @@ class TaskPublicationError(RuntimeError):
     """Raised when a generation cannot safely become executable."""
 
 
+class TaskPublicationCancelled(TaskPublicationError):
+    """Raised when publication stops before its durable database commit."""
+
+
 class TaskDigestDriftError(TaskPublicationError):
     """Raised when durable task bytes no longer match SQLite metadata."""
 
@@ -71,14 +75,23 @@ class TaskPublisher:
         failure_injector: FailureInjector | None = None,
         cancel: CancellationToken | None = None,
     ) -> None:
-        paths = RepoPaths.discover(repository.root, cancel=cancel)
+        self.cancel = cancel
+        self._raise_if_cancelled()
+        try:
+            paths = RepoPaths.discover(repository.root, cancel=cancel)
+        except ValueError as error:
+            if cancel is not None and cancel.is_set():
+                raise TaskPublicationCancelled(
+                    "task publication cancelled during repository discovery"
+                ) from error
+            raise
+        self._raise_if_cancelled()
         if paths.root != repository.root:
             raise ValueError("repository root does not match its discovered Git root")
         self.repository = repository
         self.store = store
         self.paths = paths
         self.failure_injector = failure_injector
-        self.cancel = cancel
 
     def publish(self, generation_id: UUID) -> TaskPublication:
         """Durably publish one approved generation, resuming any prior attempt."""
@@ -118,6 +131,7 @@ class TaskPublisher:
             staging = staging_parent / str(generation.id)
             self._remove_tree(staging)
             self._stage(staging, expected)
+            self._raise_if_cancelled()
             try:
                 os.rename(staging, destination)
             except OSError as error:
@@ -135,6 +149,7 @@ class TaskPublisher:
         publication = self._verify_tree(borg, generation, destination, expected)
         self._require_git_trackable(publication.files)
         self._checkpoint("before_db_commit")
+        self._raise_if_cancelled()
         try:
             generation = self.store._promote_published_task_generation(
                 generation.id, durable_root=destination
@@ -278,6 +293,7 @@ class TaskPublisher:
     ) -> None:
         self._mkdir_durable(staging)
         for index, (relative, (_record, body)) in enumerate(expected.items()):
+            self._raise_if_cancelled()
             parent = staging / relative.parent
             self._mkdir_durable(parent)
             path = staging / relative
@@ -287,7 +303,9 @@ class TaskPublisher:
                 os.fsync(output.fileno())
             if index == 0:
                 self._checkpoint("during_staging")
+            self._raise_if_cancelled()
         self._checkpoint("after_file_fsync")
+        self._raise_if_cancelled()
         directories = {staging}
         directories.update(
             path.parent for path in (staging / item for item in expected)
@@ -391,7 +409,12 @@ class TaskPublisher:
                     cancel=self.cancel,
                 )
             except (RepositoryGitVisibilityError, RepositoryPathError) as error:
+                if self.cancel is not None and self.cancel.is_set():
+                    raise TaskPublicationCancelled(
+                        "task publication cancelled while checking Git visibility"
+                    ) from error
                 raise TaskPublicationError(str(error)) from error
+            self._raise_if_cancelled()
 
     def _mkdir_durable(self, path: Path) -> None:
         missing: list[Path] = []
@@ -437,6 +460,10 @@ class TaskPublisher:
         if self.failure_injector is not None:
             self.failure_injector(name)
 
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise TaskPublicationCancelled("task publication cancelled")
+
 
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -451,6 +478,7 @@ __all__ = [
     "PublishedTaskFile",
     "TaskDigestDriftError",
     "TaskPublication",
+    "TaskPublicationCancelled",
     "TaskPublicationError",
     "TaskPublisher",
 ]

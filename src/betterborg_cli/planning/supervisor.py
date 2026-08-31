@@ -23,6 +23,8 @@ from betterborg_cli.planning.pm import (
     task_batch_semantic_digest,
 )
 from betterborg_cli.planning.task_publication import (
+    TaskPublication,
+    TaskPublicationCancelled,
     TaskPublicationError,
     TaskPublisher,
 )
@@ -118,6 +120,7 @@ class SupervisorResult:
     dependencies: tuple[TaskDependency, ...]
     findings: tuple[TaskFinding, ...]
     attempt: PlanningAttempt
+    publication: TaskPublication | None
 
 
 class SupervisorLoop:
@@ -302,17 +305,20 @@ class SupervisorLoop:
                 if decision != "approve":
                     borg = self._turns.transition(borg, next_state)
 
+            publication = None
             if decision == "approve":
                 try:
-                    generation = (
-                        TaskPublisher(
-                            self.repository,
-                            self.store,
-                            cancel=self.cancel,
-                        )
-                        .publish(generation.id)
-                        .generation
-                    )
+                    publication = TaskPublisher(
+                        self.repository,
+                        self.store,
+                        cancel=self.cancel,
+                    ).publish(generation.id)
+                    generation = publication.generation
+                except TaskPublicationCancelled as error:
+                    raise SupervisorCancelled(
+                        "Supervisor stopped while publishing approved tasks; "
+                        "the completed approval was retained"
+                    ) from error
                 except TaskPublicationError as error:
                     raise SupervisorError(
                         f"approved task publication failed: {error}"
@@ -329,6 +335,7 @@ class SupervisorLoop:
                     dependencies=dependencies,
                     findings=findings,
                     attempt=completed,
+                    publication=publication,
                 )
 
     def _approval(self) -> PlanApproval:
@@ -595,6 +602,7 @@ class SupervisorLoop:
         )
         if batch is None or generation is None:
             return None
+        publication = None
         if borg.state in {
             BorgState.SUPERVISOR_WORKING,
             BorgState.READY_TO_EXECUTE,
@@ -608,6 +616,11 @@ class SupervisorLoop:
                 if publication is None or publication.generation.id != generation.id:
                     return None
                 generation = publication.generation
+            except TaskPublicationCancelled as error:
+                raise SupervisorCancelled(
+                    "Supervisor stopped while publishing approved tasks; "
+                    "the completed approval was retained"
+                ) from error
             except TaskPublicationError as error:
                 raise SupervisorError(
                     f"approved task publication failed: {error}"
@@ -634,6 +647,7 @@ class SupervisorLoop:
                 if finding.attempt_id == attempt.id
             ),
             attempt=attempt,
+            publication=publication,
         )
 
 

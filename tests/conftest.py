@@ -710,7 +710,7 @@ def _add_approved_task_generation(
     borg: Borg,
     approval: PlanApproval,
     *,
-    body: dict,
+    body: dict | list[dict],
     round_number: int,
     task_ref: str | None = None,
 ) -> TaskGenerationFixture:
@@ -730,36 +730,49 @@ def _add_approved_task_generation(
         manifest={},
     )
     generation_id = uuid4()
-    digest = task_markdown_digest(render_task_markdown(body))
-    task = TaskRecord(
-        generation_id=generation_id,
-        borg_id=borg.id,
-        task_ref=task_ref or f"T-{generation_id.hex}",
-        stage=body["stage"],
-        stem=body["stem"],
-        position=1,
-        title=body["title"],
-        complexity=TaskComplexity(body["estimate_complexity"]),
-        digest=digest,
-        task=body,
-        manifest={"approved_plan_digest": approval.plan_digest, "task.md": digest},
-    )
-    relative_path = (
-        f".borg/tasks/{borg.name}/{generation_id}/{task.stage}/{task.stem}.md"
-    )
+    bodies = body if isinstance(body, list) else [body]
+    tasks = []
+    manifest_tasks = []
+    for position, task_body in enumerate(bodies, start=1):
+        digest = task_markdown_digest(render_task_markdown(task_body))
+        record = TaskRecord(
+            generation_id=generation_id,
+            borg_id=borg.id,
+            task_ref=(
+                task_ref
+                if position == 1 and task_ref is not None
+                else f"T-{generation_id.hex}-{position}"
+            ),
+            stage=task_body["stage"],
+            stem=task_body["stem"],
+            position=position,
+            title=task_body["title"],
+            complexity=TaskComplexity(task_body["estimate_complexity"]),
+            digest=digest,
+            task=task_body,
+            manifest={
+                "approved_plan_digest": approval.plan_digest,
+                "task.md": digest,
+            },
+        )
+        tasks.append(record)
+        manifest_tasks.append(
+            {
+                "digest": digest,
+                "path": (
+                    f".borg/tasks/{borg.name}/{generation_id}/"
+                    f"{record.stage}/{record.stem}.md"
+                ),
+                "position": record.position,
+                "task_ref": record.task_ref,
+            }
+        )
     manifest = {
         "approved_plan_digest": approval.plan_digest,
         "batch_digest": batch.digest,
         "dependencies": [],
         "plan_approval_id": str(approval.id),
-        "tasks": [
-            {
-                "digest": digest,
-                "path": relative_path,
-                "position": task.position,
-                "task_ref": task.task_ref,
-            }
-        ],
+        "tasks": manifest_tasks,
     }
     generation = TaskGeneration(
         id=generation_id,
@@ -783,14 +796,14 @@ def _add_approved_task_generation(
     )
     store.append_planning_attempt(attempt)
     store.append_task_batch(batch)
-    store.add_task_generation(generation, [task])
+    store.add_task_generation(generation, tasks)
     store.complete_planning_attempt(
         attempt.id,
         status=PlanningAttemptStatus.COMPLETED,
         result={"decision": "approve", "summary": "Ready.", "findings": []},
         summary="Ready.",
     )
-    return TaskGenerationFixture(generation=generation, task=task)
+    return TaskGenerationFixture(generation=generation, task=tasks[0])
 
 
 def _persist_repository_analysis(

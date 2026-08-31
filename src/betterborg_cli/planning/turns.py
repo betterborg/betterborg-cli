@@ -7,7 +7,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+from uuid import UUID
 
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
@@ -23,6 +24,7 @@ from betterborg_cli.agent_runtime.structured import (
 )
 from betterborg_cli.planning.plan_contracts import validate_plan
 from betterborg_cli.planning.worktree import materialize_planning_worktree
+from betterborg_cli.progress import AgentActivity
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -33,6 +35,82 @@ from betterborg_cli.store import (
 )
 
 ErrorFactory = Callable[[str], Exception]
+
+
+def current_planning_cycle_attempts(
+    store: SqliteStore, borg_id: UUID
+) -> list[PlanningAttempt]:
+    """Return attempts belonging to the latest human planning cycle."""
+
+    attempts = store.list_planning_attempts(borg_id)
+    change_requests = store.list_plan_change_requests(borg_id)
+    if not change_requests:
+        return attempts
+    cycle_started_at = change_requests[-1].created_at
+    return [item for item in attempts if item.started_at >= cycle_started_at]
+
+
+def completed_planning_phase_attempts(
+    attempts: Sequence[PlanningAttempt], phase: str
+) -> list[PlanningAttempt]:
+    """Project one phase's completed attempts from durable cycle history."""
+
+    return [
+        item
+        for item in attempts
+        if item.phase == phase and item.status is PlanningAttemptStatus.COMPLETED
+    ]
+
+
+def planning_request_change_attempts(
+    attempts: Sequence[PlanningAttempt], phase: str, *, round_cap: int
+) -> list[PlanningAttempt]:
+    """Return review rejections which are eligible to create revision work."""
+
+    return [
+        item
+        for index, item in enumerate(
+            completed_planning_phase_attempts(attempts, phase), start=1
+        )
+        if index < round_cap
+        and (item.result or {}).get("decision") == "request_changes"
+    ]
+
+
+def latest_planning_review_requests_changes(
+    attempts: Sequence[PlanningAttempt], phase: str
+) -> bool:
+    """Return whether the latest completed review requests another revision."""
+
+    completed = completed_planning_phase_attempts(attempts, phase)
+    return bool(
+        completed
+        and (completed[-1].result or {}).get("decision") == "request_changes"
+    )
+
+
+def planning_attempt_result(attempt: PlanningAttempt, *, default: str) -> str:
+    """Return the durable summary used for retained progress history."""
+
+    return attempt.summary or str((attempt.result or {}).get("title") or default)
+
+
+def planning_attempt_duration(attempt: PlanningAttempt) -> float | None:
+    """Return a completed attempt's non-negative authoritative duration."""
+
+    if attempt.finished_at is None:
+        return None
+    return max((attempt.finished_at - attempt.started_at).total_seconds(), 0.0)
+
+
+class PlanningProgress(Protocol):
+    """Provider-neutral activity operations used by a planning turn."""
+
+    def activity(self, stage_key: str, activity: AgentActivity) -> object: ...
+
+    def child_activity(
+        self, stage_key: str, child_key: str, activity: AgentActivity
+    ) -> object: ...
 
 
 class DurablePlanningTurns:
@@ -51,6 +129,9 @@ class DurablePlanningTurns:
         error_factory: ErrorFactory,
         cancelled_error_factory: ErrorFactory,
         cancel: CancellationToken | None = None,
+        progress: PlanningProgress | None = None,
+        stage_key: str | None = None,
+        child_key: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
@@ -60,6 +141,10 @@ class DurablePlanningTurns:
             raise ValueError(
                 "Borg must already belong to the supplied repository and store"
             )
+        if progress is None and (stage_key is not None or child_key is not None):
+            raise ValueError("planning progress keys require a progress reporter")
+        if progress is not None and stage_key is None:
+            raise ValueError("planning progress requires a stage key")
         self.repository = repository
         self.borg_id = borg.id
         self.store = store
@@ -70,6 +155,9 @@ class DurablePlanningTurns:
         self.error_factory = error_factory
         self.cancelled_error_factory = cancelled_error_factory
         self.cancel = cancel
+        self.progress = progress
+        self.stage_key = stage_key
+        self.child_key = child_key
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
 
@@ -141,6 +229,9 @@ class DurablePlanningTurns:
                         allowed_tools=READ_ONLY_API_TOOLS,
                         log_path=result_path.with_suffix(".log"),
                         result_path=result_path,
+                        activity_sink=(
+                            self._record_activity if self.progress is not None else None
+                        ),
                     ),
                     cancel=self.cancel,
                 )
@@ -241,6 +332,14 @@ class DurablePlanningTurns:
         with self.materialized_worktree() as worktree:
             validate_plan(plan, worktree)
 
+    def _record_activity(self, activity: AgentActivity) -> None:
+        if self.progress is None or self.stage_key is None:
+            return
+        if self.child_key is None:
+            self.progress.activity(self.stage_key, activity)
+            return
+        self.progress.child_activity(self.stage_key, self.child_key, activity)
+
     def _start_attempt(
         self,
         phase: str,
@@ -296,4 +395,12 @@ class DurablePlanningTurns:
         return payload
 
 
-__all__ = ["DurablePlanningTurns"]
+__all__ = [
+    "DurablePlanningTurns",
+    "completed_planning_phase_attempts",
+    "current_planning_cycle_attempts",
+    "latest_planning_review_requests_changes",
+    "planning_attempt_duration",
+    "planning_attempt_result",
+    "planning_request_change_attempts",
+]

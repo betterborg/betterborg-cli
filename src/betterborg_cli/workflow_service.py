@@ -107,9 +107,10 @@ def approve_plan_workflow(
         if borg is None:
             raise RuntimeError(f"Borg {name!r} disappeared during approval")
 
+        publication = None
         if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
             agent = planning_agent()
-            borg = SupervisorLoop(
+            supervisor = SupervisorLoop(
                 repository,
                 borg,
                 store,
@@ -118,15 +119,17 @@ def approve_plan_workflow(
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
                 cancel=cancel,
-            ).run().borg
+            ).run()
+            borg = supervisor.borg
+            publication = supervisor.publication
 
-        publication = None
         if borg.state is BorgState.READY_TO_EXECUTE:
-            publication = TaskPublisher(
-                repository,
-                store,
-                cancel=cancel,
-            ).reconcile(borg.id)
+            if publication is None:
+                publication = TaskPublisher(
+                    repository,
+                    store,
+                    cancel=cancel,
+                ).reconcile(borg.id)
             if publication is None:
                 raise RuntimeError(
                     f"Borg {name!r} is ready to execute but has no current tasks"
