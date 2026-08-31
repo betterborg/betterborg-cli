@@ -14,6 +14,7 @@ from uuid import UUID
 
 import anyio
 import click
+from mcp import types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -500,6 +501,39 @@ class _WorkerResult:
         return result
 
 
+class _CancelledElicitationResponses:
+    """Fence late responses for nested elicitation requests being cancelled."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._pending: dict[object, anyio.Event] = {}
+
+    def register(self, request_id: object) -> anyio.Event:
+        acknowledged = anyio.Event()
+        self._pending[request_id] = acknowledged
+        return acknowledged
+
+    def discard(self, request_id: object) -> None:
+        self._pending.pop(request_id, None)
+
+    def _route(self, request_id: object) -> bool:
+        acknowledged = self._pending.get(request_id)
+        if acknowledged is None:
+            return False
+        acknowledged.set()
+        if request_id in self._session._response_streams:
+            # Let a still-live send_request receive its normal response.
+            return False
+        self._pending.pop(request_id, None)
+        return True
+
+    def route_error(self, request_id: object, _error: object) -> bool:
+        return self._route(request_id)
+
+    def route_response(self, request_id: object, _response: object) -> bool:
+        return self._route(request_id)
+
+
 async def _wait_for_thread_event(
     event: threading.Event,
     timeout: float | None = None,
@@ -531,9 +565,20 @@ def _defer_protocol_response() -> Callable[[], None] | None:
             # The SDK's responder sends its cancellation error immediately after
             # cancelling the handler. Gate that send on BetterBorg's stronger
             # worker/result fence for requests running synchronous workflows.
+            # The SDK also awaits this method from its receive loop, so defer the
+            # wait to the session task group; keeping that loop free is required
+            # to receive a nested elicitation's cancellation acknowledgement.
             fence = response_fences.get(request_id)
             if fence is not None:
-                await fence.wait()
+                async def send_after_fence() -> None:
+                    await fence.wait()
+                    await original_send_response(
+                        request_id=request_id,
+                        response=response,
+                    )
+
+                session._task_group.start_soon(send_after_fence)
+                return
             await original_send_response(
                 request_id=request_id,
                 response=response,
@@ -633,9 +678,9 @@ async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
             # worker owns provider, subprocess, and durable-state cleanup. Shield
             # that cleanup so the request cannot disappear before its worker does.
             with anyio.CancelScope(shield=True):
-                for io in interactive_ios:
-                    io._cancel_active_elicitation()
                 control.cancellation.cancel()
+                for io in interactive_ios:
+                    await io._cancel_active_elicitation()
                 if outcome.started.is_set():
                     deadline = control.cancellation.force_deadline
                     timeout = (
@@ -827,6 +872,7 @@ class McpInteractiveIO(InteractiveIO):
         self._rendered: list[str] = []
         self._cancel: CancellationToken | None = None
         self._active_elicitation: anyio.CancelScope | None = None
+        self._active_elicitation_request_id: object | None = None
         super().__init__(
             prompt=self._prompt,
             confirm=self._confirm,
@@ -836,9 +882,66 @@ class McpInteractiveIO(InteractiveIO):
     def _bind_cancellation(self, cancel: CancellationToken) -> None:
         self._cancel = cancel
 
-    def _cancel_active_elicitation(self) -> None:
-        if self._active_elicitation is not None:
-            self._active_elicitation.cancel()
+    async def _cancel_active_elicitation(self) -> None:
+        scope = self._active_elicitation
+        if scope is None:
+            return
+
+        request_id = self._active_elicitation_request_id
+        acknowledged: anyio.Event | None = None
+        response_router: _CancelledElicitationResponses | None = None
+        try:
+            if request_id is not None:
+                session = self._context.session
+                try:
+                    response_router = session._betterborg_elicitation_responses
+                except AttributeError:
+                    response_router = _CancelledElicitationResponses(session)
+                    session._betterborg_elicitation_responses = response_router
+                    session.add_response_router(response_router)
+                acknowledged = response_router.register(request_id)
+                await session.send_notification(
+                    mcp_types.ServerNotification(
+                        mcp_types.CancelledNotification(
+                            params=mcp_types.CancelledNotificationParams(
+                                requestId=request_id,
+                                reason="Parent request cancelled",
+                            )
+                        )
+                    ),
+                    related_request_id=self._context.request_id,
+                )
+                force_deadline = (
+                    self._cancel.force_deadline
+                    if self._cancel is not None
+                    else None
+                )
+                timeout = (
+                    max(0.0, force_deadline - time.monotonic())
+                    if force_deadline is not None
+                    else 0.0
+                )
+                with anyio.move_on_after(timeout):
+                    await acknowledged.wait()
+        finally:
+            # Do not depend on the peer acknowledging cancellation before the
+            # synchronous workflow can unwind. Protocol-capable clients cancel
+            # their matching callback from the notification above; this local
+            # scope releases the worker even if a peer has disconnected.
+            scope.cancel()
+            # A cancellation response acknowledges the nested request before
+            # the peer callback's cancelled task necessarily gets its next turn.
+            # Yield once before the parent response fence can be released.
+            await anyio.lowlevel.checkpoint()
+            if (
+                acknowledged is not None
+                and acknowledged.is_set()
+                and response_router is not None
+            ):
+                response_router.discard(request_id)
+            if self._active_elicitation is scope:
+                self._active_elicitation = None
+                self._active_elicitation_request_id = None
 
     @staticmethod
     def supported(context: Context) -> bool:
@@ -862,8 +965,17 @@ class McpInteractiveIO(InteractiveIO):
         return f"{rendered}\n\n{message}"
 
     async def _await_elicitation(self, call: Callable[[], Any]) -> Any:
-        scope = anyio.CancelScope()
+        # The parent request's protocol cancellation is handled by
+        # ``_cancel_active_elicitation``. Shield this nested request long enough
+        # for that path to notify the peer and receive its cancellation response
+        # instead of abandoning the peer callback in flight.
+        scope = anyio.CancelScope(shield=True)
         self._active_elicitation = scope
+        # BaseSession.send_request allocates this ID synchronously before its
+        # first checkpoint. Recording the next ID immediately before ``call``
+        # therefore identifies the nested elicitation request that cancellation
+        # must address, even when the parent tool request has a different ID.
+        self._active_elicitation_request_id = self._context.session._request_id
         result: object = _MISSING
         try:
             with scope:
@@ -871,8 +983,12 @@ class McpInteractiveIO(InteractiveIO):
                     scope.cancel()
                 result = await call()
         finally:
-            if self._active_elicitation is scope:
+            if (
+                self._active_elicitation is scope
+                and (self._cancel is None or not self._cancel.is_set())
+            ):
                 self._active_elicitation = None
+                self._active_elicitation_request_id = None
         if scope.cancelled_caught:
             raise anyio.get_cancelled_exc_class()
         if result is _MISSING:

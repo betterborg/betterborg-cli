@@ -18,6 +18,7 @@ import anyio
 import pytest
 from conftest import blocked_dns_url_request_worker
 from mcp import types as mcp_types
+from mcp.client.session import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from test_adapter_harness import (
@@ -681,28 +682,85 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
 def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
     monkeypatch,
 ) -> None:
+    order: list[str] = []
     worker_finished = threading.Event()
     received_tokens = []
+    protocol_errors: list[McpError] = []
+    tool_results: list[object] = []
+    cancellation_requested: list[float] = []
+    request_finished: list[float] = []
 
     def blocked_create(_name, _source, io, *, cancel):
         received_tokens.append(cancel)
         try:
             io.prompt("Wait for an answer")
         finally:
+            order.append("worker-finished")
             worker_finished.set()
         raise AssertionError("cancelled elicitation fabricated a tool result")
 
     monkeypatch.setattr(mcp_server, "_create", blocked_create)
 
-    async def run() -> tuple[bool, bool]:
+    # The SDK's default in-memory client runs request callbacks in its receive
+    # loop, which prevents it from receiving cancellation while a callback is
+    # blocked. Real protocol clients dispatch incoming requests concurrently;
+    # make the test peer do the same so this exercises the cancellation
+    # notification instead of relying on session teardown.
+    received_request = ClientSession._received_request
+
+    async def dispatch_request(self, responder) -> None:
+        callback_ready = anyio.Event()
+        callback_finished = anyio.Event()
+        callback_scopes: list[anyio.CancelScope] = []
+
+        async def handle_request() -> None:
+            try:
+                await received_request(self, responder)
+            finally:
+                callback_finished.set()
+
+        async def host_request() -> None:
+            async with anyio.create_task_group() as callbacks:
+                callback_scopes.append(callbacks.cancel_scope)
+                callback_ready.set()
+                callbacks.start_soon(handle_request)
+
+        async def cancel_after_callback() -> None:
+            await callback_ready.wait()
+            callback_scopes[0].cancel()
+            await callback_finished.wait()
+            responder._completed = True
+            responder._on_complete(responder)
+            await responder._session._send_response(
+                request_id=responder.request_id,
+                response=mcp_types.ErrorData(
+                    code=0,
+                    message="Request cancelled",
+                    data=None,
+                ),
+            )
+
+        # A cancellation response is the peer's acknowledgement that its
+        # callback has unwound. The SDK sends that response before its default
+        # callback task exits, so this protocol peer tightens the ordering that
+        # the BetterBorg parent-response fence relies on and verifies.
+        responder.cancel = cancel_after_callback
+        self._task_group.start_soon(host_request)
+        await callback_ready.wait()
+
+    monkeypatch.setattr(ClientSession, "_received_request", dispatch_request)
+
+    async def run() -> None:
         elicitation_started = anyio.Event()
         elicitation_unwound = anyio.Event()
+        call_finished = anyio.Event()
 
         async def elicit(_context, _params):
             elicitation_started.set()
             try:
                 await anyio.sleep_forever()
             finally:
+                order.append("elicitation-unwound")
                 elicitation_unwound.set()
 
         async with create_connected_server_and_client_session(
@@ -710,23 +768,56 @@ def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
             raise_exceptions=True,
             elicitation_callback=elicit,
         ) as session:
-            call_scope = anyio.CancelScope()
+            request_id = session._request_id
 
             async def call() -> None:
-                with call_scope:
-                    await session.call_tool("create", {"name": "cancel-me"})
+                try:
+                    tool_results.append(
+                        await session.call_tool(
+                            "create",
+                            {"name": "cancel-me"},
+                        )
+                    )
+                except McpError as error:
+                    protocol_errors.append(error)
+                finally:
+                    order.append("request-finished")
+                    request_finished.append(time.monotonic())
+                    call_finished.set()
 
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(call)
                 await elicitation_started.wait()
-                call_scope.cancel()
+                cancellation_requested.append(time.monotonic())
+                await session.send_notification(
+                    mcp_types.CancelledNotification(
+                        params=mcp_types.CancelledNotificationParams(
+                            requestId=request_id,
+                            reason="test cancellation",
+                        )
+                    )
+                )
+                with anyio.fail_after(DEFAULT_FORCE_GRACE_SECONDS + 0.5):
+                    await call_finished.wait()
 
-        return elicitation_unwound.is_set(), worker_finished.is_set()
+                assert elicitation_unwound.is_set()
+                assert worker_finished.is_set()
+                assert len((await session.list_tools()).tools) > 0
 
-    elicitation_unwound, worker_unwound = anyio.run(run)
+    anyio.run(run)
 
-    assert elicitation_unwound is True
-    assert worker_unwound is True
+    assert tool_results == []
+    assert len(protocol_errors) == 1
+    assert str(protocol_errors[0]) == "Request cancelled"
+    assert order == [
+        "elicitation-unwound",
+        "worker-finished",
+        "request-finished",
+    ]
+    assert (
+        request_finished[0] - cancellation_requested[0]
+        <= DEFAULT_FORCE_GRACE_SECONDS + 0.1
+    )
     assert len(received_tokens) == 1
     assert received_tokens[0].is_set() is True
 
