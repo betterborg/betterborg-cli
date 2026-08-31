@@ -511,104 +511,164 @@ async def _wait_for_thread_event(
     return event.is_set()
 
 
+def _defer_protocol_response() -> Callable[[], None] | None:
+    """Hold this MCP request's response until its synchronous work is fenced."""
+    try:
+        request_context = server.get_context().request_context
+    except ValueError:
+        # Direct unit callers do not run inside an MCP request.
+        return None
+
+    session = request_context.session
+    request_id = request_context.request_id
+    try:
+        response_fences = session._betterborg_protocol_response_fences
+    except AttributeError:
+        response_fences = {}
+        original_send_response = session._send_response
+
+        async def send_response(*, request_id: object, response: object) -> None:
+            # The SDK's responder sends its cancellation error immediately after
+            # cancelling the handler. Gate that send on BetterBorg's stronger
+            # worker/result fence for requests running synchronous workflows.
+            fence = response_fences.get(request_id)
+            if fence is not None:
+                await fence.wait()
+            await original_send_response(
+                request_id=request_id,
+                response=response,
+            )
+
+        session._betterborg_protocol_response_fences = response_fences
+        session._send_response = send_response
+
+    fence = anyio.Event()
+    if request_id in response_fences:
+        raise RuntimeError(f"MCP request {request_id!r} already has a response fence")
+    response_fences[request_id] = fence
+
+    def release() -> None:
+        fence.set()
+        if response_fences.get(request_id) is fence:
+            response_fences.pop(request_id)
+
+    return release
+
+
 async def _run_cancellable(function: Callable[..., Any], *args: object) -> Any:
     """Run synchronous MCP work under cooperative cancellation and force cleanup."""
-    control = RunControl()
-    outcome = _WorkerResult()
-    invocation_finished = anyio.Event()
-    worker_slot_acquired = False
-
-    def run() -> Any:
-        outcome.started.set()
-        try:
-            return outcome.run(
-                lambda: function(*args, cancel=control.cancellation)
-            )
-        finally:
-            _MCP_WORKER_SLOTS.release()
-
-    async def invoke() -> None:
-        try:
-            await anyio.to_thread.run_sync(
-                run,
-                abandon_on_cancel=True,
-                limiter=_MCP_THREAD_LIMITER,
-            )
-        except BaseException:
-            # The result fence owns the synchronous exception. Cancellation of
-            # this adapter task abandons only its wait, never the worker.
-            pass
-        finally:
-            if not outcome.started.is_set():
-                # Thread startup itself failed or was cancelled while waiting
-                # for the shared pool after this request reserved a worker slot.
-                _MCP_WORKER_SLOTS.release()
-            invocation_finished.set()
-
+    release_protocol_response = _defer_protocol_response()
     try:
-        # Polling the process-wide semaphore keeps queued requests cancellable
-        # without spending a thread on coordination. Its nonblocking first
-        # attempt also lets an already-cancelled request start and observe its
-        # token when capacity is immediately available.
-        while not worker_slot_acquired:
-            worker_slot_acquired = _MCP_WORKER_SLOTS.acquire(blocking=False)
-            if not worker_slot_acquired:
-                await anyio.sleep(0.01)
+        control = RunControl()
+        outcome = _WorkerResult()
+        invocation_finished = anyio.Event()
+        worker_slot_acquired = False
+        interactive_ios = tuple(
+            argument
+            for argument in args
+            if isinstance(argument, McpInteractiveIO)
+        )
+        for io in interactive_ios:
+            io._bind_cancellation(control.cancellation)
 
-        # Guarantee that the AnyIO worker has started before exposing it to an
-        # already-pending request cancellation. This also preserves
-        # ``from_thread.run()`` support for MCP elicitation in the worker.
-        with anyio.CancelScope(shield=True) as startup:
-            async with anyio.create_task_group() as tasks:
-                tasks.start_soon(invoke)
-                while (
-                    not outcome.started.is_set()
-                    and not invocation_finished.is_set()
-                ):
+        def run() -> Any:
+            outcome.started.set()
+            try:
+                return outcome.run(
+                    lambda: function(*args, cancel=control.cancellation)
+                )
+            finally:
+                _MCP_WORKER_SLOTS.release()
+
+        async def invoke() -> None:
+            try:
+                await anyio.to_thread.run_sync(
+                    run,
+                    abandon_on_cancel=True,
+                    limiter=_MCP_THREAD_LIMITER,
+                )
+            except BaseException:
+                # The result fence owns the synchronous exception. Cancellation
+                # of this adapter task abandons only its wait, never the worker.
+                pass
+            finally:
+                if not outcome.started.is_set():
+                    # Thread startup itself failed or was cancelled while waiting
+                    # for the pool after this request reserved a worker slot.
+                    _MCP_WORKER_SLOTS.release()
+                invocation_finished.set()
+
+        try:
+            # Polling the process-wide semaphore keeps queued requests cancellable
+            # without spending a thread on coordination. Its nonblocking first
+            # attempt also lets an already-cancelled request start and observe its
+            # token when capacity is immediately available.
+            while not worker_slot_acquired:
+                worker_slot_acquired = _MCP_WORKER_SLOTS.acquire(blocking=False)
+                if not worker_slot_acquired:
                     await anyio.sleep(0.01)
-                startup.shield = False
-                await invocation_finished.wait()
-                if not outcome.completed.is_set():
-                    # The adapter wait was abandoned by request cancellation;
-                    # surface that pending cancellation to the cleanup branch.
-                    await anyio.lowlevel.checkpoint()
-                    raise RuntimeError("MCP worker wait ended before completion")
-    except anyio.get_cancelled_exc_class():
-        # The request task owns protocol cancellation while the synchronous
-        # worker owns provider, subprocess, and durable-state cleanup. Shield
-        # that cleanup so the request cannot disappear before its worker does.
-        with anyio.CancelScope(shield=True):
-            control.cancellation.cancel()
-            if outcome.started.is_set():
-                deadline = control.cancellation.force_deadline
-                timeout = (
-                    max(0.0, deadline - time.monotonic())
-                    if deadline is not None
-                    else 0.0
-                )
-                completed = await _wait_for_thread_event(
-                    outcome.completed,
-                    timeout,
-                )
-                if not completed:
-                    try:
-                        await anyio.to_thread.run_sync(
-                            control.cancellation.force,
-                            limiter=_MCP_THREAD_LIMITER,
+
+            # Guarantee that the AnyIO worker has started before exposing it to an
+            # already-pending request cancellation. This also preserves
+            # ``from_thread.run()`` support for MCP elicitation in the worker.
+            with anyio.CancelScope(shield=True) as startup:
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(invoke)
+                    while (
+                        not outcome.started.is_set()
+                        and not invocation_finished.is_set()
+                    ):
+                        await anyio.sleep(0.01)
+                    startup.shield = False
+                    await invocation_finished.wait()
+                    if not outcome.completed.is_set():
+                        # The adapter wait was abandoned by request cancellation;
+                        # surface that pending cancellation to the cleanup branch.
+                        await anyio.lowlevel.checkpoint()
+                        raise RuntimeError(
+                            "MCP worker wait ended before completion"
                         )
+        except anyio.get_cancelled_exc_class():
+            # The request task owns protocol cancellation while the synchronous
+            # worker owns provider, subprocess, and durable-state cleanup. Shield
+            # that cleanup so the request cannot disappear before its worker does.
+            with anyio.CancelScope(shield=True):
+                for io in interactive_ios:
+                    io._cancel_active_elicitation()
+                control.cancellation.cancel()
+                if outcome.started.is_set():
+                    deadline = control.cancellation.force_deadline
+                    timeout = (
+                        max(0.0, deadline - time.monotonic())
+                        if deadline is not None
+                        else 0.0
+                    )
+                    completed = await _wait_for_thread_event(
+                        outcome.completed,
+                        timeout,
+                    )
+                    if not completed:
+                        try:
+                            await anyio.to_thread.run_sync(
+                                control.cancellation.force,
+                                limiter=_MCP_THREAD_LIMITER,
+                            )
+                        except BaseException:
+                            # A force callback failure must not replace protocol
+                            # cancellation or bypass the worker completion fence.
+                            pass
+                        await _wait_for_thread_event(outcome.completed)
+                    try:
+                        outcome.acknowledge()
                     except BaseException:
-                        # A force callback failure must not replace protocol
-                        # cancellation or bypass the synchronous worker fence.
+                        # Protocol cancellation remains the request outcome. Reading
+                        # the worker outcome is required before re-raising it.
                         pass
-                    await _wait_for_thread_event(outcome.completed)
-                try:
-                    outcome.acknowledge()
-                except BaseException:
-                    # Protocol cancellation remains the request outcome. Reading
-                    # the worker outcome is still required before re-raising it.
-                    pass
-        raise
-    return outcome.acknowledge()
+            raise
+        return outcome.acknowledge()
+    finally:
+        if release_protocol_response is not None:
+            release_protocol_response()
 
 
 def _progress_phase(
@@ -765,11 +825,20 @@ class McpInteractiveIO(InteractiveIO):
     def __init__(self, context: Context) -> None:
         self._context = context
         self._rendered: list[str] = []
+        self._cancel: CancellationToken | None = None
+        self._active_elicitation: anyio.CancelScope | None = None
         super().__init__(
             prompt=self._prompt,
             confirm=self._confirm,
             write=self._write,
         )
+
+    def _bind_cancellation(self, cancel: CancellationToken) -> None:
+        self._cancel = cancel
+
+    def _cancel_active_elicitation(self) -> None:
+        if self._active_elicitation is not None:
+            self._active_elicitation.cancel()
 
     @staticmethod
     def supported(context: Context) -> bool:
@@ -792,8 +861,31 @@ class McpInteractiveIO(InteractiveIO):
         self._rendered.clear()
         return f"{rendered}\n\n{message}"
 
+    async def _await_elicitation(self, call: Callable[[], Any]) -> Any:
+        scope = anyio.CancelScope()
+        self._active_elicitation = scope
+        result: object = _MISSING
+        try:
+            with scope:
+                if self._cancel is not None and self._cancel.is_set():
+                    scope.cancel()
+                result = await call()
+        finally:
+            if self._active_elicitation is scope:
+                self._active_elicitation = None
+        if scope.cancelled_caught:
+            raise anyio.get_cancelled_exc_class()
+        if result is _MISSING:
+            raise RuntimeError("MCP elicitation completed without a result")
+        return result
+
     async def _elicit_answer(self, message: str) -> str | None:
-        result = await self._context.elicit(self._message(message), ElicitedAnswer)
+        result = await self._await_elicitation(
+            lambda: self._context.elicit(
+                self._message(message),
+                ElicitedAnswer,
+            )
+        )
         if result.action != "accept":
             return None
         return result.data.answer
@@ -805,7 +897,12 @@ class McpInteractiveIO(InteractiveIO):
                 description="Approve this operation",
             )
 
-        result = await self._context.elicit(self._message(message), Confirmation)
+        result = await self._await_elicitation(
+            lambda: self._context.elicit(
+                self._message(message),
+                Confirmation,
+            )
+        )
         return result.action == "accept" and result.data.approved
 
     def _prompt(self, message: str) -> str | None:

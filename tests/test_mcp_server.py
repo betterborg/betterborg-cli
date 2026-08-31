@@ -18,6 +18,7 @@ import anyio
 import pytest
 from conftest import blocked_dns_url_request_worker
 from mcp import types as mcp_types
+from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from test_adapter_harness import (
     LocalHttpServer,
@@ -185,6 +186,88 @@ def test_run_cancellable_forces_and_waits_for_worker_completion() -> None:
         "cancelled",
         "forced",
         "worker-finally",
+        "request-returned",
+    ]
+
+
+def test_protocol_cancellation_waits_for_worker_completion(monkeypatch) -> None:
+    worker_started = threading.Event()
+    cancellation_received = threading.Event()
+    release_worker = threading.Event()
+    worker_completed = threading.Event()
+    order: list[str] = []
+
+    def workflow(_io, *, cancel) -> None:
+        worker_started.set()
+        try:
+            assert cancel.wait(timeout=2)
+            order.append("token-cancelled")
+            cancellation_received.set()
+            assert release_worker.wait(timeout=2)
+        finally:
+            order.append("worker-completed")
+            worker_completed.set()
+
+    async def wait_for_thread_event(event: threading.Event) -> None:
+        while not event.is_set():
+            await anyio.sleep(0.01)
+
+    async def run() -> list[McpError]:
+        call_finished = anyio.Event()
+        errors: list[McpError] = []
+
+        async def elicit(_context, _params):
+            raise AssertionError("analyze must not elicit")
+
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+            elicitation_callback=elicit,
+        ) as session:
+            request_id = session._request_id
+
+            async def call() -> None:
+                try:
+                    await session.call_tool("analyze", {})
+                except McpError as error:
+                    errors.append(error)
+                finally:
+                    order.append("request-returned")
+                    call_finished.set()
+
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(call)
+                await wait_for_thread_event(worker_started)
+                await session.send_notification(
+                    mcp_types.CancelledNotification(
+                        params=mcp_types.CancelledNotificationParams(
+                            requestId=request_id,
+                            reason="test cancellation",
+                        )
+                    )
+                )
+                await wait_for_thread_event(cancellation_received)
+                with anyio.move_on_after(0.05):
+                    await call_finished.wait()
+                assert call_finished.is_set() is False
+                release_worker.set()
+                with anyio.fail_after(2):
+                    await call_finished.wait()
+
+        return errors
+
+    monkeypatch.setattr(mcp_server, "_analyze", workflow)
+    try:
+        errors = anyio.run(run)
+    finally:
+        release_worker.set()
+
+    assert worker_completed.is_set()
+    assert len(errors) == 1
+    assert str(errors[0]) == "Request cancelled"
+    assert order == [
+        "token-cancelled",
+        "worker-completed",
         "request-returned",
     ]
 
@@ -502,7 +585,9 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
             )
 
     request_teardown: list[float] = []
+    request_finished: list[float] = []
     session_closed: list[float] = []
+    protocol_errors: list[McpError] = []
     original_run_cancellable = mcp_server._run_cancellable
 
     async def marked_run_cancellable(function, *args):
@@ -520,11 +605,17 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
             raise_exceptions=True,
             elicitation_callback=elicit,
         ) as session:
-            call_scope = anyio.CancelScope()
+            request_id = session._request_id
+            call_finished = anyio.Event()
 
             async def call() -> None:
-                with call_scope:
+                try:
                     await session.call_tool("analyze", {})
+                except McpError as error:
+                    protocol_errors.append(error)
+                finally:
+                    request_finished.append(time.monotonic())
+                    call_finished.set()
 
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(call)
@@ -532,7 +623,16 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
                     real_process_harness.wait_for_marker,
                     f"{request_name}.dns-gate",
                 )
-                call_scope.cancel()
+                await session.send_notification(
+                    mcp_types.CancelledNotification(
+                        params=mcp_types.CancelledNotificationParams(
+                            requestId=request_id,
+                            reason="test cancellation",
+                        )
+                    )
+                )
+                with anyio.fail_after(4):
+                    await call_finished.wait()
         session_closed.append(time.monotonic())
 
     monkeypatch.setattr(mcp_server, "_analyze", workflow)
@@ -553,11 +653,14 @@ def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
         real_process_harness.wait_for_marker(f"{request_name}.worker-finished")
     )
     assert adapter_statuses == [AgentStatus.CANCELLED]
+    assert len(protocol_errors) == 1
+    assert str(protocol_errors[0]) == "Request cancelled"
     assert (
         joined_at
         <= adapter_finished_at
         <= worker_finished_at
         <= request_teardown[0]
+        <= request_finished[0]
         <= session_closed[0]
     )
     real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
@@ -732,6 +835,7 @@ def test_cancelled_execute_is_durable_before_request_returns(
         lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
+    protocol_errors: list[McpError] = []
 
     async def run() -> None:
         async def elicit(_context, _params):
@@ -745,11 +849,16 @@ def test_cancelled_execute_is_durable_before_request_returns(
             raise_exceptions=True,
             elicitation_callback=elicit,
         ) as session:
-            call_scope = anyio.CancelScope()
+            request_id = session._request_id
+            call_finished = anyio.Event()
 
             async def call() -> None:
-                with call_scope:
+                try:
                     await session.call_tool("execute", {"name": borg.name})
+                except McpError as error:
+                    protocol_errors.append(error)
+                finally:
+                    call_finished.set()
 
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(call)
@@ -757,11 +866,22 @@ def test_cancelled_execute_is_durable_before_request_returns(
                     real_process_harness.wait_for_marker,
                     f"{process_name}.child.pid",
                 )
-                call_scope.cancel()
+                await session.send_notification(
+                    mcp_types.CancelledNotification(
+                        params=mcp_types.CancelledNotificationParams(
+                            requestId=request_id,
+                            reason="test cancellation",
+                        )
+                    )
+                )
+                with anyio.fail_after(4):
+                    await call_finished.wait()
 
     anyio.run(run)
 
     assert host_finished.is_set()
+    assert len(protocol_errors) == 1
+    assert str(protocol_errors[0]) == "Request cancelled"
     real_process_harness.assert_tree_absent(process_name, timeout=0.1)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         operation = store.list_execution_runs(borg.id)[-1]
