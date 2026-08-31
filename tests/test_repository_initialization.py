@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -25,6 +26,7 @@ from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES, run_analyzer
+from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
 from betterborg_cli.repository_service import (
@@ -32,6 +34,7 @@ from betterborg_cli.repository_service import (
     RepositoryService,
     _default_branch,
 )
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
     Borg,
     PrdSession,
@@ -638,6 +641,7 @@ def test_default_branch_cancellation_reaps_process_tree_and_starts_no_later_work
     cancel = CancellationToken(grace_seconds=0.05)
     factory_calls = 0
     errors: list[BaseException] = []
+    forced_exits: list[int] = []
 
     def command_runner(
         _command: list[str], **kwargs: object
@@ -667,28 +671,127 @@ def test_default_branch_cancellation_reaps_process_tree_and_starts_no_later_work
         "_default_branch",
         blocking_default_branch,
     )
-    with SqliteStore.open(paths.state_dir / "cancel-default.sqlite3") as store:
-        service = RepositoryService(paths, store, agent_factory, cancel=cancel)
+    control = RunControl(cancel, exit_function=forced_exits.append).install()
+    try:
+        with SqliteStore.open(paths.state_dir / "cancel-default.sqlite3") as store:
+            service = RepositoryService(paths, store, agent_factory, cancel=cancel)
 
-        def initialize() -> None:
-            try:
-                service.initialize()
-            except BaseException as error:
-                errors.append(error)
+            def initialize() -> None:
+                try:
+                    service.initialize()
+                except BaseException as error:
+                    errors.append(error)
 
-        worker = threading.Thread(target=initialize)
-        worker.start()
-        real_process_harness.wait_for_marker("default-branch.parent.pid")
-        real_process_harness.wait_for_marker("default-branch.child.pid")
-        cancel.cancel()
-        worker.join(timeout=2)
+            worker = threading.Thread(target=initialize)
+            worker.start()
+            real_process_harness.wait_for_marker("default-branch.parent.pid")
+            real_process_harness.wait_for_marker("default-branch.child.pid")
+            with pytest.raises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGINT)
+            assert control.wait_for_cancellation(timeout=1)
+            worker.join(timeout=2)
 
-        assert not worker.is_alive()
-        assert len(errors) == 1
-        assert isinstance(errors[0], KeyboardInterrupt)
+            assert not worker.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], KeyboardInterrupt)
+    finally:
+        control.close()
     real_process_harness.assert_tree_absent("default-branch")
+    assert forced_exits == []
     assert not (paths.tracked_dir / CONFIG_FILENAME).exists()
     assert factory_calls == 0
+
+
+def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
+    committed_git_repo: Path,
+    real_process_harness: Any,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    adapter, selected = _adapter(committed_git_repo)
+    cancel = CancellationToken(grace_seconds=0.05)
+    progress_stream = StringIO()
+    progress = RunProgress(stream=progress_stream)
+    sender_errors: list[BaseException] = []
+    git_head_tokens: list[CancellationToken | None] = []
+    original_git_head = analyzer_module._git_head
+
+    def blocking_git_head(
+        repository_root: Path,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner=run_captured,
+    ) -> str:
+        def blocking_runner(
+            _command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            git_head_tokens.append(kwargs["cancel"])
+            assert progress.stages["discover"].state is StageState.RUNNING
+            return run_captured(
+                real_process_harness.resistant_argv("cli-git-head"),
+                cancel=kwargs["cancel"],
+                check=bool(kwargs["check"]),
+            )
+
+        return original_git_head(
+            repository_root,
+            cancel=cancel,
+            command_runner=blocking_runner,
+        )
+
+    def interrupt_after_probe_starts() -> None:
+        try:
+            real_process_harness.wait_for_marker("cli-git-head.parent.pid")
+            real_process_harness.wait_for_marker("cli-git-head.child.pid")
+            os.kill(os.getpid(), signal.SIGINT)
+        except BaseException as error:
+            sender_errors.append(error)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(committed_git_repo.parent / "state"))
+    monkeypatch.setattr(cli_module, "CancellationToken", lambda: cancel)
+    monkeypatch.setattr(cli_module, "RunProgress", lambda **_kwargs: progress)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: selected)
+    monkeypatch.setattr(analyzer_module, "_git_head", blocking_git_head)
+    monkeypatch.setattr(
+        analyzer_module,
+        "build_discovery_workspace",
+        lambda *_args, **_kwargs: pytest.fail("discovery must not start"),
+    )
+
+    sender = threading.Thread(target=interrupt_after_probe_starts)
+    sender.start()
+    try:
+        exit_code = cli_module.main(["init", "--yes"], prog_name="borg")
+    finally:
+        sender.join(timeout=2)
+
+    assert not sender.is_alive()
+    assert sender_errors == []
+    assert exit_code == 130
+    assert git_head_tokens == [cancel]
+    assert progress.stages["discover"].state is StageState.STOPPED
+    assert progress.stages["analyze"].state is StageState.PENDING
+    assert progress.closed
+    output = progress_stream.getvalue()
+    assert "stopping..." in output
+    assert "stopped Discover evidence — interrupted" in output
+    assert "failed Discover evidence" not in output
+    assert output.endswith(
+        "summary: 0 completed, 0 failed, 1 stopped — 0 retained\n"
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == ""
+    real_process_harness.assert_tree_absent("cli-git-head")
+    assert adapter.calls == []
+
+    config = load_repository_config(paths)
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        assert store.list_analyses(config.repository_id) == []
+        assert store.list_operations(config.repository_id) == []
 
 
 def test_default_branch_keeps_detached_head_classification(

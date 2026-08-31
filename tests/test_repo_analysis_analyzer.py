@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -35,6 +37,7 @@ from betterborg_cli.repo_analysis import (
 )
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentChoices, RepositoryConfig
+from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import Repository, SqliteStore
 
 
@@ -263,6 +266,7 @@ def test_git_head_cancellation_stops_discovery_before_workspace_or_agent(
     )
     workspace = git_repo.parent / "analysis-workspace"
     errors: list[BaseException] = []
+    forced_exits: list[int] = []
 
     def command_runner(
         _command: Sequence[str], **kwargs: object
@@ -273,39 +277,50 @@ def test_git_head_cancellation_stops_discovery_before_workspace_or_agent(
             check=bool(kwargs["check"]),
         )
 
-    with SqliteStore.open(git_repo / "state.sqlite3") as store:
-        store.add_repository(repository)
+    control = RunControl(
+        cancel,
+        progress=progress,
+        exit_function=forced_exits.append,
+    ).install()
+    try:
+        with SqliteStore.open(git_repo / "state.sqlite3") as store:
+            store.add_repository(repository)
 
-        def analyze() -> None:
-            try:
-                run_analyzer(
-                    repository,
-                    store,
-                    adapter,
-                    artifact_dir=git_repo / "artifacts",
-                    workspace_dir=workspace,
-                    cancel=cancel,
-                    progress=progress,
-                    command_runner=command_runner,
-                )
-            except BaseException as error:
-                errors.append(error)
+            def analyze() -> None:
+                try:
+                    run_analyzer(
+                        repository,
+                        store,
+                        adapter,
+                        artifact_dir=git_repo / "artifacts",
+                        workspace_dir=workspace,
+                        cancel=cancel,
+                        progress=progress,
+                        command_runner=command_runner,
+                    )
+                except BaseException as error:
+                    errors.append(error)
 
-        worker = threading.Thread(target=analyze)
-        worker.start()
-        real_process_harness.wait_for_marker("git-head.parent.pid")
-        real_process_harness.wait_for_marker("git-head.child.pid")
-        cancel.cancel()
-        worker.join(timeout=2)
+            worker = threading.Thread(target=analyze)
+            worker.start()
+            real_process_harness.wait_for_marker("git-head.parent.pid")
+            real_process_harness.wait_for_marker("git-head.child.pid")
+            with pytest.raises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGINT)
+            assert control.wait_for_cancellation(timeout=1)
+            worker.join(timeout=2)
 
-        assert not worker.is_alive()
-        assert len(errors) == 1
-        assert isinstance(errors[0], KeyboardInterrupt)
-        assert progress.stages["discover"].state is StageState.STOPPED
-        assert progress.stages["analyze"].state is StageState.PENDING
-        assert store.list_analyses(repository.id) == []
+            assert not worker.is_alive()
+            assert len(errors) == 1
+            assert isinstance(errors[0], KeyboardInterrupt)
+            assert progress.stages["discover"].state is StageState.STOPPED
+            assert progress.stages["analyze"].state is StageState.PENDING
+            assert store.list_analyses(repository.id) == []
+    finally:
+        control.close()
 
     real_process_harness.assert_tree_absent("git-head")
+    assert forced_exits == []
     assert not workspace.exists()
     assert adapter.calls == []
 
