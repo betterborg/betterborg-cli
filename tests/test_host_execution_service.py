@@ -2290,11 +2290,19 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
                 {},
                 cancel=cancel,
             )
-            for _ in range(200):
-                if len(fixture.review.calls) >= 2:
+            # Wait for the fix turn to claim its queued response, not merely
+            # to start. The adapter records the call before it pops, and
+            # returns early without popping when cancellation has already been
+            # requested, so cancelling in between leaves that response at the
+            # head of the queue. The resumed fix would then replay the turn
+            # that changes no files instead of the one that commits.
+            remaining_after_fix = 2
+            for _ in range(400):
+                if len(fixture.review.responses) <= remaining_after_fix:
                     break
                 threading.Event().wait(0.005)
             assert len(fixture.review.calls) == 2
+            assert len(fixture.review.responses) == remaining_after_fix
             cancel.cancel()
             cancelled = running.result(timeout=3)
 
