@@ -22,6 +22,7 @@ from betterborg_cli.planning import (
     approved_plan_digest,
     build_plan_element_catalog,
 )
+from betterborg_cli.planning import task_publication as publication_module
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
@@ -419,6 +420,183 @@ def test_plan_approve_resumes_publication_before_becoming_ready(
         assert len(store.list_task_generations(borg.id)) == 1
         assert len(store.list_plan_approvals(borg.id)) == 1
         assert len(store.list_task_batches(borg.id)) == 1
+
+
+def test_plan_approve_publication_cancellation_reports_retained_approval(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+    real_process_harness: Any,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "cancel-publication",
+        plan,
+    )
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
+    adapter.queue(MockResponse(payload=_review("approve")))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".cancel-publication-state",
+    )
+    observed_cancel: list[CancellationToken] = []
+    original_require_git_trackable = publication_module.require_git_trackable
+
+    def blocked_trackability(
+        path: Path,
+        *,
+        root: Path,
+        cancel: CancellationToken | None = None,
+    ) -> None:
+        assert cancel is not None
+        observed_cancel.append(cancel)
+
+        def runner(
+            command: list[str], **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            return run_captured(
+                real_process_harness.resistant_argv("cli-task-publication"),
+                check=kwargs["check"],
+                cancel=kwargs["cancel"],
+            )
+
+        require_git_trackable(
+            path,
+            root=root,
+            cancel=cancel,
+            command_runner=runner,
+        )
+
+    monkeypatch.setattr(
+        publication_module,
+        "require_git_trackable",
+        blocked_trackability,
+    )
+
+    def cancel_publication() -> None:
+        real_process_harness.wait_for_marker("cli-task-publication.parent.pid")
+        real_process_harness.wait_for_marker("cli-task-publication.child.pid")
+        observed_cancel[0].cancel()
+
+    canceller = threading.Thread(target=cancel_publication)
+    canceller.start()
+    interrupted = cli_runner.invoke(
+        cli, ["plan", "approve", "cancel-publication", "--yes"]
+    )
+    canceller.join(timeout=2)
+
+    assert not canceller.is_alive()
+    assert interrupted.exit_code == 1
+    assert "was interrupted" in interrupted.output
+    assert "publishing approved tasks" in interrupted.output
+    assert "completed approval was retained" in interrupted.output
+    assert len(adapter.calls) == 2
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "cancel-publication")
+        assert borg is not None
+        assert borg.state is BorgState.SUPERVISOR_WORKING
+        attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].status is PlanningAttemptStatus.COMPLETED
+        assert store.get_current_task_generation(borg.id) is None
+    real_process_harness.assert_tree_absent("cli-task-publication")
+
+    monkeypatch.setattr(
+        publication_module,
+        "require_git_trackable",
+        original_require_git_trackable,
+    )
+    resumed = cli_runner.invoke(
+        cli, ["plan", "approve", "cancel-publication", "--yes"]
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "ready to execute" in resumed.output
+    assert len(adapter.calls) == 2
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "cancel-publication")
+        assert borg is not None
+        assert borg.state is BorgState.READY_TO_EXECUTE
+        current = store.get_current_task_generation(borg.id)
+        assert current is not None
+        assert current.status is TaskGenerationStatus.CURRENT
+
+
+def test_plan_approve_post_commit_cancellation_keeps_ready_outcome(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "post-commit-cancel",
+        plan,
+    )
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
+    adapter.queue(MockResponse(payload=_review("approve")))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".post-commit-cancel-state",
+    )
+    original_checkpoint = TaskPublisher._checkpoint
+
+    def cancel_after_commit(self, point: str) -> None:
+        original_checkpoint(self, point)
+        if point == "after_db_commit":
+            assert self.cancel is not None
+            self.cancel.cancel()
+
+    monkeypatch.setattr(TaskPublisher, "_checkpoint", cancel_after_commit)
+
+    result = cli_runner.invoke(
+        cli, ["plan", "approve", "post-commit-cancel", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ready to execute" in result.output
+    assert len(adapter.calls) == 2
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "post-commit-cancel")
+        assert borg is not None
+        assert borg.state is BorgState.READY_TO_EXECUTE
+        current = store.get_current_task_generation(borg.id)
+        assert current is not None
+        assert current.status is TaskGenerationStatus.CURRENT
+        attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].status is PlanningAttemptStatus.COMPLETED
 
 
 def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(

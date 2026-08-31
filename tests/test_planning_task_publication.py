@@ -14,12 +14,13 @@ import pytest
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.planning import (
     TaskDigestDriftError,
-    TaskPublicationError,
+    TaskPublicationCancelled,
     TaskPublisher,
     render_task_markdown,
     task_markdown_digest,
 )
 from betterborg_cli.planning import task_publication as publication_module
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_files import require_git_trackable
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
@@ -155,6 +156,60 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
             TaskPublisher(repository, store).current_task_files(borg.id)
 
 
+def test_constructor_discovery_cancellation_reaps_registered_git_tree(
+    committed_git_repo: Path,
+    real_process_harness: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = committed_git_repo.parent / "cancelled-publisher-constructor.sqlite3"
+    repository, _borg, _approval = _publication_context(
+        committed_git_repo, database
+    )
+    publication_cancel = CancellationToken()
+    errors: list[BaseException] = []
+    original_discover = RepoPaths.discover
+
+    def blocked_discover(
+        cls,
+        start: Path | None = None,
+        *,
+        cancel: CancellationToken | None = None,
+        command_runner=run_captured,
+    ) -> RepoPaths:
+        assert cls is RepoPaths
+        assert cancel is publication_cancel
+
+        def runner(command: list[str], **kwargs: Any):
+            return run_captured(
+                real_process_harness.resistant_argv("publication-discovery"),
+                check=kwargs["check"],
+                cancel=kwargs["cancel"],
+            )
+
+        return original_discover(start, cancel=cancel, command_runner=runner)
+
+    monkeypatch.setattr(RepoPaths, "discover", classmethod(blocked_discover))
+
+    def construct() -> None:
+        try:
+            with SqliteStore.open(database) as store:
+                TaskPublisher(repository, store, cancel=publication_cancel)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=construct)
+    worker.start()
+    real_process_harness.wait_for_marker("publication-discovery.parent.pid")
+    real_process_harness.wait_for_marker("publication-discovery.child.pid")
+    publication_cancel.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TaskPublicationCancelled)
+    real_process_harness.assert_tree_absent("publication-discovery")
+
+
 def test_publication_visibility_uses_run_token_before_database_promotion(
     committed_git_repo: Path,
     approved_task_generation,
@@ -176,6 +231,7 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
     errors: list[BaseException] = []
     checkpoints: list[str] = []
     commands: list[tuple[str, ...]] = []
+    original_require_git_trackable = publication_module.require_git_trackable
 
     def blocked_visibility(path: Path, *, root: Path, cancel=None) -> None:
         assert cancel is publication_cancel
@@ -234,7 +290,7 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
 
     assert not worker.is_alive()
     assert len(errors) == 1
-    assert isinstance(errors[0], TaskPublicationError)
+    assert isinstance(errors[0], TaskPublicationCancelled)
     assert "before_db_commit" not in checkpoints
     assert exits == [130]
     with SqliteStore.open(database) as store:
@@ -245,6 +301,72 @@ def test_publication_visibility_uses_run_token_before_database_promotion(
         ("check-ignore", "--quiet")
     ]
     real_process_harness.assert_tree_absent("publication-visibility")
+    monkeypatch.setattr(
+        publication_module,
+        "require_git_trackable",
+        original_require_git_trackable,
+    )
+    with SqliteStore.open(database) as store:
+        resumed = TaskPublisher(repository, store).reconcile(borg.id)
+
+        assert resumed is not None
+        assert resumed.generation.id == generation.id
+        assert resumed.generation.status is TaskGenerationStatus.CURRENT
+
+
+@pytest.mark.parametrize("checkpoint", ["during_staging", "before_db_commit"])
+def test_cooperative_publication_cancellation_never_exposes_partial_markdown(
+    committed_git_repo: Path,
+    approved_task_generation,
+    checkpoint: str,
+) -> None:
+    database = committed_git_repo.parent / f"cancel-{checkpoint}.sqlite3"
+    repository, borg, approval = _publication_context(committed_git_repo, database)
+    with SqliteStore.open(database) as store:
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=[_task_body("01-first"), _task_body("02-second")],
+            round_number=1,
+        ).generation
+        cancel = CancellationToken()
+
+        def cancel_at(point: str) -> None:
+            if point == checkpoint:
+                cancel.cancel()
+
+        with pytest.raises(TaskPublicationCancelled, match="cancelled"):
+            TaskPublisher(
+                repository,
+                store,
+                failure_injector=cancel_at,
+                cancel=cancel,
+            ).publish(generation.id)
+
+        persisted = store.get_task_generation(generation.id)
+        assert persisted is not None
+        assert persisted.status is TaskGenerationStatus.PREPARING
+        assert store.get_current_task_generation(borg.id) is None
+        destination = (
+            committed_git_repo
+            / ".borg/tasks/durable-tasks"
+            / str(generation.id)
+        )
+        if checkpoint == "during_staging":
+            assert not destination.exists()
+        else:
+            assert len(tuple(destination.rglob("*.md"))) == 2
+
+        resumed = TaskPublisher(repository, store).reconcile(borg.id)
+
+        assert resumed is not None
+        assert resumed.generation.status is TaskGenerationStatus.CURRENT
+        assert [item.task.stem for item in resumed.files] == [
+            "01-first",
+            "02-second",
+        ]
+        assert len(tuple(destination.rglob("*.md"))) == 2
 
 
 @pytest.mark.parametrize(

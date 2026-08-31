@@ -38,6 +38,7 @@ from betterborg_cli.planning.task_publication import (
     PublishedTaskFile,
     TaskDigestDriftError,
     TaskPublication,
+    TaskPublicationCancelled,
     TaskPublicationError,
     TaskPublisher,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "TaskGraphValidationError",
     "TaskDigestDriftError",
     "TaskPublication",
+    "TaskPublicationCancelled",
     "TaskPublicationError",
     "TaskPublisher",
     "PlanningWorktreeError",

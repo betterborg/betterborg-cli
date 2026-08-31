@@ -589,6 +589,138 @@ def test_supervisor_restart_reconciles_current_publication_after_commit(
         assert resumed_supervisor.calls == []
 
 
+def test_supervisor_publication_cancellation_retains_approval_and_resumes(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-publication-cancel.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-publication-cancel"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("approve"))
+        )
+        cancel = CancellationToken()
+        original_checkpoint = TaskPublisher._checkpoint
+
+        def cancel_before_commit(self, point: str) -> None:
+            original_checkpoint(self, point)
+            if point == "before_db_commit":
+                cancel.cancel()
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(
+                TaskPublisher, "_checkpoint", cancel_before_commit
+            )
+            with pytest.raises(
+                SupervisorCancelled,
+                match=(
+                    "stopped while publishing approved tasks; "
+                    "the completed approval was retained"
+                ),
+            ):
+                SupervisorLoop(
+                    repository,
+                    initial.borg,
+                    store,
+                    supervisor,
+                    approved_plan=plan,
+                    cancel=cancel,
+                ).run()
+
+        persisted_borg = store.get_borg(borg.id)
+        assert persisted_borg is not None
+        assert persisted_borg.state is BorgState.SUPERVISOR_WORKING
+        attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].status is PlanningAttemptStatus.COMPLETED
+        generation = store.list_task_generations(borg.id)[0]
+        assert generation.status is TaskGenerationStatus.PREPARING
+        assert len(supervisor.calls) == 1
+
+        resumed_supervisor = MockAdapter(name="openai")
+        resumed = SupervisorLoop(
+            repository,
+            persisted_borg,
+            store,
+            resumed_supervisor,
+            approved_plan=plan,
+        ).run()
+
+        assert resumed.borg.state is BorgState.READY_TO_EXECUTE
+        assert resumed.generation.id == generation.id
+        assert resumed.generation.status is TaskGenerationStatus.CURRENT
+        assert resumed.attempt == attempts[0]
+        assert resumed_supervisor.calls == []
+
+
+def test_supervisor_post_commit_cancellation_completes_durable_publication(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-post-commit-cancel.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-post-commit-cancel"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        cancel = CancellationToken()
+        original_checkpoint = TaskPublisher._checkpoint
+
+        def cancel_after_commit(self, point: str) -> None:
+            original_checkpoint(self, point)
+            if point == "after_db_commit":
+                cancel.cancel()
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(
+                TaskPublisher, "_checkpoint", cancel_after_commit
+            )
+            result = SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                MockAdapter(name="openai").queue(
+                    MockResponse(dynamic=_review_response("approve"))
+                ),
+                approved_plan=plan,
+                cancel=cancel,
+            ).run()
+
+        assert cancel.is_set()
+        assert result.borg.state is BorgState.READY_TO_EXECUTE
+        assert result.generation.status is TaskGenerationStatus.CURRENT
+        assert result.attempt.status is PlanningAttemptStatus.COMPLETED
+
+
 def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
     committed_git_repo: Path,
     persist_planning_context,
