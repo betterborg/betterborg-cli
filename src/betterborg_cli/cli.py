@@ -998,6 +998,7 @@ def _run_execution_follow_up(
         progress.start(stage_key)
     heartbeat_stop = Event()
     heartbeat_thread: Thread | None = None
+    heartbeat_errors: list[BaseException] = []
     force_registration = None
     try:
         if cancel is not None:
@@ -1008,12 +1009,19 @@ def _run_execution_follow_up(
         if progress is not None:
             heartbeat_thread = Thread(
                 target=_refresh_execution_follow_up,
-                args=(progress, heartbeat_stop),
+                args=(progress, heartbeat_stop, heartbeat_errors),
                 name=f"betterborg-{stage_key}-progress",
                 daemon=True,
             )
             heartbeat_thread.start()
-        result = action()
+        try:
+            result = action()
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join()
+        if heartbeat_errors:
+            raise heartbeat_errors[0]
     except BaseException as error:
         if progress is not None:
             detail = str(error).strip() or type(error).__name__
@@ -1026,7 +1034,7 @@ def _run_execution_follow_up(
         raise
     finally:
         heartbeat_stop.set()
-        if heartbeat_thread is not None:
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
             heartbeat_thread.join()
         if force_registration is not None:
             force_registration.unregister()
@@ -1039,12 +1047,15 @@ def _run_execution_follow_up(
 def _refresh_execution_follow_up(
     progress: RunProgress,
     stopped: Event,
+    errors: list[BaseException],
 ) -> None:
     """Keep plain and interactive follow-up activity visibly current."""
     while not stopped.wait(0.1):
         try:
             progress.refresh()
-        except Exception:
+        except BaseException as error:
+            errors.append(error)
+            stopped.set()
             return
 
 

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -658,10 +659,12 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
     name = "push-timeout"
     local_sha = _create_project_branch(committed_git_repo, name)
     observed_timeouts: list[float | None] = []
+    observed_environments: list[dict[str, str]] = []
 
     def runner(command, **kwargs):
         if tuple(command[1:2]) == ("push",):
             observed_timeouts.append(kwargs["timeout"])
+            observed_environments.append(dict(kwargs["env"]))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return run_captured(command, **kwargs)
 
@@ -671,10 +674,40 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
         cli_module._push_project_base(git, name)
 
     assert observed_timeouts == [60]
+    assert observed_environments[0]["GIT_TERMINAL_PROMPT"] == "0"
+    assert observed_environments[0]["GCM_INTERACTIVE"] == "never"
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
+def test_follow_up_heartbeat_failure_fails_stage_and_propagates() -> None:
+    refresh_attempted = Event()
+
+    class FailingProgress(RunProgress):
+        def refresh(self) -> None:
+            refresh_attempted.set()
+            raise RuntimeError("progress heartbeat failed")
+
+    progress = FailingProgress(stream=StringIO())
+
+    def action() -> str:
+        assert refresh_attempted.wait(1)
+        return "published"
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        cli_module._run_execution_follow_up(
+            progress,
+            "push-project",
+            "Push project branch",
+            action,
+        )
+
+    stage = progress.stages["push-project"]
+    assert stage.state is StageState.FAILED
+    assert stage.result == "progress heartbeat failed"
+
+
 def test_push_interrupt_reaps_tree_stops_stage_and_preserves_core_report(
+    cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
     approved_task_generation,
@@ -689,7 +722,7 @@ def test_push_interrupt_reaps_tree_stops_stage_and_preserves_core_report(
         name=name,
     )
     local_sha = _create_project_branch(committed_git_repo, name)
-    _trust(cli_runner=CliRunner(), root=committed_git_repo, monkeypatch=monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
     operation_id = uuid4()
     resistant = real_process_harness.resistant_argv("execute-push")
     source = r'''
