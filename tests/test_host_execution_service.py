@@ -179,7 +179,9 @@ class _Compose:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
-    def cleanup_stale_projects(self, store, resources) -> tuple[object, ...]:
+    def cleanup_stale_projects(
+        self, store, resources, **kwargs
+    ) -> tuple[object, ...]:
         self.calls.append("stale-cleanup")
         return ()
 
@@ -1214,11 +1216,23 @@ def test_cancellation_during_compose_startup_does_not_start_coding(
     class PausingCompose(_Compose):
         def start_claimed_stack(self, *args, **kwargs):
             self.calls.append("services-start")
+            assert kwargs["cancel"] is cancel
+            kwargs["activity"](
+                AgentActivity(AgentActivityKind.COMMAND, "docker compose up")
+            )
             starting_services.set()
             assert cancel.wait(timeout=2)
             return SimpleNamespace(environment={"SERVICE_URL": "http://127.0.0.1"})
 
+        def stop_claimed_stack(self, *args, **kwargs) -> None:
+            assert kwargs["cancel"] is cancel
+            kwargs["activity"](
+                AgentActivity(AgentActivityKind.COMMAND, "docker compose down")
+            )
+            super().stop_claimed_stack(*args, **kwargs)
+
     compose = PausingCompose(calls)
+    activities: list[tuple[UUID, AgentActivity]] = []
     runtime = HostTaskRuntime(
         plan,
         environment_manager=_Environment(calls),
@@ -1236,6 +1250,9 @@ def test_cancellation_during_compose_startup_does_not_start_coding(
             worktree_manager=_Worktrees(calls),
             compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            activity=lambda task_id, activity: activities.append(
+                (task_id, activity)
+            ),
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
             running = executor.submit(
@@ -1255,6 +1272,16 @@ def test_cancellation_during_compose_startup_does_not_start_coding(
         )
         assert "services-stop" in calls
         assert "coding" not in calls
+        assert activities == [
+            (
+                records[0].id,
+                AgentActivity(AgentActivityKind.COMMAND, "docker compose up"),
+            ),
+            (
+                records[0].id,
+                AgentActivity(AgentActivityKind.COMMAND, "docker compose down"),
+            ),
+        ]
     finally:
         store.close()
 
@@ -3075,7 +3102,7 @@ def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
             return start if self.calls == 1 else expired_at
 
     class CleanupCompose(_Compose):
-        def cleanup_stale_projects(self, cleanup_store, resources):
+        def cleanup_stale_projects(self, cleanup_store, resources, **kwargs):
             self.calls.append("stale-cleanup")
             for stale in resources:
                 cleanup_store.confirm_compose_project_cleanup(
@@ -3290,7 +3317,9 @@ def test_cancelled_service_reconciles_compose_cleanup_before_result(
             return TaskRuntimeStatus.DONE
 
     class CleanupCompose(_Compose):
-        def cleanup_stale_projects(self, cleanup_store, resources):  # noqa: ANN001
+        def cleanup_stale_projects(  # noqa: ANN001
+            self, cleanup_store, resources, **kwargs
+        ):
             self.calls.append("stale-cleanup")
             assert resources
             assert progress.stages[str(records[0].id)].state is StageState.RUNNING

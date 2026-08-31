@@ -7,14 +7,19 @@ import json
 import os
 import shlex
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
+from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.preflight import HostPreflightPlan, HostService
+from betterborg_cli.host_execution.scheduler import TaskActivitySink
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.store import (
     ComposeResource,
     ExecutionEvent,
@@ -27,6 +32,7 @@ from betterborg_cli.store.models import utcnow
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
+ActivitySink = Callable[[AgentActivity], None]
 
 _COMPOSE_ENVIRONMENT_NAMES = ("PATH", "PATHEXT", "SYSTEMROOT", "LANG", "LC_ALL")
 _COMPOSE_HEALTH_TIMEOUT_SECONDS = 120
@@ -103,7 +109,7 @@ class HostComposeManager:
             for name in _COMPOSE_ENVIRONMENT_NAMES
             if name in source_environment
         }
-        self._run = command_runner or subprocess.run
+        self._run = command_runner or run_captured
         self._clock = clock
 
     def start_claimed_stack(
@@ -112,6 +118,9 @@ class HostComposeManager:
         plan: HostPreflightPlan,
         claim: TaskClaim,
         owner_token: str,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: ActivitySink | None = None,
     ) -> ComposeStack | None:
         """Start selected Compose services and return their consumer contract."""
         return self._start_claimed_stack(
@@ -120,6 +129,8 @@ class HostComposeManager:
             claim,
             owner_token,
             project_name=compose_project_name(claim),
+            cancel=cancel,
+            activity=activity,
         )
 
     def start_claimed_sanity_stack(
@@ -128,6 +139,9 @@ class HostComposeManager:
         plan: HostPreflightPlan,
         claim: TaskClaim,
         owner_token: str,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: ActivitySink | None = None,
     ) -> ComposeStack | None:
         """Start a fresh sanity-only project for the merged task tip."""
         return self._start_claimed_stack(
@@ -136,6 +150,8 @@ class HostComposeManager:
             claim,
             owner_token,
             project_name=f"{compose_project_name(claim)}-sanity",
+            cancel=cancel,
+            activity=activity,
         )
 
     def _start_claimed_stack(
@@ -146,6 +162,8 @@ class HostComposeManager:
         owner_token: str,
         *,
         project_name: str,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
     ) -> ComposeStack | None:
         compose_services = tuple(
             service for service in plan.services if service.kind == "compose"
@@ -290,7 +308,13 @@ class HostComposeManager:
                     now=created_at,
                 )
 
-                result = self._invoke(command, cwd=worktree)
+                result = self._invoke(
+                    command,
+                    cwd=worktree,
+                    cancel=cancel,
+                    activity=activity,
+                )
+                self._raise_if_cancelled(cancel)
                 if result.returncode != 0:
                     raise ComposeStackError(
                         _command_error(
@@ -306,6 +330,8 @@ class HostComposeManager:
                     plan.compose_profiles,
                     selected,
                     runtime_directory,
+                    cancel=cancel,
+                    activity=activity,
                 )
                 published_ports = self._published_ports(
                     docker_executable,
@@ -314,6 +340,8 @@ class HostComposeManager:
                     plan.compose_profiles,
                     compose_services,
                     runtime_directory,
+                    cancel=cancel,
+                    activity=activity,
                 )
                 environment = service_url_environment(
                     plan.services,
@@ -351,7 +379,13 @@ class HostComposeManager:
                 )
             except ExecutionOwnershipError as error:
                 cleanup = (
-                    self._stop_project_locked(store, stack, command_owner=None)
+                    self._stop_project_locked(
+                        store,
+                        stack,
+                        command_owner=None,
+                        cancel=cancel,
+                        activity=activity,
+                    )
                     if persisted
                     else None
                 )
@@ -364,12 +398,30 @@ class HostComposeManager:
                     command=command,
                 ) from error
             except ComposeStackError as error:
+                if cancel is not None and cancel.is_set():
+                    cleanup = self._stop_project_locked(
+                        store,
+                        stack,
+                        command_owner=None,
+                        cancel=cancel,
+                        activity=activity,
+                    )
+                    interrupted = KeyboardInterrupt()
+                    if cleanup.error is not None:
+                        interrupted.add_note(
+                            f"Compose cleanup failed: {cleanup.error}"
+                        )
+                    raise interrupted from error
                 try:
                     self._block_task(store, claim, owner_token, str(error))
                 except ExecutionOwnershipError:
                     pass
                 cleanup = self._stop_project_locked(
-                    store, stack, command_owner=None
+                    store,
+                    stack,
+                    command_owner=None,
+                    cancel=cancel,
+                    activity=activity,
                 )
                 message = str(error)
                 if cleanup.error is not None:
@@ -379,6 +431,17 @@ class HostComposeManager:
                     project_name=error.project_name,
                     command=error.command,
                 ) from error
+            except KeyboardInterrupt as error:
+                cleanup = self._stop_project_locked(
+                    store,
+                    stack,
+                    command_owner=None,
+                    cancel=cancel,
+                    activity=activity,
+                )
+                if cleanup.error is not None:
+                    error.add_note(f"Compose cleanup failed: {cleanup.error}")
+                raise
         return stack
 
     def _write_runtime_configuration(
@@ -460,6 +523,9 @@ class HostComposeManager:
         profiles: Sequence[str],
         selected: Sequence[str],
         runtime_directory: Path,
+        *,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
     ) -> None:
         command = _compose_base(docker_executable, project_name, files, profiles) + (
             "ps",
@@ -467,7 +533,13 @@ class HostComposeManager:
             "json",
             *selected,
         )
-        result = self._invoke(command, cwd=runtime_directory)
+        result = self._invoke(
+            command,
+            cwd=runtime_directory,
+            cancel=cancel,
+            activity=activity,
+        )
+        self._raise_if_cancelled(cancel)
         healthy = _healthy_compose_services(result.stdout)
         if result.returncode != 0 or any(
             not healthy.get(service) or not all(healthy[service])
@@ -489,6 +561,9 @@ class HostComposeManager:
         profiles: Sequence[str],
         compose_services: Sequence[HostService],
         worktree: Path,
+        *,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
     ) -> dict[tuple[str, int, str], int]:
         published: dict[tuple[str, int, str], int] = {}
         for service_name, target, protocol in _service_target_ports(compose_services):
@@ -501,7 +576,13 @@ class HostComposeManager:
                 service_name,
                 str(target),
             )
-            result = self._invoke(command, cwd=worktree)
+            result = self._invoke(
+                command,
+                cwd=worktree,
+                cancel=cancel,
+                activity=activity,
+            )
+            self._raise_if_cancelled(cancel)
             host_port = _parse_published_port(result.stdout)
             if result.returncode != 0 or host_port is None:
                 raise ComposeStackError(
@@ -522,6 +603,9 @@ class HostComposeManager:
         stack: ComposeStack,
         claim: TaskClaim,
         owner_token: str,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: ActivitySink | None = None,
     ) -> None:
         """Tear down exactly one live claim's persisted project."""
         if (stack.run_id, stack.claim_id, stack.task_id) != (
@@ -534,6 +618,8 @@ class HostComposeManager:
             store,
             stack,
             command_owner=(claim, owner_token),
+            cancel=cancel,
+            activity=activity,
         )
         if not result.stopped:
             raise ComposeStackError(
@@ -546,6 +632,9 @@ class HostComposeManager:
         self,
         store: SqliteStore,
         resources: Sequence[ComposeResource],
+        *,
+        cancel: CancellationToken | None = None,
+        activity: TaskActivitySink | None = None,
     ) -> tuple[ComposeCleanupResult, ...]:
         """Stop exactly the project identities returned by reconciliation."""
         groups: dict[tuple[UUID, UUID, str], list[ComposeResource]] = {}
@@ -559,7 +648,19 @@ class HostComposeManager:
                 project_resources,
                 fallback_worktree=self.repository_root,
             )
-            outcomes.append(self._stop_project(store, stack, command_owner=None))
+            outcomes.append(
+                self._stop_project(
+                    store,
+                    stack,
+                    command_owner=None,
+                    cancel=cancel,
+                    activity=(
+                        (lambda item, task_id=stack.task_id: activity(task_id, item))
+                        if activity is not None
+                        else None
+                    ),
+                )
+            )
         return tuple(outcomes)
 
     def _stop_project(
@@ -568,12 +669,16 @@ class HostComposeManager:
         stack: ComposeStack,
         *,
         command_owner: tuple[TaskClaim, str] | None,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
     ) -> ComposeCleanupResult:
         with path_lock(self._lifecycle_lock(stack)):
             return self._stop_project_locked(
                 store,
                 stack,
                 command_owner=command_owner,
+                cancel=cancel,
+                activity=activity,
             )
 
     def _stop_project_locked(
@@ -582,6 +687,8 @@ class HostComposeManager:
         stack: ComposeStack,
         *,
         command_owner: tuple[TaskClaim, str] | None,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
     ) -> ComposeCleanupResult:
         command = _compose_base(
             stack.docker_executable,
@@ -615,7 +722,13 @@ class HostComposeManager:
                 now=now,
             )
 
-        result = self._invoke(command, cwd=stack.runtime_directory)
+        result = self._invoke(
+            command,
+            cwd=stack.runtime_directory,
+            cancel=cancel,
+            activity=activity,
+            cleanup=True,
+        )
         if result.returncode != 0:
             error = _command_error("Compose teardown failed", result)
             failure_recorded = store.record_compose_cleanup_failure(
@@ -663,17 +776,31 @@ class HostComposeManager:
         return stack.runtime_directory / ".betterborg-lifecycle.lock"
 
     def _invoke(
-        self, command: tuple[str, ...], *, cwd: Path
+        self,
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        cancel: CancellationToken | None,
+        activity: ActivitySink | None,
+        cleanup: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        self._report_command(command, activity)
+        deadline = (
+            cancel.force_deadline
+            or time.monotonic() + _COMPOSE_COMMAND_TIMEOUT_SECONDS
+            if cleanup and cancel is not None
+            else None
+        )
         try:
             return self._run(
                 list(command),
                 cwd=cwd,
                 env=self._environment,
                 check=False,
-                capture_output=True,
-                text=True,
                 timeout=_COMPOSE_COMMAND_TIMEOUT_SECONDS,
+                cancel=cancel,
+                terminate_on_cancel=not cleanup or cancel is None,
+                deadline=deadline,
             )
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(
@@ -684,6 +811,22 @@ class HostComposeManager:
             )
         except OSError as error:
             return subprocess.CompletedProcess(command, 127, "", str(error))
+
+    @staticmethod
+    def _report_command(
+        command: Sequence[str], activity: ActivitySink | None
+    ) -> None:
+        if activity is None:
+            return
+        try:
+            activity(AgentActivity(AgentActivityKind.COMMAND, shlex.join(command)))
+        except Exception:
+            return
+
+    @staticmethod
+    def _raise_if_cancelled(cancel: CancellationToken | None) -> None:
+        if cancel is not None and cancel.is_set():
+            raise KeyboardInterrupt
 
     def _claimed_worktree(self, store: SqliteStore, claim: TaskClaim) -> Path:
         runtime = store.get_task_runtime(claim.task_id)

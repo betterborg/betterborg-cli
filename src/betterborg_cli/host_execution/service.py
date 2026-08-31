@@ -284,6 +284,8 @@ class HostTaskRuntime:
                 self.plan,
                 context.claim,
                 context.owner_token,
+                cancel=context.cancel,
+                activity=context.activity,
             )
             service_environment = dict(materialization.environment)
             service_environment.update(service_url_environment(self.plan.services))
@@ -358,6 +360,8 @@ class HostTaskRuntime:
                     stack,
                     context.claim,
                     context.owner_token,
+                    cancel=context.cancel,
+                    activity=context.activity,
                 )
 
         return published_status or self._durable_status(context)
@@ -477,7 +481,14 @@ class HostExecutionService:
             raise HostExecutionError(
                 "concrete task runtime does not match the validated preflight plan"
             )
-        cleanup = list(self._cleanup_stale())
+        activity = _ExecutionActivityBinding(
+            declared_secret_mask_values(validated, secrets),
+            self._activity,
+            self._progress,
+        )
+        cleanup = list(
+            self._cleanup_stale(cancel=cancel, activity=activity.emit)
+        )
         config = self._scheduler_config or HostSchedulerConfig()
         acquired_at = self._now()
         acquisition = self._store.acquire_execution_run(
@@ -488,11 +499,6 @@ class HostExecutionService:
         )
         behavior = self._runtime
         if acquisition.acquired:
-            activity = _ExecutionActivityBinding(
-                declared_secret_mask_values(validated, secrets),
-                self._activity,
-                self._progress,
-            )
             runtime = self._runtime.with_secret_values(secrets)
             task_activity = (
                 activity.emit
@@ -521,7 +527,9 @@ class HostExecutionService:
                 # can happen after the pre-acquisition reconciliation above,
                 # so repeat cleanup while the new lease is heartbeating and
                 # before any new worktree setup or task dispatch begins.
-                cleanup.extend(self._cleanup_stale())
+                cleanup.extend(
+                    self._cleanup_stale(cancel=cancel, activity=activity.emit)
+                )
                 heartbeats.checkpoint()
                 prepared = self._worktrees.prepare_current_task_worktrees(
                     self._store,
@@ -562,6 +570,8 @@ class HostExecutionService:
                     owner_token,
                     cleanup,
                     setup_error,
+                    cancel=cancel,
+                    activity=activity.emit,
                 )
                 raise
             else:
@@ -573,24 +583,24 @@ class HostExecutionService:
                         owner_token,
                         cleanup,
                         setup_error,
+                        cancel=cancel,
+                        activity=activity.emit,
                     )
                     raise
             behavior = partial(self._run_claimed_task, runtime, borg.name)
-        else:
-            activity = None
-
         scheduler = HostTaskScheduler(
             self._store,
             behavior,
             config=self._scheduler_config,
             activity=(
                 activity.emit
-                if activity is not None
-                and (self._activity is not None or self._progress is not None)
+                if self._activity is not None or self._progress is not None
                 else None
             ),
             progress=self._progress,
-            interruption_cleanup=lambda: cleanup.extend(self._cleanup_stale()),
+            interruption_cleanup=lambda: cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity.emit)
+            ),
             **({"clock": self._clock} if self._clock is not None else {}),
         )
 
@@ -603,7 +613,9 @@ class HostExecutionService:
         # interruption fence.  Retrying a failed teardown here could mutate a
         # cleanup-blocked task after progress and counts were finalized.
         if scheduled.status is not ExecutionRunStatus.CANCELLED:
-            cleanup.extend(self._cleanup_stale())
+            cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity.emit)
+            )
         return HostExecutionResult(validated, scheduled, tuple(cleanup))
 
     def _run_claimed_task(
@@ -640,11 +652,21 @@ class HostExecutionService:
                 return TaskRuntimeStatus.BLOCKED
         return runtime(context)
 
-    def _cleanup_stale(self) -> tuple[ComposeCleanupResult, ...]:
+    def _cleanup_stale(
+        self,
+        *,
+        cancel: CancellationToken | None = None,
+        activity: TaskActivitySink | None = None,
+    ) -> tuple[ComposeCleanupResult, ...]:
         resources = self._store.reconcile_expired_execution_runs(now=self._now())
         if not resources:
             return ()
-        return self._compose.cleanup_stale_projects(self._store, resources)
+        return self._compose.cleanup_stale_projects(
+            self._store,
+            resources,
+            cancel=cancel,
+            activity=activity,
+        )
 
     def _interrupt_failed_setup(
         self,
@@ -652,6 +674,9 @@ class HostExecutionService:
         owner_token: str,
         cleanup: list[ComposeCleanupResult],
         error: BaseException,
+        *,
+        cancel: CancellationToken | None,
+        activity: TaskActivitySink | None,
     ) -> None:
         try:
             self._store.interrupt_execution_run(
@@ -663,7 +688,9 @@ class HostExecutionService:
         except BaseException as interrupt_error:
             error.add_note(f"setup run interruption failed: {interrupt_error}")
         try:
-            cleanup.extend(self._cleanup_stale())
+            cleanup.extend(
+                self._cleanup_stale(cancel=cancel, activity=activity)
+            )
         except BaseException as cleanup_error:
             error.add_note(f"setup stale cleanup failed: {cleanup_error}")
 

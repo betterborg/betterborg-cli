@@ -55,18 +55,22 @@ class _RecordingCompose:
         self.started: list[object] = []
         self.stopped: list[object] = []
 
-    def start_claimed_stack(self, store, plan, claim, owner_token):  # noqa: ANN001
+    def start_claimed_stack(  # noqa: ANN001
+        self, store, plan, claim, owner_token, **kwargs
+    ):
         assert self.repository_lock.locked()
         self.started.append(claim)
         return self.stack
 
     def start_claimed_sanity_stack(  # noqa: ANN001
-        self, store, plan, claim, owner_token
+        self, store, plan, claim, owner_token, **kwargs
     ):
-        return self.start_claimed_stack(store, plan, claim, owner_token)
+        return self.start_claimed_stack(
+            store, plan, claim, owner_token, **kwargs
+        )
 
     def stop_claimed_stack(  # noqa: ANN001
-        self, store, stack, claim, owner_token
+        self, store, stack, claim, owner_token, **kwargs
     ) -> None:
         assert self.repository_lock.locked()
         assert stack is not None
