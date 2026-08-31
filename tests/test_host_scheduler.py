@@ -17,6 +17,7 @@ from betterborg_cli.host_execution import (
     HostTaskScheduler,
     ScheduledTaskContext,
 )
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.store import (
     Borg,
     ExecutionOwnershipError,
@@ -239,6 +240,42 @@ def test_scheduler_limits_jobs_renews_claims_and_reports_active_operation(
         claims = owner_store.list_task_claims(run.id)
         assert len(claims) == 4
         assert {claim.run_id for claim in claims} == {run.id}
+
+
+def test_scheduler_exposes_only_one_task_bound_activity_sink(tmp_path: Path) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    reported: list[tuple[object, AgentActivity]] = []
+
+    def report(task_id, activity: AgentActivity) -> None:  # noqa: ANN001
+        reported.append((task_id, activity))
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            assert context.activity is context.agent_activity_sink
+            assert context.activity is not None
+            context.activity(
+                AgentActivity(AgentActivityKind.COMMAND, "bound activity")
+            )
+            assert "report" not in repr(context)
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return TaskRuntimeStatus.DONE
+
+        result = HostTaskScheduler(store, behavior, activity=report).run(
+            borg.id, generation.id
+        )
+
+    assert result.status is ExecutionRunStatus.COMPLETED
+    assert reported == [
+        (
+            records["task"].id,
+            AgentActivity(AgentActivityKind.COMMAND, "bound activity"),
+        )
+    ]
 
 
 def test_scheduler_cancellation_preserves_done_work_for_durable_resume(

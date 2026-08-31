@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -22,6 +23,7 @@ from cryptography.x509.oid import NameOID
 
 from betterborg_cli.agent_runtime import (
     AbortableApiRequest,
+    AgentActivity,
     AgentAdapter,
     AgentRunSpec,
     AnthropicAdapter,
@@ -33,11 +35,23 @@ from betterborg_cli.agent_runtime import (
     UrlRequestSpec,
     UrlResponse,
 )
+from betterborg_cli.host_execution.service import _ExecutionActivityBinding
 
 Response = Mapping[str, Any]
 QueuedResponse = Response | Exception | Callable[[CancellationToken | None], Response]
 Provider = Literal["anthropic", "openai"]
 RunProvider = Literal["anthropic", "openai", "claude", "codex"]
+
+
+def redacting_execution_activity_sink(
+    secret: str, received: list[AgentActivity]
+) -> Callable[[AgentActivity], None]:
+    """Return the execution-owned sink shape used by provider tests."""
+    binding = _ExecutionActivityBinding(
+        (secret,), lambda _task_id, activity: received.append(activity)
+    )
+    task_id = uuid4()
+    return lambda activity: binding.emit(task_id, activity)
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,10 +6,12 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.progress import AgentActivity
 from betterborg_cli.store import (
     ExecutionOwnershipError,
     ExecutionRunAcquisition,
@@ -31,6 +33,10 @@ _TERMINAL_TASK_STATUSES = frozenset(
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+ActivitySink = Callable[[AgentActivity], None]
+TaskActivitySink = Callable[[UUID, AgentActivity], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,12 @@ class ScheduledTaskContext:
     owner_token: str = field(repr=False)
     cancel: CancellationToken
     clock: Callable[[], datetime] = field(repr=False)
+    activity: ActivitySink | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def agent_activity_sink(self) -> ActivitySink | None:
+        """Return the same task-bound sink accepted by agent providers."""
+        return self.activity
 
     @property
     def runtime(self) -> TaskRuntime:
@@ -130,11 +142,13 @@ class HostTaskScheduler:
         *,
         config: HostSchedulerConfig | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        activity: TaskActivitySink | None = None,
     ) -> None:
         self._store = store
         self._behavior = behavior
         self._config = config or HostSchedulerConfig()
         self._clock = clock
+        self._activity = activity
 
     def run(
         self,
@@ -225,6 +239,11 @@ class HostTaskScheduler:
                             owner_token=owner_token,
                             cancel=token,
                             clock=self._clock,
+                            activity=(
+                                partial(self._activity, claim.task_id)
+                                if self._activity is not None
+                                else None
+                            ),
                         )
                         active[executor.submit(self._behavior, context)] = claim
 

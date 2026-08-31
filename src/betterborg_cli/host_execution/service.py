@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from threading import Event, Lock, Thread
@@ -21,6 +21,8 @@ from betterborg_cli.host_execution.compose import (
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
     HostEnvironmentManager,
+    declared_secret_mask_values,
+    redact_secrets,
 )
 from betterborg_cli.host_execution.guard import PrimaryCheckoutContaminationError
 from betterborg_cli.host_execution.merge import HostMergePhase
@@ -37,13 +39,36 @@ from betterborg_cli.host_execution.scheduler import (
     HostSchedulerResult,
     HostTaskScheduler,
     ScheduledTaskContext,
+    TaskActivitySink,
 )
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
+from betterborg_cli.progress import AgentActivity
 from betterborg_cli.store import ExecutionRunStatus, SqliteStore, TaskRuntimeStatus
 
 
 class HostExecutionError(RuntimeError):
     """Raised when run-scoped host setup cannot be completed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionActivityBinding:
+    """Mask one acquired run's activity before any reporter can observe it."""
+
+    mask_values: tuple[str, ...] = field(repr=False)
+    reporter: TaskActivitySink | None = field(repr=False)
+
+    def emit(self, task_id: UUID, activity: AgentActivity) -> None:
+        """Publish a freshly redacted activity without affecting execution."""
+        if self.reporter is None:
+            return
+        detail = activity.detail
+        if detail is not None:
+            detail = redact_secrets(detail, self.mask_values)
+        try:
+            self.reporter(task_id, AgentActivity(activity.kind, detail))
+        except Exception:
+            # Activity reporters are observational and cannot change execution.
+            return
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +178,7 @@ class HostTaskRuntime:
         merge: HostMergePhase,
         sanity: HostSanityPhase,
         secret_values: Mapping[str, str] | None = None,
+        task_activity: TaskActivitySink | None = None,
         publication_lock: Any | None = None,
     ) -> None:
         self.plan = plan
@@ -163,9 +189,13 @@ class HostTaskRuntime:
         self._merge = merge
         self._sanity = sanity
         self._secret_values = dict(secret_values or {})
+        self._task_activity = task_activity
         self._publication_lock = publication_lock or Lock()
 
-    def with_secret_values(self, secret_values: Mapping[str, str]) -> HostTaskRuntime:
+    def with_secret_values(
+        self,
+        secret_values: Mapping[str, str],
+    ) -> HostTaskRuntime:
         """Bind one run's validated secret values without shared mutation."""
         return HostTaskRuntime(
             self.plan,
@@ -176,6 +206,24 @@ class HostTaskRuntime:
             merge=self._merge,
             sanity=self._sanity,
             secret_values=secret_values,
+            task_activity=self._task_activity,
+            publication_lock=self._publication_lock,
+        )
+
+    def with_task_activity(
+        self, task_activity: TaskActivitySink | None
+    ) -> HostTaskRuntime:
+        """Bind one acquired run's already-redacting task reporter."""
+        return HostTaskRuntime(
+            self.plan,
+            environment_manager=self._environment,
+            compose_manager=self._compose,
+            coding=self._coding,
+            review_fix=self._review_fix,
+            merge=self._merge,
+            sanity=self._sanity,
+            secret_values=self._secret_values,
+            task_activity=task_activity,
             publication_lock=self._publication_lock,
         )
 
@@ -196,6 +244,7 @@ class HostTaskRuntime:
             owner_token,
             tuple(worktrees),
             secret_values=secret_values,
+            activity=self._task_activity,
         )
 
     def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
@@ -209,6 +258,7 @@ class HostTaskRuntime:
                 context.claim,
                 context.owner_token,
                 secret_values=self._secret_values,
+                activity=context.activity,
             )
         except EnvironmentMaterializationError:
             return self._durable_status(context)
@@ -372,6 +422,7 @@ class HostExecutionService:
         compose_manager: HostComposeManager,
         scheduler_config: HostSchedulerConfig | None = None,
         clock=None,
+        activity: TaskActivitySink | None = None,
     ) -> None:
         self._store = store
         self._preflight = preflight
@@ -380,6 +431,7 @@ class HostExecutionService:
         self._compose = compose_manager
         self._scheduler_config = scheduler_config
         self._clock = clock
+        self._activity = activity
 
     def run(
         self,
@@ -411,8 +463,6 @@ class HostExecutionService:
             raise HostExecutionError(
                 "concrete task runtime does not match the validated preflight plan"
             )
-        runtime = self._runtime.with_secret_values(secrets)
-
         cleanup = list(self._cleanup_stale())
         config = self._scheduler_config or HostSchedulerConfig()
         acquired_at = self._now()
@@ -422,8 +472,16 @@ class HostExecutionService:
             lease_duration=config.lease_duration,
             now=acquired_at,
         )
-        behavior = runtime
+        behavior = self._runtime
         if acquisition.acquired:
+            activity = _ExecutionActivityBinding(
+                declared_secret_mask_values(validated, secrets),
+                self._activity,
+            )
+            runtime = self._runtime.with_secret_values(secrets)
+            task_activity = activity.emit if self._activity is not None else None
+            if isinstance(runtime, HostTaskRuntime):
+                runtime = runtime.with_task_activity(task_activity)
             owner_token = acquisition.owner_token
             if owner_token is None:
                 raise HostExecutionError("acquired execution run has no owner token")
@@ -499,11 +557,18 @@ class HostExecutionService:
                     )
                     raise
             behavior = partial(self._run_claimed_task, runtime, borg.name)
+        else:
+            activity = None
 
         scheduler = HostTaskScheduler(
             self._store,
             behavior,
             config=self._scheduler_config,
+            activity=(
+                activity.emit
+                if activity is not None and self._activity is not None
+                else None
+            ),
             **({"clock": self._clock} if self._clock is not None else {}),
         )
 

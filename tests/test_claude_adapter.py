@@ -6,11 +6,13 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from test_adapter_harness import (
     claude_spec,
     native_event_stream,
+    redacting_execution_activity_sink,
     write_native_output,
 )
 
@@ -205,6 +207,44 @@ def test_fragmented_large_tool_event_emits_activity_without_changing_log(
         AgentActivity(AgentActivityKind.WRITING, "large-output.txt"),
         AgentActivity(AgentActivityKind.THINKING),
     ]
+
+
+def test_native_activity_uses_execution_secret_redaction_without_changing_result(
+    tmp_path: Path,
+) -> None:
+    secret = 'native"secret/slash?x=1'
+    escaped = json.dumps(secret)[1:-1]
+    encoded = quote(secret, safe="")
+    detail = f"{secret} {escaped} {encoded}"
+    activities: list[AgentActivity] = []
+    transcript = native_event_stream(
+        _tool_event("Read", {"file_path": detail}),
+        _envelope({"status": "completed", "version": "unchanged"}),
+    )
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        write_native_output(log_path, transcript, on_line)
+        return 0
+
+    result = ClaudeAdapter(ApiAgentRole.CODING, proc_runner=runner).run(
+        claude_spec(
+            tmp_path,
+            activity_sink=redacting_execution_activity_sink(secret, activities),
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "unchanged"}
+    assert activities[1].detail == "[REDACTED] [REDACTED] [REDACTED]"
+    assert all(value not in repr(activities) for value in (secret, escaped, encoded))
 
 
 def test_unknown_malformed_result_and_usage_events_fall_back_to_thinking(

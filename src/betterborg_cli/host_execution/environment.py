@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import quote
@@ -77,6 +78,7 @@ class _PathSnapshot:
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ActivitySink = Callable[[AgentActivity], None]
+TaskActivitySink = Callable[[UUID, AgentActivity], None]
 Clock = Callable[[], datetime]
 
 
@@ -305,6 +307,7 @@ class HostEnvironmentManager:
         worktrees: Sequence[tuple[UUID, Path]],
         *,
         secret_values: Mapping[str, str] | None = None,
+        activity: TaskActivitySink | None = None,
     ) -> tuple[str, ...]:
         """Prepare every distinct task fingerprint before claims may dispatch."""
         if plan.repository_root.resolve() != self.repository_root:
@@ -350,6 +353,11 @@ class HostEnvironmentManager:
                     completion_marker=marker,
                     command_environments=command_environments,
                     prepared_before_dispatch=True,
+                    activity=(
+                        partial(activity, task_id)
+                        if activity is not None
+                        else None
+                    ),
                 )
             prepared.append(fingerprint)
         return tuple(prepared)
@@ -362,6 +370,7 @@ class HostEnvironmentManager:
         owner_token: str,
         *,
         secret_values: Mapping[str, str] | None = None,
+        activity: ActivitySink | None = None,
     ) -> EnvironmentMaterialization:
         """Move one claimed task through environment setup into coding.
 
@@ -433,6 +442,7 @@ class HostEnvironmentManager:
                 source_worktree=worktree,
                 descriptors=descriptors,
                 command_environments=command_environments,
+                activity=activity,
             )
             materialization_reused = self._materialize_worktree(
                 store,
@@ -443,6 +453,7 @@ class HostEnvironmentManager:
                 worktree=worktree,
                 cache_path=cache_path,
                 command_environments=command_environments,
+                activity=activity,
             )
         except BaseException as error:
             self._raise_if_cancelled(error)
@@ -482,6 +493,7 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None,
     ) -> bool:
         if not plan.prepare_commands:
             return False
@@ -507,6 +519,7 @@ class HostEnvironmentManager:
                 cache_path=cache_path,
                 completion_marker=marker,
                 command_environments=command_environments,
+                activity=activity,
             )
             return False
 
@@ -523,6 +536,7 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None,
     ) -> bool:
         marker = self._materialization_marker(worktree)
         if (
@@ -554,6 +568,7 @@ class HostEnvironmentManager:
             cache_path=cache_path,
             completion_marker=marker,
             command_environments=command_environments,
+            activity=activity,
         )
         return False
 
@@ -577,6 +592,7 @@ class HostEnvironmentManager:
         preparation_descriptors: Sequence[_EnvironmentDescriptor] = (),
         completion_marker: Path | None = None,
         prepared_before_dispatch: bool = False,
+        activity: ActivitySink | None = None,
     ) -> None:
         if claim is not None:
             run_id = claim.run_id
@@ -633,6 +649,7 @@ class HostEnvironmentManager:
                         commands,
                         worktree=worktree,
                         command_environments=command_environments,
+                        activity=activity,
                     )
                     if completion_marker is not None:
                         _write_marker(completion_marker, fingerprint)
@@ -648,6 +665,7 @@ class HostEnvironmentManager:
                     descriptors=preparation_descriptors,
                     command_environments=command_environments,
                     completion_marker=completion_marker,
+                    activity=activity,
                 )
         except BaseException as error:
             duration = time.monotonic() - started
@@ -699,6 +717,7 @@ class HostEnvironmentManager:
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
         completion_marker: Path | None,
+        activity: ActivitySink | None,
     ) -> list[dict[str, object]]:
         with self._guard.protect(fingerprint, "environment prepare"):
             with self._preparation_worktree(
@@ -708,6 +727,7 @@ class HostEnvironmentManager:
                     commands,
                     worktree=preparation_worktree,
                     command_environments=command_environments,
+                    activity=activity,
                 )
             if completion_marker is not None:
                 _write_marker(completion_marker, fingerprint)
@@ -721,13 +741,14 @@ class HostEnvironmentManager:
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
+        activity: ActivitySink | None = None,
     ) -> list[dict[str, object]]:
         before = self._tracked_state(worktree)
         results: list[dict[str, object]] = []
         for command in commands:
             cwd = command_cwd(worktree, command.cwd)
             environment, mask_values = command_environments[command.stage]
-            self._report_command(command.argv, mask_values)
+            self._report_command(command.argv, mask_values, activity=activity)
             try:
                 completed = self._run(
                     list(command.argv),
@@ -772,14 +793,19 @@ class HostEnvironmentManager:
         return results
 
     def _report_command(
-        self, command: Sequence[str], mask_values: Sequence[str]
+        self,
+        command: Sequence[str],
+        mask_values: Sequence[str],
+        *,
+        activity: ActivitySink | None = None,
     ) -> None:
         """Publish one redacted environment command without affecting setup."""
-        if self._activity is None:
+        sink = activity if activity is not None else self._activity
+        if sink is None:
             return
         redacted = [redact_secrets(argument, mask_values) for argument in command]
         try:
-            self._activity(
+            sink(
                 AgentActivity(AgentActivityKind.COMMAND, shlex.join(redacted))
             )
         except Exception:

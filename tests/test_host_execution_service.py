@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import threading
@@ -10,11 +11,15 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
+from progress_test_support import FakeClock as ProgressClock
+from progress_test_support import TTYStringIO
 from test_execution_preflight import FakeComposeRunner
 from test_host_scheduler import FakeClock
 
@@ -58,13 +63,20 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
-from betterborg_cli.progress import AgentActivity, AgentActivityKind
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ChildSpec,
+    RunProgress,
+    StageSpec,
+)
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
     BorgState,
     ComposeResource,
     ExecutionAttemptStatus,
+    ExecutionEvent,
     ExecutionRunStatus,
     PlanApproval,
     Repository,
@@ -914,6 +926,156 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             "services-start",
             "sanity",
             "services-stop",
+        ]
+    finally:
+        store.close()
+
+
+def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    token = 'declared"secret/slash space?x=1&y=2'
+    escaped = json.dumps(token)[1:-1]
+    encoded = quote(token, safe="")
+    plan = replace(
+        _plan(tmp_path),
+        required_secret_names=("EXECUTION_TOKEN",),
+        secret_requirements=(
+            HostSecret(
+                name="EXECUTION_TOKEN",
+                scope="agent",
+                used_by=("coding",),
+                evidence="activity redaction fixture",
+            ),
+        ),
+    )
+
+    class ActivityEnvironment(_Environment):
+        def materialize_claimed_task(
+            self, store, plan, claim, owner_token, **kwargs
+        ):
+            activity = kwargs["activity"]
+            assert activity is not None
+            activity(
+                AgentActivity(
+                    AgentActivityKind.COMMAND,
+                    f"local {token} {escaped} {encoded}",
+                )
+            )
+            return super().materialize_claimed_task(
+                store, plan, claim, owner_token, **kwargs
+            )
+
+    class ActivityCoding(_Coding):
+        def run(self, context, *, environment=None) -> TaskRuntimeStatus:
+            assert context.agent_activity_sink is not None
+            context.agent_activity_sink(
+                AgentActivity(
+                    AgentActivityKind.READING,
+                    f"agent {token} {escaped} {encoded}",
+                )
+            )
+            return super().run(context, environment=environment)
+
+    child_key = str(records[0].id)
+    plain_stream = StringIO()
+    live_stream = TTYStringIO()
+    plain_clock = ProgressClock()
+    live_clock = ProgressClock()
+    progress_instances = (
+        RunProgress(
+            [StageSpec("execute", "Execute", (ChildSpec(child_key, "Task"),))],
+            stream=plain_stream,
+            clock=plain_clock,
+            heartbeat_interval=1,
+        ),
+        RunProgress(
+            [StageSpec("execute", "Execute", (ChildSpec(child_key, "Task"),))],
+            stream=live_stream,
+            clock=live_clock,
+            heartbeat_interval=1,
+        ),
+    )
+    for progress in progress_instances:
+        progress.start("execute")
+        progress.start_child("execute", child_key)
+    received: list[AgentActivity] = []
+
+    def report(task_id: UUID, activity: AgentActivity) -> None:
+        assert task_id == records[0].id
+        received.append(activity)
+        for progress, clock in zip(
+            progress_instances, (plain_clock, live_clock), strict=True
+        ):
+            progress.child_activity("execute", child_key, activity)
+            clock.advance(2)
+            progress.refresh()
+        run = store.list_execution_runs(borg.id)[-1]
+        store.append_execution_event(
+            ExecutionEvent(
+                run_id=run.id,
+                task_id=task_id,
+                kind="task.activity",
+                payload={"detail": activity.detail},
+            )
+        )
+
+    compose = _Compose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=ActivityEnvironment(calls),
+        compose_manager=compose,
+        coding=ActivityCoding(
+            calls,
+            {
+                "CACHE": "prepared",
+                "SERVICE_URL": "http://127.0.0.1",
+                "EXECUTION_TOKEN": token,
+            },
+        ),
+        review_fix=_Review(calls),
+        merge=_Merge(calls),
+        sanity=_Sanity(calls),
+    )
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            activity=report,
+        ).run(
+            borg.id,
+            generation.id,
+            {},
+            secret_values={"EXECUTION_TOKEN": token},
+        )
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        events = store.list_task_execution_events(
+            records[0].id, kind="task.activity"
+        )
+        surfaces = (
+            repr(received),
+            repr(
+                progress_instances[0].records["execute"].children[child_key]
+            ),
+            plain_stream.getvalue(),
+            live_stream.getvalue(),
+            repr(events),
+        )
+        for surface in surfaces:
+            assert token not in surface
+            assert escaped not in surface
+            assert encoded not in surface
+            assert "[REDACTED]" in surface
+        assert [activity.detail for activity in received] == [
+            "local [REDACTED] [REDACTED] [REDACTED]",
+            "agent [REDACTED] [REDACTED] [REDACTED]",
         ]
     finally:
         store.close()

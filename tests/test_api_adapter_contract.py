@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from conftest import RealProcessHarness
@@ -20,6 +21,7 @@ from test_adapter_harness import (
     FakeUrlRequestFactory,
     LocalHttpServer,
     LocalTlsServer,
+    redacting_execution_activity_sink,
 )
 
 import betterborg_cli.agent_runtime.api_http as api_http
@@ -623,6 +625,55 @@ def test_submit_result_emits_no_tool_activity(
 
     assert result.status == AgentStatus.COMPLETED
     assert activities == [AgentActivity(AgentActivityKind.THINKING)]
+
+
+def test_api_activity_uses_execution_secret_redaction_without_changing_result(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    secret = 'api"secret/slash?x=1'
+    escaped = json.dumps(secret)[1:-1]
+    encoded = quote(secret, safe="")
+    detail = f"{secret} {escaped} {encoded}"
+    activities: list[AgentActivity] = []
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "search_text",
+                        {"query": detail},
+                        call_id="secret-activity",
+                    )
+                ]
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "unchanged"},
+                        call_id="submit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.CODING,
+        transport=transport,
+        workspace_trusted=True,
+    ).run(
+        harness.spec(
+            tmp_path,
+            activity_sink=redacting_execution_activity_sink(secret, activities),
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "unchanged"}
+    assert activities[1].detail == "[REDACTED] [REDACTED] [REDACTED]"
+    assert all(value not in repr(activities) for value in (secret, escaped, encoded))
 
 
 @pytest.mark.parametrize("call_kind", ["malformed", "disallowed"])
