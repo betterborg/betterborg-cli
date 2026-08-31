@@ -11,7 +11,13 @@ from typing import Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime import CancellationToken
-from betterborg_cli.progress import AgentActivity, RunProgress, StageSpec, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    ProgressError,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.store import (
     ExecutionOwnershipError,
     ExecutionRunAcquisition,
@@ -229,6 +235,18 @@ class HostTaskScheduler:
                 next_heartbeat,
             )
             raise
+        except ProgressError:
+            if not self._cancellation_requested(token):
+                raise
+            self._interrupt(
+                token,
+                active,
+                acquisition.run_id,
+                generation_id,
+                owner_token,
+                next_heartbeat,
+            )
+            return self._result(acquisition.run_id, generation_id, acquired=True)
 
         with ThreadPoolExecutor(
             max_workers=self._config.jobs,
@@ -237,7 +255,7 @@ class HostTaskScheduler:
             try:
                 while True:
                     now = self._clock()
-                    if token.is_set():
+                    if self._cancellation_requested(token):
                         self._interrupt(
                             token,
                             active,
@@ -261,7 +279,10 @@ class HostTaskScheduler:
 
                     self._settle_completed(active, owner_token)
 
-                    while len(active) < self._config.jobs and not token.is_set():
+                    while (
+                        len(active) < self._config.jobs
+                        and not self._cancellation_requested(token)
+                    ):
                         claim = self._store.claim_dependency_ready_task(
                             acquisition.run_id,
                             owner_token,
@@ -270,7 +291,11 @@ class HostTaskScheduler:
                         )
                         if claim is None:
                             break
+                        if self._cancellation_requested(token):
+                            break
                         self._start_progress(claim)
+                        if self._cancellation_requested(token):
+                            break
                         context = ScheduledTaskContext(
                             store=self._store,
                             claim=claim,
@@ -286,6 +311,8 @@ class HostTaskScheduler:
                         )
                         active[executor.submit(self._behavior, context)] = claim
 
+                    if self._cancellation_requested(token):
+                        continue
                     if not active:
                         return self._finish(
                             acquisition.run_id,
@@ -309,6 +336,20 @@ class HostTaskScheduler:
                     next_heartbeat,
                 )
                 raise
+            except ProgressError:
+                if not self._cancellation_requested(token):
+                    raise
+                self._interrupt(
+                    token,
+                    active,
+                    acquisition.run_id,
+                    generation_id,
+                    owner_token,
+                    next_heartbeat,
+                )
+                return self._result(
+                    acquisition.run_id, generation_id, acquired=True
+                )
             except ExecutionOwnershipError:
                 token.cancel()
                 try:
@@ -320,6 +361,12 @@ class HostTaskScheduler:
                         acquisition.run_id, generation_id
                     )
                 raise
+
+    def _cancellation_requested(self, token: CancellationToken) -> bool:
+        """Return whether either execution cancellation surface has fired."""
+        return token.is_set() or (
+            self._progress is not None and self._progress.cancelling
+        )
 
     def _seed_progress(self, run_id: UUID, generation_id: UUID) -> None:
         """Declare tasks and seed only authoritative terminal projections."""

@@ -26,6 +26,8 @@ from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
     RunProgress,
+    StageRecord,
+    StageSpec,
     StageState,
 )
 from betterborg_cli.run_control import RunControl
@@ -523,6 +525,108 @@ def test_scheduler_cancellation_preserves_done_work_for_durable_resume(
         )
         assert runs_by_id[resumed.operation_id].status is (
             ExecutionRunStatus.COMPLETED
+        )
+
+
+def test_scheduler_cancels_claim_accepted_as_progress_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    original_start = progress.start
+    cancelled_before_start = False
+
+    def cancel_then_start(stage_key: str) -> StageRecord:
+        nonlocal cancelled_before_start
+        if not cancelled_before_start:
+            cancelled_before_start = True
+            cancel.cancel()
+            progress.begin_cancellation()
+        return original_start(stage_key)
+
+    monkeypatch.setattr(progress, "start", cancel_then_start)
+
+    with SqliteStore.open(database) as store:
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("cancelled claimed work must not start")
+
+        result = HostTaskScheduler(
+            store,
+            unexpected_behavior,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
+        ).run(borg.id, generation.id, cancel=cancel)
+
+        assert cancelled_before_start is True
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert (result.done, result.failed, result.blocked, result.pending) == (
+            0,
+            0,
+            0,
+            1,
+        )
+        runtime = store.get_task_runtime(records["task"].id)
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
+        stage = progress.stages[str(records["task"].id)]
+        assert stage.state is StageState.PENDING
+        claims = store.list_task_claims(result.operation_id)
+        assert len(claims) == 1
+        assert claims[0].released_at is not None
+        assert any(
+            event.kind == "run.interrupted"
+            for event in store.list_execution_events(result.operation_id)
+        )
+
+
+def test_scheduler_cancels_when_progress_stops_during_seeding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    original_declare = progress.declare
+
+    def cancel_then_declare(spec: StageSpec) -> StageRecord:
+        cancel.cancel()
+        progress.begin_cancellation()
+        return original_declare(spec)
+
+    monkeypatch.setattr(progress, "declare", cancel_then_declare)
+
+    with SqliteStore.open(database) as store:
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("cancelled work must not be claimed")
+
+        result = HostTaskScheduler(
+            store,
+            unexpected_behavior,
+            progress=progress,
+        ).run(borg.id, generation.id, cancel=cancel)
+
+        assert result.status is ExecutionRunStatus.CANCELLED
+        assert result.pending == 1
+        assert store.list_task_claims(result.operation_id) == []
+        assert any(
+            event.kind == "run.interrupted"
+            for event in store.list_execution_events(result.operation_id)
         )
 
 
