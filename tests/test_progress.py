@@ -305,6 +305,21 @@ def test_close_rejects_unresolved_started_parent_and_child() -> None:
     progress.close()
 
 
+def test_stopped_parent_preserves_children_not_started_before_cancellation() -> None:
+    progress = RunProgress(
+        [StageSpec("work", "Work", (ChildSpec("child", "Child"),))],
+        stream=StringIO(),
+    )
+    progress.start("work")
+    progress.begin_cancellation()
+
+    progress.stop("work", "cancelled")
+    progress.close()
+
+    assert progress.stages["work"].state is StageState.STOPPED
+    assert progress.stages["work"].children["child"].state is StageState.PENDING
+
+
 def test_nested_suspension_queues_one_time_lines_in_transition_order() -> None:
     stream = StringIO()
     progress = RunProgress(

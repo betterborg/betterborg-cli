@@ -307,7 +307,11 @@ class RunProgress:
         return self._finish_stage(stage_key, StageState.FAILED, result)
 
     def stop(self, stage_key: str, result: object | None = None) -> StageRecord:
-        """Stop a running parent after its workflow owner reconciles it."""
+        """Stop a running parent after running children are reconciled.
+
+        Pending children remain pending because cancellation can prevent their
+        work from ever starting.
+        """
 
         return self._finish_stage(stage_key, StageState.STOPPED, result)
 
@@ -538,7 +542,10 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_open()
             self._require_running(record, f"stage {stage_key!r}")
-            self._require_terminal_children(record)
+            if state is StageState.STOPPED:
+                self._require_no_running_children(record)
+            else:
+                self._require_terminal_children(record)
             self._finish_record(record, state, result)
             self._emit_terminal(record)
             self._refresh_transient()
@@ -657,6 +664,18 @@ class RunProgress:
             raise ProgressError(
                 f"stage {parent.key!r} has unresolved children: "
                 + ", ".join(unresolved)
+            )
+
+    @staticmethod
+    def _require_no_running_children(parent: StageRecord) -> None:
+        running = [
+            child.key
+            for child in parent._children.values()
+            if child.state is StageState.RUNNING
+        ]
+        if running:
+            raise ProgressError(
+                f"stage {parent.key!r} has running children: " + ", ".join(running)
             )
 
     def _emit_terminal(

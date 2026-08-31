@@ -182,6 +182,44 @@ def test_cancellation_token_broadcasts_with_one_absolute_deadline() -> None:
     assert all(registration.unregister() for registration in registrations)
 
 
+def test_cancellation_token_serializes_work_start_against_cancellation() -> None:
+    cancel = CancellationToken()
+    transition_started = threading.Event()
+    release_transition = threading.Event()
+    transition_finished = threading.Event()
+    cancellation_started = threading.Event()
+    cancellation_finished = threading.Event()
+
+    def transition() -> None:
+        transition_started.set()
+        assert release_transition.wait(1)
+
+    def start_work() -> None:
+        assert cancel.start_if_active(transition)
+        transition_finished.set()
+
+    def request_cancellation() -> None:
+        cancellation_started.set()
+        cancel.cancel()
+        cancellation_finished.set()
+
+    starter = threading.Thread(target=start_work)
+    starter.start()
+    assert transition_started.wait(1)
+    canceller = threading.Thread(target=request_cancellation)
+    canceller.start()
+    assert cancellation_started.wait(1)
+    assert not cancellation_finished.wait(0.05)
+
+    release_transition.set()
+    starter.join(timeout=1)
+    canceller.join(timeout=1)
+
+    assert transition_finished.is_set()
+    assert cancellation_finished.is_set()
+    assert not cancel.start_if_active(lambda: pytest.fail("work started after cancel"))
+
+
 def test_cancellation_token_late_delivery_is_synchronous_and_exactly_once() -> None:
     cancel = CancellationToken(clock=lambda: 5.0)
     cancel.cancel()

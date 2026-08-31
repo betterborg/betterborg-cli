@@ -12,7 +12,7 @@ from typing import TypeAlias
 from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.agent_runtime.selection import SelectedAgent
-from betterborg_cli.progress import RunProgress, StageSpec
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
     ImprovementPrd,
@@ -20,6 +20,7 @@ from betterborg_cli.repo_analysis import (
     build_machine_report,
     generate_improvement_prds,
     generate_role_prompts,
+    get_durable_role_prompt,
     render_markdown_report,
     resolve_theme_key,
     run_analyzer,
@@ -31,13 +32,11 @@ from betterborg_cli.repository_config import (
     RepositoryConfig,
     load_repository_config,
 )
-from betterborg_cli.repository_files import (
-    RepositoryPathError,
-    publish_repository_text,
-)
+from betterborg_cli.repository_files import RepositoryPathError, publish_repository_text
 from betterborg_cli.store import Operation, Repository, RepositoryAnalysis, SqliteStore
 
 _INITIALIZED_OPERATION = "repository.initialized"
+_PROMPTS_STAGE_KEY = "prompts"
 
 AnalysisAgent: TypeAlias = AgentAdapter | SelectedAgent
 AgentFactory: TypeAlias = Callable[[RepositoryConfig], AnalysisAgent]
@@ -91,6 +90,16 @@ class RepositoryService:
         if progress is not None:
             progress.declare(StageSpec("discover", "Discover evidence"))
             progress.declare(StageSpec("analyze", "Analyze repository"))
+            progress.declare(
+                StageSpec(
+                    _PROMPTS_STAGE_KEY,
+                    "Generate role prompts",
+                    tuple(
+                        ChildSpec(role, f"{role.title()} prompt")
+                        for role in PROMPT_ROLES
+                    ),
+                )
+            )
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
@@ -100,6 +109,7 @@ class RepositoryService:
         analysis = self.store.get_prior_ready_analysis(repository.id)
         if analysis is not None:
             self._seed_retained_analysis(analysis)
+        retained_prompt_roles = self._seed_retained_prompts(repository)
         if self._is_initialized(repository):
             if analysis is None:
                 raise RepositoryInitializationError(
@@ -124,8 +134,14 @@ class RepositoryService:
             )
 
         self._write_score(analysis)
-        prompt_runs = self._generate_missing_prompts(repository, analysis, agent)
+        prompt_runs = self._generate_missing_prompts(
+            repository,
+            analysis,
+            agent,
+            retained_prompt_roles=retained_prompt_roles,
+        )
         _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
 
         improvement_prds = generate_improvement_prds(
             analysis,
@@ -183,9 +199,12 @@ class RepositoryService:
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=PROMPT_ROLES,
                 cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_PROMPTS_STAGE_KEY,
             )
         )
         _require_complete_prompts(prompt_runs)
+        self._raise_if_cancelled()
 
         improvement_prds = generate_improvement_prds(
             analysis,
@@ -280,18 +299,44 @@ class RepositoryService:
         report = render_markdown_report(build_machine_report(analysis, packages))
         _publish_text(self.paths.score_report, report, root=self.paths.root)
 
+    def _seed_retained_prompts(self, repository: Repository) -> frozenset[str]:
+        retained_roles = frozenset(
+            role
+            for role in PROMPT_ROLES
+            if get_durable_role_prompt(
+                repository,
+                self.store,
+                role=role,
+                path=self.paths.prompts_dir / f"{role}.system.md",
+            )
+            is not None
+        )
+        if self.progress is None:
+            return retained_roles
+        for role in PROMPT_ROLES:
+            if role in retained_roles:
+                self.progress.seed_child_completed(
+                    _PROMPTS_STAGE_KEY,
+                    role,
+                    "prompt retained",
+                )
+        if len(retained_roles) == len(PROMPT_ROLES):
+            self.progress.seed_completed(
+                _PROMPTS_STAGE_KEY,
+                f"{len(PROMPT_ROLES)} prompts retained",
+            )
+        return retained_roles
+
     def _generate_missing_prompts(
         self,
         repository: Repository,
         analysis: RepositoryAnalysis,
         agent: AnalysisAgent,
+        *,
+        retained_prompt_roles: frozenset[str],
     ) -> tuple[PromptGeneration, ...]:
-        latest = self.store.get_latest_generated_prompts(repository.id)
         missing_roles = tuple(
-            role
-            for role in PROMPT_ROLES
-            if role not in latest
-            or not (self.paths.prompts_dir / f"{role}.system.md").is_file()
+            role for role in PROMPT_ROLES if role not in retained_prompt_roles
         )
         if not missing_roles:
             return ()
@@ -304,8 +349,14 @@ class RepositoryService:
                 artifact_dir=self.paths.artifacts_dir / "prompts",
                 roles=missing_roles,
                 cancel=self.cancel,
+                progress=self.progress,
+                stage_key=_PROMPTS_STAGE_KEY,
             )
         )
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise KeyboardInterrupt
 
 
 def _default_branch(
