@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterable
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -26,6 +27,7 @@ from betterborg_cli.planning import (
     validate_task_graph,
     validate_task_repair_progress,
 )
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -789,6 +791,148 @@ def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
         assert len(pm.calls) == 1
         assert len(supervisor.calls) == 2
         assert store.get_current_task_generation(borg.id) == result.generation
+
+
+def test_fresh_progress_finishes_project_manager_before_supervisor_starts(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_payload(plan)))
+    adapter.queue(MockResponse(dynamic=_review_response("approve")))
+    progress = RunProgress(stream=StringIO())
+    database = committed_git_repo.parent / "fresh-pm-progress.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "fresh-pm-progress"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        borg = store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.PM_WORKING,
+        )
+
+        result = SupervisorLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            pm_agent=adapter,
+            approved_plan=plan,
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.READY_TO_EXECUTE
+        project_manager = progress.stages["project-manager"]
+        supervisor = progress.stages["supervisor"]
+        assert project_manager.state is StageState.COMPLETED
+        assert project_manager.retained is False
+        assert project_manager.started_at is not None
+        assert supervisor.state is StageState.COMPLETED
+        assert supervisor.started_at is not None
+        assert project_manager.finished_at <= supervisor.started_at
+        assert supervisor.children == {}
+    progress.close()
+
+
+def test_two_pm_revision_children_reconstruct_from_rejected_attempt_ids(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    payloads = [_pm_payload(plan) for _ in range(3)]
+    payloads[1]["tasks"][0]["title"] = "Foundation revision one"
+    payloads[2]["tasks"][0]["title"] = "Foundation revision two"
+    pm = MockAdapter(name="openai")
+    pm.queue(MockResponse(payload=payloads[0]))
+    pm.queue(MockResponse(payload=payloads[1]))
+    pm.queue(MockResponse(raise_error=RuntimeError("revision interrupted")))
+    supervisor = MockAdapter(name="openai")
+    supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+    supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+    database = committed_git_repo.parent / "pm-progress-resume.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-progress-resume"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        borg = store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.PM_WORKING,
+        )
+        interrupted_progress = RunProgress(stream=StringIO())
+
+        with pytest.raises(SupervisorError, match="revision interrupted"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+                progress=interrupted_progress,
+            ).run()
+
+        reviews = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+        ]
+        keys = [f"pm-revision:{attempt.id}" for attempt in reviews]
+        assert len(keys) == 2
+        assert len(set(keys)) == 2
+        children = interrupted_progress.stages["supervisor"].children
+        assert children[keys[0]].state is StageState.COMPLETED
+        assert children[keys[1]].state is StageState.FAILED
+        assert interrupted_progress.stages["supervisor"].state is StageState.FAILED
+        interrupted_progress.close()
+
+    with SqliteStore.open(database) as reopened:
+        resumed_borg = reopened.get_borg(borg.id)
+        assert resumed_borg is not None
+        pm.queue(MockResponse(payload=payloads[2]))
+        supervisor.queue(MockResponse(dynamic=_review_response("approve")))
+        resumed_progress = RunProgress(
+            stream=StringIO(), attempt_history_limit=1
+        )
+
+        result = SupervisorLoop(
+            repository,
+            resumed_borg,
+            reopened,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            progress=resumed_progress,
+        ).run()
+
+        assert result.borg.state is BorgState.READY_TO_EXECUTE
+        project_manager = resumed_progress.stages["project-manager"]
+        assert project_manager.state is StageState.COMPLETED
+        assert project_manager.retained is True
+        assert project_manager.started_at is None
+        children = resumed_progress.stages["supervisor"].children
+        assert list(children) == keys
+        assert children[keys[0]].state is StageState.COMPLETED
+        assert children[keys[0]].retained is True
+        assert children[keys[0]].started_at is None
+        assert children[keys[1]].state is StageState.COMPLETED
+        assert children[keys[1]].retained is False
+        assert children[keys[1]].started_at is not None
+        assert resumed_progress.stages["supervisor"].state is StageState.COMPLETED
+        bounded = resumed_progress.child_render_state("supervisor")
+        assert [item.key for item in bounded.children] == [keys[1]]
+        assert bounded.earlier_attempt_count == 1
+        assert len(pm.calls) == 4
+        assert len(supervisor.calls) == 3
+        resumed_progress.close()
 
 
 def test_supervisor_rejects_nonprogressing_pm_revisions(

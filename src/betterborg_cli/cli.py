@@ -1383,6 +1383,9 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
+        context = click.get_current_context(silent=True)
+        run = context.find_root().obj if context is not None else None
+        progress = run.progress if isinstance(run, CliRunContext) else None
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -1395,6 +1398,7 @@ def approve_plan(
             ),
             on_bound=mark_resumable,
             cancel=cancel,
+            progress=progress,
         )
     except (SupervisorCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()

@@ -27,7 +27,12 @@ from betterborg_cli.planning.task_validation import (
     build_plan_element_catalog,
     validate_task_graph,
 )
-from betterborg_cli.planning.turns import DurablePlanningTurns
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    planning_attempt_duration,
+    planning_attempt_result,
+)
+from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
@@ -214,6 +219,9 @@ class ProjectManagerLoop:
         artifact_dir: Path | None = None,
         model: str | None = None,
         cancel: CancellationToken | None = None,
+        progress: RunProgress | None = None,
+        stage_key: str = "project-manager",
+        child_key: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
@@ -241,6 +249,22 @@ class ProjectManagerLoop:
         ).resolve()
         self.model = resolved_model
         self.cancel = cancel
+        self.progress = progress
+        self.stage_key = stage_key
+        self.child_key = child_key
+        if progress is not None:
+            if child_key is None and stage_key not in progress.stages:
+                progress.declare(StageSpec(stage_key, "Project Manager"))
+            elif child_key is not None:
+                if stage_key not in progress.stages:
+                    raise ValueError(
+                        "Project Manager revision parent must already be declared"
+                    )
+                if child_key not in progress.stages[stage_key].children:
+                    progress.declare_child(
+                        stage_key,
+                        ChildSpec(child_key, "Project Manager revision"),
+                    )
         self._turns = DurablePlanningTurns(
             repository,
             borg,
@@ -252,17 +276,39 @@ class ProjectManagerLoop:
             error_factory=ProjectManagerError,
             cancelled_error_factory=ProjectManagerCancelled,
             cancel=cancel,
+            progress=progress,
+            stage_key=stage_key if progress is not None else None,
+            child_key=child_key if progress is not None else None,
             dirty_borg_documents=dirty_borg_documents,
             worktrees_root=worktrees_root,
         )
 
     def run(self) -> ProjectManagerResult:
         """Resume or generate until a complete validated batch is persisted."""
-        approval = self._approval()
+        try:
+            approval = self._approval()
+            terminal = self._terminal_result(approval)
+            if terminal is not None:
+                self._seed_progress(terminal.attempt)
+                return terminal
+
+            self._start_progress()
+            result = self._run(approval)
+            self._complete_progress(result.attempt)
+            return result
+        except (ProjectManagerCancelled, KeyboardInterrupt) as error:
+            self._reconcile_progress(str(error), stopped=True)
+            raise
+        except Exception as error:
+            self._reconcile_progress(
+                str(error),
+                stopped=self.cancel is not None and self.cancel.is_set(),
+            )
+            raise
+
+    def _run(self, approval: PlanApproval) -> ProjectManagerResult:
+        """Execute fresh Project Manager work after its progress record starts."""
         plan = self._approved_plan(approval)
-        terminal = self._terminal_result(approval)
-        if terminal is not None:
-            return terminal
 
         borg = self._turns.current_borg()
         if borg.state is BorgState.PLAN_APPROVAL_PENDING:
@@ -398,6 +444,75 @@ class ProjectManagerLoop:
                 dependencies=dependencies,
                 attempt=completed,
             )
+
+    def _start_progress(self) -> None:
+        if self.progress is None:
+            return
+        if self.child_key is None:
+            record = self.progress.stages[self.stage_key]
+            if record.state is StageState.PENDING:
+                self.progress.start(self.stage_key)
+            elif record.state is not StageState.RUNNING:
+                raise ProjectManagerError(
+                    f"Project Manager progress {self.stage_key!r} is already terminal"
+                )
+            return
+        child = self.progress.stages[self.stage_key].children[self.child_key]
+        if child.state is StageState.PENDING:
+            self.progress.start_child(self.stage_key, self.child_key)
+        elif child.state is not StageState.RUNNING:
+            raise ProjectManagerError(
+                "Project Manager revision progress "
+                f"{self.child_key!r} is already terminal"
+            )
+
+    def _seed_progress(self, attempt: PlanningAttempt) -> None:
+        if self.progress is None:
+            return
+        result = planning_attempt_result(attempt, default="task batch ready")
+        duration = planning_attempt_duration(attempt)
+        if self.child_key is None:
+            record = self.progress.stages[self.stage_key]
+            if record.state is StageState.PENDING:
+                self.progress.seed_completed(self.stage_key, result, duration)
+            return
+        child = self.progress.stages[self.stage_key].children[self.child_key]
+        if child.state is StageState.PENDING:
+            self.progress.seed_child_completed(
+                self.stage_key, self.child_key, result, duration
+            )
+
+    def _complete_progress(self, attempt: PlanningAttempt) -> None:
+        if self.progress is None:
+            return
+        result = planning_attempt_result(attempt, default="task batch ready")
+        if self.child_key is None:
+            self.progress.complete(self.stage_key, result)
+        else:
+            self.progress.complete_child(self.stage_key, self.child_key, result)
+
+    def _reconcile_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        record = (
+            self.progress.stages[self.stage_key]
+            if self.child_key is None
+            else self.progress.stages[self.stage_key].children[self.child_key]
+        )
+        if record.state is not StageState.RUNNING:
+            return
+        approval = self._approval()
+        terminal = self._terminal_result(approval)
+        if terminal is not None:
+            self._complete_progress(terminal.attempt)
+        elif self.child_key is None:
+            operation = self.progress.stop if stopped else self.progress.fail
+            operation(self.stage_key, result)
+        else:
+            operation = (
+                self.progress.stop_child if stopped else self.progress.fail_child
+            )
+            operation(self.stage_key, self.child_key, result)
 
     def _approval(self) -> PlanApproval:
         approvals = self.store.list_plan_approvals(self.borg_id)
