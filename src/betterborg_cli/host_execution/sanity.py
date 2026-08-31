@@ -194,6 +194,8 @@ class HostSanityPhase:
                         stack_to_stop,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                 except BaseException as cleanup_error:
                     cleanup_detail = (
@@ -265,6 +267,8 @@ class HostSanityPhase:
                         prior_stack,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                     prior_stack = None
                 materialization = self._environment_manager.materialize_claimed_task(
@@ -280,6 +284,8 @@ class HostSanityPhase:
                     self.plan,
                     context.claim,
                     context.owner_token,
+                    cancel=context.cancel,
+                    activity=context.activity,
                 )
                 service_environment = service_url_environment(self.plan.services)
                 if sanity_stack is not None:
@@ -318,6 +324,8 @@ class HostSanityPhase:
                         stack_to_stop,
                         context.claim,
                         context.owner_token,
+                        cancel=context.cancel,
+                        activity=context.activity,
                     )
                 except BaseException as cleanup_error:
                     if active_error is None:
