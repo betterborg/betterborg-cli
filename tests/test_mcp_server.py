@@ -19,23 +19,34 @@ import pytest
 from conftest import blocked_dns_url_request_worker
 from mcp import types as mcp_types
 from mcp.shared.memory import create_connected_server_and_client_session
+from test_adapter_harness import (
+    LocalHttpServer,
+    openai_function_call,
+    openai_response,
+)
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli import mcp_server
 from betterborg_cli.agent_runtime import (
+    AgentRunSpec,
     AgentStatus,
     AgentUsage,
     BillingMode,
-    MultiprocessUrlRequest,
-    UrlRequestSpec,
+    OpenAIAdapter,
+    UrllibOpenAITransport,
     api_http,
 )
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.process import run_captured
-from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
-from betterborg_cli.host_execution.scheduler import HostSchedulerResult
+from betterborg_cli.host_execution import (
+    HostExecutionResult,
+    HostPreflightPlan,
+    HostSchedulerConfig,
+    HostSchedulerResult,
+    HostTaskScheduler,
+    ScheduledTaskContext,
+)
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
-from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     AgentAttempt,
@@ -250,55 +261,134 @@ def test_run_cancellable_reaps_resistant_local_descendants_before_return(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process cleanup required")
-def test_run_cancellable_joins_blocked_provider_process_before_return(
+def test_api_backed_mcp_cancellation_joins_provider_before_request_return(
     real_process_harness,
     monkeypatch,
 ) -> None:
     request_name = "mcp-provider-request"
     root = real_process_harness.root
-    original_cleanup = api_http._cleanup_process
+    target = root / "late-tool-target.txt"
+    original_execute = api_http.MultiprocessUrlRequest.execute
+    request_join_lock = threading.Lock()
 
-    def marked_cleanup(process, *, terminate, deadline):
-        original_cleanup(process, terminate=terminate, deadline=deadline)
-        marker = root / f"{request_name}.request-joined"
-        if not marker.exists():
-            marker.write_text(str(time.monotonic()), encoding="utf-8")
+    def marked_execute(request):
+        try:
+            return original_execute(request)
+        finally:
+            child_pid = int(
+                real_process_harness.wait_for_marker(
+                    f"{request_name}.request.pid"
+                )
+            )
+            real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
+            with request_join_lock:
+                marker = root / f"{request_name}.request-joined"
+                if not marker.exists():
+                    marker.write_text(str(time.monotonic()), encoding="utf-8")
 
     monkeypatch.setenv("BETTERBORG_TEST_REQUEST_ROOT", str(root))
     monkeypatch.setenv("BETTERBORG_TEST_REQUEST_NAME", request_name)
     monkeypatch.setenv("BETTERBORG_TEST_REQUEST_RESISTANT", "1")
     monkeypatch.setattr(api_http, "_url_request_worker", blocked_dns_url_request_worker)
-    monkeypatch.setattr(api_http, "_cleanup_process", marked_cleanup)
+    monkeypatch.setattr(api_http.MultiprocessUrlRequest, "execute", marked_execute)
 
-    def workflow(*, cancel) -> None:
+    provider_response = openai_response(
+        [
+            openai_function_call(
+                "apply_patch",
+                {
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Add File: late-tool-target.txt\n"
+                        "+late mutation\n"
+                        "*** End Patch"
+                    )
+                },
+                call_id="late-tool",
+            )
+        ]
+    )
+
+    def respond(_request):
+        return (
+            200,
+            {"content-type": "application/json"},
+            json.dumps(provider_response).encode(),
+        )
+
+    adapter_statuses: list[AgentStatus] = []
+
+    def workflow(_io, *, cancel) -> None:
         try:
-            MultiprocessUrlRequest(
-                UrlRequestSpec("http://127.0.0.1:9/", "GET", {}, None),
-                cancel,
-            ).run()
+            result = OpenAIAdapter(
+                "analysis",
+                api_key="test-key",
+                transport=UrllibOpenAITransport(server.url()),
+            ).run(
+                AgentRunSpec(
+                    system_prompt="Do not mutate after cancellation.",
+                    user_prompt="Wait for the provider.",
+                    schema={
+                        "type": "object",
+                        "properties": {"status": {"type": "string"}},
+                    },
+                    cwd=root,
+                    model="gpt-test",
+                    log_path=root / "provider.jsonl",
+                    result_path=root / "provider-result.json",
+                    allowed_tools=("apply_patch",),
+                ),
+                cancel=cancel,
+            )
+            adapter_statuses.append(result.status)
+            (root / f"{request_name}.adapter-finished").write_text(
+                str(time.monotonic()),
+                encoding="utf-8",
+            )
         finally:
             (root / f"{request_name}.worker-finished").write_text(
                 str(time.monotonic()),
                 encoding="utf-8",
             )
 
-    async def cancel_at_dns_gate(scope: anyio.CancelScope) -> None:
-        await anyio.to_thread.run_sync(
-            real_process_harness.wait_for_marker,
-            f"{request_name}.dns-gate",
-        )
-        scope.cancel()
+    request_teardown: list[float] = []
+    session_closed: list[float] = []
+    original_run_cancellable = mcp_server._run_cancellable
 
-    request_returned: list[float] = []
+    async def marked_run_cancellable(function, *args):
+        try:
+            return await original_run_cancellable(function, *args)
+        finally:
+            request_teardown.append(time.monotonic())
 
     async def run() -> None:
-        with anyio.CancelScope() as scope:
-            async with anyio.create_task_group() as tasks:
-                tasks.start_soon(cancel_at_dns_gate, scope)
-                await mcp_server._run_cancellable(workflow)
-        request_returned.append(time.monotonic())
+        async def elicit(_context, _params):
+            raise AssertionError("analyze must not elicit")
 
-    anyio.run(run)
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+            elicitation_callback=elicit,
+        ) as session:
+            call_scope = anyio.CancelScope()
+
+            async def call() -> None:
+                with call_scope:
+                    await session.call_tool("analyze", {})
+
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(call)
+                await anyio.to_thread.run_sync(
+                    real_process_harness.wait_for_marker,
+                    f"{request_name}.dns-gate",
+                )
+                call_scope.cancel()
+        session_closed.append(time.monotonic())
+
+    monkeypatch.setattr(mcp_server, "_analyze", workflow)
+    monkeypatch.setattr(mcp_server, "_run_cancellable", marked_run_cancellable)
+    with LocalHttpServer(respond) as server:
+        anyio.run(run)
 
     child_pid = int(
         real_process_harness.wait_for_marker(f"{request_name}.request.pid")
@@ -306,11 +396,25 @@ def test_run_cancellable_joins_blocked_provider_process_before_return(
     joined_at = float(
         real_process_harness.wait_for_marker(f"{request_name}.request-joined")
     )
+    adapter_finished_at = float(
+        real_process_harness.wait_for_marker(f"{request_name}.adapter-finished")
+    )
     worker_finished_at = float(
         real_process_harness.wait_for_marker(f"{request_name}.worker-finished")
     )
-    assert joined_at <= worker_finished_at <= request_returned[0]
+    assert adapter_statuses == [AgentStatus.CANCELLED]
+    assert (
+        joined_at
+        <= adapter_finished_at
+        <= worker_finished_at
+        <= request_teardown[0]
+        <= session_closed[0]
+    )
     real_process_harness.assert_pid_absent(child_pid, timeout=0.1)
+    (root / f"release-{request_name}").write_text("released", encoding="utf-8")
+    time.sleep(0.05)
+    assert target.exists() is False
+    assert server.requests == []
 
 
 def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
@@ -370,15 +474,65 @@ def test_cancelled_execute_is_durable_before_request_returns(
     committed_git_repo: Path,
     planning_cli_repository,
     approved_task_generation,
+    real_process_harness,
     monkeypatch,
 ) -> None:
-    paths, borg, current, _publication = _published_runtime(
+    repository, paths = planning_cli_repository(
         committed_git_repo,
-        planning_cli_repository,
-        approved_task_generation,
+        "mcp-cancel-execute",
     )
-    host_started = threading.Event()
+    with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "mcp-cancel-execute")
+        assert borg is not None
+        borg = store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.READY_TO_EXECUTE,
+        )
+        approval = PlanApproval(
+            borg_id=borg.id,
+            plan_digest="sha256:mcp-cancel-execute",
+            manifest={},
+        )
+        store.append_plan_approval(approval)
+        second_task = {
+            **_task_body(),
+            "stem": "02-cancellable-runtime",
+            "title": "Cancellable runtime task",
+        }
+        current = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=[_task_body(), second_task],
+            round_number=1,
+        )
+        TaskPublisher(repository, store).publish(current.generation.id)
+        records = store.list_task_records(current.generation.id)
+
+    process_name = "mcp-execute-local-command"
     host_finished = threading.Event()
+    first_task, active_task = records
+
+    def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus | None:
+        if context.claim.task_id == first_task.id:
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.DONE,
+            )
+            return TaskRuntimeStatus.DONE
+        assert context.claim.task_id == active_task.id
+        try:
+            run_captured(
+                real_process_harness.resistant_argv(process_name),
+                cwd=real_process_harness.root,
+                input="",
+                cancel=context.cancel,
+            )
+        except KeyboardInterrupt:
+            return None
+        raise AssertionError("resistant command returned without cancellation")
 
     def invoke(
         _paths,
@@ -392,24 +546,36 @@ def test_cancelled_execute_is_durable_before_request_returns(
         progress,
     ):
         assert progress is None
-        operation = store.list_execution_runs(borg.id)[0]
-        host_started.set()
         try:
-            assert cancel.wait(timeout=2)
-            store.interrupt_execution_run(
-                operation.id,
-                operation.owner_token,
-                reason="MCP request cancelled",
+            scheduler = HostTaskScheduler(
+                store,
+                behavior,
+                config=HostSchedulerConfig(
+                    jobs=1,
+                    poll_interval_seconds=0.005,
+                ),
+            ).run(
+                borg.id,
+                current.generation.id,
+                cancel=cancel,
             )
         finally:
             host_finished.set()
-        raise KeyboardInterrupt
+        return HostExecutionResult(
+            preflight=HostPreflightPlan(
+                repository_root=paths.root,
+                commands=(),
+                prepare_commands=(),
+                materialize_commands=(),
+                environment_files=(),
+                executables=(),
+                required_secret_names=(),
+                compose_files=(),
+                services=(),
+            ),
+            scheduler=scheduler,
+        )
 
-    io = InteractiveIO(
-        prompt=lambda _message: None,
-        confirm=lambda _message, _default: True,
-        write=lambda _message: None,
-    )
     monkeypatch.setattr(
         mcp_server,
         "_paths",
@@ -417,32 +583,49 @@ def test_cancelled_execute_is_durable_before_request_returns(
     )
     monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
 
-    async def cancel_after_host_starts(scope: anyio.CancelScope) -> None:
-        await anyio.to_thread.run_sync(host_started.wait)
-        scope.cancel()
-
     async def run() -> None:
-        with anyio.CancelScope() as scope:
+        async def elicit(_context, _params):
+            return mcp_types.ElicitResult(
+                action="accept",
+                content={"approved": True},
+            )
+
+        async with create_connected_server_and_client_session(
+            mcp_server.server,
+            raise_exceptions=True,
+            elicitation_callback=elicit,
+        ) as session:
+            call_scope = anyio.CancelScope()
+
+            async def call() -> None:
+                with call_scope:
+                    await session.call_tool("execute", {"name": borg.name})
+
             async with anyio.create_task_group() as tasks:
-                tasks.start_soon(cancel_after_host_starts, scope)
-                await mcp_server._run_cancellable(
-                    mcp_server._execute,
-                    borg.name,
-                    io,
+                tasks.start_soon(call)
+                await anyio.to_thread.run_sync(
+                    real_process_harness.wait_for_marker,
+                    f"{process_name}.child.pid",
                 )
+                call_scope.cancel()
 
     anyio.run(run)
 
     assert host_finished.is_set()
+    real_process_harness.assert_tree_absent(process_name, timeout=0.1)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
-        operation = store.list_execution_runs(borg.id)[0]
-        runtime = store.get_task_runtime(current.task.id)
-        claim = store.list_task_claims(operation.id)[0]
+        operation = store.list_execution_runs(borg.id)[-1]
+        retained = store.get_task_runtime(first_task.id)
+        unfinished = store.get_task_runtime(active_task.id)
+        claims = store.list_task_claims(operation.id)
         event_ids = [event.id for event in store.list_execution_events(operation.id)]
         assert operation.status is ExecutionRunStatus.CANCELLED
-        assert runtime is not None
-        assert runtime.status is TaskRuntimeStatus.PENDING
-        assert claim.released_at is not None
+        assert retained is not None
+        assert retained.status is TaskRuntimeStatus.DONE
+        assert unfinished is not None
+        assert unfinished.status is TaskRuntimeStatus.PENDING
+        assert len(claims) == 2
+        assert all(claim.released_at is not None for claim in claims)
 
     time.sleep(0.05)
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -1537,7 +1720,26 @@ def test_create_elicits_prd_question_and_final_confirmation(
     assert requests[1].requestedSchema["properties"]["approved"]["default"] is False
 
 
-def test_stdio_stdout_contains_only_protocol_json() -> None:
+def test_stdio_stdout_contains_only_protocol_json_for_api_backed_tool(
+    tmp_path: Path,
+) -> None:
+    provider_response = openai_response(
+        [
+            openai_function_call(
+                "submit_result",
+                {"status": "completed", "version": "stdio-clean"},
+                call_id="submit",
+            )
+        ]
+    )
+
+    def respond(_request):
+        return (
+            200,
+            {"content-type": "application/json"},
+            json.dumps(provider_response).encode(),
+        )
+
     messages = [
         {
             "jsonrpc": "2.0",
@@ -1545,48 +1747,123 @@ def test_stdio_stdout_contains_only_protocol_json() -> None:
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-06-18",
-                "capabilities": {},
+                "capabilities": {"elicitation": {}},
                 "clientInfo": {"name": "pytest", "version": "1"},
             },
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "analyze", "arguments": {}},
+        },
     ]
+    server_script = r'''
+from __future__ import annotations
 
-    process = subprocess.Popen(
-        [str(Path(sys.executable).with_name("borg")), "mcp"],
-        text=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+import sys
+from pathlib import Path
+from uuid import uuid4
+
+from rich.console import Console
+
+from betterborg_cli import mcp_server
+from betterborg_cli.agent_runtime import (
+    AgentRunSpec,
+    AgentStatus,
+    OpenAIAdapter,
+    UrllibOpenAITransport,
+)
+
+root = Path(sys.argv[2])
+Console
+
+
+def analyze(_io, *, cancel):
+    result = OpenAIAdapter(
+        "analysis",
+        api_key="stdio-key",
+        transport=UrllibOpenAITransport(sys.argv[1]),
+    ).run(
+        AgentRunSpec(
+            system_prompt="Return a structured result.",
+            user_prompt="Submit the result.",
+            schema={
+                "type": "object",
+                "required": ["status", "version"],
+                "properties": {
+                    "status": {"const": "completed"},
+                    "version": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            cwd=root,
+            model="gpt-test",
+            log_path=root / "stdio-provider.jsonl",
+            result_path=root / "stdio-result.json",
+        ),
+        cancel=cancel,
     )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    assert process.stderr is not None
-    responses = []
-    try:
-        process.stdin.write(json.dumps(messages[0]) + "\n")
-        process.stdin.flush()
-        ready, _, _ = select.select([process.stdout], [], [], 5)
-        assert ready, "MCP server did not answer initialize"
-        responses.append(json.loads(process.stdout.readline()))
+    assert result.status is AgentStatus.COMPLETED
+    return mcp_server.AnalyzeResult(
+        status="completed",
+        data=mcp_server.AnalyzeData(
+            repository_id=uuid4(),
+            analysis_id=uuid4(),
+            score=5,
+            previous_score=4,
+            delta=1,
+        ),
+    )
 
-        process.stdin.write(json.dumps(messages[1]) + "\n")
-        process.stdin.write(json.dumps(messages[2]) + "\n")
-        process.stdin.flush()
-        ready, _, _ = select.select([process.stdout], [], [], 5)
-        assert ready, "MCP server did not answer tools/list"
-        responses.append(json.loads(process.stdout.readline()))
-        process.stdin.close()
-        returncode = process.wait(timeout=5)
-        stderr = process.stderr.read()
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+
+mcp_server._analyze = analyze
+mcp_server.run_stdio_server()
+'''
+
+    with LocalHttpServer(respond) as server:
+        process = subprocess.Popen(
+            [sys.executable, "-c", server_script, server.url(), str(tmp_path)],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        protocol_lines: list[str] = []
+        try:
+            process.stdin.write(json.dumps(messages[0]) + "\n")
+            process.stdin.flush()
+            ready, _, _ = select.select([process.stdout], [], [], 5)
+            assert ready, "MCP server did not answer initialize"
+            protocol_lines.append(process.stdout.readline())
+
+            process.stdin.write(json.dumps(messages[1]) + "\n")
+            for message in messages[2:]:
+                process.stdin.write(json.dumps(message) + "\n")
+                process.stdin.flush()
+                ready, _, _ = select.select([process.stdout], [], [], 5)
+                assert ready, f"MCP server did not answer request {message['id']}"
+                protocol_lines.append(process.stdout.readline())
+            process.stdin.close()
+            returncode = process.wait(timeout=5)
+            protocol_lines.extend(process.stdout.readlines())
+            stderr = process.stderr.read()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     assert returncode == 0, stderr
-    assert [response["id"] for response in responses] == [1, 2]
+    raw_stdout = "".join(protocol_lines)
+    assert "\x1b" not in raw_stdout
+    responses = [json.loads(line) for line in protocol_lines if line.strip()]
+    assert [response["id"] for response in responses] == [1, 2, 3]
     assert all(response["jsonrpc"] == "2.0" for response in responses)
+    assert responses[-1]["result"]["structuredContent"]["status"] == "completed"
     assert "Processing request" not in "\n".join(map(json.dumps, responses))
     assert "Processing request" in stderr
