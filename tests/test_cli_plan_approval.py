@@ -240,6 +240,9 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     assert "Borg 'approved-plan' is ready to execute." in result.output
     assert ".borg/plans/approved-plan.md" in result.output
     assert ".borg/tasks/approved-plan/" in result.output
+    project_manager_line = result.output.index("completed Project Manager")
+    supervisor_line = result.output.index("completed Supervisor")
+    assert project_manager_line < supervisor_line
     assert selected_roles == [ApiAgentRole.PLANNING]
     approved_markdown = """# Release workflow
 
@@ -343,6 +346,11 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
 
     assert resumed.exit_code == 0, resumed.output
     assert "ready to execute" in resumed.output
+    assert "completed Project Manager" in resumed.output
+    assert "[retained]" in resumed.output
+    assert resumed.output.index("completed Project Manager") < resumed.output.index(
+        "completed Supervisor"
+    )
     assert len(adapter.calls) == 3
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")

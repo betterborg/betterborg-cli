@@ -25,6 +25,7 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     validate_plan,
 )
+from betterborg_cli.progress import RunProgress
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import RepositoryConfig
 from betterborg_cli.repository_files import (
@@ -90,6 +91,7 @@ def approve_plan_workflow(
     planning_agent: PlanningAgentFactory,
     on_bound: Callable[[], None] | None = None,
     cancel: CancellationToken | None = None,
+    progress: RunProgress | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
     with SqliteStore.open(paths.state_dir / "borg.sqlite3") as store:
@@ -119,6 +121,7 @@ def approve_plan_workflow(
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
                 cancel=cancel,
+                progress=progress,
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication
