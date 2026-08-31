@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
+from pytest import MonkeyPatch
 
+from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
 from betterborg_cli.repo_analysis.improvement_prds import (
     generate_improvement_prds,
     resolve_theme_key,
@@ -147,6 +151,80 @@ def test_generates_one_prd_per_theme_with_exact_canonical_values(
     assert "**+0.0625** repository score." in docs_prd
     assert "`README.md`" in docs_prd
     assert "**S**" not in docs_prd
+
+
+def test_reports_each_local_draft_before_atomic_publication(
+    git_repo: Path,
+    analysis: RepositoryAnalysis,
+    recording_progress: Any,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+
+    documents = generate_improvement_prds(
+        analysis,
+        paths,
+        {"ci-safety": "Sentinel", "docs": "Scribe"},
+        progress=recording_progress,
+        stage_key="drafts",
+    )
+
+    assert [document.path.name for document in documents] == [
+        "ci-safety.md",
+        "docs.md",
+    ]
+    assert recording_progress.updates == [
+        ("drafts", "drafting ci-safety.md"),
+        ("drafts", "drafting docs.md"),
+    ]
+
+
+def test_cancellation_between_atomic_publications_exposes_no_partial_prd(
+    git_repo: Path,
+    analysis: RepositoryAnalysis,
+    recording_progress: Any,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    cancel = CancellationToken()
+    published: list[Path] = []
+    publish = improvement_prds_module.publish_repository_text
+
+    def publish_then_cancel(
+        path: Path,
+        body: str,
+        *,
+        root: Path,
+        overwrite: bool,
+    ) -> None:
+        publish(path, body, root=root, overwrite=overwrite)
+        published.append(path)
+        cancel.cancel()
+
+    monkeypatch.setattr(
+        improvement_prds_module,
+        "publish_repository_text",
+        publish_then_cancel,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        generate_improvement_prds(
+            analysis,
+            paths,
+            {"ci-safety": "Sentinel", "docs": "Scribe"},
+            cancel=cancel,
+            progress=recording_progress,
+            stage_key="drafts",
+        )
+
+    assert published == [paths.improvement_prds_dir / "ci-safety.md"]
+    assert paths.improvement_prds_dir.joinpath("ci-safety.md").read_text(
+        encoding="utf-8"
+    ).startswith("# Reliable checks\n")
+    assert not paths.improvement_prds_dir.joinpath("docs.md").exists()
+    assert list(paths.improvement_prds_dir.glob(".*.tmp")) == []
+    assert recording_progress.updates == [
+        ("drafts", "drafting ci-safety.md")
+    ]
 
 
 def test_refresh_removes_only_obsolete_generated_markdown(
