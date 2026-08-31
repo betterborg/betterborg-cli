@@ -563,7 +563,7 @@ def _defer_protocol_response() -> Callable[[], None] | None:
 
         async def send_response(*, request_id: object, response: object) -> None:
             # The SDK's responder sends its cancellation error immediately after
-            # cancelling the handler. Gate that send on BetterBorg's stronger
+            # cancelling the handler. Gate that send on Betterborg's stronger
             # worker/result fence for requests running synchronous workflows.
             # The SDK also awaits this method from its receive loop, so defer the
             # wait to the session task group; keeping that loop free is required

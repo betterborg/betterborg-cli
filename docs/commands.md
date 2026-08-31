@@ -115,7 +115,7 @@ progress renderer.
 
 ## Interrupting work
 
-Press Ctrl+C once to request cooperative cancellation. BetterBorg prints
+Press Ctrl+C once to request cooperative cancellation. Betterborg prints
 `stopping...`, stops starting new work, cancels active agent, provider, and
 local-command processes, and waits for their cleanup and durable state to be
 reconciled. A normally reconciled interruption exits with status 130 and can
@@ -127,7 +127,7 @@ stopped Analyze repository — interrupted (12.4s)
 summary: 1 completed, 0 failed, 1 stopped — 0 retained
 ```
 
-If cooperative cleanup has not finished after one second, BetterBorg requests
+If cooperative cleanup has not finished after one second, Betterborg requests
 a forced stop of registered child process groups and prints `Force stopping...`.
 Pressing Ctrl+C a second time is the safety valve that requests this force path
 immediately instead of waiting for the deadline. A forced exit may occur before

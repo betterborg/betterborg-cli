@@ -744,7 +744,7 @@ def test_cancelling_active_elicitation_unwinds_coroutine_and_worker(
         # A cancellation response is the peer's acknowledgement that its
         # callback has unwound. The SDK sends that response before its default
         # callback task exits, so this protocol peer tightens the ordering that
-        # the BetterBorg parent-response fence relies on and verifies.
+        # the Betterborg parent-response fence relies on and verifies.
         responder.cancel = cancel_after_callback
         self._task_group.start_soon(host_request)
         await callback_ready.wait()
