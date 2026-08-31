@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     ArchitectCancelled,
@@ -18,13 +19,31 @@ from betterborg_cli.planning import (
     TechLeadLoop,
 )
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.progress import ChildRecord, RunProgress, StageState
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
     SqliteStore,
 )
+
+
+class _SeedOrderProgress(RunProgress):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.seed_parent_states: list[StageState] = []
+
+    def seed_child_completed(
+        self,
+        stage_key: str,
+        child_key: str,
+        result: object,
+        duration_seconds: float | None = None,
+    ) -> ChildRecord:
+        self.seed_parent_states.append(self.stages[stage_key].state)
+        return super().seed_child_completed(
+            stage_key, child_key, result, duration_seconds
+        )
 
 
 def test_findings_drive_bounded_revision_then_exact_approval_transition(
@@ -394,7 +413,7 @@ def test_two_revision_children_reconstruct_once_from_durable_attempt_ids(
 
         architect.queue(MockResponse(payload=plans[2]))
         reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
-        resumed_progress = RunProgress(
+        resumed_progress = _SeedOrderProgress(
             stream=StringIO(), attempt_history_limit=1
         )
         result = TechLeadLoop(
@@ -421,11 +440,89 @@ def test_two_revision_children_reconstruct_once_from_durable_attempt_ids(
         assert children[keys[1]].retained is False
         assert children[keys[1]].started_at is not None
         assert resumed_progress.stages["tech-lead"].state is StageState.COMPLETED
+        assert resumed_progress.seed_parent_states == [StageState.PENDING]
         bounded = resumed_progress.child_render_state("tech-lead")
         assert [item.key for item in bounded.children] == [keys[1]]
         assert bounded.earlier_attempt_count == 1
         assert len(architect.calls) == 5
         assert len(reviewer.calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("cancel_setup", "error_type", "expected_state"),
+    [
+        pytest.param(
+            True,
+            ArchitectCancelled,
+            StageState.STOPPED,
+            id="cancelled",
+        ),
+        pytest.param(False, RuntimeError, StageState.FAILED, id="failed"),
+    ],
+)
+def test_revision_constructor_error_reconciles_child_before_parent(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    cancel_setup: bool,
+    error_type: type[Exception],
+    expected_state: StageState,
+) -> None:
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Revise the rollout plan.")
+        )
+    )
+    database = committed_git_repo.parent / "tech-lead-constructor-cancel.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-constructor-cancel"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        cancel = CancellationToken()
+        progress = RunProgress(stream=StringIO())
+        loop = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            cancel=cancel,
+            progress=progress,
+        )
+
+        def interrupt_revision_setup(_self, *_args, **_kwargs) -> None:
+            if cancel_setup:
+                cancel.cancel()
+                progress.begin_cancellation()
+            raise error_type("revision setup interrupted")
+
+        monkeypatch.setattr(ArchitectLoop, "__init__", interrupt_revision_setup)
+        with pytest.raises(error_type, match="setup interrupted"):
+            loop.run()
+
+        review = next(
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "tech_review"
+        )
+        child = progress.stages["tech-lead"].children[
+            f"architect-revision:{review.id}"
+        ]
+        assert child.state is expected_state
+        assert child.started_at is not None
+        assert progress.stages["tech-lead"].state is expected_state
+        progress.close()
 
 
 def test_revalidates_architect_handoff_before_invoking_tech_lead(

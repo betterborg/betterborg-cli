@@ -20,7 +20,14 @@ from betterborg_cli.agent_runtime.selection import (
 )
 from betterborg_cli.planning.architect import ArchitectCancelled, ArchitectLoop
 from betterborg_cli.planning.plan_contracts import PlanValidationError
-from betterborg_cli.planning.turns import DurablePlanningTurns
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    completed_planning_phase_attempts,
+    current_planning_cycle_attempts,
+    planning_attempt_duration,
+    planning_attempt_result,
+    planning_request_change_attempts,
+)
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
@@ -182,20 +189,18 @@ class TechLeadLoop:
             return terminal
 
         if self.progress is not None:
-            self.progress.start("tech-lead")
             self._seed_revision_progress()
+            self.progress.start("tech-lead")
         try:
             result = self._run()
         except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
-            if self.progress is not None:
-                self.progress.stop("tech-lead", str(error))
+            self._finish_progress(str(error), stopped=True)
             raise
         except Exception as error:
-            if self.progress is not None:
-                if self.cancel is not None and self.cancel.is_set():
-                    self.progress.stop("tech-lead", str(error))
-                else:
-                    self.progress.fail("tech-lead", str(error))
+            self._finish_progress(
+                str(error),
+                stopped=self.cancel is not None and self.cancel.is_set(),
+            )
             raise
         if self.progress is not None:
             self.progress.complete(
@@ -217,6 +222,7 @@ class TechLeadLoop:
                     raise TechLeadError(
                         "Architect revision requires a rejected Tech Lead attempt"
                     )
+                self._start_revision_progress(child_key)
                 revised = ArchitectLoop(
                     self.repository,
                     borg,
@@ -392,14 +398,8 @@ class TechLeadLoop:
             BorgState.BLOCKED,
         }:
             return None
-        attempt = next(
-            (
-                item
-                for item in reversed(self._review_attempts())
-                if item.status is PlanningAttemptStatus.COMPLETED
-            ),
-            None,
-        )
+        completed_reviews = self._completed_reviews()
+        attempt = completed_reviews[-1] if completed_reviews else None
         if attempt is None:
             return None
         decision = (attempt.result or {}).get("decision")
@@ -435,29 +435,12 @@ class TechLeadLoop:
         )
 
     def _completed_reviews(self) -> list[PlanningAttempt]:
-        return [
-            item
-            for item in self._review_attempts()
-            if item.status is PlanningAttemptStatus.COMPLETED
-        ]
-
-    def _review_attempts(self) -> list[PlanningAttempt]:
-        attempts = self._turns.attempts(_TECH_REVIEW_PHASE)
-        change_requests = self.store.list_plan_change_requests(self.borg_id)
-        if not change_requests:
-            return attempts
-        cycle_started_at = change_requests[-1].created_at
-        return [
-            attempt for attempt in attempts if attempt.started_at >= cycle_started_at
-        ]
+        return completed_planning_phase_attempts(
+            self._cycle_attempts(), _TECH_REVIEW_PHASE
+        )
 
     def _cycle_attempts(self) -> list[PlanningAttempt]:
-        attempts = self.store.list_planning_attempts(self.borg_id)
-        change_requests = self.store.list_plan_change_requests(self.borg_id)
-        if not change_requests:
-            return attempts
-        cycle_started_at = change_requests[-1].created_at
-        return [item for item in attempts if item.started_at >= cycle_started_at]
+        return current_planning_cycle_attempts(self.store, self.borg_id)
 
     def _initial_architect_plan(self) -> PlanningAttempt | None:
         return next(
@@ -473,12 +456,11 @@ class TechLeadLoop:
         )
 
     def _revision_reviews(self) -> list[PlanningAttempt]:
-        return [
-            item
-            for index, item in enumerate(self._completed_reviews(), start=1)
-            if index < TECH_REVIEW_ROUND_CAP
-            and (item.result or {}).get("decision") == "request_changes"
-        ]
+        return planning_request_change_attempts(
+            self._cycle_attempts(),
+            _TECH_REVIEW_PHASE,
+            round_cap=TECH_REVIEW_ROUND_CAP,
+        )
 
     @staticmethod
     def _revision_key(review: PlanningAttempt) -> str:
@@ -517,6 +499,13 @@ class TechLeadLoop:
                     "tech-lead", ChildSpec(key, f"Architect revision {number}")
                 )
 
+    def _start_revision_progress(self, child_key: str) -> None:
+        if self.progress is None:
+            return
+        child = self.progress.stages["tech-lead"].children[child_key]
+        if child.state is StageState.PENDING:
+            self.progress.start_child("tech-lead", child_key)
+
     def _seed_revision_progress(self) -> None:
         if self.progress is None:
             return
@@ -530,8 +519,8 @@ class TechLeadLoop:
                 self.progress.seed_child_completed(
                     "tech-lead",
                     key,
-                    _attempt_result(plan),
-                    _attempt_duration(plan),
+                    planning_attempt_result(plan, default="plan ready"),
+                    planning_attempt_duration(plan),
                 )
 
     def _seed_architect_progress(self) -> None:
@@ -542,8 +531,8 @@ class TechLeadLoop:
         if plan is not None and record.state is StageState.PENDING:
             self.progress.seed_completed(
                 "architect",
-                _attempt_result(plan),
-                _attempt_duration(plan),
+                planning_attempt_result(plan, default="plan ready"),
+                planning_attempt_duration(plan),
             )
 
     def _seed_tech_lead_progress(self, attempt: PlanningAttempt) -> None:
@@ -553,18 +542,21 @@ class TechLeadLoop:
         if record.state is StageState.PENDING:
             self.progress.seed_completed(
                 "tech-lead",
-                _attempt_result(attempt),
-                _attempt_duration(attempt),
+                planning_attempt_result(attempt, default="review complete"),
+                planning_attempt_duration(attempt),
             )
 
-
-def _attempt_result(attempt: PlanningAttempt) -> str:
-    return attempt.summary or str(
-        (attempt.result or {}).get("title") or "review complete"
-    )
-
-
-def _attempt_duration(attempt: PlanningAttempt) -> float | None:
-    if attempt.finished_at is None:
-        return None
-    return max((attempt.finished_at - attempt.started_at).total_seconds(), 0.0)
+    def _finish_progress(self, result: str, *, stopped: bool) -> None:
+        if self.progress is None:
+            return
+        for child in self.progress.stages["tech-lead"].children.values():
+            if child.state is not StageState.RUNNING:
+                continue
+            if stopped:
+                self.progress.stop_child("tech-lead", child.key, result)
+            else:
+                self.progress.fail_child("tech-lead", child.key, result)
+        if stopped:
+            self.progress.stop("tech-lead", result)
+        else:
+            self.progress.fail("tech-lead", result)

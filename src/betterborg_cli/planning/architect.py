@@ -20,7 +20,11 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.planning.plan_contracts import PlanValidationError
-from betterborg_cli.planning.turns import DurablePlanningTurns
+from betterborg_cli.planning.turns import (
+    DurablePlanningTurns,
+    planning_attempt_duration,
+    planning_attempt_result,
+)
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
@@ -558,13 +562,20 @@ class ArchitectLoop:
         if self.child_key is None:
             self.progress.start(self.stage_key)
         else:
-            self.progress.start_child(self.stage_key, self.child_key)
+            child = self.progress.stages[self.stage_key].children[self.child_key]
+            if child.state is StageState.PENDING:
+                self.progress.start_child(self.stage_key, self.child_key)
+            elif child.state is not StageState.RUNNING:
+                raise ArchitectError(
+                    "Architect revision progress "
+                    f"{self.child_key!r} is already terminal"
+                )
 
     def _seed_progress(self, attempt: PlanningAttempt) -> None:
         if self.progress is None:
             return
-        result = _attempt_result(attempt)
-        duration = _attempt_duration(attempt)
+        result = planning_attempt_result(attempt, default="plan ready")
+        duration = planning_attempt_duration(attempt)
         if self.child_key is None:
             record = self.progress.stages[self.stage_key]
             if record.state is StageState.PENDING:
@@ -580,10 +591,15 @@ class ArchitectLoop:
         if self.progress is None:
             return
         if self.child_key is None:
-            self.progress.complete(self.stage_key, _attempt_result(attempt))
+            self.progress.complete(
+                self.stage_key,
+                planning_attempt_result(attempt, default="plan ready"),
+            )
         else:
             self.progress.complete_child(
-                self.stage_key, self.child_key, _attempt_result(attempt)
+                self.stage_key,
+                self.child_key,
+                planning_attempt_result(attempt, default="plan ready"),
             )
 
     def _fail_progress(self, result: str) -> None:
@@ -697,16 +713,6 @@ class ArchitectLoop:
         identifiers = [item["id"] for item in questions]
         if len(identifiers) != len(set(identifiers)):
             raise ArchitectError("Architect question IDs must be unique within a round")
-
-
-def _attempt_result(attempt: PlanningAttempt) -> str:
-    return attempt.summary or str((attempt.result or {}).get("title") or "plan ready")
-
-
-def _attempt_duration(attempt: PlanningAttempt) -> float | None:
-    if attempt.finished_at is None:
-        return None
-    return max((attempt.finished_at - attempt.started_at).total_seconds(), 0.0)
 
 
 __all__ = [

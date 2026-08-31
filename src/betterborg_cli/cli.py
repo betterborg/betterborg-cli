@@ -69,6 +69,10 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.planning.turns import (
+    current_planning_cycle_attempts,
+    latest_planning_review_requests_changes,
+)
 from betterborg_cli.plugins import (
     SUPPORTED_PLUGIN_HOSTS,
     PluginInstaller,
@@ -85,7 +89,6 @@ from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
     PlanChangeRequest,
-    PlanningAttemptStatus,
     SqliteStore,
     TaskGenerationStatus,
     TaskRecord,
@@ -1562,24 +1565,9 @@ def _continue_planning(
 
 def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
     """Return whether the current Architect state follows a Tech Lead rejection."""
-    attempts = store.list_planning_attempts(borg.id)
-    changes = store.list_plan_change_requests(borg.id)
-    if changes:
-        attempts = [
-            item for item in attempts if item.started_at >= changes[-1].created_at
-        ]
-    latest = next(
-        (
-            item
-            for item in reversed(attempts)
-            if item.phase == "tech_review"
-            and item.status is PlanningAttemptStatus.COMPLETED
-        ),
-        None,
+    return latest_planning_review_requests_changes(
+        current_planning_cycle_attempts(store, borg.id), "tech_review"
     )
-    return latest is not None and (
-        latest.result or {}
-    ).get("decision") == "request_changes"
 
 
 def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:

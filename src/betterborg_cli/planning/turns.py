@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import UUID
 
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
@@ -34,6 +35,72 @@ from betterborg_cli.store import (
 )
 
 ErrorFactory = Callable[[str], Exception]
+
+
+def current_planning_cycle_attempts(
+    store: SqliteStore, borg_id: UUID
+) -> list[PlanningAttempt]:
+    """Return attempts belonging to the latest human planning cycle."""
+
+    attempts = store.list_planning_attempts(borg_id)
+    change_requests = store.list_plan_change_requests(borg_id)
+    if not change_requests:
+        return attempts
+    cycle_started_at = change_requests[-1].created_at
+    return [item for item in attempts if item.started_at >= cycle_started_at]
+
+
+def completed_planning_phase_attempts(
+    attempts: Sequence[PlanningAttempt], phase: str
+) -> list[PlanningAttempt]:
+    """Project one phase's completed attempts from durable cycle history."""
+
+    return [
+        item
+        for item in attempts
+        if item.phase == phase and item.status is PlanningAttemptStatus.COMPLETED
+    ]
+
+
+def planning_request_change_attempts(
+    attempts: Sequence[PlanningAttempt], phase: str, *, round_cap: int
+) -> list[PlanningAttempt]:
+    """Return review rejections which are eligible to create revision work."""
+
+    return [
+        item
+        for index, item in enumerate(
+            completed_planning_phase_attempts(attempts, phase), start=1
+        )
+        if index < round_cap
+        and (item.result or {}).get("decision") == "request_changes"
+    ]
+
+
+def latest_planning_review_requests_changes(
+    attempts: Sequence[PlanningAttempt], phase: str
+) -> bool:
+    """Return whether the latest completed review requests another revision."""
+
+    completed = completed_planning_phase_attempts(attempts, phase)
+    return bool(
+        completed
+        and (completed[-1].result or {}).get("decision") == "request_changes"
+    )
+
+
+def planning_attempt_result(attempt: PlanningAttempt, *, default: str) -> str:
+    """Return the durable summary used for retained progress history."""
+
+    return attempt.summary or str((attempt.result or {}).get("title") or default)
+
+
+def planning_attempt_duration(attempt: PlanningAttempt) -> float | None:
+    """Return a completed attempt's non-negative authoritative duration."""
+
+    if attempt.finished_at is None:
+        return None
+    return max((attempt.finished_at - attempt.started_at).total_seconds(), 0.0)
 
 
 class PlanningProgress(Protocol):
@@ -328,4 +395,12 @@ class DurablePlanningTurns:
         return payload
 
 
-__all__ = ["DurablePlanningTurns"]
+__all__ = [
+    "DurablePlanningTurns",
+    "completed_planning_phase_attempts",
+    "current_planning_cycle_attempts",
+    "latest_planning_review_requests_changes",
+    "planning_attempt_duration",
+    "planning_attempt_result",
+    "planning_request_change_attempts",
+]
