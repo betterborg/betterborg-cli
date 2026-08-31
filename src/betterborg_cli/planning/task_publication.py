@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.planning.pm import approved_plan_digest
 from betterborg_cli.planning.task_render import (
     render_task_markdown,
@@ -74,11 +76,17 @@ class TaskPublisher:
         *,
         failure_injector: FailureInjector | None = None,
         cancel: CancellationToken | None = None,
+        command_runner: Callable[..., subprocess.CompletedProcess[str]] = run_captured,
     ) -> None:
         self.cancel = cancel
+        self.command_runner = command_runner
         self._raise_if_cancelled()
         try:
-            paths = RepoPaths.discover(repository.root, cancel=cancel)
+            paths = RepoPaths.discover(
+                repository.root,
+                cancel=cancel,
+                command_runner=command_runner,
+            )
         except ValueError as error:
             if cancel is not None and cancel.is_set():
                 raise TaskPublicationCancelled(
@@ -95,6 +103,7 @@ class TaskPublisher:
 
     def publish(self, generation_id: UUID) -> TaskPublication:
         """Durably publish one approved generation, resuming any prior attempt."""
+        self._raise_if_cancelled()
         generation = self.store.get_task_generation(generation_id)
         if generation is None:
             raise TaskPublicationError(f"task generation {generation_id} not found")
@@ -105,8 +114,10 @@ class TaskPublisher:
         current = self.store.get_current_task_generation(borg.id)
         if current is not None:
             self._verify_current(borg, current)
+            self._raise_if_cancelled()
         if generation.status is TaskGenerationStatus.CURRENT:
             publication = self._verify_tree(borg, generation, destination, expected)
+            self._raise_if_cancelled()
             self._cleanup_noncurrent(borg, generation.id)
             return publication
         if generation.status is not TaskGenerationStatus.PREPARING:
@@ -116,6 +127,7 @@ class TaskPublisher:
             )
         self._require_approved_handoff(borg, generation)
         self._checkpoint("after_preparing")
+        self._raise_if_cancelled()
 
         ensure_managed_gitignore(self.paths)
         staging_parent = self.paths.task_staging_dir / borg.name
@@ -130,6 +142,7 @@ class TaskPublisher:
         if not os.path.lexists(destination):
             staging = staging_parent / str(generation.id)
             self._remove_tree(staging)
+            self._raise_if_cancelled()
             self._stage(staging, expected)
             self._raise_if_cancelled()
             try:
@@ -146,7 +159,9 @@ class TaskPublisher:
         self._checkpoint("during_parent_fsync")
         _fsync_directory(destination_parent)
         self._checkpoint("after_parent_fsync")
+        self._raise_if_cancelled()
         publication = self._verify_tree(borg, generation, destination, expected)
+        self._raise_if_cancelled()
         self._require_git_trackable(publication.files)
         self._checkpoint("before_db_commit")
         self._raise_if_cancelled()
@@ -407,6 +422,7 @@ class TaskPublisher:
                     published.path,
                     root=self.paths.root,
                     cancel=self.cancel,
+                    command_runner=self.command_runner,
                 )
             except (RepositoryGitVisibilityError, RepositoryPathError) as error:
                 if self.cancel is not None and self.cancel.is_set():

@@ -467,8 +467,10 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
         *,
         root: Path,
         cancel: CancellationToken | None = None,
+        command_runner=run_captured,
     ) -> None:
         assert cancel is not None
+        assert command_runner is run_captured
         observed_cancel.append(cancel)
 
         def runner(
