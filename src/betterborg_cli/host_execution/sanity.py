@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution.compose import (
     ComposeStack,
     ComposeStackError,
@@ -33,6 +33,7 @@ from betterborg_cli.host_execution.merge import MergeTip
 from betterborg_cli.host_execution.preflight import HostCommand, HostPreflightPlan
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
+from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import ExecutionEvent, TaskRuntime, TaskRuntimeStatus
 
@@ -115,7 +116,7 @@ class HostSanityPhase:
         self._compose_manager = compose_manager
         self._worktree_manager = worktree_manager
         self._repository_lock = repository_lock
-        self._run = command_runner or subprocess.run
+        self._run = command_runner or run_captured
         self._timeout_seconds = timeout_seconds
         if git is not None and git.cwd != self.repository_root:
             raise SanityPhaseError("sanity phase Git binding must match repository")
@@ -295,6 +296,8 @@ class HostSanityPhase:
                     materialization_environment=materialization.environment,
                     service_environment=service_environment,
                     secret_values=secret_values,
+                    cancel=context.cancel,
+                    activity=context.activity_sink("sanity"),
                 )
                 command_results.extend(commands)
                 failure = next(
@@ -396,6 +399,8 @@ class HostSanityPhase:
         materialization_environment: Mapping[str, str],
         service_environment: Mapping[str, str],
         secret_values: Mapping[str, str],
+        cancel: CancellationToken,
+        activity: Callable[[AgentActivity], None] | None,
     ) -> tuple[SanityCommandResult, ...]:
         results: list[SanityCommandResult] = []
         masks = declared_secret_mask_values(self.plan, secret_values)
@@ -414,16 +419,17 @@ class HostSanityPhase:
                 redact_secrets(command.cwd, masks),
                 redact_secrets(command.evidence, masks),
             )
+            self._report_command(command.argv, masks, activity)
             try:
                 completed = self._run(
                     list(command.argv),
                     cwd=cwd,
                     env=environment,
                     check=False,
-                    capture_output=True,
-                    text=True,
                     timeout=self._timeout_seconds,
+                    cancel=cancel,
                 )
+                self._raise_if_cancelled(cancel)
                 result = SanityCommandResult(
                     redacted_command,
                     completed.returncode,
@@ -431,6 +437,7 @@ class HostSanityPhase:
                     redact_secrets(completed.stderr or "", masks),
                 )
             except subprocess.TimeoutExpired as error:
+                self._raise_if_cancelled(cancel, error)
                 result = SanityCommandResult(
                     redacted_command,
                     -1,
@@ -442,6 +449,7 @@ class HostSanityPhase:
                     ),
                 )
             except OSError as error:
+                self._raise_if_cancelled(cancel, error)
                 result = SanityCommandResult(
                     redacted_command,
                     -1,
@@ -452,6 +460,31 @@ class HostSanityPhase:
             if result.returncode != 0:
                 break
         return tuple(results)
+
+    @staticmethod
+    def _report_command(
+        command: Sequence[str],
+        masks: Sequence[str],
+        activity: Callable[[AgentActivity], None] | None,
+    ) -> None:
+        if activity is None:
+            return
+        redacted = [redact_secrets(argument, masks) for argument in command]
+        try:
+            activity(AgentActivity(AgentActivityKind.COMMAND, shlex.join(redacted)))
+        except Exception:
+            return
+
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel: CancellationToken,
+        cause: BaseException | None = None,
+    ) -> None:
+        if not cancel.is_set():
+            return
+        if cause is None:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt from cause
 
     def _runtime_and_worktree(
         self, context: ScheduledTaskContext, tip: MergeTip

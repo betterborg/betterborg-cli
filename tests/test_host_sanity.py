@@ -236,6 +236,81 @@ def test_sanity_attestation_reuses_bound_git_and_reaps_cancelled_probe(
     assert any("rev-parse --abbrev-ref HEAD" in item.detail for item in activities)
 
 
+def test_sanity_catalog_command_reports_redacted_activity_and_reaps_cancellation(
+    tmp_path: Path,
+    real_process_harness,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    secret = 'sanity"secret/with space?x=1&y=2'
+    escaped_secret = json.dumps(secret)[1:-1]
+    encoded_secret = quote(secret, safe="")
+    original_plan = _plan(fixture)
+    plan = replace(
+        original_plan,
+        commands=(
+            replace(
+                original_plan.commands[0],
+                argv=(
+                    "catalog-install",
+                    secret,
+                    escaped_secret,
+                    encoded_secret,
+                ),
+            ),
+            original_plan.commands[1],
+        ),
+    )
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    cancel = CancellationToken()
+    resistant = real_process_harness.resistant_argv("sanity-catalog-command")
+    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    activities = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        invocations.append((tuple(argv), dict(kwargs)))
+        return run_captured(resistant, **kwargs)
+
+    with SqliteStore.open(fixture.database) as store:
+        phase = _sanity_phase(
+            fixture,
+            plan,
+            repository_lock,
+            compose,
+            runner,
+            cancel=cancel,
+        )
+        context = fixture.context(store, cancel=cancel, activity=activities.append)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                phase.run,
+                context,
+                tip,
+                secret_values={"BUILD_TOKEN": secret, "AGENT_TOKEN": "agent"},
+            )
+            real_process_harness.wait_for_marker(
+                "sanity-catalog-command.child.pid"
+            )
+            cancel.cancel()
+            with pytest.raises(KeyboardInterrupt):
+                result.result(timeout=5)
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    real_process_harness.assert_tree_absent("sanity-catalog-command")
+    assert len(invocations) == 1
+    command, kwargs = invocations[0]
+    assert command == plan.commands[0].argv
+    assert kwargs["cancel"] is cancel
+    assert kwargs["timeout"] == 600
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
+    assert len(activities) == 1
+    detail = activities[0].detail
+    assert detail.startswith("sanity: catalog-install")
+    assert detail.count("[REDACTED]") == 3
+    assert secret not in detail
+    assert escaped_secret not in detail
+    assert encoded_secret not in detail
+
+
 def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     tmp_path: Path,
 ) -> None:
