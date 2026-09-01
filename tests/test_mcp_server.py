@@ -34,8 +34,10 @@ from betterborg_cli.agent_runtime import (
     AgentRunSpec,
     AgentStatus,
     AgentUsage,
+    ApiAgentRole,
     BillingMode,
     OpenAIAdapter,
+    SelectedAgent,
     UrllibOpenAITransport,
     api_http,
 )
@@ -51,6 +53,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.run_control import DEFAULT_FORCE_GRACE_SECONDS
 from betterborg_cli.store import (
     AgentAttempt,
@@ -1479,11 +1482,13 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
     analysis = SimpleNamespace(id=uuid4(), overall_score=4.5, score_delta=0.5)
     previous = SimpleNamespace(overall_score=4.0)
     calls: list[str] = []
+    selected_stages: list[AgentStage] = []
 
     class FakeRepositoryService:
-        def __init__(self, service_paths, _store, _factory, *, cancel) -> None:
+        def __init__(self, service_paths, _store, factory, *, cancel) -> None:
             assert service_paths == paths
             assert cancel is not None
+            factory(object())
 
         def initialize(self):
             calls.append("init")
@@ -1523,11 +1528,17 @@ def test_init_and_analyze_use_repository_service_with_typed_actions(
         lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
+    monkeypatch.setattr(
+        mcp_server,
+        "select_agent",
+        lambda _config, stage, _paths, **_kwargs: selected_stages.append(stage),
+    )
 
     initialized = _structured(_call_tool("init"))
     analyzed = _structured(_call_tool("analyze"))
 
     assert calls == ["init", "analyze"]
+    assert selected_stages == [AgentStage.ANALYSIS, AgentStage.ANALYSIS]
     assert initialized["status"] == "already_initialized"
     assert initialized["artifacts"] == [
         {"kind": "score", "path": ".betterborg/score.md"},
@@ -1562,6 +1573,7 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     prd_path = paths.tracked_dir / "prds" / "new-borg.md"
     created_borg = Borg(repository_id=borg.repository_id, name="new-borg")
     create_calls: list[tuple[str, Path | None]] = []
+    selected_stages: list[AgentStage] = []
 
     class FakeCreateService:
         def __init__(
@@ -1595,7 +1607,11 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
         "_paths",
         lambda *, trusted, io=None, cancel=None: paths,
     )
-    monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        mcp_server,
+        "select_agent",
+        lambda _config, stage, _paths, **_kwargs: selected_stages.append(stage),
+    )
     monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
 
     created = _structured(
@@ -1606,6 +1622,7 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     )
 
     assert create_calls == [("new-borg", paths.root / "source.md")]
+    assert selected_stages == [AgentStage.REQUIREMENTS]
     assert created["status"] == "confirmed"
     assert created["artifacts"] == [
         {"kind": "prd", "path": ".betterborg/prds/new-borg.md"}
@@ -1624,7 +1641,7 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
 ) -> None:
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-start")
     plan = planning_plan_response(summary="MCP plan is ready.")
-    adapter = MockAdapter(name="openai").queue(
+    architect = MockAdapter(name="openai").queue(
         MockResponse(
             payload={
                 "decision": "ask_more",
@@ -1639,14 +1656,39 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
         )
     ).queue(MockResponse(payload={"decision": "ready_to_plan"})).queue(
         MockResponse(payload=plan)
-    ).queue(MockResponse(payload=tech_lead_approval_response()))
+    )
+    tech_lead = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    selected_stages: list[AgentStage] = []
+    continuations: list[tuple[str, str | None]] = []
+    continue_planning = cli_module._continue_planning
+
+    def select(_config, stage, _paths, **_kwargs):
+        selected_stages.append(stage)
+        return {
+            AgentStage.ARCHITECT: architect,
+            AgentStage.TECH_LEAD: tech_lead,
+        }[stage]
+
+    def continue_spy(selected_paths, name, *, change_note=None, io=None, cancel=None):
+        continuations.append((name, change_note))
+        return continue_planning(
+            selected_paths,
+            name,
+            change_note=change_note,
+            io=io,
+            cancel=cancel,
+        )
+
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
         mcp_server,
         "_paths",
         lambda *, trusted, io=None, cancel=None: paths,
     )
-    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    monkeypatch.setattr(cli_module, "_continue_planning", continue_spy)
 
     requests: list = []
     started = _structured(
@@ -1662,6 +1704,10 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     )
 
     assert started["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+    assert continuations == [("mcp-start", None)]
+    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert len(architect.calls) == 3
+    assert len(tech_lead.calls) == 1
     assert [action["arguments"]["action"] for action in started["next_actions"]] == [
         "show",
         "approve",
@@ -1691,20 +1737,44 @@ def test_plan_change_validates_note_and_preserves_service_history(
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-change")
     original = planning_plan_response(summary="Original MCP plan.")
     revised = planning_plan_response(summary="Revised MCP plan.")
-    adapter = MockAdapter(name="openai")
+    architect = MockAdapter(name="openai")
     for payload in (
         {"decision": "ready_to_plan"},
         original,
-        tech_lead_approval_response(),
     ):
-        adapter.queue(MockResponse(payload=payload))
+        architect.queue(MockResponse(payload=payload))
+    tech_lead = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    selected_stages: list[AgentStage] = []
+    continuations: list[tuple[str, str | None]] = []
+    continue_planning = cli_module._continue_planning
+
+    def select(_config, stage, _paths, **_kwargs):
+        selected_stages.append(stage)
+        return {
+            AgentStage.ARCHITECT: architect,
+            AgentStage.TECH_LEAD: tech_lead,
+        }[stage]
+
+    def continue_spy(selected_paths, name, *, change_note=None, io=None, cancel=None):
+        continuations.append((name, change_note))
+        return continue_planning(
+            selected_paths,
+            name,
+            change_note=change_note,
+            io=io,
+            cancel=cancel,
+        )
+
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
         mcp_server,
         "_paths",
         lambda *, trusted, io=None, cancel=None: paths,
     )
-    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: adapter)
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    monkeypatch.setattr(cli_module, "_continue_planning", continue_spy)
 
     started = _structured(
         _call_tool("plan", {"name": "mcp-change", "action": "start"})
@@ -1718,8 +1788,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
     assert invalid.isError is True
     assert "plan change note must not be empty" in invalid.content[0].text
 
-    adapter.queue(MockResponse(payload=revised))
-    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    architect.queue(MockResponse(payload=revised))
+    tech_lead.queue(MockResponse(payload=tech_lead_approval_response()))
     changed = _structured(
         _call_tool(
             "plan",
@@ -1735,6 +1805,18 @@ def test_plan_change_validates_note_and_preserves_service_history(
     )
 
     assert changed["status"] == BorgState.PLAN_APPROVAL_PENDING.value
+    assert continuations == [
+        ("mcp-change", None),
+        ("mcp-change", "Add staged rollout checks."),
+    ]
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+    ]
+    assert len(architect.calls) == 3
+    assert len(tech_lead.calls) == 2
     assert shown["data"]["plan"]["summary"] == "Revised MCP plan."
     assert shown["data"]["plan"]["code_pointers"] == revised["code_pointers"]
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -1782,9 +1864,10 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
             new_state=BorgState.PLAN_APPROVAL_PENDING,
         )
 
-    adapter = MockAdapter(name="openai").queue(
+    project_manager = MockAdapter(name="openai").queue(
         MockResponse(payload=_pm_tasks(plan))
-    ).queue(
+    )
+    supervisor = MockAdapter(name="openai").queue(
         MockResponse(
             payload={
                 "decision": "approve",
@@ -1793,6 +1876,15 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
             }
         )
     )
+    selected_stages: list[AgentStage] = []
+
+    def select(_config, stage, _paths, **_kwargs):
+        selected_stages.append(stage)
+        return {
+            AgentStage.PM: project_manager,
+            AgentStage.SUPERVISOR: supervisor,
+        }[stage]
+
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
         mcp_server,
@@ -1802,7 +1894,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     monkeypatch.setattr(
         mcp_server,
         "select_agent",
-        lambda *_args, **_kwargs: adapter,
+        select,
     )
 
     requests: list = []
@@ -1815,6 +1907,9 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     )
 
     assert result["status"] == BorgState.READY_TO_EXECUTE.value
+    assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
+    assert len(project_manager.calls) == 1
+    assert len(supervisor.calls) == 1
     assert [artifact["kind"] for artifact in result["artifacts"]] == [
         "approved_plan",
         "task",
@@ -1848,21 +1943,52 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
     )
     operation_id = uuid4()
     invoked: list[tuple] = []
+    selected_stages: list[AgentStage] = []
+    selected_settings = {
+        AgentStage.CODING: ("mcp-coding-model", "mcp-coding-effort"),
+        AgentStage.REVIEW: ("mcp-review-model", "mcp-review-effort"),
+        AgentStage.MERGE: ("mcp-merge-model", "mcp-merge-effort"),
+    }
+    invoke_host_execution = cli_module._invoke_host_execution
+
+    def select(_config, stage, selected_paths, **_kwargs):
+        selected_stages.append(stage)
+        model, effort = selected_settings[stage]
+        return SelectedAgent(
+            role=ApiAgentRole(stage.value),
+            adapter=MockAdapter(name="openai"),
+            paths=selected_paths,
+            model=model,
+            effort=effort,
+        )
 
     def invoke(*args, **kwargs):
         invoked.append((args, kwargs))
+        return invoke_host_execution(*args, **kwargs)
+
+    def run(service, *_args, **_kwargs):
+        coding_config = service._runtime._coding._config
+        assert (coding_config.model, coding_config.effort) == (
+            "mcp-coding-model",
+            "mcp-coding-effort",
+        )
+        review_config = service._runtime._review_fix._config
+        assert (
+            review_config.review_model,
+            review_config.review_effort,
+            review_config.fix_effort,
+        ) == (
+            "mcp-review-model",
+            "mcp-review-effort",
+            "mcp-review-effort",
+        )
+        merge_config = service._runtime._merge._config
+        assert (merge_config.model, merge_config.effort) == (
+            "mcp-merge-model",
+            "mcp-merge-effort",
+        )
         return HostExecutionResult(
-            preflight=HostPreflightPlan(
-                repository_root=paths.root,
-                commands=(),
-                prepare_commands=(),
-                materialize_commands=(),
-                environment_files=(),
-                executables=(),
-                required_secret_names=(),
-                compose_files=(),
-                services=(),
-            ),
+            preflight=service._runtime.plan,
             scheduler=HostSchedulerResult(
                 operation_id=operation_id,
                 acquired=True,
@@ -1882,6 +2008,23 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         lambda *, trusted, io=None, cancel=None: paths,
     )
     monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke)
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    monkeypatch.setattr(cli_module.HostExecutionService, "run", run)
+    monkeypatch.setattr(
+        cli_module.HostPreflight,
+        "validate",
+        lambda _preflight, _plan, **_kwargs: HostPreflightPlan(
+            repository_root=paths.root,
+            commands=(),
+            prepare_commands=(),
+            materialize_commands=(),
+            environment_files=(),
+            executables=(),
+            required_secret_names=(),
+            compose_files=(),
+            services=(),
+        ),
+    )
 
     listed = _structured(_call_tool("task_list", {"name": borg.name}))
     requests: list = []
@@ -1915,6 +2058,11 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         }
     ]
     assert len(invoked) == 1
+    assert selected_stages == [
+        AgentStage.CODING,
+        AgentStage.REVIEW,
+        AgentStage.MERGE,
+    ]
     assert len(requests) == 1
     assert "Approve this estimate" in requests[0].message
     invoked_args, invoked_kwargs = invoked[0]
@@ -2072,11 +2220,13 @@ def test_init_elicits_onboarding_door_theme_and_name(
     )
     analysis = SimpleNamespace(id=uuid4(), overall_score=3.5)
     created = Borg(repository_id=repository.id, name="repair-ci")
+    selected_stages: list[AgentStage] = []
 
     class FakeRepositoryService:
-        def __init__(self, service_paths, _store, _factory, *, cancel) -> None:
+        def __init__(self, service_paths, _store, factory, *, cancel) -> None:
             assert service_paths == paths
             assert cancel is not None
+            factory(object())
 
         def initialize(self):
             return SimpleNamespace(
@@ -2121,7 +2271,11 @@ def test_init_elicits_onboarding_door_theme_and_name(
     )
     monkeypatch.setattr(mcp_server, "RepositoryService", FakeRepositoryService)
     monkeypatch.setattr(mcp_server, "CreateService", FakeCreateService)
-    monkeypatch.setattr(mcp_server, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        mcp_server,
+        "select_agent",
+        lambda _config, stage, _paths, **_kwargs: selected_stages.append(stage),
+    )
     requests: list = []
 
     result = _structured(
@@ -2133,6 +2287,7 @@ def test_init_elicits_onboarding_door_theme_and_name(
     )
 
     assert result["status"] == "initialized"
+    assert selected_stages == [AgentStage.ANALYSIS, AgentStage.REQUIREMENTS]
     assert result["artifacts"][-1] == {
         "kind": "prd",
         "path": ".betterborg/prds/repair-ci.md",
