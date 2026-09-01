@@ -72,15 +72,28 @@ def test_production_selectors_use_stage_identities() -> None:
     for path in package_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.id != "select_agent" or len(node.args) < 2:
+            called_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if called_name != "select_agent":
                 continue
-            identity = node.args[1]
-            if (
-                isinstance(identity, ast.Attribute)
-                and isinstance(identity.value, ast.Name)
-                and identity.value.id == "ApiAgentRole"
+            stage_arguments = node.args[1:2]
+            stage_arguments.extend(
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == "stage"
+            )
+            if any(
+                isinstance(stage, ast.Attribute)
+                and isinstance(stage.value, ast.Name)
+                and stage.value.id == "ApiAgentRole"
+                for stage in stage_arguments
             ):
                 violations.append(f"{path.relative_to(package_root)}:{node.lineno}")
 
@@ -243,69 +256,6 @@ def test_configured_anthropic_stage_accepts_effort(
     assert selected.effort == effort
 
 
-@pytest.mark.parametrize(
-    "identity",
-    [
-        ApiAgentRole.ANALYSIS,
-        "analysis",
-        ApiAgentRole.PLANNING,
-        "planning",
-    ],
-)
-def test_legacy_analysis_and_planning_identities_use_shared_defaults(
-    git_repo: Path, identity: ApiAgentRole | str
-) -> None:
-    selected = select_agent(
-        _config(
-            defaults=AgentChoice(
-                adapter="codex", model="shared-model", effort="low"
-            ),
-            analysis=AgentChoice(adapter="missing"),
-            architect=AgentChoice(adapter="missing"),
-        ),
-        identity,
-        RepoPaths.discover(git_repo),
-        credentials={},
-        executable_lookup=lambda binary: (
-            "/bin/codex" if binary == "codex" else None
-        ),
-    )
-
-    assert selected.name == "codex"
-    assert selected.role is ApiAgentRole(identity)
-    assert selected.model == "shared-model"
-    assert selected.effort == "low"
-
-
-@pytest.mark.parametrize(
-    "role",
-    [ApiAgentRole.CODING, ApiAgentRole.REVIEW, ApiAgentRole.MERGE],
-)
-def test_legacy_execution_roles_retain_their_stage_configuration(
-    git_repo: Path, role: ApiAgentRole
-) -> None:
-    selected = select_agent(
-        _config(
-            defaults=AgentChoice(adapter="claude"),
-            **{
-                role.value: AgentChoice(
-                    adapter="codex",
-                    model=f"{role.value}-model",
-                    effort="low",
-                )
-            },
-        ),
-        role,
-        RepoPaths.discover(git_repo),
-        credentials={},
-        executable_lookup=lambda binary: f"/bin/{binary}",
-    )
-
-    assert selected.name == "codex"
-    assert selected.model == f"{role.value}-model"
-    assert selected.effort == "low"
-
-
 def test_configured_native_role_applies_overrides_after_trust_before_spawn(
     git_repo: Path,
 ) -> None:
@@ -350,7 +300,7 @@ def test_configured_native_role_applies_overrides_after_trust_before_spawn(
                 adapter="claude", model="role-model", effort="high"
             )
         ),
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
@@ -647,7 +597,7 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
 
     selected = select_agent(
         _config(coding=AgentChoice(adapter="codex")),
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
@@ -665,7 +615,7 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
 def _selected_codex(git_repo: Path, **changes: Any) -> SelectedAgent:
     return select_agent(
         _config(coding=AgentChoice(adapter="codex")),
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
@@ -784,7 +734,7 @@ def test_run_rejects_a_cwd_from_a_different_repository_before_trust_or_spawn(
     subprocess.run(["git", "init", "--quiet", str(other_repo)], check=True)
     selected = select_agent(
         _config(coding=AgentChoice(adapter="codex")),
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
@@ -842,7 +792,7 @@ def test_run_accepts_a_managed_linked_worktree_and_trusts_that_workspace(
     )
     selected = select_agent(
         _config(review=AgentChoice(adapter="openai")),
-        ApiAgentRole.REVIEW,
+        AgentStage.REVIEW,
         paths,
         interactive=False,
         credentials={"OPENAI_API_KEY": "key"},
@@ -864,7 +814,7 @@ def test_pre_cancelled_native_run_does_not_request_trust_or_spawn(
 ) -> None:
     selected = select_agent(
         _config(coding=AgentChoice(adapter="codex")),
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         RepoPaths.discover(git_repo),
         interactive=True,
         credentials={},
@@ -890,7 +840,7 @@ def test_api_execution_discloses_host_capability_and_trusts_before_request(
     secret = "sk-proj-owner-only-secret"
     selected = select_agent(
         _config(review=AgentChoice(adapter="openai", model="review-model")),
-        ApiAgentRole.REVIEW,
+        AgentStage.REVIEW,
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"OPENAI_API_KEY": secret},
@@ -934,7 +884,7 @@ def test_api_analysis_remains_contained_without_workspace_trust(
 ) -> None:
     selected = select_agent(
         _config(),
-        ApiAgentRole.ANALYSIS,
+        AgentStage.ANALYSIS,
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"OPENAI_API_KEY": "key"},
@@ -962,7 +912,7 @@ def test_missing_setup_and_unusable_overrides_name_every_setup_option(
     with pytest.raises(AgentSelectionError) as captured:
         select_agent(
             _config(coding=choice),
-            ApiAgentRole.CODING,
+            AgentStage.CODING,
             RepoPaths.discover(git_repo),
             interactive=False,
             credentials={"UNRELATED": secret},
