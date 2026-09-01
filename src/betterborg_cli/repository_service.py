@@ -11,7 +11,7 @@ from typing import TypeAlias
 
 from betterborg_cli.agent_runtime.base import AgentAdapter, CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
-from betterborg_cli.agent_runtime.selection import SelectedAgent
+from betterborg_cli.agent_runtime.selection import SelectedAgent, resolve_agent_model
 from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
@@ -29,6 +29,7 @@ from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.repository_config import (
     CONFIG_FILENAME,
     CONFIG_VERSION,
+    AgentStage,
     RepositoryConfig,
     load_repository_config,
 )
@@ -107,7 +108,7 @@ class RepositoryService:
 
     def initialize(self) -> RepositoryInitialization:
         """Register and analyze a repository once, resuming partial attempts."""
-        repository, config = self._ensure_repository()
+        repository, config, bootstrap_agent = self._ensure_repository()
         ensure_managed_gitignore(self.paths)
 
         analysis = self.store.get_prior_ready_analysis(repository.id)
@@ -126,7 +127,7 @@ class RepositoryService:
                 score_path=self.paths.score_report,
             )
 
-        agent = self._agent_factory(config)
+        agent = bootstrap_agent or self._agent_factory(config)
         if analysis is None:
             analysis = run_analyzer(
                 repository,
@@ -234,10 +235,15 @@ class RepositoryService:
             )
         return repository, config
 
-    def _ensure_repository(self) -> tuple[Repository, RepositoryConfig]:
+    def _ensure_repository(
+        self,
+    ) -> tuple[Repository, RepositoryConfig, AnalysisAgent | None]:
         config_path = self.paths.tracked_dir / CONFIG_FILENAME
+        bootstrap_agent = None
         if not config_path.exists():
-            self._write_initial_config(Repository(root=self.paths.root))
+            bootstrap_agent = self._write_initial_config(
+                Repository(root=self.paths.root)
+            )
         config = load_repository_config(self.paths)
         repository = Repository(root=self.paths.root, id=config.repository_id)
 
@@ -250,15 +256,26 @@ class RepositoryService:
             )
         else:
             repository = stored
-        return repository, config
+        return repository, config, bootstrap_agent
 
-    def _write_initial_config(self, repository: Repository) -> None:
+    def _write_initial_config(self, repository: Repository) -> AnalysisAgent:
         default_branch = _default_branch(self.paths.root, cancel=self.cancel)
-        body = (
-            f"version = {CONFIG_VERSION}\n\n"
-            "[repository]\n"
-            f'id = "{repository.id}"\n'
-            f"default_branch = {json.dumps(default_branch, ensure_ascii=False)}\n"
+        bootstrap_config = RepositoryConfig(
+            version=CONFIG_VERSION,
+            repository_id=repository.id,
+            default_branch=default_branch,
+        )
+        bootstrap_agent = self._agent_factory(bootstrap_config)
+        body = _render_initial_config(
+            bootstrap_config,
+            adapter=bootstrap_agent.name,
+            model=resolve_agent_model(bootstrap_agent, None),
+            effort=(
+                bootstrap_agent.effort
+                if isinstance(bootstrap_agent, SelectedAgent)
+                and bootstrap_agent.effort is not None
+                else "high"
+            ),
         )
         try:
             publish_repository_text(
@@ -269,9 +286,10 @@ class RepositoryService:
             )
         except FileExistsError:
             # Another initializer won the creation race; its identity is canonical.
-            return
+            return self._agent_factory(load_repository_config(self.paths))
         except RepositoryPathError as error:
             raise RepositoryInitializationError(str(error)) from error
+        return bootstrap_agent
 
     def _is_initialized(self, repository: Repository) -> bool:
         return any(
@@ -396,6 +414,32 @@ class RepositoryService:
                 f"{len(documents)} {noun}",
             )
         return documents
+
+
+def _render_initial_config(
+    config: RepositoryConfig,
+    *,
+    adapter: str,
+    model: str,
+    effort: str,
+) -> str:
+    sections = [
+        f"version = {config.version}",
+        (
+            "[repository]\n"
+            f'id = "{config.repository_id}"\n'
+            "default_branch = "
+            f"{json.dumps(config.default_branch, ensure_ascii=False)}"
+        ),
+        (
+            "[agents.defaults]\n"
+            f"adapter = {json.dumps(adapter, ensure_ascii=False)}\n"
+            f"model = {json.dumps(model, ensure_ascii=False)}\n"
+            f"effort = {json.dumps(effort, ensure_ascii=False)}"
+        ),
+        *(f"[agents.{stage.value}]" for stage in AgentStage),
+    ]
+    return "\n\n".join(sections) + "\n"
 
 
 def _default_branch(
