@@ -64,6 +64,15 @@ Verify that the tag is annotated or signed according to the project's release
 policy, that its version matches the source and artifact names, and that the
 tagged commit is the current tip of `main`.
 
+0.1.1 is the first release whose standalone assets are named
+`betterborg-<os>-<arch>`; 0.1.0 published them as `borg-<os>-<arch>`. The
+asset names reach `release-manifest.json`, the target the installer selects,
+and the file the npm launcher downloads, so dispatch that release once with
+`publish` unchecked and confirm the manifest job before authorizing the
+publication. A copy of `install.sh` from 0.1.0 looks for the old names and
+cannot install 0.1.1; the documented command always fetches the installer from
+the release it is installing.
+
 The workflow's publication guard accepts only `main`, so select `main` in the
 Actions form, not the tag. Before each dispatch, compare the workflow run's SHA
 with the peeled `vVERSION` tag SHA. Stop if `main` has moved; never publish a
