@@ -29,7 +29,6 @@ from betterborg_cli.progress import (
 )
 from betterborg_cli.repo_analysis import (
     PROMPT_ROLES,
-    AnalyzerError,
     PromptManagerConfig,
     generate_role_prompts,
     prompts_manager,
@@ -803,8 +802,9 @@ def test_stable_prompt_directory_cannot_escape_repository_through_symlink(
         assert list(outside.iterdir()) == []
 
 
-def test_prompt_manager_rejects_effort_for_anthropic_before_adapter_call(
-    git_repo: Path,
+@pytest.mark.parametrize("effort", ["high", "low"])
+def test_prompt_manager_passes_effort_to_anthropic(
+    git_repo: Path, effort: str
 ) -> None:
     repository = Repository(root=git_repo)
     adapter = MockAdapter(name="anthropic")
@@ -822,21 +822,24 @@ def test_prompt_manager_rejects_effort_for_anthropic_before_adapter_call(
         store.add_repository(repository)
         analysis = _append_analysis(store, repository, score=3)
 
-        with pytest.raises(
-            AnalyzerError, match="Anthropic does not support an effort override"
-        ):
-            generate_role_prompts(
-                repository,
-                analysis,
-                store,
-                selected,
-                artifact_dir=git_repo / "artifacts",
-                config=PromptManagerConfig(effort="high"),
-                roles=("coding",),
-            )
+        runs = generate_role_prompts(
+            repository,
+            analysis,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+            config=PromptManagerConfig(effort=effort),
+            roles=("coding",),
+        )
 
-        assert adapter.calls == []
-        assert store.get_latest_generated_prompts(repository.id) == {}
+        assert len(runs) == 1
+        assert runs[0].ok
+        assert store.get_latest_generated_prompts(repository.id)["coding"] == (
+            runs[0].prompt
+        )
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].effort == effort
 
 
 def test_partial_failure_preserves_score_then_reanalysis_refreshes_prompts(

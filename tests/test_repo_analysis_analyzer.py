@@ -410,8 +410,9 @@ def test_analyzer_resolves_the_anthropic_default_model(git_repo: Path) -> None:
     assert adapter.calls[0].model == "claude-opus-4-8"
 
 
-def test_analyzer_rejects_effort_for_default_selected_anthropic(
-    git_repo: Path,
+@pytest.mark.parametrize("effort", ["high", "low"])
+def test_analyzer_passes_effort_to_default_selected_anthropic(
+    git_repo: Path, effort: str
 ) -> None:
     _commit_repository(git_repo)
     repository = Repository(root=git_repo)
@@ -433,20 +434,18 @@ def test_analyzer_rejects_effort_for_default_selected_anthropic(
 
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
+        analysis = run_analyzer(
+            repository,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+            config=AnalyzerConfig(effort=effort),
+        )
 
-        with pytest.raises(
-            AnalyzerError, match="Anthropic does not support an effort override"
-        ):
-            run_analyzer(
-                repository,
-                store,
-                selected,
-                artifact_dir=git_repo / "artifacts",
-                config=AnalyzerConfig(effort="high"),
-            )
+        assert store.list_analyses(repository.id) == [analysis]
 
-        assert adapter.calls == []
-        assert store.list_analyses(repository.id) == []
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].effort == effort
 
 
 def test_native_analyzer_runs_read_only_in_the_bounded_workspace(
