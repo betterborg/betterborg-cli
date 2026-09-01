@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
@@ -24,6 +25,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning import task_publication as publication_module
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repository_config import load_repository_config
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
     require_git_trackable,
@@ -110,6 +112,188 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
         "summary": message,
         "findings": findings,
     }
+
+
+def test_approval_workflow_uses_distinct_pm_and_supervisor_factories_for_revisions(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "dual-approval",
+        plan,
+    )
+    project_manager = MockAdapter(name="openai")
+    project_manager.queue(MockResponse(payload=_pm_tasks(plan)))
+    project_manager.queue(
+        MockResponse(
+            payload=_pm_tasks(
+                plan,
+                title="Document the independently verifiable release workflow",
+            )
+        )
+    )
+    supervisor = MockAdapter(name="openai")
+    supervisor.queue(
+        MockResponse(
+            payload=_review(
+                "request_changes",
+                "The release task needs independent verification.",
+            )
+        )
+    )
+    supervisor.queue(MockResponse(payload=_review("approve")))
+    constructed: list[str] = []
+
+    def pm_factory() -> MockAdapter:
+        constructed.append("pm")
+        return project_manager
+
+    def supervisor_factory() -> MockAdapter:
+        constructed.append("supervisor")
+        return supervisor
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "dual-approval",
+        pm_agent=pm_factory,
+        supervisor_agent=supervisor_factory,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    assert result.publication is not None
+    assert constructed == ["pm", "supervisor"]
+    assert len(project_manager.calls) == 2
+    assert len(supervisor.calls) == 2
+    assert all(
+        "You are the Project Manager" in call.system_prompt
+        for call in project_manager.calls
+    )
+    assert all(
+        "You are the Supervisor" in call.system_prompt for call in supervisor.calls
+    )
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-approval")
+        assert borg is not None
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 2
+
+
+def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "dual-resume-approval",
+        plan,
+    )
+    first_pm = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    first_supervisor = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=RuntimeError("review interrupted"))
+    )
+    resumed_pm = MockAdapter(name="openai")
+    resumed_supervisor = MockAdapter(name="openai").queue(
+        MockResponse(payload=_review("approve"))
+    )
+    project_managers = iter((first_pm, resumed_pm))
+    supervisors = iter((first_supervisor, resumed_supervisor))
+    pm_factory_calls = 0
+    supervisor_factory_calls = 0
+
+    def pm_factory() -> MockAdapter:
+        nonlocal pm_factory_calls
+        pm_factory_calls += 1
+        return next(project_managers)
+
+    def supervisor_factory() -> MockAdapter:
+        nonlocal supervisor_factory_calls
+        supervisor_factory_calls += 1
+        return next(supervisors)
+
+    with pytest.raises(RuntimeError, match="review interrupted"):
+        workflow_service_module.approve_plan_workflow(
+            paths,
+            load_repository_config(paths),
+            "dual-resume-approval",
+            pm_agent=pm_factory,
+            supervisor_agent=supervisor_factory,
+        )
+
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-resume-approval")
+        assert borg is not None
+        assert borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "dual-resume-approval",
+        pm_agent=pm_factory,
+        supervisor_agent=supervisor_factory,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    assert result.publication is not None
+    assert pm_factory_calls == 2
+    assert supervisor_factory_calls == 2
+    assert len(first_pm.calls) == 1
+    assert resumed_pm.calls == []
+    assert len(first_supervisor.calls) == 1
+    assert len(resumed_supervisor.calls) == 1
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-resume-approval")
+        assert borg is not None
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
+
+
+def test_approval_workflow_legacy_factory_retains_single_agent_behavior(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    plan = planning_plan_response()
+    _repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "legacy-approval",
+        plan,
+    )
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
+    adapter.queue(MockResponse(payload=_review("approve")))
+    factory_calls = 0
+
+    def planning_factory() -> MockAdapter:
+        nonlocal factory_calls
+        factory_calls += 1
+        return adapter
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "legacy-approval",
+        planning_agent=planning_factory,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    assert result.publication is not None
+    assert factory_calls == 1
+    assert len(adapter.calls) == 2
+    assert "You are the Project Manager" in adapter.calls[0].system_prompt
+    assert "You are the Supervisor" in adapter.calls[1].system_prompt
 
 
 def test_approved_plan_trackability_uses_run_token(
