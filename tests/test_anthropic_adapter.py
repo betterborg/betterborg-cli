@@ -62,13 +62,15 @@ def test_multi_turn_messages_use_anthropic_wire_format(tmp_path: Path) -> None:
         transport=transport,
     )
 
-    result = adapter.run(_spec(tmp_path))
+    result = adapter.run(_spec(tmp_path, effort="high"))
 
     assert result.status == AgentStatus.COMPLETED
 
     first_tools = {tool["name"]: tool for tool in transport.payloads[0]["tools"]}
     assert "run_command" not in first_tools
     assert first_tools["submit_result"]["input_schema"] == _spec(tmp_path).schema
+    assert transport.payloads[0]["output_config"] == {"effort": "high"}
+    assert transport.payloads[1]["output_config"] == {"effort": "high"}
     assert transport.payloads[1]["messages"][-2] == {
         "role": "assistant",
         "content": [
@@ -83,6 +85,33 @@ def test_multi_turn_messages_use_anthropic_wire_format(tmp_path: Path) -> None:
     tool_result = transport.payloads[1]["messages"][-1]["content"][0]
     assert tool_result["tool_use_id"] == "tool_read"
     assert json.loads(tool_result["content"]) == {"content": "1.2.3\n"}
+
+
+def test_message_without_effort_omits_output_config(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            _message(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tool_submit",
+                        "name": "submit_result",
+                        "input": {"status": "completed", "version": "1.2.3"},
+                    }
+                ]
+            )
+        ]
+    )
+    adapter = AnthropicAdapter(
+        ApiAgentRole.ANALYSIS,
+        api_key="sk-ant-secret",
+        transport=transport,
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert "output_config" not in transport.payloads[0]
 
 
 def test_truncated_tool_response_does_not_dispatch_tool(tmp_path: Path) -> None:

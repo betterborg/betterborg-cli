@@ -264,13 +264,15 @@ class AnthropicAdapter:
         for _turn in range(self.max_turns):
             if cancel is not None and cancel.is_set():
                 return runtime.cancelled()
-            request_payload = {
+            request_payload: dict[str, Any] = {
                 "model": spec.model,
                 "max_tokens": self.max_tokens,
                 "system": spec.system_prompt,
                 "messages": messages,
                 "tools": tool_definitions,
             }
+            if spec.effort is not None:
+                request_payload["output_config"] = {"effort": spec.effort}
             response = runtime.request(
                 lambda request_cancel, payload=request_payload: (
                     self.transport.create_message(
