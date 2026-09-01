@@ -102,12 +102,24 @@ def approve_plan_workflow(
     config: RepositoryConfig,
     name: str,
     *,
-    planning_agent: PlanningAgentFactory,
+    pm_agent: PlanningAgentFactory | None = None,
+    supervisor_agent: PlanningAgentFactory | None = None,
+    planning_agent: PlanningAgentFactory | None = None,
     on_bound: Callable[[], None] | None = None,
     cancel: CancellationToken | None = None,
     progress: RunProgress | None = None,
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
+    if planning_agent is not None:
+        if pm_agent is not None or supervisor_agent is not None:
+            raise TypeError(
+                "planning_agent cannot be combined with pm_agent or supervisor_agent"
+            )
+    elif pm_agent is None or supervisor_agent is None:
+        raise TypeError(
+            "approve_plan_workflow requires both pm_agent and supervisor_agent"
+        )
+
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         repository = _repository(store, config)
         borg = _borg(store, repository, name)
@@ -125,13 +137,20 @@ def approve_plan_workflow(
 
         publication = None
         if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
-            agent = planning_agent()
+            if planning_agent is not None:
+                supervisor_instance = planning_agent()
+                project_manager_instance = supervisor_instance
+            else:
+                assert pm_agent is not None
+                assert supervisor_agent is not None
+                project_manager_instance = pm_agent()
+                supervisor_instance = supervisor_agent()
             supervisor = SupervisorLoop(
                 repository,
                 borg,
                 store,
-                agent,
-                pm_agent=agent,
+                supervisor_instance,
+                pm_agent=project_manager_instance,
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
                 cancel=cancel,
