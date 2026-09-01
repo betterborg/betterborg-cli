@@ -11,13 +11,13 @@ from pathlib import Path
 import pytest
 from planning_progress_test_support import BoundaryInterruptProgress
 
-from betterborg_cli.agent_runtime import ApiAgentRole, CodexAdapter, select_agent
+from betterborg_cli.agent_runtime import CodexAdapter, select_agent
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -245,7 +245,7 @@ def test_selected_codex_agent_runs_architect_in_read_only_sandbox(
         paths = RepoPaths.discover(committed_git_repo)
         selected = select_agent(
             load_repository_config(paths),
-            ApiAgentRole.PLANNING,
+            AgentStage.ARCHITECT,
             paths,
             interactive=True,
             credentials={},

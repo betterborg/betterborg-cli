@@ -6,7 +6,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -33,10 +33,12 @@ from betterborg_cli.agent_runtime import (
     run_captured,
     select_agent,
 )
+from betterborg_cli.agent_runtime.selection import _STAGE_ROLES
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
     AgentChoice,
     AgentChoices,
+    AgentStage,
     RepositoryConfig,
 )
 from betterborg_cli.workspace_trust import UntrustedWorkspaceError, WorkspaceIdentity
@@ -87,7 +89,7 @@ def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
 
 
 @pytest.mark.parametrize("interactive", [True, False])
-@pytest.mark.parametrize("role", list(ApiAgentRole))
+@pytest.mark.parametrize("stage", list(AgentStage))
 @pytest.mark.parametrize(
     ("installed", "credentials", "expected"),
     [
@@ -101,17 +103,17 @@ def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:
         (set(), {"OPENAI_API_KEY": "o"}, "openai"),
     ],
 )
-def test_every_role_prefers_an_installed_native_cli_over_a_credential(
+def test_every_stage_uses_native_first_provider_defaults_and_security_role(
     git_repo: Path,
     interactive: bool,
-    role: ApiAgentRole,
+    stage: AgentStage,
     installed: set[str],
     credentials: Mapping[str, str],
     expected: str,
 ) -> None:
     selected = select_agent(
         _config(),
-        role,
+        stage,
         RepoPaths.discover(git_repo),
         interactive=interactive,
         credentials=credentials,
@@ -121,6 +123,165 @@ def test_every_role_prefers_an_installed_native_cli_over_a_credential(
     )
 
     assert selected.name == expected
+    assert selected.role is _STAGE_ROLES[stage]
+    assert selected.model == (
+        "claude-opus-5"
+        if expected in {"claude", "anthropic"}
+        else "gpt-5.6-sol"
+    )
+    assert selected.effort == "high"
+
+
+def test_stage_catalog_configuration_and_security_roles_have_structural_parity(
+) -> None:
+    choice_fields = {item.name for item in fields(AgentChoices)} - {"defaults"}
+
+    assert choice_fields == {stage.value for stage in AgentStage}
+    assert set(_STAGE_ROLES) == set(AgentStage)
+
+
+@pytest.mark.parametrize(
+    ("stage_choice", "expected_model", "expected_effort"),
+    [
+        (AgentChoice(effort="high"), "default-model", "high"),
+        (AgentChoice(model="stage-model"), "stage-model", "low"),
+    ],
+)
+def test_stage_overrides_inherit_other_selection_fields(
+    git_repo: Path,
+    stage_choice: AgentChoice,
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    selected = select_agent(
+        _config(
+            defaults=AgentChoice(
+                adapter="codex", model="default-model", effort="low"
+            ),
+            architect=stage_choice,
+        ),
+        AgentStage.ARCHITECT,
+        RepoPaths.discover(git_repo),
+        credentials={},
+        executable_lookup=lambda binary: (
+            "/bin/codex" if binary == "codex" else None
+        ),
+    )
+
+    assert selected.name == "codex"
+    assert selected.model == expected_model
+    assert selected.effort == expected_effort
+
+
+@pytest.mark.parametrize(
+    ("choice", "problem"),
+    [
+        (AgentChoice(adapter="missing"), "is unknown"),
+        (AgentChoice(adapter="codex"), "executable was not found"),
+        (AgentChoice(adapter="anthropic"), "ANTHROPIC_API_KEY is not set"),
+    ],
+)
+def test_configured_stage_adapter_failure_names_stage_and_never_falls_back(
+    git_repo: Path,
+    choice: AgentChoice,
+    problem: str,
+) -> None:
+    with pytest.raises(AgentSelectionError) as captured:
+        select_agent(
+            _config(architect=choice),
+            AgentStage.ARCHITECT,
+            RepoPaths.discover(git_repo),
+            credentials={"OPENAI_API_KEY": "available"},
+            executable_lookup=lambda binary: (
+                "/bin/claude" if binary == "claude" else None
+            ),
+        )
+
+    message = str(captured.value)
+    assert "stage 'architect'" in message
+    assert problem in message
+
+
+@pytest.mark.parametrize("effort", ["high", "low"])
+def test_configured_anthropic_stage_accepts_effort(
+    git_repo: Path, effort: str
+) -> None:
+    selected = select_agent(
+        _config(
+            analysis=AgentChoice(adapter="anthropic", effort=effort)
+        ),
+        AgentStage.ANALYSIS,
+        RepoPaths.discover(git_repo),
+        credentials={"ANTHROPIC_API_KEY": "available"},
+        executable_lookup=lambda _binary: None,
+    )
+
+    assert selected.name == "anthropic"
+    assert selected.model == "claude-opus-5"
+    assert selected.effort == effort
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        ApiAgentRole.ANALYSIS,
+        "analysis",
+        ApiAgentRole.PLANNING,
+        "planning",
+    ],
+)
+def test_legacy_analysis_and_planning_identities_use_shared_defaults(
+    git_repo: Path, identity: ApiAgentRole | str
+) -> None:
+    selected = select_agent(
+        _config(
+            defaults=AgentChoice(
+                adapter="codex", model="shared-model", effort="low"
+            ),
+            analysis=AgentChoice(adapter="missing"),
+            architect=AgentChoice(adapter="missing"),
+        ),
+        identity,
+        RepoPaths.discover(git_repo),
+        credentials={},
+        executable_lookup=lambda binary: (
+            "/bin/codex" if binary == "codex" else None
+        ),
+    )
+
+    assert selected.name == "codex"
+    assert selected.role is ApiAgentRole(identity)
+    assert selected.model == "shared-model"
+    assert selected.effort == "low"
+
+
+@pytest.mark.parametrize(
+    "role",
+    [ApiAgentRole.CODING, ApiAgentRole.REVIEW, ApiAgentRole.MERGE],
+)
+def test_legacy_execution_roles_retain_their_stage_configuration(
+    git_repo: Path, role: ApiAgentRole
+) -> None:
+    selected = select_agent(
+        _config(
+            defaults=AgentChoice(adapter="claude"),
+            **{
+                role.value: AgentChoice(
+                    adapter="codex",
+                    model=f"{role.value}-model",
+                    effort="low",
+                )
+            },
+        ),
+        role,
+        RepoPaths.discover(git_repo),
+        credentials={},
+        executable_lookup=lambda binary: f"/bin/{binary}",
+    )
+
+    assert selected.name == "codex"
+    assert selected.model == f"{role.value}-model"
+    assert selected.effort == "low"
 
 
 def test_configured_native_role_applies_overrides_after_trust_before_spawn(
@@ -739,7 +900,7 @@ def test_api_execution_discloses_host_capability_and_trusts_before_request(
     assert events == ["trust", "request"]
     assert transport.api_keys == [secret]
     assert transport.payloads[0]["model"] == "review-model"
-    assert transport.payloads[0]["reasoning"] == {"effort": "low"}
+    assert transport.payloads[0]["reasoning"] == {"effort": "high"}
     assert result.status == AgentStatus.COMPLETED
     assert result.model == "resolved-openai-model"
     assert secret not in repr(selected)
@@ -795,19 +956,3 @@ def test_missing_setup_and_unusable_overrides_name_every_setup_option(
     ):
         assert setup_name in message
     assert secret not in message
-
-
-def test_effort_override_skips_unsupported_anthropic_default(
-    git_repo: Path,
-) -> None:
-    selected = select_agent(
-        _config(merge=AgentChoice(effort="high")),
-        ApiAgentRole.MERGE,
-        RepoPaths.discover(git_repo),
-        interactive=False,
-        credentials={"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"},
-        executable_lookup=lambda _binary: None,
-    )
-
-    assert selected.name == "openai"
-    assert selected.effort == "high"
