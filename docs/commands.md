@@ -30,6 +30,63 @@ initialization status, score, and suggested create commands. Credentials
 belong in the process environment or a secret manager and must not be
 committed.
 
+## Agent configuration
+
+The first `betterborg init` creates `.betterborg/config.toml`. Alongside the
+generated repository identity, its agent configuration has this complete
+shape (this example shows the values produced when Codex is selected):
+
+```toml
+[agents.defaults]
+adapter = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+
+[agents.analysis]
+
+[agents.requirements]
+
+[agents.architect]
+
+[agents.tech_lead]
+
+[agents.pm]
+
+[agents.supervisor]
+
+[agents.coding]
+
+[agents.review]
+
+[agents.merge]
+```
+
+Each table accepts optional, non-empty `adapter`, `model`, and `effort`
+strings. Betterborg resolves each of those three settings independently: the
+stage value wins when present, then `[agents.defaults]`, then the built-in
+selection or value. This means, for example, that a stage can override only
+its effort and continue to inherit its adapter and model.
+
+Without an adapter in either applicable table, selection is native-first:
+Betterborg looks for the `claude` and then `codex` executables before trying
+the `anthropic` and `openai` API adapters. The built-in current model is
+`claude-opus-5` for `claude` or `anthropic`, and `gpt-5.6-sol` for `codex` or
+`openai`; built-in effort is `high` for every stage.
+
+Fresh initialization pins the selected adapter, its corresponding current
+model, and high effort in `[agents.defaults]`. If that initial selection is a
+native adapter, the pin intentionally prevents a later invocation from
+switching automatically merely because another adapter becomes available.
+An adapter named explicitly by a stage or by the defaults is authoritative:
+an unknown adapter, a missing native executable, or a missing API credential
+causes selection to fail with setup guidance instead of falling back to a
+different adapter.
+
+Provider credentials are environment-only. Keep `ANTHROPIC_API_KEY` and
+`OPENAI_API_KEY` in the process environment or a secret manager; they are not
+valid tracked configuration and `betterborg init` never writes them to this
+file.
+
 ## Host integrations
 
 ```console
