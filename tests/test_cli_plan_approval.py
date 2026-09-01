@@ -113,6 +113,27 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
     }
 
 
+def _select_approval_agents(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    project_manager: MockAdapter,
+    supervisor: MockAdapter,
+) -> list[AgentStage]:
+    selected_stages: list[AgentStage] = []
+    adapters = {
+        AgentStage.PM: project_manager,
+        AgentStage.SUPERVISOR: supervisor,
+    }
+
+    def select(_config, stage, _paths, *, interactive):
+        assert interactive is True
+        selected_stages.append(stage)
+        return adapters[stage]
+
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    return selected_stages
+
+
 def test_approval_workflow_uses_distinct_pm_and_supervisor_factories_for_revisions(
     committed_git_repo: Path,
     planning_cli_repository,
@@ -392,12 +413,15 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     repository, plan_attempt, paths = _seed_approval_pending(
         committed_git_repo, planning_cli_repository, "approved-plan", plan
     )
-    adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
-    adapter.queue(MockResponse(payload=_review("approve")))
+    project_manager = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = MockAdapter(name="openai").queue(
+        MockResponse(payload=_review("approve"))
+    )
     configure_interactive_cli(
         repository.root,
-        adapter,
+        project_manager,
         InteractiveIO(
             prompt=lambda _message: None,
             confirm=lambda _message, _default: False,
@@ -405,13 +429,11 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
         ),
         state_home=repository.root.parent / ".approval-state",
     )
-    selected_stages: list[AgentStage] = []
-
-    def select(config, stage, selected_paths, *, interactive):
-        selected_stages.append(stage)
-        return adapter
-
-    monkeypatch.setattr(cli_module, "select_agent", select)
+    selected_stages = _select_approval_agents(
+        monkeypatch,
+        project_manager=project_manager,
+        supervisor=supervisor,
+    )
 
     shown = cli_runner.invoke(cli, ["plan", "show", "approved-plan", "--json"])
     assert shown.exit_code == 0, shown.output
@@ -427,6 +449,11 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     supervisor_line = result.output.index("completed Supervisor")
     assert project_manager_line < supervisor_line
     assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
+    assert project_manager is not supervisor
+    assert len(project_manager.calls) == 1
+    assert len(supervisor.calls) == 1
+    assert "You are the Project Manager" in project_manager.calls[0].system_prompt
+    assert "You are the Supervisor" in supervisor.calls[0].system_prompt
     approved_markdown = """# Release workflow
 
 Add a small, tested release workflow.
@@ -490,23 +517,32 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
+    monkeypatch,
 ) -> None:
     plan = planning_plan_response()
     repository, _attempt, paths = _seed_approval_pending(
         committed_git_repo, planning_cli_repository, "resume-approval", plan
     )
-    adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
-    adapter.queue(MockResponse(raise_error=RuntimeError("review interrupted")))
+    project_manager = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=RuntimeError("review interrupted"))
+    )
     configure_interactive_cli(
         repository.root,
-        adapter,
+        project_manager,
         InteractiveIO(
             prompt=lambda _message: None,
             confirm=lambda _message, _default: False,
             write=lambda _message: None,
         ),
         state_home=repository.root.parent / ".resume-approval-state",
+    )
+    selected_stages = _select_approval_agents(
+        monkeypatch,
+        project_manager=project_manager,
+        supervisor=supervisor,
     )
 
     interrupted = cli_runner.invoke(
@@ -522,7 +558,7 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
         assert len(store.list_plan_approvals(borg.id)) == 1
         assert len(store.list_task_batches(borg.id)) == 1
 
-    adapter.queue(MockResponse(payload=_review("approve")))
+    supervisor.queue(MockResponse(payload=_review("approve")))
     resumed = cli_runner.invoke(
         cli, ["plan", "approve", "resume-approval", "--yes"]
     )
@@ -534,7 +570,19 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     assert resumed.output.index("completed Project Manager") < resumed.output.index(
         "completed Supervisor"
     )
-    assert len(adapter.calls) == 3
+    assert selected_stages == [
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+    ]
+    assert project_manager is not supervisor
+    assert len(project_manager.calls) == 1
+    assert len(supervisor.calls) == 2
+    assert "You are the Project Manager" in project_manager.calls[0].system_prompt
+    assert all(
+        "You are the Supervisor" in call.system_prompt for call in supervisor.calls
+    )
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None
