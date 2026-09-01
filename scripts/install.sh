@@ -42,8 +42,8 @@ manifest_version() {
         $0 == "  \"schema_version\": 1," { schemas += 1 }
         index($0, "  \"version\": \"") == 1 {
             value = $0
-            sub(/^  \"version\": \"/, "", value)
-            sub(/\",$/, "", value)
+            sub(/^  "version": "/, "", value)
+            sub(/",$/, "", value)
             versions += 1
         }
         END {
@@ -75,8 +75,8 @@ manifest_checksum() {
         }
         active && index($0, "      \"sha256\": \"") == 1 {
             digest = $0
-            sub(/^      \"sha256\": \"/, "", digest)
-            sub(/\",$/, "", digest)
+            sub(/^      "sha256": "/, "", digest)
+            sub(/",$/, "", digest)
             next
         }
         active && ($0 == "    }," || $0 == "    }") {

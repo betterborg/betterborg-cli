@@ -178,7 +178,9 @@ def test_fresh_activation_materializes_registers_enables_and_spawns_mcp(
         "user",
     ) in fake.calls
     assert ("plugin", "install", PLUGIN_ID, "--scope", "user") in fake.calls
-    assert ("plugin", "enable", PLUGIN_ID, "--scope", "user") in fake.calls
+    # `plugin install` enables at user scope, and enabling twice is an error on
+    # the real host, so activation must not follow it with a redundant enable.
+    assert ("plugin", "enable", PLUGIN_ID, "--scope", "user") not in fake.calls
     assert len(spawns) == 1
     assert result.reload_guidance is not None
     assert "/reload-plugins" in result.reload_guidance
@@ -203,6 +205,23 @@ def test_native_windows_user_profile_selects_owned_data_root(tmp_path: Path) -> 
     assert result.bundle_path == expected
     assert fake.marketplace_source == str(expected)
     assert len(spawns) == 1
+
+
+def test_installed_but_disabled_plugin_is_enabled(tmp_path: Path) -> None:
+    """Activation still enables when the host left the plugin installed-disabled."""
+    fake = _FakeClaude()
+    _install(tmp_path, fake)
+    fake.enabled = False
+    fake.calls.clear()
+
+    result, _ = _install(tmp_path, fake)
+
+    assert fake.enabled is True
+    assert ("plugin", "enable", PLUGIN_ID, "--scope", "user") in fake.calls
+    assert result.status in (
+        ClaudePluginStatus.INSTALLED,
+        ClaudePluginStatus.UNCHANGED,
+    )
 
 
 def test_reinstall_is_a_verified_no_op(tmp_path: Path) -> None:

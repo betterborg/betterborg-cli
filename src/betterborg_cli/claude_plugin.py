@@ -291,7 +291,20 @@ def install_claude_plugin(
                 command_runner,
             )
 
-        if not before.installed or change.changed or not before.enabled:
+        # `plugin install` can enable at user scope on its own, and enabling an
+        # already-enabled plugin is an error rather than a no-op, so ask the
+        # host what it did rather than inferring it. Only install and update can
+        # move that state, so an untouched host still answers from `before`.
+        current = before
+        if host_changes.plugin_installed or change.changed:
+            current = _plugin_state(
+                json_plugin_command(
+                    (str(Path(claude)), "plugin", "list", "--json"),
+                    environment,
+                    command_runner,
+                )
+            )
+        if not current.enabled:
             run_plugin_command(
                 (
                     str(Path(claude)),
