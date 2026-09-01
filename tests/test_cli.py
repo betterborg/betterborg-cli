@@ -27,6 +27,7 @@ from betterborg_cli.cli import cli
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
 
@@ -709,19 +710,30 @@ def test_create_without_prd_runs_brainstorm_and_prints_plan_handoff(
         confirm=lambda _message, _default: next(confirmations),
         write=output.append,
     )
+    selected_stages: list[AgentStage] = []
 
-    result = _invoke_create(
-        cli_runner,
-        monkeypatch,
-        configure_interactive_cli,
-        repository,
+    configure_interactive_cli(
+        repository.root,
         adapter,
         io,
-        "release-guide",
-        editor=lambda _body: pytest.fail("editor was declined"),
+        state_home=repository.root.parent / "machine-state",
     )
 
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selected_stages.append(stage)
+        return adapter
+
+    monkeypatch.setattr(cli_module, "select_agent", select_mock)
+    monkeypatch.setattr(
+        cli_module,
+        "_edit_markdown",
+        lambda _body: pytest.fail("editor was declined"),
+    )
+
+    result = cli_runner.invoke(cli, ["create", "release-guide", "--yes"])
+
     assert result.exit_code == 0, result.output
+    assert selected_stages == [AgentStage.REQUIREMENTS]
     assert "No starting PRD was supplied" in adapter.calls[0].user_prompt
     confirmed = paths.tracked_dir / "prds" / "release-guide.md"
     assert confirmed.read_text(encoding="utf-8") == (

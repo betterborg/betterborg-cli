@@ -30,7 +30,11 @@ from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
 from betterborg_cli.repo_analysis import prompts_manager as prompts_manager_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
-from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
+from betterborg_cli.repository_config import (
+    CONFIG_FILENAME,
+    AgentStage,
+    load_repository_config,
+)
 from betterborg_cli.repository_service import (
     RepositoryInitializationError,
     RepositoryService,
@@ -137,11 +141,10 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
     adapter, selected = _adapter(git_repo)
-    selections = 0
+    selections: list[AgentStage] = []
 
-    def select_mock(*_args, **_kwargs):
-        nonlocal selections
-        selections += 1
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -166,7 +169,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert improvement.is_file()
     assert "theme-ci" in improvement.read_text(encoding="utf-8")
     assert len(adapter.calls) == 4
-    assert selections == 1
+    assert selections == [AgentStage.ANALYSIS]
     assert (
         "betterborg create theme-ci --prd "
         ".betterborg/prds/improvements/theme-ci.md\n"
@@ -189,7 +192,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert paths.gitignore.read_text(encoding="utf-8") == first_ignore
     assert first_ignore.count(MANAGED_IGNORE_BEGIN) == 1
     assert len(adapter.calls) == 4
-    assert selections == 1
+    assert selections == [AgentStage.ANALYSIS]
 
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         analyses = store.list_analyses(config.repository_id)
@@ -373,10 +376,10 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
             }
         )
     )
-    selections: list[ApiAgentRole] = []
+    selections: list[AgentStage] = []
 
-    def select_mock(_config, role, _paths, **_kwargs):
-        selections.append(role)
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -407,7 +410,7 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
     assert generated.read_text(encoding="utf-8").startswith(
         "# Make validation visible\n"
     )
-    assert selections == [ApiAgentRole.ANALYSIS, ApiAgentRole.PLANNING]
+    assert selections == [AgentStage.ANALYSIS, AgentStage.REQUIREMENTS]
     assert len(adapter.calls) == 5
 
 
@@ -419,11 +422,10 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
     adapter, selected = _adapter(git_repo)
-    selections = 0
+    selections: list[AgentStage] = []
 
-    def select_mock(*_args, **_kwargs):
-        nonlocal selections
-        selections += 1
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -476,7 +478,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     assert "Score: 4.00/5 (estimated)" in score_report
     assert "Previous: 3.00" in score_report
     assert "Delta: +1.00" in score_report
-    assert selections == 2
+    assert selections == [AgentStage.ANALYSIS, AgentStage.ANALYSIS]
     assert len(adapter.calls) == 8
 
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:

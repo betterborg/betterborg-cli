@@ -88,7 +88,11 @@ from betterborg_cli.progress import (
     StageState,
 )
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
+from betterborg_cli.repository_config import (
+    AgentStage,
+    RepositoryConfig,
+    load_repository_config,
+)
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import INTERRUPTED_EXIT_CODE, RunControl
@@ -357,7 +361,7 @@ def initialize_repository(
                 store,
                 lambda config: select_agent(
                     config,
-                    ApiAgentRole.ANALYSIS,
+                    AgentStage.ANALYSIS,
                     paths,
                     interactive=interactive,
                 ),
@@ -380,7 +384,7 @@ def initialize_repository(
                     store,
                     select_agent(
                         config,
-                        ApiAgentRole.PLANNING,
+                        AgentStage.REQUIREMENTS,
                         paths,
                         interactive=True,
                     ),
@@ -462,7 +466,7 @@ def analyze_repository(
                 store,
                 lambda config: select_agent(
                     config,
-                    ApiAgentRole.ANALYSIS,
+                    AgentStage.ANALYSIS,
                     paths,
                     interactive=interactive,
                 ),
@@ -542,7 +546,7 @@ def create_borg(
                 store,
                 select_agent(
                     config,
-                    ApiAgentRole.PLANNING,
+                    AgentStage.REQUIREMENTS,
                     paths,
                     interactive=True,
                 ),
