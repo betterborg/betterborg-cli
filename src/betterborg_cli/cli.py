@@ -25,7 +25,7 @@ import click
 from betterborg_cli import __version__
 from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
-from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
+from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
     estimate_generation,
@@ -1342,21 +1342,21 @@ def _invoke_host_execution(
     execution_trust = _execution_agent_trust_requirement(paths)
     coding_agent = select_agent(
         config,
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
     review_agent = select_agent(
         config,
-        ApiAgentRole.REVIEW,
+        AgentStage.REVIEW,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
     merge_agent = select_agent(
         config,
-        ApiAgentRole.MERGE,
+        AgentStage.MERGE,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
@@ -1384,9 +1384,9 @@ def _invoke_host_execution(
             paths.root,
             coding_agent,
             config=HostCodingConfig(
-                model=resolve_agent_model(coding_agent, config.agents.coding.model),
+                model=coding_agent.model,
                 billing_mode=_agent_billing_mode(coding_agent.name),
-                effort=config.agents.coding.effort,
+                effort=coding_agent.effort,
             ),
             cancel=cancel,
             git=git,
@@ -1395,14 +1395,12 @@ def _invoke_host_execution(
             paths.root,
             review_agent,
             config=HostReviewFixConfig(
-                review_model=resolve_agent_model(
-                    review_agent, config.agents.review.model
-                ),
+                review_model=review_agent.model,
                 review_passes=config.execution.review_passes,
                 review_billing_mode=_agent_billing_mode(review_agent.name),
                 fix_billing_mode=_agent_billing_mode(review_agent.name),
-                review_effort=config.agents.review.effort,
-                fix_effort=config.agents.review.effort,
+                review_effort=review_agent.effort,
+                fix_effort=review_agent.effort,
             ),
             cancel=cancel,
             git=git,
@@ -1411,9 +1409,9 @@ def _invoke_host_execution(
             paths.root,
             merge_agent,
             config=HostMergeConfig(
-                model=resolve_agent_model(merge_agent, config.agents.merge.model),
+                model=merge_agent.model,
                 billing_mode=_agent_billing_mode(merge_agent.name),
-                effort=config.agents.merge.effort,
+                effort=merge_agent.effort,
             ),
             repository_lock=locked_repository,
             cancel=cancel,
