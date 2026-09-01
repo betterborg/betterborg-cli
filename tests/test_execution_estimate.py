@@ -246,9 +246,9 @@ def test_phase_billing_resolves_configured_merge_agent() -> None:
     )
 
     assert phase_billing_from_config(config) == (
-        PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+        PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5.6-sol"),
         PhaseBilling(
-            "review", BillingMode.SUBSCRIPTION, None, "claude-opus-4-8"
+            "review", BillingMode.SUBSCRIPTION, None, "claude-opus-5"
         ),
         PhaseBilling("merge", BillingMode.API, "openai", "gpt-5-mini"),
     )
