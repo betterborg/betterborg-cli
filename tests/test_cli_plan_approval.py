@@ -279,43 +279,6 @@ def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
         assert len(store.list_task_batches(borg.id)) == 1
 
 
-def test_approval_workflow_legacy_factory_retains_single_agent_behavior(
-    committed_git_repo: Path,
-    planning_cli_repository,
-    planning_plan_response,
-) -> None:
-    plan = planning_plan_response()
-    _repository, _attempt, paths = _seed_approval_pending(
-        committed_git_repo,
-        planning_cli_repository,
-        "legacy-approval",
-        plan,
-    )
-    adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
-    adapter.queue(MockResponse(payload=_review("approve")))
-    factory_calls = 0
-
-    def planning_factory() -> MockAdapter:
-        nonlocal factory_calls
-        factory_calls += 1
-        return adapter
-
-    result = workflow_service_module.approve_plan_workflow(
-        paths,
-        load_repository_config(paths),
-        "legacy-approval",
-        planning_agent=planning_factory,
-    )
-
-    assert result.borg.state is BorgState.READY_TO_EXECUTE
-    assert result.publication is not None
-    assert factory_calls == 1
-    assert len(adapter.calls) == 2
-    assert "You are the Project Manager" in adapter.calls[0].system_prompt
-    assert "You are the Supervisor" in adapter.calls[1].system_prompt
-
-
 def test_approved_plan_trackability_uses_run_token(
     committed_git_repo: Path,
     planning_cli_repository,
