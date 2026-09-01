@@ -1,5 +1,6 @@
 """Tracked repository configuration contracts."""
 
+from dataclasses import fields
 from pathlib import Path
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
     AgentChoice,
     AgentChoices,
+    AgentStage,
     ExecutionLimits,
     RepositoryConfigError,
     load_repository_config,
@@ -51,7 +53,158 @@ review_passes = 1
     assert config.agents == AgentChoices()
 
 
-def test_loads_optional_agent_choices(git_repo: Path) -> None:
+@pytest.mark.parametrize("stage", list(AgentStage))
+def test_loads_optional_agent_choices_for_each_stage(
+    git_repo: Path, stage: AgentStage
+) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "trunk"
+
+[agents.{stage.value}]
+adapter = "codex"
+model = "stage-model"
+effort = "high"
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert getattr(config.agents, stage.value) == AgentChoice(
+        adapter="codex", model="stage-model", effort="high"
+    )
+    assert config.execution == ExecutionLimits()
+
+
+def test_loads_agent_defaults(git_repo: Path) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "trunk"
+
+[agents.defaults]
+adapter = "codex"
+model = "default-model"
+effort = "medium"
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.agents.defaults == AgentChoice(
+        adapter="codex", model="default-model", effort="medium"
+    )
+
+
+@pytest.mark.parametrize("stage", list(AgentStage))
+@pytest.mark.parametrize("setting", ["adapter", "model", "effort"])
+def test_resolving_one_stage_setting_does_not_change_other_stages(
+    stage: AgentStage, setting: str
+) -> None:
+    defaults = AgentChoice(
+        adapter="default-adapter", model="default-model", effort="medium"
+    )
+    override = AgentChoice(**{setting: f"stage-{setting}"})
+    choices = AgentChoices(defaults=defaults, **{stage.value: override})
+
+    for other_stage in AgentStage:
+        resolved = choices.resolve(other_stage)
+        expected = (
+            AgentChoice(
+                adapter=override.adapter or defaults.adapter,
+                model=override.model or defaults.model,
+                effort=override.effort or defaults.effort,
+            )
+            if other_stage is stage
+            else defaults
+        )
+        assert resolved == expected
+
+
+@pytest.mark.parametrize(
+    ("override_setting", "expected"),
+    [
+        (
+            'effort = "high"',
+            AgentChoice(adapter="codex", model="default-model", effort="high"),
+        ),
+        (
+            'model = "stage-model"',
+            AgentChoice(adapter="codex", model="stage-model", effort="medium"),
+        ),
+    ],
+)
+def test_stage_overrides_inherit_each_other_field_independently(
+    git_repo: Path, override_setting: str, expected: AgentChoice
+) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "trunk"
+
+[agents.defaults]
+adapter = "codex"
+model = "default-model"
+effort = "medium"
+
+[agents.architect]
+{override_setting}
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.agents.resolve(AgentStage.ARCHITECT) == expected
+
+
+@pytest.mark.parametrize(
+    "choice_name", ["defaults", *(stage.value for stage in AgentStage)]
+)
+@pytest.mark.parametrize("setting", ["adapter", "model", "effort"])
+def test_rejects_empty_agent_choice_values(
+    git_repo: Path, choice_name: str, setting: str
+) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "trunk"
+
+[agents.{choice_name}]
+{setting} = " "
+""",
+    )
+
+    with pytest.raises(
+        RepositoryConfigError,
+        match=rf"agents\.{choice_name}\.{setting} must be a non-empty string",
+    ):
+        load_repository_config(paths)
+
+
+def test_agent_choices_fields_match_agent_stage_catalog() -> None:
+    stage_fields = {field.name for field in fields(AgentChoices)} - {"defaults"}
+
+    assert stage_fields == {stage.value for stage in AgentStage}
+
+
+def test_loads_legacy_three_stage_agent_choices(git_repo: Path) -> None:
     paths = _write_config(
         git_repo,
         f"""
@@ -82,7 +235,6 @@ effort = "low"
     )
     assert config.agents.review == AgentChoice(adapter="claude")
     assert config.agents.merge == AgentChoice(model="merge-model", effort="low")
-    assert config.execution == ExecutionLimits()
 
 
 @pytest.mark.parametrize(
