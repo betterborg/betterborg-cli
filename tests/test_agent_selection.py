@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import threading
@@ -63,6 +64,27 @@ def _config(**choices: AgentChoice) -> RepositoryConfig:
         default_branch="main",
         agents=AgentChoices(**choices),
     )
+
+
+def test_production_selectors_use_stage_identities() -> None:
+    package_root = Path(__file__).parents[1] / "src" / "betterborg_cli"
+    violations: list[str] = []
+    for path in package_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "select_agent" or len(node.args) < 2:
+                continue
+            identity = node.args[1]
+            if (
+                isinstance(identity, ast.Attribute)
+                and isinstance(identity.value, ast.Name)
+                and identity.value.id == "ApiAgentRole"
+            ):
+                violations.append(f"{path.relative_to(package_root)}:{node.lineno}")
+
+    assert violations == []
 
 
 def _spec(tmp_path: Path, **changes: Any) -> AgentRunSpec:

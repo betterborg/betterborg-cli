@@ -24,7 +24,6 @@ import click
 
 from betterborg_cli import __version__
 from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
@@ -1732,9 +1731,15 @@ def approve_plan(
             paths,
             config,
             name,
-            planning_agent=lambda: select_agent(
+            pm_agent=lambda: select_agent(
                 config,
-                ApiAgentRole.PLANNING,
+                AgentStage.PM,
+                paths,
+                interactive=_stdin_is_interactive(),
+            ),
+            supervisor_agent=lambda: select_agent(
+                config,
+                AgentStage.SUPERVISOR,
                 paths,
                 interactive=_stdin_is_interactive(),
             ),

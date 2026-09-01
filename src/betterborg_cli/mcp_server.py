@@ -18,7 +18,6 @@ from mcp import types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.host_execution import HostPreflightBlock
@@ -26,7 +25,7 @@ from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
@@ -1118,7 +1117,7 @@ def _initialize(
             paths,
             store,
             lambda config: select_agent(
-                config, ApiAgentRole.ANALYSIS, paths, interactive=False
+                config, AgentStage.ANALYSIS, paths, interactive=False
             ),
             cancel=cancel,
         ).initialize()
@@ -1129,7 +1128,7 @@ def _initialize(
                 result.repository,
                 store,
                 select_agent(
-                    config, ApiAgentRole.PLANNING, paths, interactive=False
+                    config, AgentStage.REQUIREMENTS, paths, interactive=False
                 ),
                 io=io,
                 interactive=True,
@@ -1197,7 +1196,7 @@ def _analyze(
             paths,
             store,
             lambda config: select_agent(
-                config, ApiAgentRole.ANALYSIS, paths, interactive=False
+                config, AgentStage.ANALYSIS, paths, interactive=False
             ),
             cancel=cancel,
         ).analyze()
@@ -1248,7 +1247,7 @@ def _create(
             repository,
             store,
             select_agent(
-                config, ApiAgentRole.PLANNING, paths, interactive=False
+                config, AgentStage.REQUIREMENTS, paths, interactive=False
             ),
             io=io,
             interactive=True,
@@ -1368,8 +1367,11 @@ def _approve_plan(
         paths,
         config,
         name,
-        planning_agent=lambda: select_agent(
-            config, ApiAgentRole.PLANNING, paths, interactive=False
+        pm_agent=lambda: select_agent(
+            config, AgentStage.PM, paths, interactive=False
+        ),
+        supervisor_agent=lambda: select_agent(
+            config, AgentStage.SUPERVISOR, paths, interactive=False
         ),
         cancel=cancel,
     )

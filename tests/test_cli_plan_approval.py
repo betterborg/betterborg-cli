@@ -15,7 +15,6 @@ from click.testing import CliRunner
 from betterborg_cli import cli as cli_module
 from betterborg_cli import workflow_service as workflow_service_module
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import (
@@ -25,7 +24,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning import task_publication as publication_module
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.repository_config import load_repository_config
+from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
     require_git_trackable,
@@ -406,10 +405,10 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
         ),
         state_home=repository.root.parent / ".approval-state",
     )
-    selected_roles: list[ApiAgentRole] = []
+    selected_stages: list[AgentStage] = []
 
-    def select(config, role, selected_paths, *, interactive):
-        selected_roles.append(role)
+    def select(config, stage, selected_paths, *, interactive):
+        selected_stages.append(stage)
         return adapter
 
     monkeypatch.setattr(cli_module, "select_agent", select)
@@ -427,7 +426,7 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     project_manager_line = result.output.index("completed Project Manager")
     supervisor_line = result.output.index("completed Supervisor")
     assert project_manager_line < supervisor_line
-    assert selected_roles == [ApiAgentRole.PLANNING]
+    assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
     approved_markdown = """# Release workflow
 
 Add a small, tested release workflow.
