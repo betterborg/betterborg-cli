@@ -67,7 +67,8 @@ Keep provider keys in your shell or a secret manager, never in `.betterborg/conf
 ## Documentation
 
 - [Installation guide](docs/installation.md): version pinning, WSL2, providers, recovery
-- [Command guide](docs/commands.md): bootstrap and initialization
+- [Command guide](docs/commands.md#agent-configuration): bootstrap,
+  initialization, and per-stage agent configuration
 - [Release runbook](docs/releasing.md): for maintainers
 
 ## Reporting bugs
