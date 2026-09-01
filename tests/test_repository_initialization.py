@@ -32,6 +32,7 @@ from betterborg_cli.repo_analysis import prompts_manager as prompts_manager_modu
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
 from betterborg_cli.repository_config import (
     CONFIG_FILENAME,
+    AgentChoice,
     AgentStage,
     load_repository_config,
 )
@@ -173,6 +174,7 @@ def test_initial_config_pins_and_reuses_the_bootstrap_selection(
         assert len(factory_configs) == 1
         assert factory_configs[0].agents.resolve(AgentStage.ANALYSIS).adapter is None
         for stage in AgentStage:
+            assert getattr(config.agents, stage.value) == AgentChoice()
             assert config.agents.resolve(stage) == config.agents.defaults
 
         body = paths.tracked_dir.joinpath(CONFIG_FILENAME).read_text(
