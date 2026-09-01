@@ -25,7 +25,7 @@ from betterborg_cli.agent_runtime.claude import ClaudeAdapter
 from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.openai import OpenAIAdapter
 from betterborg_cli.agent_runtime.process import run_captured
-from betterborg_cli.repository_config import AgentChoice, AgentStage, RepositoryConfig
+from betterborg_cli.repository_config import AgentStage, RepositoryConfig
 
 if TYPE_CHECKING:
     from betterborg_cli.repo_paths import RepoPaths
@@ -277,7 +277,7 @@ class SelectedAgent:
 
 def select_agent(
     config: RepositoryConfig,
-    identity: AgentStage | ApiAgentRole | str,
+    stage: AgentStage,
     paths: RepoPaths,
     *,
     interactive: bool | None = None,
@@ -290,23 +290,17 @@ def select_agent(
 ) -> SelectedAgent:
     """Resolve one configured stage across native and API transports.
 
-    Typed stages use their exact configuration and map to a security role.
-    Runtime-role and string identities retain the temporary legacy behavior.
-    Every identity prefers a logged-in native CLI and falls back to a provider
+    The stage uses its exact configuration and maps to an internal security role.
+    Every stage prefers a logged-in native CLI and falls back to a provider
     API credential, so subscription billing is chosen ahead of metered billing.
     ``interactive`` governs only whether a trust prompt may be shown, never
     which transports are eligible. Provider credentials are read here, by the
     selection-policy owner, and only the credential for the selected API
     adapter is retained.
     """
-    if isinstance(identity, AgentStage):
-        resolved_role = _STAGE_ROLES[identity]
-        choice = config.agents.resolve(identity)
-        identity_description = f"stage {identity.value!r}"
-    else:
-        resolved_role = ApiAgentRole(identity)
-        choice = _choice_for_legacy_role(config, resolved_role)
-        identity_description = f"role {resolved_role.value!r}"
+    resolved_role = _STAGE_ROLES[stage]
+    choice = config.agents.resolve(stage)
+    identity_description = f"stage {stage.value!r}"
     tty = sys.stdin.isatty() if interactive is None else interactive
     environment = os.environ if credentials is None else credentials
     find_executable = executable_lookup or shutil.which
@@ -399,14 +393,6 @@ def resolve_adapter_model(adapter: str, configured_model: str | None) -> str:
         raise AgentSelectionError(
             f"Agent model must be configured for adapter {adapter!r}"
         ) from error
-
-
-def _choice_for_legacy_role(
-    config: RepositoryConfig, role: ApiAgentRole
-) -> AgentChoice:
-    if role in _EXECUTION_ROLES:
-        return config.agents.resolve(AgentStage(role.value))
-    return config.agents.defaults
 
 
 def _unusable_reason(
