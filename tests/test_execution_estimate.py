@@ -233,24 +233,64 @@ def test_merge_agent_usage_and_billing_are_part_of_api_commitment() -> None:
     )
 
 
-def test_phase_billing_resolves_configured_merge_agent() -> None:
+def test_phase_billing_resolves_inherited_execution_choices() -> None:
     config = RepositoryConfig(
         version=1,
         repository_id=uuid4(),
         default_branch="main",
         agents=AgentChoices(
-            coding=AgentChoice(adapter="codex"),
+            defaults=AgentChoice(adapter="openai", model="default-model"),
             review=AgentChoice(adapter="claude"),
-            merge=AgentChoice(adapter="openai", model="gpt-5-mini"),
+            merge=AgentChoice(model="merge-model"),
         ),
     )
 
     assert phase_billing_from_config(config) == (
-        PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5.6-sol"),
-        PhaseBilling(
-            "review", BillingMode.SUBSCRIPTION, None, "claude-opus-5"
-        ),
-        PhaseBilling("merge", BillingMode.API, "openai", "gpt-5-mini"),
+        PhaseBilling("coding", BillingMode.API, "openai", "default-model"),
+        PhaseBilling("review", BillingMode.SUBSCRIPTION, None, "default-model"),
+        PhaseBilling("merge", BillingMode.API, "openai", "merge-model"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("adapter", "mode", "provider", "model"),
+    (
+        ("anthropic", BillingMode.API, "anthropic", "claude-opus-5"),
+        ("claude", BillingMode.SUBSCRIPTION, None, "claude-opus-5"),
+        ("codex", BillingMode.SUBSCRIPTION, None, "gpt-5.6-sol"),
+        ("openai", BillingMode.API, "openai", "gpt-5.6-sol"),
+    ),
+)
+def test_phase_billing_uses_provider_default_for_pinned_adapter(
+    adapter: str,
+    mode: BillingMode,
+    provider: str | None,
+    model: str,
+) -> None:
+    config = RepositoryConfig(
+        version=1,
+        repository_id=uuid4(),
+        default_branch="main",
+        agents=AgentChoices(defaults=AgentChoice(adapter=adapter)),
+    )
+
+    assert phase_billing_from_config(config) == tuple(
+        PhaseBilling(phase, mode, provider, model)
+        for phase in ("coding", "review", "merge")
+    )
+
+
+def test_phase_billing_stays_unknown_without_a_pinned_adapter() -> None:
+    config = RepositoryConfig(
+        version=1,
+        repository_id=uuid4(),
+        default_branch="main",
+        agents=AgentChoices(defaults=AgentChoice(model="environment-model")),
+    )
+
+    assert phase_billing_from_config(config) == tuple(
+        PhaseBilling(phase, None, None, "environment-model")
+        for phase in ("coding", "review", "merge")
     )
 
 
