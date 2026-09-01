@@ -66,6 +66,10 @@ def test_multi_turn_messages_use_anthropic_wire_format(tmp_path: Path) -> None:
 
     assert result.status == AgentStatus.COMPLETED
 
+    assert all(
+        payload["tool_choice"] == {"type": "any"}
+        for payload in transport.payloads
+    )
     first_tools = {tool["name"]: tool for tool in transport.payloads[0]["tools"]}
     assert "run_command" not in first_tools
     assert first_tools["submit_result"]["input_schema"] == _spec(tmp_path).schema

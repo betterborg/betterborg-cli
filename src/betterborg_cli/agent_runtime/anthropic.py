@@ -270,6 +270,10 @@ class AnthropicAdapter:
                 "system": spec.system_prompt,
                 "messages": messages,
                 "tools": tool_definitions,
+                # Every turn must end in a tool call: a run concludes by
+                # calling submit_result, so a prose answer is never a valid
+                # turn and the model would otherwise be free to give one.
+                "tool_choice": {"type": "any"},
             }
             if spec.effort is not None:
                 request_payload["output_config"] = {"effort": spec.effort}

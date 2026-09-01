@@ -42,6 +42,42 @@ def _failed_response(message: str) -> dict[str, Any]:
     }
 
 
+def test_prose_only_turn_fails_without_submitting_a_result(tmp_path: Path) -> None:
+    """A turn that answers in text rather than calling a tool cannot complete.
+
+    `tool_choice` is what stops the provider taking this path; the run still
+    has to fail cleanly if one ever arrives.
+    """
+    transport = FakeTransport(
+        [
+            _response(
+                [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "This repository only contains a readme.",
+                            }
+                        ],
+                    }
+                ],
+                response_id="resp_prose",
+            )
+        ]
+    )
+    adapter = OpenAIAdapter(
+        ApiAgentRole.ANALYSIS, api_key="sk-proj-secret", transport=transport
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.FAILED
+    assert result.error == "OpenAI ended without submit_result"
+    assert transport.payloads[0]["tool_choice"] == "required"
+
+
 def test_multi_turn_responses_use_openai_wire_format(tmp_path: Path) -> None:
     (tmp_path / "VERSION").write_text("1.2.3\n", encoding="utf-8")
     transport = FakeTransport(
@@ -77,6 +113,9 @@ def test_multi_turn_responses_use_openai_wire_format(tmp_path: Path) -> None:
     assert first_tools["submit_result"]["parameters"] == _spec(tmp_path).schema
     assert transport.payloads[0]["input"] == _spec(tmp_path).user_prompt
     assert transport.payloads[0]["reasoning"] == {"effort": "high"}
+    assert all(
+        payload["tool_choice"] == "required" for payload in transport.payloads
+    )
     assert transport.payloads[1]["previous_response_id"] == "resp_read"
     tool_output = transport.payloads[1]["input"][0]
     assert tool_output["type"] == "function_call_output"

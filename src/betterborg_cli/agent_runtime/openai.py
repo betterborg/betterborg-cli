@@ -267,6 +267,10 @@ class OpenAIAdapter:
                 "instructions": spec.system_prompt,
                 "input": input_items,
                 "tools": tool_definitions,
+                # Every turn must end in a tool call: a run concludes by
+                # calling submit_result, so a prose answer is never a valid
+                # turn and the model would otherwise be free to give one.
+                "tool_choice": "required",
                 "parallel_tool_calls": False,
                 "max_output_tokens": self.max_output_tokens,
             }
