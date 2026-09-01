@@ -1856,11 +1856,18 @@ def _continue_planning(
                 BorgState.BLOCKED,
             }:
                 resumable = True
-                agent = select_agent(
+                interactive = _stdin_is_interactive()
+                architect_agent = select_agent(
                     config,
-                    ApiAgentRole.PLANNING,
+                    AgentStage.ARCHITECT,
                     paths,
-                    interactive=_stdin_is_interactive(),
+                    interactive=interactive,
+                )
+                tech_lead_agent = select_agent(
+                    config,
+                    AgentStage.TECH_LEAD,
+                    paths,
+                    interactive=interactive,
                 )
                 planning_io = io or _interactive_io()
                 progress = _repository_progress(False)
@@ -1876,7 +1883,7 @@ def _continue_planning(
                         repository,
                         borg,
                         store,
-                        agent,
+                        architect_agent,
                         io=planning_io,
                         cancel=cancel,
                         progress=progress,
@@ -1885,8 +1892,8 @@ def _continue_planning(
                     repository,
                     borg,
                     store,
-                    agent,
-                    architect_agent=agent,
+                    tech_lead_agent,
+                    architect_agent=architect_agent,
                     io=planning_io,
                     cancel=cancel,
                     progress=progress,
