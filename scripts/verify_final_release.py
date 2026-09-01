@@ -180,7 +180,7 @@ class _FixtureRunner:
         ["git", "init", "--initial-branch=main", "."],
         ["git", "config", "user.name", "Release Smoke"],
         ["git", "config", "user.email", "release-smoke@betterborg.com"],
-        ["git", "add", "README.md"],
+        ["git", "add", "README.md", ".betterborg/config.toml"],
         ["git", "commit", "-m", "Initialize fixture"],
     )
 

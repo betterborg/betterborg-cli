@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import subprocess
+import tomllib
 import urllib.parse
 from pathlib import Path
 
@@ -51,6 +52,13 @@ def test_three_fresh_fixtures_isolate_trust_provider_and_machine_state(
         if command[-1:] == ["version"]:
             stdout = b"betterborg 1.2.3\n"
         elif command[-3:] == ["init", "--yes", "--json"]:
+            with (cwd / ".betterborg/config.toml").open("rb") as config_file:
+                config = tomllib.load(config_file)
+            assert config["agents"]["analysis"] == {
+                "adapter": "openai",
+                "model": "gpt-5.6-luna",
+                "effort": "low",
+            }
             stdout = b'{"initialized":true}\n'
         else:
             stdout = b""
@@ -75,6 +83,14 @@ def test_three_fresh_fixtures_isolate_trust_provider_and_machine_state(
         "npx",
     }
     assert {cwd.name for _command, cwd, _environment in init_calls} == {"repo"}
+    git_add_calls = [
+        command
+        for command, _cwd, _environment in calls
+        if command[:2] == ["git", "add"]
+    ]
+    assert git_add_calls == [
+        ["git", "add", "README.md", ".betterborg/config.toml"],
+    ] * 3
     for command, _cwd, environment in calls:
         if command[-3:] == ["init", "--yes", "--json"]:
             assert environment["OPENAI_API_KEY"] == CREDENTIAL

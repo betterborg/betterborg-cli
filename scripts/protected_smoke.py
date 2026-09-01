@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
+from uuid import uuid4
 
 PROVIDER_VARIABLE = "OPENAI_API_KEY"
 OTHER_PROVIDER_VARIABLE = "ANTHROPIC_API_KEY"
@@ -177,11 +178,24 @@ def initialize_git_fixture(
     (repository / "README.md").write_text(
         "# Betterborg release fixture\n", encoding="utf-8"
     )
+    tracked_directory = repository / ".betterborg"
+    tracked_directory.mkdir()
+    (tracked_directory / "config.toml").write_text(
+        "version = 1\n\n"
+        "[repository]\n"
+        f'id = "{uuid4()}"\n'
+        'default_branch = "main"\n\n'
+        "[agents.analysis]\n"
+        'adapter = "openai"\n'
+        'model = "gpt-5.6-luna"\n'
+        'effort = "low"\n',
+        encoding="utf-8",
+    )
     commands = (
         ["git", "init", "--initial-branch=main", "."],
         ["git", "config", "user.name", "Release Smoke"],
         ["git", "config", "user.email", "release-smoke@betterborg.com"],
-        ["git", "add", "README.md"],
+        ["git", "add", "README.md", ".betterborg/config.toml"],
         ["git", "commit", "-m", "Initialize fixture"],
     )
     for command in commands:
