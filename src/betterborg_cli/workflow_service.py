@@ -102,7 +102,8 @@ def approve_plan_workflow(
     config: RepositoryConfig,
     name: str,
     *,
-    planning_agent: PlanningAgentFactory,
+    pm_agent: PlanningAgentFactory,
+    supervisor_agent: PlanningAgentFactory,
     on_bound: Callable[[], None] | None = None,
     cancel: CancellationToken | None = None,
     progress: RunProgress | None = None,
@@ -125,13 +126,14 @@ def approve_plan_workflow(
 
         publication = None
         if borg.state in {BorgState.PM_WORKING, BorgState.SUPERVISOR_WORKING}:
-            agent = planning_agent()
+            project_manager_instance = pm_agent()
+            supervisor_instance = supervisor_agent()
             supervisor = SupervisorLoop(
                 repository,
                 borg,
                 store,
-                agent,
-                pm_agent=agent,
+                supervisor_instance,
+                pm_agent=project_manager_instance,
                 approved_plan=approval.manifest["plan"],
                 plan_approval=approval,
                 cancel=cancel,

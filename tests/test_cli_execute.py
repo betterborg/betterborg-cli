@@ -20,11 +20,18 @@ import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
-from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_captured
+from betterborg_cli.agent_runtime import (
+    ApiAgentRole,
+    CancellationToken,
+    MockAdapter,
+    SelectedAgent,
+    run_captured,
+)
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
 from betterborg_cli.planning import TaskPublisher
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
+from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
@@ -1708,14 +1715,28 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     _trust(cli_runner, committed_git_repo, monkeypatch)
     config = cli_module.load_repository_config(paths)
     monkeypatch.setenv("EXECUTE_TOKEN", "owner-secret")
-    adapters: list[MockAdapter] = []
+    selected_agents: list[SelectedAgent] = []
+    selected_stages: list[AgentStage] = []
     execution_trust: list[object] = []
+    selected_settings = {
+        AgentStage.CODING: ("selected-coding-model", "coding-effort"),
+        AgentStage.REVIEW: ("selected-review-model", "review-effort"),
+        AgentStage.MERGE: ("selected-merge-model", "merge-effort"),
+    }
 
-    def select(*_args, **kwargs):
-        adapter = MockAdapter(name="openai")
-        adapters.append(adapter)
+    def select(_config, stage, selected_paths, **kwargs):
+        selected_stages.append(stage)
         execution_trust.append(kwargs["trust_requirement"])
-        return adapter
+        model, effort = selected_settings[stage]
+        selected = SelectedAgent(
+            role=ApiAgentRole(stage.value),
+            adapter=MockAdapter(name="openai"),
+            paths=selected_paths,
+            model=model,
+            effort=effort,
+        )
+        selected_agents.append(selected)
+        return selected
 
     calls: list[tuple[object, ...]] = []
 
@@ -1727,6 +1748,17 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         assert type(service._runtime._review_fix) is cli_module.HostReviewFixPhase
         assert type(service._runtime._merge) is cli_module.HostMergePhase
         assert type(service._runtime._sanity) is cli_module.HostSanityPhase
+        coding_config = service._runtime._coding._config
+        assert coding_config.model == "selected-coding-model"
+        assert coding_config.effort == "coding-effort"
+        review_config = service._runtime._review_fix._config
+        assert review_config.review_model == "selected-review-model"
+        assert review_config.review_effort == "review-effort"
+        assert review_config.fix_effort == "review-effort"
+        assert review_config.review_passes == config.execution.review_passes
+        merge_config = service._runtime._merge._config
+        assert merge_config.model == "selected-merge-model"
+        assert merge_config.effort == "merge-effort"
         calls.append((borg_id, generation_id, analyzer_plan, kwargs))
         return HostExecutionResult(service._runtime.plan)
 
@@ -1769,7 +1801,12 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
             )
 
     assert isinstance(result, HostExecutionResult)
-    assert len(adapters) == 3
+    assert selected_stages == [
+        AgentStage.CODING,
+        AgentStage.REVIEW,
+        AgentStage.MERGE,
+    ]
+    assert len(selected_agents) == 3
     observed_trust_paths: list[Path] = []
     monkeypatch.setattr(
         cli_module,

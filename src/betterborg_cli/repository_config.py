@@ -5,6 +5,7 @@ from __future__ import annotations
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import UUID
@@ -14,7 +15,6 @@ from betterborg_cli.repo_paths import RepoPaths
 CONFIG_FILENAME = "config.toml"
 CONFIG_VERSION = 1
 
-_AGENT_PHASES = ("coding", "review", "merge")
 _SECRET_KEY_PARTS = {
     "credential",
     "credentials",
@@ -29,9 +29,23 @@ class RepositoryConfigError(ValueError):
     """Raised when tracked repository configuration is invalid or unsafe."""
 
 
+class AgentStage(StrEnum):
+    """Canonical stages that can select an agent."""
+
+    ANALYSIS = "analysis"
+    REQUIREMENTS = "requirements"
+    ARCHITECT = "architect"
+    TECH_LEAD = "tech_lead"
+    PM = "pm"
+    SUPERVISOR = "supervisor"
+    CODING = "coding"
+    REVIEW = "review"
+    MERGE = "merge"
+
+
 @dataclass(frozen=True)
 class AgentChoice:
-    """Optional adapter selection for one agent phase."""
+    """Optional adapter selection for one agent stage."""
 
     adapter: str | None = None
     model: str | None = None
@@ -40,11 +54,33 @@ class AgentChoice:
 
 @dataclass(frozen=True)
 class AgentChoices:
-    """Agent selections used during coding, review, and merge phases."""
+    """Default and stage-specific agent selections."""
 
+    defaults: AgentChoice = field(default_factory=AgentChoice)
+    analysis: AgentChoice = field(default_factory=AgentChoice)
+    requirements: AgentChoice = field(default_factory=AgentChoice)
+    architect: AgentChoice = field(default_factory=AgentChoice)
+    tech_lead: AgentChoice = field(default_factory=AgentChoice)
+    pm: AgentChoice = field(default_factory=AgentChoice)
+    supervisor: AgentChoice = field(default_factory=AgentChoice)
     coding: AgentChoice = field(default_factory=AgentChoice)
     review: AgentChoice = field(default_factory=AgentChoice)
     merge: AgentChoice = field(default_factory=AgentChoice)
+
+    def resolve(self, stage: AgentStage) -> AgentChoice:
+        """Resolve one stage, inheriting each absent value from defaults."""
+        choice = getattr(self, stage.value)
+        return AgentChoice(
+            adapter=(
+                choice.adapter
+                if choice.adapter is not None
+                else self.defaults.adapter
+            ),
+            model=choice.model if choice.model is not None else self.defaults.model,
+            effort=(
+                choice.effort if choice.effort is not None else self.defaults.effort
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -106,15 +142,18 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     )
 
     agents_document = _optional_table(document, "agents")
-    _require_only_keys(agents_document, set(_AGENT_PHASES), section="agents")
+    choice_names = ("defaults", *(stage.value for stage in AgentStage))
+    _require_only_keys(agents_document, set(choice_names), section="agents")
     agent_choices: dict[str, AgentChoice] = {}
-    for phase in _AGENT_PHASES:
-        choice_document = _optional_table(agents_document, phase, section="agents")
-        section = f"agents.{phase}"
+    for choice_name in choice_names:
+        choice_document = _optional_table(
+            agents_document, choice_name, section="agents"
+        )
+        section = f"agents.{choice_name}"
         _require_only_keys(
             choice_document, {"adapter", "model", "effort"}, section=section
         )
-        agent_choices[phase] = AgentChoice(
+        agent_choices[choice_name] = AgentChoice(
             adapter=_optional_nonempty_string(choice_document, "adapter", section),
             model=_optional_nonempty_string(choice_document, "model", section),
             effort=_optional_nonempty_string(choice_document, "effort", section),

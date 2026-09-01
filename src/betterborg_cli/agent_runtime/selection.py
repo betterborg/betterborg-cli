@@ -25,7 +25,7 @@ from betterborg_cli.agent_runtime.claude import ClaudeAdapter
 from betterborg_cli.agent_runtime.codex import CodexAdapter
 from betterborg_cli.agent_runtime.openai import OpenAIAdapter
 from betterborg_cli.agent_runtime.process import run_captured
-from betterborg_cli.repository_config import AgentChoice, RepositoryConfig
+from betterborg_cli.repository_config import AgentStage, RepositoryConfig
 
 if TYPE_CHECKING:
     from betterborg_cli.repo_paths import RepoPaths
@@ -42,10 +42,22 @@ _API_CREDENTIALS = {
     "openai": "OPENAI_API_KEY",
 }
 _DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "claude": "claude-opus-4-8",
-    "codex": "gpt-5",
-    "openai": "gpt-5",
+    "anthropic": "claude-opus-5",
+    "claude": "claude-opus-5",
+    "codex": "gpt-5.6-sol",
+    "openai": "gpt-5.6-sol",
+}
+_DEFAULT_EFFORT = "high"
+_STAGE_ROLES = {
+    AgentStage.ANALYSIS: ApiAgentRole.ANALYSIS,
+    AgentStage.REQUIREMENTS: ApiAgentRole.PLANNING,
+    AgentStage.ARCHITECT: ApiAgentRole.PLANNING,
+    AgentStage.TECH_LEAD: ApiAgentRole.PLANNING,
+    AgentStage.PM: ApiAgentRole.PLANNING,
+    AgentStage.SUPERVISOR: ApiAgentRole.PLANNING,
+    AgentStage.CODING: ApiAgentRole.CODING,
+    AgentStage.REVIEW: ApiAgentRole.REVIEW,
+    AgentStage.MERGE: ApiAgentRole.MERGE,
 }
 _SETUP_GUIDANCE = (
     "Install and log in to the 'claude' or 'codex' CLI, or set "
@@ -265,7 +277,7 @@ class SelectedAgent:
 
 def select_agent(
     config: RepositoryConfig,
-    role: ApiAgentRole | str,
+    stage: AgentStage,
     paths: RepoPaths,
     *,
     interactive: bool | None = None,
@@ -276,42 +288,43 @@ def select_agent(
     trust_confirm: Callable[[str], bool] | None = None,
     trust_requirement: Callable[..., Any] | None = None,
 ) -> SelectedAgent:
-    """Resolve one configured role across native and provider API transports.
+    """Resolve one configured stage across native and API transports.
 
-    Every role prefers a logged-in native CLI and falls back to a provider API
-    credential, so subscription billing is chosen ahead of metered billing.
+    The stage uses its exact configuration and maps to an internal security role.
+    Every stage prefers a logged-in native CLI and falls back to a provider
+    API credential, so subscription billing is chosen ahead of metered billing.
     ``interactive`` governs only whether a trust prompt may be shown, never
     which transports are eligible. Provider credentials are read here, by the
     selection-policy owner, and only the credential for the selected API
     adapter is retained.
     """
-    resolved_role = ApiAgentRole(role)
+    resolved_role = _STAGE_ROLES[stage]
+    choice = config.agents.resolve(stage)
+    identity_description = f"stage {stage.value!r}"
     tty = sys.stdin.isatty() if interactive is None else interactive
     environment = os.environ if credentials is None else credentials
     find_executable = executable_lookup or shutil.which
-    choice = _choice_for_role(config, resolved_role)
 
     if choice.adapter is not None:
         adapter_name = choice.adapter
         if adapter_name not in _KNOWN_ADAPTERS:
             raise AgentSelectionError(
                 _with_setup(
-                    f"Configured adapter {adapter_name!r} for role "
-                    f"{resolved_role.value!r} is unknown; choose one of "
+                    f"Configured adapter {adapter_name!r} for "
+                    f"{identity_description} is unknown; choose one of "
                     f"{', '.join(sorted(_KNOWN_ADAPTERS))}."
                 )
             )
         unusable = _unusable_reason(
             adapter_name,
-            effort=choice.effort,
             credentials=environment,
             executable_lookup=find_executable,
         )
         if unusable is not None:
             raise AgentSelectionError(
                 _with_setup(
-                    f"Configured adapter {adapter_name!r} for role "
-                    f"{resolved_role.value!r} is not usable: {unusable}."
+                    f"Configured adapter {adapter_name!r} for "
+                    f"{identity_description} is not usable: {unusable}."
                 )
             )
     else:
@@ -321,7 +334,6 @@ def select_agent(
                 for candidate in (*_NATIVE_ADAPTERS, *_API_ADAPTERS)
                 if _unusable_reason(
                     candidate,
-                    effort=choice.effort,
                     credentials=environment,
                     executable_lookup=find_executable,
                 )
@@ -331,7 +343,10 @@ def select_agent(
         )
         if adapter_name is None:
             raise AgentSelectionError(
-                _with_setup("No usable agent adapter is configured.")
+                _with_setup(
+                    f"No usable agent adapter is configured for "
+                    f"{identity_description}."
+                )
             )
 
     adapter = _build_adapter(
@@ -345,8 +360,8 @@ def select_agent(
     return SelectedAgent(
         role=resolved_role,
         adapter=adapter,
-        model=choice.model,
-        effort=choice.effort,
+        model=resolve_adapter_model(adapter_name, choice.model),
+        effort=choice.effort or _DEFAULT_EFFORT,
         paths=paths,
         interactive=tty,
         trust_store=trust_store,
@@ -380,16 +395,9 @@ def resolve_adapter_model(adapter: str, configured_model: str | None) -> str:
         ) from error
 
 
-def _choice_for_role(config: RepositoryConfig, role: ApiAgentRole) -> AgentChoice:
-    if role in _EXECUTION_ROLES:
-        return getattr(config.agents, role.value)
-    return AgentChoice()
-
-
 def _unusable_reason(
     name: str,
     *,
-    effort: str | None,
     credentials: Mapping[str, str],
     executable_lookup: Callable[[str], str | None],
 ) -> str | None:
@@ -397,8 +405,6 @@ def _unusable_reason(
         if executable_lookup(name) is None:
             return f"the {name!r} executable was not found on PATH"
         return None
-    if effort is not None and name == "anthropic":
-        return "Anthropic does not support an effort override"
     variable = _API_CREDENTIALS[name]
     if not credentials.get(variable):
         return f"{variable} is not set"

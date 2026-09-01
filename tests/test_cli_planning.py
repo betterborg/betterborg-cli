@@ -6,12 +6,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from click.testing import CliRunner
+from pytest import MonkeyPatch
 
+from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
     PlanChangeRequest,
@@ -30,9 +33,11 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
 ) -> None:
-    adapter = MockAdapter(name="openai")
-    adapter.queue(
+    architect_adapter = MockAdapter(name="openai")
+    tech_lead_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(
         MockResponse(
             payload={
                 "decision": "ask_more",
@@ -46,22 +51,31 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
             }
         )
     )
-    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    adapter.queue(MockResponse(payload=planning_plan_response()))
-    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    architect_adapter.queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter.queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
     prompts: list[str] = []
     outputs: list[str] = []
 
     repository, paths = planning_cli_repository(committed_git_repo, "inline-plan")
     configure_interactive_cli(
         repository.root,
-        adapter,
+        architect_adapter,
         InteractiveIO(
             prompt=lambda message: prompts.append(message) or "Linux and macOS.",
             confirm=lambda _message, _default: False,
             write=outputs.append,
         ),
         state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
     )
 
     result = cli_runner.invoke(cli, ["plan", "start", "inline-plan", "--yes"])
@@ -71,7 +85,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert outputs == ["Why this matters: This controls the test matrix."]
     assert "Plan approval pending" in result.output
     assert "betterborg plan show inline-plan" in result.output
-    assert len(adapter.calls) == 4
+    assert architect_adapter is not tech_lead_adapter
+    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert len(architect_adapter.calls) == 3
+    assert len(tech_lead_adapter.calls) == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "inline-plan")
         assert borg is not None
@@ -88,8 +105,9 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
 ) -> None:
-    adapter = MockAdapter(name="openai").queue(
+    architect_adapter = MockAdapter(name="openai").queue(
         MockResponse(
             payload={
                 "decision": "ask_more",
@@ -99,17 +117,23 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
             }
         )
     )
+    tech_lead_adapter = MockAdapter(name="openai")
     answers: Iterator[str | None] = iter((None, "Repository maintainers."))
     repository, paths = planning_cli_repository(committed_git_repo, "resume-plan")
     configure_interactive_cli(
         repository.root,
-        adapter,
+        architect_adapter,
         InteractiveIO(
             prompt=lambda _message: next(answers),
             confirm=lambda _message, _default: False,
             write=lambda _message: None,
         ),
         state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
     )
 
     interrupted = cli_runner.invoke(
@@ -125,14 +149,25 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
         assert borg.state is BorgState.ARCHITECT_AWAITING_ANSWERS
         assert store.list_planning_questions(borg.id)[0].answers is None
 
-    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    adapter.queue(MockResponse(payload=planning_plan_response()))
-    adapter.queue(MockResponse(payload=tech_lead_approval_response()))
+    architect_adapter.queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter.queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
     resumed = cli_runner.invoke(cli, ["plan", "start", "resume-plan", "--yes"])
 
     assert resumed.exit_code == 0, resumed.output
     assert "Plan approval pending" in resumed.output
-    assert len(adapter.calls) == 4
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+    ]
+    assert len(architect_adapter.calls) == 3
+    assert len(tech_lead_adapter.calls) == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-plan")
         assert borg is not None
@@ -142,29 +177,27 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
         ]
 
 
-def test_plan_start_reports_review_cap_as_blocked(
+def test_plan_start_resumes_directly_with_tech_lead_agent(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
     planning_plan_response,
-    tech_lead_change_request_response,
+    tech_lead_approval_response,
     configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
 ) -> None:
-    adapter = MockAdapter(name="openai")
-    for payload in (
-        {"decision": "ready_to_plan"},
-        planning_plan_response(),
-        tech_lead_change_request_response("Clarify rollback behavior."),
-        planning_plan_response(summary="Clarify rollback behavior."),
-        tech_lead_change_request_response("Name the rollback checks."),
-        planning_plan_response(summary="Name the rollback checks."),
-        tech_lead_change_request_response("Cover a partial rollback."),
-    ):
-        adapter.queue(MockResponse(payload=payload))
-    repository, paths = planning_cli_repository(committed_git_repo, "blocked-plan")
+    architect_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=RuntimeError("review provider unavailable"))
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "resume-review")
     configure_interactive_cli(
         repository.root,
-        adapter,
+        architect_adapter,
         InteractiveIO(
             prompt=lambda _message: None,
             confirm=lambda _message, _default: False,
@@ -172,13 +205,107 @@ def test_plan_start_reports_review_cap_as_blocked(
         ),
         state_home=repository.root.parent / f".{repository.root.name}-state",
     )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    interrupted = cli_runner.invoke(
+        cli, ["plan", "start", "resume-review", "--yes"]
+    )
+
+    assert interrupted.exit_code == 1
+    assert "review provider unavailable" in interrupted.output
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "resume-review")
+        assert borg is not None
+        assert borg.state is BorgState.TECH_REVIEW_WORKING
+
+    tech_lead_adapter.queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    resumed = cli_runner.invoke(
+        cli, ["plan", "start", "resume-review", "--yes"]
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "Plan approval pending" in resumed.output
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+    ]
+    assert len(architect_adapter.calls) == 2
+    assert len(tech_lead_adapter.calls) == 2
+    assert all(
+        "You are the Architect" in call.system_prompt
+        for call in architect_adapter.calls
+    )
+    assert all(
+        "You are the Tech Lead" in call.system_prompt
+        for call in tech_lead_adapter.calls
+    )
+
+
+def test_plan_start_reports_review_cap_as_blocked(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(),
+        planning_plan_response(summary="Clarify rollback behavior."),
+        planning_plan_response(summary="Name the rollback checks."),
+    ):
+        architect_adapter.queue(MockResponse(payload=payload))
+    tech_lead_adapter = MockAdapter(name="openai")
+    for payload in (
+        tech_lead_change_request_response("Clarify rollback behavior."),
+        tech_lead_change_request_response("Name the rollback checks."),
+        tech_lead_change_request_response("Cover a partial rollback."),
+    ):
+        tech_lead_adapter.queue(MockResponse(payload=payload))
+    repository, paths = planning_cli_repository(committed_git_repo, "blocked-plan")
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
 
     result = cli_runner.invoke(cli, ["plan", "start", "blocked-plan", "--yes"])
 
     assert result.exit_code == 0, result.output
     assert "Planning blocked" in result.output
     assert "betterborg plan show blocked-plan" in result.output
-    assert len(adapter.calls) == 7
+    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert len(architect_adapter.calls) == 4
+    assert len(tech_lead_adapter.calls) == 3
+    assert all(
+        "You are the Architect" in call.system_prompt
+        for call in architect_adapter.calls
+    )
+    assert all(
+        "You are the Tech Lead" in call.system_prompt
+        for call in tech_lead_adapter.calls
+    )
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-plan")
         assert borg is not None
@@ -586,3 +713,24 @@ class _SuspensionRecorder:
     def suspend(self):
         self.entries += 1
         yield self
+
+
+def _select_planning_agents(
+    monkeypatch: MonkeyPatch,
+    *,
+    architect: MockAdapter,
+    tech_lead: MockAdapter,
+) -> list[AgentStage]:
+    selected_stages: list[AgentStage] = []
+    adapters = {
+        AgentStage.ARCHITECT: architect,
+        AgentStage.TECH_LEAD: tech_lead,
+    }
+
+    def select(_config, stage, _paths, *, interactive):
+        assert interactive is True
+        selected_stages.append(stage)
+        return adapters[stage]
+
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    return selected_stages

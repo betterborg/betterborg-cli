@@ -19,7 +19,7 @@ from betterborg_cli.agent_runtime.pricing import (
     estimate_api_cost_usd,
 )
 from betterborg_cli.agent_runtime.selection import resolve_adapter_model
-from betterborg_cli.repository_config import AgentChoice, RepositoryConfig
+from betterborg_cli.repository_config import AgentChoice, AgentStage, RepositoryConfig
 from betterborg_cli.store.models import (
     TaskCompletionSample,
     TaskComplexity,
@@ -139,10 +139,10 @@ class PhaseBilling:
 
 def phase_billing_from_config(config: RepositoryConfig) -> tuple[PhaseBilling, ...]:
     """Resolve non-secret agent-phase billing facts from tracked config."""
-    return (
-        _choice_billing("coding", config.agents.coding),
-        _choice_billing("review", config.agents.review),
-        _choice_billing("merge", config.agents.merge),
+    stages = (AgentStage.CODING, AgentStage.REVIEW, AgentStage.MERGE)
+    return tuple(
+        _choice_billing(stage.value, config.agents.resolve(stage))
+        for stage in stages
     )
 
 

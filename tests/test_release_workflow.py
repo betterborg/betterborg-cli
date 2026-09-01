@@ -141,6 +141,12 @@ def test_protected_smokes_follow_all_registries_with_one_provider() -> None:
     assert 'f"@betterborg/cli@{version}"' in script
     assert "releases/download/v{version}/install.sh" in script
     assert '[*prefix, "init", "--yes", "--json"]' in shared_smoke
+    for analysis_setting in (
+        'adapter = "openai"',
+        'model = "gpt-5.6-luna"',
+        'effort = "low"',
+    ):
+        assert analysis_setting in shared_smoke
     assert workflow.index("publish-npm:") < workflow.index("smoke-public-release:")
 
 

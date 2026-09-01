@@ -30,7 +30,12 @@ from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
 from betterborg_cli.repo_analysis import prompts_manager as prompts_manager_module
 from betterborg_cli.repo_paths import MANAGED_IGNORE_BEGIN, RepoPaths
-from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
+from betterborg_cli.repository_config import (
+    CONFIG_FILENAME,
+    AgentChoice,
+    AgentStage,
+    load_repository_config,
+)
 from betterborg_cli.repository_service import (
     RepositoryInitializationError,
     RepositoryService,
@@ -129,6 +134,75 @@ def _adapter(repository: Path) -> tuple[MockAdapter, SelectedAgent]:
     )
 
 
+def _selected_agent(
+    repository: Path,
+    *,
+    adapter: str,
+    model: str,
+    effort: str = "high",
+) -> SelectedAgent:
+    return SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=MockAdapter(name=adapter),
+        paths=RepoPaths.discover(repository),
+        model=model,
+        effort=effort,
+    )
+
+
+def test_initial_config_pins_and_reuses_the_bootstrap_selection(
+    committed_git_repo: Path,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    selected = _selected_agent(
+        committed_git_repo,
+        adapter="codex",
+        model="gpt-5.6-sol",
+    )
+    factory_configs = []
+
+    def agent_factory(config):
+        factory_configs.append(config)
+        return selected
+
+    with SqliteStore.open(paths.state_dir / "pinned-config.sqlite3") as store:
+        service = RepositoryService(paths, store, agent_factory)
+        repository, config, bootstrap_agent = service._ensure_repository()
+
+        assert bootstrap_agent is selected
+        assert repository.id == config.repository_id
+        assert len(factory_configs) == 1
+        assert factory_configs[0].agents.resolve(AgentStage.ANALYSIS).adapter is None
+        for stage in AgentStage:
+            assert getattr(config.agents, stage.value) == AgentChoice()
+            assert config.agents.resolve(stage) == config.agents.defaults
+
+        body = paths.tracked_dir.joinpath(CONFIG_FILENAME).read_text(
+            encoding="utf-8"
+        )
+        assert [line for line in body.splitlines() if line.startswith("[")] == [
+            "[repository]",
+            "[agents.defaults]",
+            *(f"[agents.{stage.value}]" for stage in AgentStage),
+        ]
+        assert config.agents.defaults.adapter == "codex"
+        assert config.agents.defaults.model == "gpt-5.6-sol"
+        assert config.agents.defaults.effort == "high"
+        assert "credential" not in body.casefold()
+        assert "token" not in body.casefold()
+        assert "secret" not in body.casefold()
+
+        same_repository, same_config, second_bootstrap = service._ensure_repository()
+
+        assert same_repository == repository
+        assert same_config == config
+        assert second_bootstrap is None
+        assert len(factory_configs) == 1
+        assert paths.tracked_dir.joinpath(CONFIG_FILENAME).read_text(
+            encoding="utf-8"
+        ) == body
+
+
 def test_init_creates_outputs_once_and_preserves_repository_identity(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -137,11 +211,10 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
     adapter, selected = _adapter(git_repo)
-    selections = 0
+    selections: list[AgentStage] = []
 
-    def select_mock(*_args, **_kwargs):
-        nonlocal selections
-        selections += 1
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -166,7 +239,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert improvement.is_file()
     assert "theme-ci" in improvement.read_text(encoding="utf-8")
     assert len(adapter.calls) == 4
-    assert selections == 1
+    assert selections == [AgentStage.ANALYSIS]
     assert (
         "betterborg create theme-ci --prd "
         ".betterborg/prds/improvements/theme-ci.md\n"
@@ -189,7 +262,7 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     assert paths.gitignore.read_text(encoding="utf-8") == first_ignore
     assert first_ignore.count(MANAGED_IGNORE_BEGIN) == 1
     assert len(adapter.calls) == 4
-    assert selections == 1
+    assert selections == [AgentStage.ANALYSIS]
 
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         analyses = store.list_analyses(config.repository_id)
@@ -227,13 +300,24 @@ def test_initial_config_interruption_leaves_no_file_or_complete_parseable_config
     monkeypatch.setattr(repository_files_module.os, "link", interrupt)
 
     with SqliteStore.open(paths.state_dir / "atomic-config.sqlite3") as store:
-        service = RepositoryService(paths, store, lambda _config: MockAdapter())
+        service = RepositoryService(
+            paths,
+            store,
+            lambda _config: MockAdapter(name="openai"),
+        )
         with pytest.raises(KeyboardInterrupt, match="config publication interrupted"):
             service._write_initial_config(repository)
 
     if interrupt_after_claim:
         config = load_repository_config(paths)
         assert config.repository_id == repository.id
+        assert config.agents.defaults.adapter == "openai"
+        assert config.agents.defaults.model == "gpt-5.6-sol"
+        assert config.agents.defaults.effort == "high"
+        assert all(
+            config.agents.resolve(stage) == config.agents.defaults
+            for stage in AgentStage
+        )
         assert config_path.read_text(encoding="utf-8").endswith("\n")
     else:
         assert not config_path.exists()
@@ -245,14 +329,19 @@ def test_initial_config_create_race_preserves_the_winning_repository_identity(
     monkeypatch: MonkeyPatch,
 ) -> None:
     paths = RepoPaths.discover(committed_git_repo)
-    losing_repository = Repository(root=paths.root)
     winning_repository = Repository(root=paths.root)
     config_path = paths.tracked_dir / CONFIG_FILENAME
     winning_body = (
         "version = 1\n\n"
         "[repository]\n"
         f'id = "{winning_repository.id}"\n'
-        'default_branch = "winning-branch"\n'
+        'default_branch = "winning-branch"\n\n'
+        "[agents.defaults]\n"
+        'adapter = "codex"\n'
+        'model = "gpt-5.6-sol"\n'
+        'effort = "high"\n\n'
+        + "\n\n".join(f"[agents.{stage.value}]" for stage in AgentStage)
+        + "\n"
     )
     unrelated_temporary = paths.tracked_dir / ".config.toml.concurrent.tmp"
     original_link = os.link
@@ -274,17 +363,44 @@ def test_initial_config_create_race_preserves_the_winning_repository_identity(
         publish_winner_then_lose,
     )
 
+    losing_selection = _selected_agent(
+        committed_git_repo,
+        adapter="openai",
+        model="gpt-5.6-sol",
+    )
+    winning_selection = _selected_agent(
+        committed_git_repo,
+        adapter="codex",
+        model="gpt-5.6-sol",
+    )
+    factory_configs = []
+
+    def agent_factory(config):
+        factory_configs.append(config)
+        if config.agents.resolve(AgentStage.ANALYSIS).adapter == "codex":
+            return winning_selection
+        return losing_selection
+
     with SqliteStore.open(paths.state_dir / "config-race.sqlite3") as store:
-        service = RepositoryService(paths, store, lambda _config: MockAdapter())
-        service._write_initial_config(losing_repository)
-        first_repository, first_config = service._ensure_repository()
-        second_repository, second_config = service._ensure_repository()
+        service = RepositoryService(paths, store, agent_factory)
+        first_repository, first_config, bootstrap_agent = (
+            service._ensure_repository()
+        )
+        second_repository, second_config, second_bootstrap = (
+            service._ensure_repository()
+        )
 
         assert first_repository.id == winning_repository.id
         assert second_repository.id == winning_repository.id
         assert first_config.repository_id == winning_repository.id
         assert second_config.repository_id == winning_repository.id
         assert store.get_repository(winning_repository.id) == first_repository
+        assert bootstrap_agent is winning_selection
+        assert second_bootstrap is None
+        assert len(factory_configs) == 2
+        assert factory_configs[0].repository_id != winning_repository.id
+        assert factory_configs[0].agents.defaults.adapter is None
+        assert factory_configs[1] == first_config
 
     assert config_path.read_text(encoding="utf-8") == winning_body
     assert unrelated_temporary.read_text(encoding="utf-8") == (
@@ -304,7 +420,11 @@ def test_initial_config_rejects_a_tracked_directory_outside_the_repository(
     paths.tracked_dir.symlink_to(outside, target_is_directory=True)
 
     with SqliteStore.open(outside / "containment.sqlite3") as store:
-        service = RepositoryService(paths, store, lambda _config: MockAdapter())
+        service = RepositoryService(
+            paths,
+            store,
+            lambda _config: MockAdapter(name="openai"),
+        )
         with pytest.raises(RepositoryInitializationError, match="escapes repository"):
             service._write_initial_config(Repository(root=paths.root))
 
@@ -373,10 +493,10 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
             }
         )
     )
-    selections: list[ApiAgentRole] = []
+    selections: list[AgentStage] = []
 
-    def select_mock(_config, role, _paths, **_kwargs):
-        selections.append(role)
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -407,7 +527,7 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
     assert generated.read_text(encoding="utf-8").startswith(
         "# Make validation visible\n"
     )
-    assert selections == [ApiAgentRole.ANALYSIS, ApiAgentRole.PLANNING]
+    assert selections == [AgentStage.ANALYSIS, AgentStage.REQUIREMENTS]
     assert len(adapter.calls) == 5
 
 
@@ -419,11 +539,10 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
     adapter, selected = _adapter(git_repo)
-    selections = 0
+    selections: list[AgentStage] = []
 
-    def select_mock(*_args, **_kwargs):
-        nonlocal selections
-        selections += 1
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selections.append(stage)
         return selected
 
     monkeypatch.chdir(git_repo)
@@ -476,7 +595,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     assert "Score: 4.00/5 (estimated)" in score_report
     assert "Previous: 3.00" in score_report
     assert "Delta: +1.00" in score_report
-    assert selections == 2
+    assert selections == [AgentStage.ANALYSIS, AgentStage.ANALYSIS]
     assert len(adapter.calls) == 8
 
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:

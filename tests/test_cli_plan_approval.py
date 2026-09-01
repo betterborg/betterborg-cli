@@ -9,12 +9,12 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli import workflow_service as workflow_service_module
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.planning import (
@@ -24,6 +24,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning import task_publication as publication_module
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
     require_git_trackable,
@@ -110,6 +111,172 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
         "summary": message,
         "findings": findings,
     }
+
+
+def _select_approval_agents(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    project_manager: MockAdapter,
+    supervisor: MockAdapter,
+) -> list[AgentStage]:
+    selected_stages: list[AgentStage] = []
+    adapters = {
+        AgentStage.PM: project_manager,
+        AgentStage.SUPERVISOR: supervisor,
+    }
+
+    def select(_config, stage, _paths, *, interactive):
+        assert interactive is True
+        selected_stages.append(stage)
+        return adapters[stage]
+
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    return selected_stages
+
+
+def test_approval_workflow_uses_distinct_pm_and_supervisor_factories_for_revisions(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "dual-approval",
+        plan,
+    )
+    project_manager = MockAdapter(name="openai")
+    project_manager.queue(MockResponse(payload=_pm_tasks(plan)))
+    project_manager.queue(
+        MockResponse(
+            payload=_pm_tasks(
+                plan,
+                title="Document the independently verifiable release workflow",
+            )
+        )
+    )
+    supervisor = MockAdapter(name="openai")
+    supervisor.queue(
+        MockResponse(
+            payload=_review(
+                "request_changes",
+                "The release task needs independent verification.",
+            )
+        )
+    )
+    supervisor.queue(MockResponse(payload=_review("approve")))
+    constructed: list[str] = []
+
+    def pm_factory() -> MockAdapter:
+        constructed.append("pm")
+        return project_manager
+
+    def supervisor_factory() -> MockAdapter:
+        constructed.append("supervisor")
+        return supervisor
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "dual-approval",
+        pm_agent=pm_factory,
+        supervisor_agent=supervisor_factory,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    assert result.publication is not None
+    assert constructed == ["pm", "supervisor"]
+    assert len(project_manager.calls) == 2
+    assert len(supervisor.calls) == 2
+    assert all(
+        "You are the Project Manager" in call.system_prompt
+        for call in project_manager.calls
+    )
+    assert all(
+        "You are the Supervisor" in call.system_prompt for call in supervisor.calls
+    )
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-approval")
+        assert borg is not None
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 2
+
+
+def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "dual-resume-approval",
+        plan,
+    )
+    first_pm = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    first_supervisor = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=RuntimeError("review interrupted"))
+    )
+    resumed_pm = MockAdapter(name="openai")
+    resumed_supervisor = MockAdapter(name="openai").queue(
+        MockResponse(payload=_review("approve"))
+    )
+    project_managers = iter((first_pm, resumed_pm))
+    supervisors = iter((first_supervisor, resumed_supervisor))
+    pm_factory_calls = 0
+    supervisor_factory_calls = 0
+
+    def pm_factory() -> MockAdapter:
+        nonlocal pm_factory_calls
+        pm_factory_calls += 1
+        return next(project_managers)
+
+    def supervisor_factory() -> MockAdapter:
+        nonlocal supervisor_factory_calls
+        supervisor_factory_calls += 1
+        return next(supervisors)
+
+    with pytest.raises(RuntimeError, match="review interrupted"):
+        workflow_service_module.approve_plan_workflow(
+            paths,
+            load_repository_config(paths),
+            "dual-resume-approval",
+            pm_agent=pm_factory,
+            supervisor_agent=supervisor_factory,
+        )
+
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-resume-approval")
+        assert borg is not None
+        assert borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "dual-resume-approval",
+        pm_agent=pm_factory,
+        supervisor_agent=supervisor_factory,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    assert result.publication is not None
+    assert pm_factory_calls == 2
+    assert supervisor_factory_calls == 2
+    assert len(first_pm.calls) == 1
+    assert resumed_pm.calls == []
+    assert len(first_supervisor.calls) == 1
+    assert len(resumed_supervisor.calls) == 1
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "dual-resume-approval")
+        assert borg is not None
+        assert len(store.list_plan_approvals(borg.id)) == 1
+        assert len(store.list_task_batches(borg.id)) == 1
 
 
 def test_approved_plan_trackability_uses_run_token(
@@ -209,12 +376,15 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     repository, plan_attempt, paths = _seed_approval_pending(
         committed_git_repo, planning_cli_repository, "approved-plan", plan
     )
-    adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
-    adapter.queue(MockResponse(payload=_review("approve")))
+    project_manager = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = MockAdapter(name="openai").queue(
+        MockResponse(payload=_review("approve"))
+    )
     configure_interactive_cli(
         repository.root,
-        adapter,
+        project_manager,
         InteractiveIO(
             prompt=lambda _message: None,
             confirm=lambda _message, _default: False,
@@ -222,13 +392,11 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
         ),
         state_home=repository.root.parent / ".approval-state",
     )
-    selected_roles: list[ApiAgentRole] = []
-
-    def select(config, role, selected_paths, *, interactive):
-        selected_roles.append(role)
-        return adapter
-
-    monkeypatch.setattr(cli_module, "select_agent", select)
+    selected_stages = _select_approval_agents(
+        monkeypatch,
+        project_manager=project_manager,
+        supervisor=supervisor,
+    )
 
     shown = cli_runner.invoke(cli, ["plan", "show", "approved-plan", "--json"])
     assert shown.exit_code == 0, shown.output
@@ -243,7 +411,12 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     project_manager_line = result.output.index("completed Project Manager")
     supervisor_line = result.output.index("completed Supervisor")
     assert project_manager_line < supervisor_line
-    assert selected_roles == [ApiAgentRole.PLANNING]
+    assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
+    assert project_manager is not supervisor
+    assert len(project_manager.calls) == 1
+    assert len(supervisor.calls) == 1
+    assert "You are the Project Manager" in project_manager.calls[0].system_prompt
+    assert "You are the Supervisor" in supervisor.calls[0].system_prompt
     approved_markdown = """# Release workflow
 
 Add a small, tested release workflow.
@@ -307,23 +480,32 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     planning_cli_repository,
     planning_plan_response,
     configure_interactive_cli,
+    monkeypatch,
 ) -> None:
     plan = planning_plan_response()
     repository, _attempt, paths = _seed_approval_pending(
         committed_git_repo, planning_cli_repository, "resume-approval", plan
     )
-    adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
-    adapter.queue(MockResponse(raise_error=RuntimeError("review interrupted")))
+    project_manager = MockAdapter(name="openai").queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=RuntimeError("review interrupted"))
+    )
     configure_interactive_cli(
         repository.root,
-        adapter,
+        project_manager,
         InteractiveIO(
             prompt=lambda _message: None,
             confirm=lambda _message, _default: False,
             write=lambda _message: None,
         ),
         state_home=repository.root.parent / ".resume-approval-state",
+    )
+    selected_stages = _select_approval_agents(
+        monkeypatch,
+        project_manager=project_manager,
+        supervisor=supervisor,
     )
 
     interrupted = cli_runner.invoke(
@@ -339,7 +521,7 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
         assert len(store.list_plan_approvals(borg.id)) == 1
         assert len(store.list_task_batches(borg.id)) == 1
 
-    adapter.queue(MockResponse(payload=_review("approve")))
+    supervisor.queue(MockResponse(payload=_review("approve")))
     resumed = cli_runner.invoke(
         cli, ["plan", "approve", "resume-approval", "--yes"]
     )
@@ -351,7 +533,19 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     assert resumed.output.index("completed Project Manager") < resumed.output.index(
         "completed Supervisor"
     )
-    assert len(adapter.calls) == 3
+    assert selected_stages == [
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+    ]
+    assert project_manager is not supervisor
+    assert len(project_manager.calls) == 1
+    assert len(supervisor.calls) == 2
+    assert "You are the Project Manager" in project_manager.calls[0].system_prompt
+    assert all(
+        "You are the Supervisor" in call.system_prompt for call in supervisor.calls
+    )
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-approval")
         assert borg is not None

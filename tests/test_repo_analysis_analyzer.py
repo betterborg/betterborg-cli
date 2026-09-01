@@ -31,12 +31,16 @@ from betterborg_cli.progress import (
 )
 from betterborg_cli.repo_analysis import (
     DIMENSIONS,
-    AnalyzerConfig,
     AnalyzerError,
     run_analyzer,
 )
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import AgentChoices, RepositoryConfig
+from betterborg_cli.repository_config import (
+    AgentChoice,
+    AgentChoices,
+    AgentStage,
+    RepositoryConfig,
+)
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import Repository, SqliteStore
 
@@ -154,7 +158,7 @@ def test_dynamic_selected_agent_persists_append_only_history_and_prompts(
 
         assert store.applied_migrations() == tuple(range(1, 12))
         assert len(observed_workspaces) == 2
-        assert all(call.model == "gpt-5" for call in adapter.calls)
+        assert all(call.model == "gpt-5.6-sol" for call in adapter.calls)
         assert all(
             call.allowed_tools == ("list_files", "read_file", "search_text")
             for call in adapter.calls
@@ -407,11 +411,12 @@ def test_analyzer_resolves_the_anthropic_default_model(git_repo: Path) -> None:
             artifact_dir=git_repo / "artifacts",
         )
 
-    assert adapter.calls[0].model == "claude-opus-4-8"
+    assert adapter.calls[0].model == "claude-opus-5"
 
 
-def test_analyzer_rejects_effort_for_default_selected_anthropic(
-    git_repo: Path,
+@pytest.mark.parametrize("effort", ["high", "low"])
+def test_analyzer_passes_stage_effort_to_selected_anthropic(
+    git_repo: Path, effort: str
 ) -> None:
     _commit_repository(git_repo)
     repository = Repository(root=git_repo)
@@ -420,9 +425,11 @@ def test_analyzer_rejects_effort_for_default_selected_anthropic(
             version=1,
             repository_id=repository.id,
             default_branch="main",
-            agents=AgentChoices(),
+            agents=AgentChoices(
+                analysis=AgentChoice(adapter="anthropic", effort=effort)
+            ),
         ),
-        ApiAgentRole.ANALYSIS,
+        AgentStage.ANALYSIS,
         RepoPaths.discover(git_repo),
         interactive=False,
         credentials={"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o"},
@@ -433,20 +440,17 @@ def test_analyzer_rejects_effort_for_default_selected_anthropic(
 
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
+        analysis = run_analyzer(
+            repository,
+            store,
+            selected,
+            artifact_dir=git_repo / "artifacts",
+        )
 
-        with pytest.raises(
-            AnalyzerError, match="Anthropic does not support an effort override"
-        ):
-            run_analyzer(
-                repository,
-                store,
-                selected,
-                artifact_dir=git_repo / "artifacts",
-                config=AnalyzerConfig(effort="high"),
-            )
+        assert store.list_analyses(repository.id) == [analysis]
 
-        assert adapter.calls == []
-        assert store.list_analyses(repository.id) == []
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].effort == effort
 
 
 def test_native_analyzer_runs_read_only_in_the_bounded_workspace(

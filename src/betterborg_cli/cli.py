@@ -24,8 +24,7 @@ import click
 
 from betterborg_cli import __version__
 from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
-from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
-from betterborg_cli.agent_runtime.selection import resolve_agent_model, select_agent
+from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.execution_estimate import (
     DUMMY_PRIOR_LABEL,
     estimate_generation,
@@ -88,7 +87,11 @@ from betterborg_cli.progress import (
     StageState,
 )
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import RepositoryConfig, load_repository_config
+from betterborg_cli.repository_config import (
+    AgentStage,
+    RepositoryConfig,
+    load_repository_config,
+)
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import INTERRUPTED_EXIT_CODE, RunControl
@@ -357,7 +360,7 @@ def initialize_repository(
                 store,
                 lambda config: select_agent(
                     config,
-                    ApiAgentRole.ANALYSIS,
+                    AgentStage.ANALYSIS,
                     paths,
                     interactive=interactive,
                 ),
@@ -380,7 +383,7 @@ def initialize_repository(
                     store,
                     select_agent(
                         config,
-                        ApiAgentRole.PLANNING,
+                        AgentStage.REQUIREMENTS,
                         paths,
                         interactive=True,
                     ),
@@ -462,7 +465,7 @@ def analyze_repository(
                 store,
                 lambda config: select_agent(
                     config,
-                    ApiAgentRole.ANALYSIS,
+                    AgentStage.ANALYSIS,
                     paths,
                     interactive=interactive,
                 ),
@@ -542,7 +545,7 @@ def create_borg(
                 store,
                 select_agent(
                     config,
-                    ApiAgentRole.PLANNING,
+                    AgentStage.REQUIREMENTS,
                     paths,
                     interactive=True,
                 ),
@@ -1338,21 +1341,21 @@ def _invoke_host_execution(
     execution_trust = _execution_agent_trust_requirement(paths)
     coding_agent = select_agent(
         config,
-        ApiAgentRole.CODING,
+        AgentStage.CODING,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
     review_agent = select_agent(
         config,
-        ApiAgentRole.REVIEW,
+        AgentStage.REVIEW,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
     merge_agent = select_agent(
         config,
-        ApiAgentRole.MERGE,
+        AgentStage.MERGE,
         paths,
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
@@ -1380,9 +1383,9 @@ def _invoke_host_execution(
             paths.root,
             coding_agent,
             config=HostCodingConfig(
-                model=resolve_agent_model(coding_agent, config.agents.coding.model),
+                model=coding_agent.model,
                 billing_mode=_agent_billing_mode(coding_agent.name),
-                effort=config.agents.coding.effort,
+                effort=coding_agent.effort,
             ),
             cancel=cancel,
             git=git,
@@ -1391,14 +1394,12 @@ def _invoke_host_execution(
             paths.root,
             review_agent,
             config=HostReviewFixConfig(
-                review_model=resolve_agent_model(
-                    review_agent, config.agents.review.model
-                ),
+                review_model=review_agent.model,
                 review_passes=config.execution.review_passes,
                 review_billing_mode=_agent_billing_mode(review_agent.name),
                 fix_billing_mode=_agent_billing_mode(review_agent.name),
-                review_effort=config.agents.review.effort,
-                fix_effort=config.agents.review.effort,
+                review_effort=review_agent.effort,
+                fix_effort=review_agent.effort,
             ),
             cancel=cancel,
             git=git,
@@ -1407,9 +1408,9 @@ def _invoke_host_execution(
             paths.root,
             merge_agent,
             config=HostMergeConfig(
-                model=resolve_agent_model(merge_agent, config.agents.merge.model),
+                model=merge_agent.model,
                 billing_mode=_agent_billing_mode(merge_agent.name),
-                effort=config.agents.merge.effort,
+                effort=merge_agent.effort,
             ),
             repository_lock=locked_repository,
             cancel=cancel,
@@ -1730,9 +1731,15 @@ def approve_plan(
             paths,
             config,
             name,
-            planning_agent=lambda: select_agent(
+            pm_agent=lambda: select_agent(
                 config,
-                ApiAgentRole.PLANNING,
+                AgentStage.PM,
+                paths,
+                interactive=_stdin_is_interactive(),
+            ),
+            supervisor_agent=lambda: select_agent(
+                config,
+                AgentStage.SUPERVISOR,
                 paths,
                 interactive=_stdin_is_interactive(),
             ),
@@ -1852,11 +1859,18 @@ def _continue_planning(
                 BorgState.BLOCKED,
             }:
                 resumable = True
-                agent = select_agent(
+                interactive = _stdin_is_interactive()
+                architect_agent = select_agent(
                     config,
-                    ApiAgentRole.PLANNING,
+                    AgentStage.ARCHITECT,
                     paths,
-                    interactive=_stdin_is_interactive(),
+                    interactive=interactive,
+                )
+                tech_lead_agent = select_agent(
+                    config,
+                    AgentStage.TECH_LEAD,
+                    paths,
+                    interactive=interactive,
                 )
                 planning_io = io or _interactive_io()
                 progress = _repository_progress(False)
@@ -1872,7 +1886,7 @@ def _continue_planning(
                         repository,
                         borg,
                         store,
-                        agent,
+                        architect_agent,
                         io=planning_io,
                         cancel=cancel,
                         progress=progress,
@@ -1881,8 +1895,8 @@ def _continue_planning(
                     repository,
                     borg,
                     store,
-                    agent,
-                    architect_agent=agent,
+                    tech_lead_agent,
+                    architect_agent=architect_agent,
                     io=planning_io,
                     cancel=cancel,
                     progress=progress,
