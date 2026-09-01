@@ -22,10 +22,7 @@ from betterborg_cli.agent_runtime.base import (
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.progress import AgentActivity, RunProgress, StageState
-from betterborg_cli.repo_analysis.analyzer import (
-    AnalyzerError,
-    resolve_analysis_model,
-)
+from betterborg_cli.repo_analysis.analyzer import resolve_analysis_model
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_files import RepositoryPathError, read_repository_text
 from betterborg_cli.store import (
@@ -132,8 +129,6 @@ def generate_role_prompts(
     _validate_persisted_inputs(repository, analysis, store)
     selected_roles = _validate_roles(roles)
     resolved_config = config or PromptManagerConfig()
-    if resolved_config.effort is not None and agent.name == "anthropic":
-        raise AnalyzerError("Anthropic does not support an effort override")
     model = resolve_analysis_model(agent, resolved_config.model)
     try:
         paths = RepoPaths.discover(repository.root, cancel=cancel)

@@ -381,8 +381,6 @@ def run_analyzer(
     artifact_dir = Path(artifact_dir).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     resolved_config = config or AnalyzerConfig()
-    if resolved_config.effort is not None and agent.name == "anthropic":
-        raise AnalyzerError("Anthropic does not support an effort override")
 
     if progress is not None:
         progress.start(stage_key)
