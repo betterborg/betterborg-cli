@@ -113,6 +113,7 @@ def test_multi_turn_responses_use_openai_wire_format(tmp_path: Path) -> None:
     assert first_tools["submit_result"]["parameters"] == _spec(tmp_path).schema
     assert transport.payloads[0]["input"] == _spec(tmp_path).user_prompt
     assert transport.payloads[0]["reasoning"] == {"effort": "high"}
+    assert len(transport.payloads) == 2
     assert all(
         payload["tool_choice"] == "required" for payload in transport.payloads
     )

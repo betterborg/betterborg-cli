@@ -66,6 +66,7 @@ def test_multi_turn_messages_use_anthropic_wire_format(tmp_path: Path) -> None:
 
     assert result.status == AgentStatus.COMPLETED
 
+    assert len(transport.payloads) == 2
     assert all(
         payload["tool_choice"] == {"type": "any"}
         for payload in transport.payloads
