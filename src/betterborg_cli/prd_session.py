@@ -187,15 +187,7 @@ class PrdSession:
         confirmation; material questions are returned to the caller instead of
         being prompted.
         """
-        validate_borg_name(name)
-        relative_prd_path = Path(".betterborg") / "prds" / f"{name}.md"
-        prd_path = self.repository.root / relative_prd_path
-        borg = Borg(repository_id=self.repository.id, name=name)
-        session = StoredPrdSession(
-            repository_id=self.repository.id,
-            borg_id=borg.id,
-            prd_path=relative_prd_path,
-        )
+        borg, session, prd_path = _new_borg_records(self.repository, name)
         base_result = {
             "borg": borg,
             "session": session,
@@ -205,21 +197,13 @@ class PrdSession:
             return PrdSessionResult(**base_result, confirmed=False)
 
         initial_markdown = _read_source(source) if source is not None else None
-        if source is not None and source.resolve() == prd_path.resolve():
-            raise ValueError("source PRD cannot also be the confirmed output path")
-        if self.store.get_borg_by_name(self.repository.id, name) is not None:
-            raise ValueError(f"Borg name already exists in this repository: {name!r}")
-        if prd_path.exists() or prd_path.is_symlink():
-            raise FileExistsError(f"confirmed Borg PRD already exists: {prd_path}")
-
-        with self.store.transaction():
-            self.store.add_borg(borg)
-            self.store.add_prd_session(session)
-            self.store.append_prd_turn(
-                session_id=session.id,
-                role="user",
-                content=initial_markdown or _BRAINSTORM_OPENING,
-            )
+        _require_unclaimed_borg(self.store, self.repository, name, prd_path, source)
+        _open_prd_session(
+            self.store,
+            borg,
+            session,
+            initial_markdown or _BRAINSTORM_OPENING,
+        )
 
         if self._cancelled():
             return PrdSessionResult(**base_result, confirmed=False)
@@ -470,6 +454,52 @@ class PrdSession:
         return True
 
 
+def adopt_prd(
+    repository: Repository,
+    store: SqliteStore,
+    name: str,
+    source: Path,
+    *,
+    cancel: CancellationToken | None = None,
+) -> PrdSessionResult:
+    """Create one named Borg from an authoritative PRD, adopted verbatim.
+
+    Adoption is the agent-free counterpart to :class:`PrdSession`. The caller
+    already owns the requirements, so there is nothing to interview about and
+    no draft to improve, and the source is published verbatim as UTF-8 text.
+    Everything
+    a confirmed interview records is recorded here too, so nothing downstream
+    can tell an adopted Borg from an interviewed one.
+    """
+    if store.get_repository(repository.id) != repository:
+        raise ValueError("repository must already be present in the supplied store")
+    paths = RepoPaths.discover(repository.root, cancel=cancel)
+    if paths.root != repository.root:
+        raise ValueError("repository root does not match its discovered Git root")
+    borg, session, prd_path = _new_borg_records(repository, name)
+    body_md = _read_source(source)
+    _require_unclaimed_borg(store, repository, name, prd_path, source)
+    _open_prd_session(store, borg, session, body_md)
+    # An adopted PRD tolerates a failed publish on the same terms an
+    # interviewed one does: if the file on disk already holds the confirmed
+    # body, the publish did its job and a late error unwinding it would
+    # otherwise strand a fully written Borg behind a claimed name.
+    try:
+        _publish_confirmed_prd(prd_path, body_md, root=repository.root)
+    except FileExistsError:
+        raise
+    except BaseException:
+        if not _confirmed_prd_matches(prd_path, body_md, root=repository.root):
+            raise
+    return PrdSessionResult(
+        borg=borg,
+        session=session,
+        prd_path=prd_path,
+        confirmed=True,
+        body_md=body_md,
+    )
+
+
 def validate_borg_name(name: str) -> None:
     """Require a nonempty Borg name that is a portable filename stem."""
     if not isinstance(name, str) or not name.strip():
@@ -493,6 +523,54 @@ def validate_borg_name(name: str) -> None:
         raise ValueError("Borg name must be a portable filename stem")
     if is_windows_reserved_filename(name):
         raise ValueError("Borg name must not be a reserved filename")
+
+
+def _new_borg_records(
+    repository: Repository, name: str
+) -> tuple[Borg, StoredPrdSession, Path]:
+    """Return the Borg, its stored session, and its confirmed PRD path."""
+    validate_borg_name(name)
+    relative_prd_path = Path(".betterborg") / "prds" / f"{name}.md"
+    borg = Borg(repository_id=repository.id, name=name)
+    session = StoredPrdSession(
+        repository_id=repository.id,
+        borg_id=borg.id,
+        prd_path=relative_prd_path,
+    )
+    return borg, session, repository.root / relative_prd_path
+
+
+def _require_unclaimed_borg(
+    store: SqliteStore,
+    repository: Repository,
+    name: str,
+    prd_path: Path,
+    source: Path | None,
+) -> None:
+    """Reject a name or output path the store, the tree, or the source holds."""
+    if source is not None and source.resolve() == prd_path.resolve():
+        raise ValueError("source PRD cannot also be the confirmed output path")
+    if store.get_borg_by_name(repository.id, name) is not None:
+        raise ValueError(f"Borg name already exists in this repository: {name!r}")
+    if prd_path.exists() or prd_path.is_symlink():
+        raise FileExistsError(f"confirmed Borg PRD already exists: {prd_path}")
+
+
+def _open_prd_session(
+    store: SqliteStore,
+    borg: Borg,
+    session: StoredPrdSession,
+    opening: str,
+) -> None:
+    """Record the Borg, its session, and its opening turn in one transaction."""
+    with store.transaction():
+        store.add_borg(borg)
+        store.add_prd_session(session)
+        store.append_prd_turn(
+            session_id=session.id,
+            role="user",
+            content=opening,
+        )
 
 
 def _read_source(source: Path) -> str:

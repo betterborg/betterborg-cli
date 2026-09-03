@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
 
@@ -682,6 +683,69 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
         assert [
             request.note for request in store.list_plan_change_requests(borg.id)
         ] == ["Add rollback verification."]
+
+
+def test_plan_start_proceeds_from_an_adopted_borg(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "seeded-plan")
+    state_home = repository.root.parent / f".{repository.root.name}-state"
+    source = repository.root / "authoritative.md"
+    source.write_text(
+        "# Adopted PRD\n\nPublish releases unattended.\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setattr(
+        cli_module,
+        "select_agent",
+        lambda *_args, **_kwargs: pytest.fail("adoption must not select an agent"),
+    )
+
+    adopted = cli_runner.invoke(
+        cli,
+        ["create", "adopted-plan", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert adopted.exit_code == 0, adopted.output
+
+    architect_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: pytest.fail("the adopted PRD needs no answers"),
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=state_home,
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "adopted-plan", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan approval pending" in result.output
+    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "adopted-plan")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
 
 
 def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:

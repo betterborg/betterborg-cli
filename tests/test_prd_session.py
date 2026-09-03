@@ -848,3 +848,77 @@ def test_confirmed_publication_winning_cancellation_race_completes_after_reconci
     assert result.confirmed
     assert result.prd_path.read_text(encoding="utf-8") == result.body_md
     assert progress.stages["requirements"].state is StageState.COMPLETED
+
+
+def test_adopted_publication_tolerates_a_failure_after_the_file_is_stable(
+    repository_store,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repository, store = repository_store
+    source = repository.root / "authoritative.md"
+    source.write_text("# Adopted\n\nStable on disk.\n", encoding="utf-8")
+    publish = prd_session_module._publish_confirmed_prd
+
+    def publish_then_fail(path: Path, body: str, *, root: Path) -> None:
+        publish(path, body, root=root)
+        # Publication hard-links the draft into place and unlinks the temporary
+        # file afterwards. An unlink that fails leaves the PRD correctly
+        # published, so adoption must not unwind a Borg that is fully written.
+        raise OSError("temporary file could not be unlinked")
+
+    monkeypatch.setattr(
+        prd_session_module,
+        "_publish_confirmed_prd",
+        publish_then_fail,
+    )
+
+    result = prd_session_module.adopt_prd(repository, store, "Adopted", source)
+
+    assert result.confirmed
+    assert result.prd_path.read_text(encoding="utf-8") == result.body_md
+
+
+def test_adoption_forwards_its_cancellation_token_to_repository_discovery(
+    repository_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, store = repository_store
+    source = repository.root / "authoritative.md"
+    source.write_text("# Adopted\n\nCancellable.\n", encoding="utf-8")
+    cancel = CancellationToken()
+    discover = RepoPaths.discover
+    seen: list[CancellationToken | None] = []
+
+    def recording_discover(start=None, **kwargs):
+        seen.append(kwargs.get("cancel"))
+        return discover(start, **kwargs)
+
+    monkeypatch.setattr(prd_session_module.RepoPaths, "discover", recording_discover)
+
+    prd_session_module.adopt_prd(repository, store, "Adopted", source, cancel=cancel)
+
+    # Discovery shells out to git, so a headless worker's interrupt has to be
+    # able to cut it short exactly as it can during an interview.
+    assert seen == [cancel]
+
+
+def test_adopted_publication_still_raises_when_the_file_never_landed(
+    repository_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, store = repository_store
+    source = repository.root / "authoritative.md"
+    source.write_text("# Adopted\n\nNever published.\n", encoding="utf-8")
+
+    def publish_without_writing(path: Path, body: str, *, root: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        prd_session_module,
+        "_publish_confirmed_prd",
+        publish_without_writing,
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        prd_session_module.adopt_prd(repository, store, "Adopted", source)

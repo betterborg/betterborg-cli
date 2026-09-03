@@ -77,7 +77,11 @@ from betterborg_cli.plugins import (
     SUPPORTED_PLUGIN_HOSTS,
     PluginInstaller,
 )
-from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
+from betterborg_cli.prd_session import (
+    InteractiveIO,
+    adopt_prd,
+    validate_borg_name,
+)
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
@@ -263,7 +267,12 @@ def install_plugins(all_hosts: bool, host: str | None) -> None:
 
 
 def _stdin_is_interactive() -> bool:
-    return click.get_text_stream("stdin").isatty()
+    # A process started with file descriptor 0 closed has no stdin stream at
+    # all. That is emphatically not a terminal, so report it as one more
+    # noninteractive case rather than letting the absent stream raise: a daemon
+    # or queue worker closes the descriptor instead of redirecting it.
+    stream = click.get_text_stream("stdin")
+    return stream is not None and stream.isatty()
 
 
 def _repository_progress(machine_readable: bool) -> RunProgress | None:
@@ -508,7 +517,13 @@ def analyze_repository(
     "--prd",
     "source",
     type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True),
-    help="Optional local Markdown PRD to improve.",
+    help="Local Markdown PRD to improve, or to adopt with --adopt.",
+)
+@click.option(
+    "--adopt",
+    "adopt",
+    is_flag=True,
+    help="Adopt the --prd file verbatim, without an interview, agent, or terminal.",
 )
 @click.option(
     "--yes",
@@ -522,15 +537,19 @@ def create_borg(
     cancel: CancellationToken | None,
     name: str,
     source: Path | None,
+    adopt: bool,
 ) -> None:
-    """Brainstorm or improve a PRD and create a named Borg."""
+    """Brainstorm, improve, or adopt a PRD and create a named Borg."""
+    if adopt and source is None:
+        raise click.UsageError("--adopt requires --prd")
     try:
         _validate_create_name(name)
     except ValueError as error:
         raise click.ClickException(str(error)) from error
-    if not _stdin_is_interactive():
+    # Only the interview needs a person at a terminal to answer it.
+    if not adopt and not _stdin_is_interactive():
         raise click.ClickException("betterborg create requires an interactive terminal")
-    progress = _repository_progress(False)
+    progress = None if adopt else _repository_progress(False)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -539,21 +558,27 @@ def create_borg(
                 raise ValueError(
                     "repository is not initialized; run 'betterborg init' first"
                 )
-            io = _interactive_io()
-            result = CreateService(
-                repository,
-                store,
-                select_agent(
-                    config,
-                    AgentStage.REQUIREMENTS,
-                    paths,
-                    interactive=True,
-                ),
-                io=io,
-                editor=_edit_markdown,
-                cancel=cancel,
-                progress=progress,
-            ).create(name, source)
+            if adopt:
+                assert source is not None
+                result = adopt_prd(
+                    repository, store, name, source, cancel=cancel
+                )
+            else:
+                io = _interactive_io()
+                result = CreateService(
+                    repository,
+                    store,
+                    select_agent(
+                        config,
+                        AgentStage.REQUIREMENTS,
+                        paths,
+                        interactive=True,
+                    ),
+                    io=io,
+                    editor=_edit_markdown,
+                    cancel=cancel,
+                    progress=progress,
+                ).create(name, source)
     except click.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:

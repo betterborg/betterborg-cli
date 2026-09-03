@@ -72,7 +72,7 @@ from an interviewed one to everything downstream.
 - `plan start` succeeds against an adopted Borg.
 - Adopting without a PRD source is rejected before any state is written.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: Preflight releases every Compose network it creates
 

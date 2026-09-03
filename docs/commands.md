@@ -109,6 +109,25 @@ and `betterborg execute` as shown by `betterborg COMMAND --help`. Before executi
 published task generation, `betterborg task estimate NAME` shows its P50/P80 work and
 billing-mode estimate.
 
+## Adopt an existing PRD
+
+When the PRD is already written and authoritative, `--adopt` publishes it as
+the Borg's confirmed PRD unchanged, including whether it ends in a newline.
+Line endings are read the way every other PRD source is read, so a CRLF file
+is published with newlines:
+
+```console
+betterborg create my-feature --prd spec.md --adopt --yes
+```
+
+Adoption holds no requirements interview, so it selects no agent, needs no
+provider credential, reports no progress stages, and does not require an
+interactive terminal. It still requires a trusted workspace, which is what
+`--yes` grants above. `--adopt` requires `--prd`, because a PRD that has yet to
+be brainstormed is not one that can be adopted. The Borg it creates is the one
+an interview would have confirmed, so continue with `betterborg plan start
+NAME` as usual.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

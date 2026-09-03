@@ -660,6 +660,7 @@ def test_create_help_registers_required_positional_name(
     assert result.exit_code == 0
     assert "Usage: cli create [OPTIONS] NAME" in result.output
     assert "--prd FILE" in result.output
+    assert "--adopt" in result.output
     assert "--name" not in result.output
 
 
@@ -852,6 +853,223 @@ def test_create_does_not_print_plan_handoff_before_confirmation(
             store.get_borg_by_name(repository.id, "wait-for-approval") is not None
         )
         assert store.list_operations(repository.id) == []
+
+
+def _configure_adopt_cli(
+    monkeypatch: MonkeyPatch,
+    repository: Repository,
+    *,
+    select_agent,
+) -> None:
+    """Point the CLI at a repository without faking an interactive stdin.
+
+    Unlike ``configure_interactive_cli`` this deliberately leaves
+    ``_stdin_is_interactive`` alone, so the runner's own non-terminal stdin
+    exercises the real terminal gate.
+    """
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "select_agent", select_agent)
+    monkeypatch.setattr(
+        cli_module,
+        "_interactive_io",
+        lambda: pytest.fail("adoption must not open an interactive session"),
+    )
+
+
+def test_create_adopt_publishes_the_source_prd_without_a_terminal(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    source = repository.root / "authoritative.md"
+    original = "# Adopted PRD\n\nShip the queue worker unattended.\n"
+    source.write_text(original, encoding="utf-8")
+    _configure_adopt_cli(
+        monkeypatch,
+        repository,
+        select_agent=lambda *_args, **_kwargs: pytest.fail(
+            "adoption must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["create", "adopted-guide", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    confirmed = paths.tracked_dir / "prds" / "adopted-guide.md"
+    assert confirmed.read_text(encoding="utf-8") == original
+    assert source.read_text(encoding="utf-8") == original
+    assert result.output.endswith("betterborg plan start adopted-guide\n")
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "adopted-guide")
+        assert borg is not None
+        session = store.get_prd_session_for_borg(borg.id)
+        assert session is not None
+        assert session.prd_path == Path(".betterborg/prds/adopted-guide.md")
+        assert [turn.content for turn in store.list_prd_turns(session.id)] == [
+            original
+        ]
+
+
+def test_create_adopt_selects_and_invokes_no_agent(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    source = repository.root / "authoritative.md"
+    original = "# Adopted PRD\n\nNo interview is needed.\n"
+    source.write_text(original, encoding="utf-8")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "questions": [],
+                "prd_markdown": "# Interviewed PRD\n\nAgent revision.",
+            }
+        )
+    )
+    selected_stages: list[AgentStage] = []
+
+    def select_mock(_config, stage, _paths, **_kwargs):
+        selected_stages.append(stage)
+        return adapter
+
+    _configure_adopt_cli(monkeypatch, repository, select_agent=select_mock)
+
+    result = cli_runner.invoke(
+        cli,
+        ["create", "adopted-silent", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert selected_stages == []
+    assert adapter.calls == []
+    confirmed = paths.tracked_dir / "prds" / "adopted-silent.md"
+    assert confirmed.read_text(encoding="utf-8") == original
+
+
+def test_stdin_is_not_interactive_when_the_stream_is_absent(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A process started with descriptor 0 closed has no stdin stream at all."""
+    monkeypatch.setattr(cli_module.click, "get_text_stream", lambda _name: None)
+
+    assert cli_module._stdin_is_interactive() is False
+
+
+def test_create_adopt_publishes_a_source_without_a_final_newline(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    source = repository.root / "authoritative.md"
+    # The interview appends a final newline to agent output. Adoption must not,
+    # which is only observable on a source that lacks one.
+    original = "# Adopted PRD\n\nNo final newline."
+    source.write_text(original, encoding="utf-8")
+    _configure_adopt_cli(
+        monkeypatch,
+        repository,
+        select_agent=lambda *_args, **_kwargs: pytest.fail(
+            "adoption must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["create", "adopted-bare", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    confirmed = paths.tracked_dir / "prds" / "adopted-bare.md"
+    assert confirmed.read_text(encoding="utf-8") == original
+    assert not confirmed.read_text(encoding="utf-8").endswith("\n")
+
+
+def test_create_adopt_publishes_a_crlf_source_with_newlines(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    source = repository.root / "authoritative.md"
+    # Adoption reads its source as text, so a CRLF file is published with
+    # newlines. Writing the bytes directly is the only way to observe it:
+    # a str written through write_text would be translated on the way out too.
+    source.write_bytes(b"# Adopted PRD\r\n\r\nCarriage returns.\r\n")
+    _configure_adopt_cli(
+        monkeypatch,
+        repository,
+        select_agent=lambda *_args, **_kwargs: pytest.fail(
+            "adoption must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["create", "adopted-crlf", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    confirmed = paths.tracked_dir / "prds" / "adopted-crlf.md"
+    assert confirmed.read_bytes() == b"# Adopted PRD\n\nCarriage returns.\n"
+
+
+def test_create_without_adopt_still_requires_an_interactive_terminal(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    source = repository.root / "authoritative.md"
+    source.write_text("# Needs review\n", encoding="utf-8")
+    _configure_adopt_cli(
+        monkeypatch,
+        repository,
+        select_agent=lambda *_args, **_kwargs: pytest.fail(
+            "the terminal gate runs before agent selection"
+        ),
+    )
+
+    result = cli_runner.invoke(
+        cli, ["create", "needs-terminal", "--prd", str(source), "--yes"]
+    )
+
+    assert result.exit_code == 1
+    assert "betterborg create requires an interactive terminal" in result.output
+    assert not paths.tracked_dir.joinpath("prds").exists()
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        assert store.get_borg_by_name(repository.id, "needs-terminal") is None
+
+
+def test_create_adopt_without_a_prd_source_writes_no_state(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = initialized_cli_repository
+    _configure_adopt_cli(
+        monkeypatch,
+        repository,
+        select_agent=lambda *_args, **_kwargs: pytest.fail(
+            "adoption must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(cli, ["create", "needs-a-prd", "--adopt", "--yes"])
+
+    assert result.exit_code == 2
+    assert "--adopt requires --prd" in result.output
+    assert not paths.tracked_dir.joinpath("prds").exists()
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        assert store.get_borg_by_name(repository.id, "needs-a-prd") is None
 
 
 @pytest.mark.parametrize(
