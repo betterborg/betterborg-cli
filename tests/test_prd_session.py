@@ -567,7 +567,7 @@ def test_machine_mode_returns_questions_instead_of_prompting(
 @pytest.mark.parametrize(
     "capabilities, message",
     [
-        (AgentCapabilities(), "read-only tool allowlist"),
+        (AgentCapabilities(), "read-only execution boundary"),
         (
             AgentCapabilities(
                 tool_allowlist=True,
@@ -576,7 +576,7 @@ def test_machine_mode_returns_questions_instead_of_prompting(
             "wrapped by SelectedAgent",
         ),
     ],
-    ids=["no-tool-allowlist", "raw-host-capable"],
+    ids=["no-read-only-boundary", "raw-host-capable"],
 )
 def test_prd_session_rejects_unconfined_adapters(
     repository_store,
@@ -590,6 +590,36 @@ def test_prd_session_rejects_unconfined_adapters(
         PrdSession(repository, store, adapter, interactive=False)
 
     assert adapter.calls == []
+
+
+# Each adapter carries the one capability under test and nothing else, so a
+# failure names the boundary that stopped qualifying. The adapter names have to
+# resolve a default model; the real host-capable Codex shape is covered by
+# test_selected_sandbox_only_agent_receives_read_only_tools.
+@pytest.mark.parametrize(
+    "name, capabilities",
+    [
+        ("openai", AgentCapabilities(tool_allowlist=True)),
+        ("codex", AgentCapabilities(read_only_sandbox=True)),
+    ],
+    ids=["tool-allowlist", "read-only-sandbox"],
+)
+def test_prd_session_accepts_either_read_only_boundary(
+    repository_store,
+    name: str,
+    capabilities: AgentCapabilities,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(name=name, capabilities=capabilities).queue(
+        MockResponse(
+            payload={"questions": [], "prd_markdown": "# Bounded\n\nRead only."}
+        )
+    )
+    session = PrdSession(repository, store, adapter, interactive=False)
+
+    result = session.run("Bounded", confirmed=True)
+
+    assert result.confirmed
 
 
 def test_selected_host_capable_agent_requires_workspace_trust(
@@ -620,6 +650,43 @@ def test_selected_host_capable_agent_requires_workspace_trust(
 
     assert result.confirmed
     assert trusted == [repository.root]
+    assert adapter.calls[0].allowed_tools == (
+        "list_files",
+        "read_file",
+        "search_text",
+    )
+
+
+def test_selected_sandbox_only_agent_receives_read_only_tools(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    adapter = MockAdapter(
+        name="codex",
+        capabilities=AgentCapabilities(
+            read_only_sandbox=True,
+            host_capable=True,
+        ),
+    ).queue(
+        MockResponse(
+            payload={"questions": [], "prd_markdown": "# Sandboxed\n\nRead only."}
+        )
+    )
+    trusted: list[Path] = []
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(repository.root),
+        trust_requirement=lambda paths, **_kwargs: trusted.append(paths.root),
+    )
+    session = PrdSession(repository, store, selected, interactive=False)
+
+    result = session.run("Sandboxed", confirmed=True)
+
+    assert result.confirmed
+    assert trusted == [repository.root]
+    # A sandbox-only adapter takes its read-only boundary from the tool set it
+    # is handed, so the confinement holds only while this stays read-only.
     assert adapter.calls[0].allowed_tools == (
         "list_files",
         "read_file",

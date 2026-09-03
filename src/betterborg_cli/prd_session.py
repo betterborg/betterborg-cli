@@ -18,6 +18,7 @@ from betterborg_cli.agent_runtime.base import (
 from betterborg_cli.agent_runtime.selection import (
     AgentSelectionError,
     SelectedAgent,
+    require_read_only_agent,
     resolve_agent_model,
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
@@ -150,16 +151,7 @@ class PrdSession:
             raise ValueError("repository root does not match its discovered Git root")
         if interactive and io is None:
             raise ValueError("interactive PRD sessions require InteractiveIO")
-        if not agent.capabilities.tool_allowlist:
-            raise PrdSessionError(
-                f"adapter {agent.name!r} cannot enforce the PRD read-only "
-                "tool allowlist"
-            )
-        if agent.capabilities.host_capable and not isinstance(agent, SelectedAgent):
-            raise PrdSessionError(
-                f"host-capable adapter {agent.name!r} must be wrapped by "
-                "SelectedAgent to enforce workspace trust"
-            )
+        require_read_only_agent(agent, role="PRD", error_factory=PrdSessionError)
         try:
             resolved_model = resolve_agent_model(agent, model)
         except AgentSelectionError as error:
