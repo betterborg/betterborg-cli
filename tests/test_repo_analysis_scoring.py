@@ -8,6 +8,7 @@ import pytest
 
 from betterborg_cli.agent_runtime.structured import StructuredResultError
 from betterborg_cli.repo_analysis.discovery import (
+    ANALYSIS_INPUT_FILENAME,
     DiscoveryFile,
     DiscoveryManifest,
 )
@@ -286,3 +287,25 @@ def test_explicit_theme_effort_controls_order_despite_member_effort(
 
     assert [result.theme.id for result in ranked] == ["theme-small", "theme-large"]
     assert ranked[0].ranking_score == pytest.approx(3 * ranked[1].ranking_score)
+
+
+def test_recommendation_may_cite_the_analysis_index_it_was_told_to_open(
+    recommendation_payload: dict[str, object], manifest: DiscoveryManifest
+) -> None:
+    recommendation_payload["manifest_evidence"] = [
+        ANALYSIS_INPUT_FILENAME,
+        ".github/workflows/ci.yml",
+    ]
+
+    recommendation = validate_recommendation(recommendation_payload, manifest)
+
+    assert recommendation.manifest_evidence == (".github/workflows/ci.yml",)
+
+
+def test_recommendation_citing_only_the_analysis_index_has_no_evidence(
+    recommendation_payload: dict[str, object], manifest: DiscoveryManifest
+) -> None:
+    recommendation_payload["manifest_evidence"] = [ANALYSIS_INPUT_FILENAME]
+
+    with pytest.raises(ValueError, match="cites no manifest evidence"):
+        validate_recommendation(recommendation_payload, manifest)

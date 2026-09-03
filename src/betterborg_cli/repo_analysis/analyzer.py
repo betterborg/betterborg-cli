@@ -27,6 +27,7 @@ from betterborg_cli.agent_runtime.selection import (
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_analysis.discovery import (
+    ANALYSIS_INPUT_FILENAME,
     DiscoveryLimits,
     DiscoveryManifest,
     build_discovery_workspace,
@@ -334,6 +335,8 @@ ANALYZER_OUTPUT_SCHEMA: dict[str, Any] = {
 
 _SYSTEM_PROMPT = """You analyze only the bounded evidence workspace at cwd.
 Open analysis_input.json first and inspect only files listed in its files array.
+That index lists where to look and is never itself evidence: cite the repository
+files it names, never analysis_input.json.
 Score every package on the eight required dimensions. Every recommendation must
 cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
@@ -710,7 +713,12 @@ def _add_source(paths: set[str], value: object) -> None:
 
 def _source(value: object) -> str | None:
     if isinstance(value, Mapping) and isinstance(value.get("source"), str):
-        return value["source"]
+        source = value["source"]
+        # The workspace index names where analysis was told to look, so it is no
+        # evidence for a command or service. Reporting it as no source at all
+        # keeps the uncited-claim guard, which is the accurate complaint.
+        if source.partition("#")[0] != ANALYSIS_INPUT_FILENAME:
+            return source
     return None
 
 

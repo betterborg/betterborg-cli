@@ -21,6 +21,7 @@ from betterborg_cli.repo_analysis.analyzer import (
     AnalyzerError,
     run_analyzer,
 )
+from betterborg_cli.repo_analysis.discovery import ANALYSIS_INPUT_FILENAME
 from betterborg_cli.repo_analysis.reporting import (
     build_machine_report,
     render_json_report,
@@ -812,3 +813,48 @@ def test_report_rejects_duplicate_package_rows(
 ) -> None:
     with pytest.raises(ValueError, match="each package exactly once"):
         build_machine_report(analysis, [packages[0], packages[0], packages[1]])
+
+
+def test_analyzer_treats_the_workspace_index_as_no_harness_evidence(
+    git_repo: Path,
+) -> None:
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small application citing the index as Harness evidence.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": ANALYSIS_INPUT_FILENAME,
+            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="lacks bounded evidence") as error:
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []
+
+    assert ANALYSIS_INPUT_FILENAME not in str(error.value)

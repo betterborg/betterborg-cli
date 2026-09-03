@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from betterborg_cli.agent_runtime.structured import validate_structured_result
-from betterborg_cli.repo_analysis.discovery import DiscoveryManifest
+from betterborg_cli.repo_analysis.discovery import (
+    ANALYSIS_INPUT_FILENAME,
+    DiscoveryManifest,
+)
 
 DIMENSIONS = (
     "agent_guidance",
@@ -211,7 +214,17 @@ def validate_recommendation(
     """Validate a recommendation and require citations from the manifest."""
     validate_structured_result(payload, RECOMMENDATION_SCHEMA)
     known_evidence = {file.path for file in manifest.files}
-    unknown_evidence = set(payload["manifest_evidence"]) - known_evidence
+    # Analysis is instructed to open the workspace index first, so citing it
+    # names where the model looked rather than what it found. Dropping it costs
+    # nothing; failing the run over it would discard a whole analysis.
+    evidence = tuple(
+        path
+        for path in payload["manifest_evidence"]
+        if path != ANALYSIS_INPUT_FILENAME
+    )
+    if not evidence:
+        raise ValueError("recommendation cites no manifest evidence")
+    unknown_evidence = set(evidence) - known_evidence
     if unknown_evidence:
         names = ", ".join(sorted(unknown_evidence))
         raise ValueError(f"recommendation cites evidence absent from manifest: {names}")
@@ -220,7 +233,7 @@ def validate_recommendation(
         title=payload["title"],
         package_path=payload["package_path"],
         dimension=payload["dimension"],
-        manifest_evidence=tuple(payload["manifest_evidence"]),
+        manifest_evidence=evidence,
         estimated_delta=float(payload["estimated_delta"]),
         effort=payload["effort"],
         overlap_group=payload["overlap_group"],

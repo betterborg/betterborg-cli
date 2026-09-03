@@ -17,6 +17,11 @@ from betterborg_cli.agent_runtime.base import CancellationToken
 
 Clock = Callable[[], float]
 
+#: Index of the evidence workspace, written beside the copied files. Analysis is
+#: told to open it first, so a model naming it as evidence is describing where it
+#: looked rather than what it found; it is never itself a manifest file.
+ANALYSIS_INPUT_FILENAME = "analysis_input.json"
+
 
 @dataclass(frozen=True)
 class DiscoveryLimits:
@@ -383,7 +388,7 @@ def build_discovery_workspace(
         limits=effective_limits,
         deadline_exceeded=deadline_exceeded,
     )
-    (workspace / "analysis_input.json").write_text(
+    (workspace / ANALYSIS_INPUT_FILENAME).write_text(
         json.dumps(manifest.to_json_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
