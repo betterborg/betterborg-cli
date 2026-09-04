@@ -904,6 +904,87 @@ def test_concurrent_stop_display_calls_wait_for_shared_teardown(
     assert progress._cadence_worker is None
 
 
+@pytest.mark.parametrize("teardown_owner", ["suspend", "close"])
+def test_stop_display_waits_for_renderer_teardown_owned_by_another_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    teardown_owner: str,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    progress = RunProgress([StageSpec("stage", "Stage")], stream=stream)
+    progress.start("stage")
+    if teardown_owner == "close":
+        progress.complete("stage", "done")
+    live = progress._live
+    assert live is not None
+    original_stop = live.stop
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+    body_entered = threading.Event()
+    body_release = threading.Event()
+    owner_finished = threading.Event()
+    disposal_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_stop() -> None:
+        stop_entered.set()
+        assert stop_release.wait(timeout=2)
+        original_stop()
+
+    def own_teardown() -> None:
+        try:
+            if teardown_owner == "suspend":
+                with progress.suspend():
+                    body_entered.set()
+                    assert body_release.wait(timeout=2)
+            else:
+                progress.close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            owner_finished.set()
+
+    def dispose() -> None:
+        try:
+            progress.stop_display()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            disposal_finished.set()
+
+    monkeypatch.setattr(live, "stop", blocking_stop)
+    owner = threading.Thread(target=own_teardown)
+    owner.start()
+    assert stop_entered.wait(timeout=1)
+
+    disposer = threading.Thread(target=dispose)
+    disposer.start()
+    assert not disposal_finished.wait(timeout=0.03)
+    assert progress._lock.acquire(timeout=0.1)
+    progress._lock.release()
+
+    stop_release.set()
+    assert disposal_finished.wait(timeout=1)
+    output_after_disposal = stream.getvalue()
+    if teardown_owner == "suspend":
+        assert body_entered.wait(timeout=1)
+        assert not owner_finished.is_set()
+        body_release.set()
+    owner.join(timeout=1)
+    disposer.join(timeout=1)
+
+    assert owner_finished.is_set()
+    assert errors == []
+    assert stream.getvalue() == output_after_disposal
+    assert progress._live is None
+    assert progress._cadence_worker is None
+    if teardown_owner == "suspend":
+        progress.fail("stage", "stopped")
+        progress.close()
+
+
 @pytest.mark.parametrize("interactive", [False, True])
 def test_autonomous_render_failure_is_raised_once_and_gates_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
@@ -1011,6 +1092,29 @@ def test_suspension_entry_teardown_failure_restores_suspension_depth(
     progress.fail("stage", "progress heartbeat failed")
     progress.close()
     assert progress.closed
+
+
+def test_suspension_restart_failure_does_not_mask_workflow_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = FailingStringIO(interactive=True)
+    progress = RunProgress([StageSpec("stage", "Stage")], stream=stream)
+    progress.start("stage")
+
+    with pytest.raises(ValueError, match="workflow failed"):
+        with progress.suspend():
+            stream.fail_next_write()
+            raise ValueError("workflow failed")
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        progress.raise_if_render_failed()
+    progress.raise_if_render_failed()
+    progress.fail("stage", "workflow failed")
+    progress.stop_display()
+    progress.close()
 
 
 def test_suspension_flush_failure_latches_and_gates_remaining_output() -> None:

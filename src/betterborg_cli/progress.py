@@ -190,6 +190,7 @@ class _DetachedDisplay:
     live: Live | None
     worker: threading.Thread | None
     stopped: threading.Event | None
+    teardown_complete: threading.Event | None = None
 
 
 _ChildRenderRecord = TypeVar(
@@ -279,6 +280,7 @@ class RunProgress:
         self._render_failed = False
         self._display_stopped = False
         self._display_stop_complete = threading.Event()
+        self._display_teardowns: set[threading.Event] = set()
         self._closing = False
         self._stages: dict[str, StageRecord] = {}
         self._preview_specs: tuple[StageSpec, ...] = ()
@@ -599,6 +601,7 @@ class RunProgress:
 
         self.raise_if_render_failed()
         detached = _DetachedDisplay(None, None, None)
+        body_failed = False
         with self._lock:
             self._require_open()
             if self._suspension_depth == 0:
@@ -609,7 +612,11 @@ class RunProgress:
         try:
             self._teardown_display(detached)
             self.raise_if_render_failed()
-            yield self
+            try:
+                yield self
+            except BaseException:
+                body_failed = True
+                raise
         finally:
             with self._lock:
                 self._suspension_depth -= 1
@@ -624,7 +631,12 @@ class RunProgress:
                             self._latch_render_failure(error)
                     if not self._render_failed and not self._display_stopped:
                         self._reset_heartbeat()
-                        self._refresh_safely()
+                        try:
+                            self._refresh_safely()
+                        except BaseException as error:
+                            if not body_failed:
+                                raise
+                            self._render_failure = error
         self.raise_if_render_failed()
 
     def close(self) -> None:
@@ -685,11 +697,14 @@ class RunProgress:
                 self._startup_label = None
                 self._queued_lines = []
                 detached = self._detach_display()
+                pending_teardowns = tuple(self._display_teardowns)
         if detached is None:
             self._display_stop_complete.wait()
             return
         try:
             self._teardown_display(detached)
+            for teardown_complete in pending_teardowns:
+                teardown_complete.wait()
         finally:
             self._display_stop_complete.set()
 
@@ -1322,7 +1337,9 @@ class RunProgress:
         except BaseException as error:
             with self._lock:
                 self._latch_render_failure(error)
-                detached = _DetachedDisplay(self._detach_live(), None, None)
+                detached = self._register_display_teardown(
+                    self._detach_live(), None, None
+                )
                 self._next_heartbeat_at = None
             self._teardown_display(detached)
             return False
@@ -1363,7 +1380,19 @@ class RunProgress:
         if stopped is not None:
             stopped.set()
         self._next_heartbeat_at = None
-        return _DetachedDisplay(live, worker, stopped)
+        return self._register_display_teardown(live, worker, stopped)
+
+    def _register_display_teardown(
+        self,
+        live: Live | None,
+        worker: threading.Thread | None,
+        stopped: threading.Event | None,
+    ) -> _DetachedDisplay:
+        teardown_complete = None
+        if live is not None or worker is not None:
+            teardown_complete = threading.Event()
+            self._display_teardowns.add(teardown_complete)
+        return _DetachedDisplay(live, worker, stopped, teardown_complete)
 
     def _detach_live(self) -> Live | None:
         live, self._live = self._live, None
@@ -1371,17 +1400,23 @@ class RunProgress:
         return live
 
     def _teardown_display(self, detached: _DetachedDisplay) -> None:
-        if detached.live is not None:
-            try:
-                detached.live.stop()
-            except BaseException as error:
+        try:
+            if detached.live is not None:
+                try:
+                    detached.live.stop()
+                except BaseException as error:
+                    with self._lock:
+                        self._latch_render_failure(error)
+            if (
+                detached.worker is not None
+                and detached.worker is not threading.current_thread()
+            ):
+                detached.worker.join()
+        finally:
+            if detached.teardown_complete is not None:
                 with self._lock:
-                    self._latch_render_failure(error)
-        if (
-            detached.worker is not None
-            and detached.worker is not threading.current_thread()
-        ):
-            detached.worker.join()
+                    self._display_teardowns.discard(detached.teardown_complete)
+                detached.teardown_complete.set()
 
     def _output_console(self) -> Console:
         if self._console is None:
