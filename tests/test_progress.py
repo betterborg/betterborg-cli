@@ -20,6 +20,7 @@ from betterborg_cli.progress import (
     RunProgress,
     StageSpec,
     StageState,
+    _format_duration,
 )
 
 
@@ -28,20 +29,22 @@ def _terminal_text(value: str) -> str:
 
 
 @pytest.mark.parametrize(
-    ("method_name", "state", "result", "duration", "rendered_duration"),
+    ("method_name", "state", "glyph", "result", "duration", "rendered_duration"),
     [
-        ("seed_completed", StageState.COMPLETED, "cached", 12.5, "12.5s"),
+        ("seed_completed", StageState.COMPLETED, "✔", "cached", 12.5, "0:12"),
         (
             "seed_completed",
             StageState.COMPLETED,
+            "✔",
             "cached",
             None,
             "—",
         ),
-        ("seed_failed", StageState.FAILED, "durable error", 4.0, "4.0s"),
+        ("seed_failed", StageState.FAILED, "✖", "durable error", 4.0, "0:04"),
         (
             "seed_failed",
             StageState.FAILED,
+            "✖",
             "durable error",
             None,
             "—",
@@ -51,6 +54,7 @@ def _terminal_text(value: str) -> str:
 def test_retained_parent_seeding_preserves_authoritative_outcome(
     method_name: str,
     state: StageState,
+    glyph: str,
     result: str,
     duration: float | None,
     rendered_duration: str,
@@ -76,9 +80,222 @@ def test_retained_parent_seeding_preserves_authoritative_outcome(
     assert progress.elapsed("analysis") == duration
     assert progress.counts[state] == 1
     assert stream.getvalue().splitlines() == [
-        f"{state.value} Repository analysis — {result} "
-        f"({rendered_duration}) [retained]"
+        f"{glyph} Repository analysis    {rendered_duration}  {result} "
+        "· reused from earlier run"
     ]
+    assert "[retained]" not in stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("seconds", "rendered"),
+    [
+        (0.0, "0:00"),
+        (59.0, "0:59"),
+        (60.0, "1:00"),
+        (3599.0, "59:59"),
+        (3600.0, "1:00:00"),
+        (27_845.75, "7:44:05"),
+    ],
+)
+def test_duration_boundaries_preserve_source_precision(
+    seconds: float, rendered: str
+) -> None:
+    stream = StringIO()
+    progress = RunProgress([StageSpec("stage", "Stage")], stream=stream)
+
+    record = progress.seed_completed("stage", "result", seconds)
+
+    assert _format_duration(seconds) == rendered
+    assert f"  {rendered}  result" in stream.getvalue()
+    assert record.duration_seconds == seconds
+
+
+def test_completed_row_uses_exact_canonical_alignment() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("analysis", "Analyze repository")], stream=stream, clock=clock
+    )
+    progress.start("analysis")
+    stream.seek(0)
+    stream.truncate()
+    clock.advance(134)
+
+    progress.complete("analysis", "claude · opus-4-8")
+
+    assert stream.getvalue().strip() == (
+        "✔ Analyze repository     2:14  claude · opus-4-8"
+    )
+    assert "completed" not in stream.getvalue()
+
+
+def test_terminal_state_glyphs_and_rich_styles_remain_distinct_without_colour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    raw_outputs: dict[str, str] = {}
+
+    for resolution in ("complete", "fail", "stop"):
+        stream = TTYStringIO()
+        progress = RunProgress([StageSpec("stage", "Stage")], stream=stream)
+        progress.start("stage")
+        getattr(progress, resolution)("stage", "result")
+        raw_outputs[resolution] = stream.getvalue()
+
+    assert "\x1b[32m✔" in raw_outputs["complete"]
+    assert "\x1b[31m✖" in raw_outputs["fail"]
+    assert "\x1b[2;36m■" in raw_outputs["stop"]
+    assert "\x1b[31m■" not in raw_outputs["stop"]
+    assert "\x1b[2;31m0:00" in raw_outputs["fail"]
+
+    pending_stream = TTYStringIO()
+    pending = RunProgress(
+        [StageSpec("stage", "Stage", (ChildSpec("child", "Child"),))],
+        stream=pending_stream,
+    )
+    pending.start("stage")
+    assert "\x1b[2m◦ Stage: Child" in pending_stream.getvalue()
+
+    stripped = {
+        resolution: _terminal_text(output)
+        for resolution, output in raw_outputs.items()
+    }
+    assert "✔ Stage" in stripped["complete"]
+    assert "✖ Stage" in stripped["fail"]
+    assert "■ Stage" in stripped["stop"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "detail", "expected"),
+    [
+        (AgentActivityKind.THINKING, None, "thinking"),
+        (
+            AgentActivityKind.READING,
+            "src/webhook/retry.go",
+            "reading src/webhook/retry.go",
+        ),
+        (
+            AgentActivityKind.SEARCHING,
+            "docker-compose",
+            'searching "docker-compose"',
+        ),
+        (AgentActivityKind.COMMAND, "make test", "running make test"),
+        (AgentActivityKind.WRITING, "result.json", "writing result.json"),
+    ],
+)
+def test_activity_kinds_use_product_language(
+    kind: AgentActivityKind, detail: str | None, expected: str
+) -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=1,
+    )
+    progress.start("stage")
+    stream.seek(0)
+    stream.truncate()
+    progress.activity("stage", AgentActivity(kind, detail))
+    clock.advance(1)
+
+    progress.refresh()
+
+    assert stream.getvalue().splitlines() == [
+        f"⠋ Stage                  0:01  {expected}"
+    ]
+    assert f"{kind.value}:" not in stream.getvalue()
+
+
+def test_empty_parent_and_child_activity_falls_back_to_thinking() -> None:
+    stream = StringIO()
+    progress = RunProgress(
+        [StageSpec("stage", "Parent", (ChildSpec("child", "Child"),))],
+        stream=stream,
+    )
+
+    progress.start("stage")
+    progress.start_child("stage", "child")
+
+    assert stream.getvalue().splitlines() == [
+        "⠋ Parent                 0:00  thinking",
+        "⠋ Parent: Child          0:00  thinking",
+    ]
+
+
+def test_dynamic_cells_normalize_controls_before_layout_and_truncation() -> None:
+    unsafe = "left\r\nright\rmid\nnext\ttab\x1b[31mred\x00nul\x85c1"
+    normalized = "left right mid next tab [31mred nul c1"
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", unsafe, (ChildSpec("child", unsafe),))],
+        stream=stream,
+        clock=clock,
+        heartbeat_interval=1,
+    )
+    progress.start("stage")
+    progress.start_child("stage", "child")
+    stream.seek(0)
+    stream.truncate()
+
+    progress.update("stage", unsafe)
+    progress.update_child("stage", "child", unsafe)
+    clock.advance(1)
+    progress.refresh()
+
+    update_lines = stream.getvalue().splitlines()
+    assert len(update_lines) == 2
+    assert all(normalized in line for line in update_lines)
+
+    stream.seek(0)
+    stream.truncate()
+    progress.activity("stage", AgentActivity(AgentActivityKind.READING, unsafe))
+    progress.child_activity(
+        "stage", "child", AgentActivity(AgentActivityKind.COMMAND, unsafe)
+    )
+    clock.advance(1)
+    progress.refresh()
+
+    activity_lines = stream.getvalue().splitlines()
+    assert len(activity_lines) == 2
+    assert all(normalized in line for line in activity_lines)
+
+    class UnsafeResult:
+        def __str__(self) -> str:
+            return unsafe
+
+    stream.seek(0)
+    stream.truncate()
+    progress.complete_child("stage", "child", UnsafeResult())
+    progress.complete("stage", UnsafeResult())
+
+    result_lines = stream.getvalue().splitlines()
+    assert len(result_lines) == 2
+    assert all(normalized in line for line in result_lines)
+    assert all(not re.search(r"[\x00-\x1f\x7f-\x9f]", line) for line in result_lines)
+
+
+def test_control_normalization_cannot_expand_the_live_region() -> None:
+    unsafe = "stage\r\nchild\t\x1b\x85"
+    progress = RunProgress(
+        [StageSpec(f"stage-{number}", f"{unsafe}{number}") for number in range(12)],
+        stream=TTYStringIO(),
+        width=80,
+    )
+
+    with progress.suspend():
+        for number in range(12):
+            progress.start(f"stage-{number}")
+
+    live_lines = progress._live_lines()
+    assert len(live_lines) == 8
+    assert all(len(line.plain.splitlines()) == 1 for line in live_lines)
+    assert all(
+        not re.search(r"[\x00-\x1f\x7f-\x9f]", line.plain) for line in live_lines
+    )
 
 
 def test_fresh_parent_and_child_have_independent_frozen_timing() -> None:
@@ -255,8 +472,8 @@ def test_cancellation_is_nonterminal_until_authoritative_reconciliation(
     assert progress.cancelling is True
     assert record.state is StageState.RUNNING
     assert stream.getvalue().splitlines() == [
-        "running Work (0.0s)",
-        "stopping...",
+        "⠋ Work                   0:00  thinking",
+        "stopping…",
     ]
     with pytest.raises(ProgressError, match="after cancellation"):
         progress.declare(StageSpec("late", "Late"))
@@ -320,9 +537,9 @@ def test_nested_suspension_queues_one_time_lines_in_transition_order() -> None:
             progress.begin_cancellation()
         assert stream.getvalue() == ""
     assert stream.getvalue().splitlines() == [
-        "completed One — cached (1.0s) [retained]",
-        "failed Two — cached failure (—) [retained]",
-        "stopping...",
+        "✔ One                    0:01  cached · reused from earlier run",
+        "✖ Two                    —  cached failure · reused from earlier run",
+        "stopping…",
     ]
 
 
@@ -357,10 +574,10 @@ def test_plain_heartbeats_cover_only_fresh_running_work() -> None:
     progress.complete("fresh", "built")
 
     assert stream.getvalue().splitlines() == [
-        "running Fresh (0.0s)",
-        "completed Retained — cached (9.0s) [retained]",
-        "running Fresh (5.0s)",
-        "completed Fresh — built (5.0s)",
+        "⠋ Fresh                  0:00  thinking",
+        "✔ Retained               0:09  cached · reused from earlier run",
+        "⠋ Fresh                  0:05  thinking",
+        "✔ Fresh                  0:05  built",
     ]
 
 
@@ -384,9 +601,9 @@ def test_plain_starts_emit_only_new_row_without_postponing_heartbeat() -> None:
     progress.start_child("one", "child")
 
     assert stream.getvalue().splitlines() == [
-        "running One (0.0s)",
-        "running Two (0.0s)",
-        "running One: Child (0.0s)",
+        "⠋ One                    0:00  thinking",
+        "⠋ Two                    0:00  thinking",
+        "⠋ One: Child             0:00  thinking",
     ]
 
     clock.advance(2.9)
@@ -396,9 +613,9 @@ def test_plain_starts_emit_only_new_row_without_postponing_heartbeat() -> None:
     progress.refresh()
 
     assert stream.getvalue().splitlines()[3:] == [
-        "running One (5.0s)",
-        "running One: Child (3.0s)",
-        "running Two (4.0s)",
+        "⠋ One                    0:05  thinking",
+        "⠋ One: Child             0:03  thinking",
+        "⠋ Two                    0:04  thinking",
     ]
 
 
@@ -422,14 +639,16 @@ def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() ->
         assert stream.getvalue() == ""
 
     assert stream.getvalue().splitlines() == [
-        "failed Retained — cached failure (—) [retained]"
+        "✖ Retained               —  cached failure · reused from earlier run"
     ]
     clock.advance(4)
     progress.refresh()
     assert len(stream.getvalue().splitlines()) == 1
     clock.advance(1)
     progress.refresh()
-    assert stream.getvalue().splitlines()[-1] == "running Fresh (15.0s)"
+    assert stream.getvalue().splitlines()[-1] == (
+        "⠋ Fresh                  0:15  thinking"
+    )
 
 
 def test_permanent_lines_match_in_plain_and_rich_modes(
@@ -445,7 +664,7 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
         )
         progress.seed_completed("stage", "cached", 2.5)
 
-    expected = "completed Stage — cached (2.5s) [retained]"
+    expected = "✔ Stage                  0:02  cached · reused from earlier run"
     assert plain.getvalue().strip() == expected
     assert _terminal_text(rich.getvalue()).strip() == expected
 
@@ -454,7 +673,7 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
     ("label", "width", "expected"),
     [
         ("A" * 100, None, None),
-        ("界" * 10, 12, "completed …"),
+        ("界" * 10, 12, "✔ 界界界界…"),
     ],
 )
 def test_long_permanent_lines_remain_one_canonical_terminal_line(
@@ -547,10 +766,10 @@ def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
         assert stream.getvalue() == ""
 
     permanent_lines = [
-        "completed Cached one — reused (3.0s) [retained]",
-        "completed One — first (10.0s)",
-        "failed Two — second (10.0s)",
-        "failed Cached two — cached failure (—) [retained]",
+        "✔ Cached one             0:03  reused · reused from earlier run",
+        "✔ One                    0:10  first",
+        "✖ Two                    0:10  second",
+        "✖ Cached two             —  cached failure · reused from earlier run",
     ]
     resumed = _terminal_text(stream.getvalue()) if interactive else stream.getvalue()
     assert all(resumed.count(line) == 1 for line in permanent_lines)
@@ -564,7 +783,9 @@ def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
         assert stream.getvalue() == resumed
         clock.advance(1)
         progress.refresh()
-        assert stream.getvalue().splitlines()[-1] == "running Active (15.0s)"
+        assert stream.getvalue().splitlines()[-1] == (
+            "⠋ Active                 0:15  thinking"
+        )
     else:
         refreshed = _terminal_text(stream.getvalue())
         assert all(refreshed.count(line) == 1 for line in permanent_lines)
@@ -595,10 +816,10 @@ def test_rich_live_output_uses_bounded_dynamic_child_projection(
     progress.start("plan")
     output = _terminal_text(stream.getvalue())
 
-    assert "completed Plan: Attempt 1" not in output
-    assert "completed Plan: Attempt 2" not in output
-    assert "completed Plan: Attempt 3 — retry (—) [retained]" in output
-    assert "pending Plan: Attempt 4" in output
+    assert "✔ Plan: Attempt 1" not in output
+    assert "✔ Plan: Attempt 2" not in output
+    assert "✔ Plan: Attempt 3        —  retry · reused from earlier run" in output
+    assert "◦ Plan: Attempt 4" in output
     assert "Plan: … 2 earlier attempts" in output
 
 
@@ -618,8 +839,8 @@ def test_rich_live_output_is_bounded_for_many_running_stages(
             progress.start(f"stage-{number}")
     initial_frame = _terminal_text(stream.getvalue())
 
-    assert all(f"running Stage {number}" in initial_frame for number in range(7))
-    assert "running Stage 7" not in initial_frame
+    assert all(f"Stage {number}" in initial_frame for number in range(7))
+    assert "Stage 7" not in initial_frame
     assert "… 5 more running" in initial_frame
 
 
@@ -701,32 +922,46 @@ def test_concurrent_permanent_lines_follow_lock_transition_order() -> None:
             future.result(timeout=2)
 
     assert stream.getvalue().splitlines() == [
-        "completed One — first (0.0s)",
-        "failed Two — second (0.0s)",
+        "✔ One                    0:00  first",
+        "✖ Two                    0:00  second",
     ]
 
 
 @pytest.mark.parametrize(
-    ("kind", "detail", "truncated"),
+    ("kind", "detail", "work", "truncated"),
     [
-        (AgentActivityKind.THINKING, None, False),
+        (AgentActivityKind.THINKING, None, "thinking", False),
         (
             AgentActivityKind.READING,
             "src/betterborg_cli/a/deeply/nested/provider_adapter.py",
+            "reading src/betterborg_cli/a/deeply/nested/provider_adapter.py",
             True,
         ),
         (
             AgentActivityKind.SEARCHING,
             "every occurrence of the long-lived\nexecution attempt identifier",
+            "searching \"every occurrence of the long-lived "
+            "execution attempt identifier\"",
             True,
         ),
-        (AgentActivityKind.COMMAND, "pytest tests/test_progress.py", False),
-        (AgentActivityKind.WRITING, "src/betterborg_cli/progress.py", False),
+        (
+            AgentActivityKind.COMMAND,
+            "pytest tests/test_progress.py",
+            "running pytest tests/test_progress.py",
+            False,
+        ),
+        (
+            AgentActivityKind.WRITING,
+            "src/betterborg_cli/progress.py",
+            "writing src/betterborg_cli/progress.py",
+            False,
+        ),
     ],
 )
 def test_parent_and_child_neutral_activity_render_as_one_capped_line(
     kind: AgentActivityKind,
     detail: str | None,
+    work: str,
     truncated: bool,
 ) -> None:
     stream = StringIO()
@@ -752,11 +987,13 @@ def test_parent_and_child_neutral_activity_render_as_one_capped_line(
 
     lines = stream.getvalue().splitlines()
     assert len(lines) == 2
-    assert lines[0].startswith(f"running Parent (1.0s) — {kind.value}")
-    assert lines[1].startswith(f"running Parent: Child (1.0s) — {kind.value}")
-    assert all(cell_len(line) <= width for line in lines)
+    assert lines[0].startswith("⠋ Parent                 0:01  ")
+    assert lines[1].startswith("⠋ Parent: Child          0:01  ")
     if truncated:
         assert all(line.endswith("…") for line in lines)
+    else:
+        assert all(line.endswith(work) for line in lines)
+    assert all(cell_len(line) <= width for line in lines)
 
 
 def test_latest_detail_or_activity_replaces_the_rendered_parent_and_child_state(
@@ -796,8 +1033,8 @@ def test_latest_detail_or_activity_replaces_the_rendered_parent_and_child_state(
         AgentActivityKind.SEARCHING, "old child detail"
     )
     detail_lines = stream.getvalue().splitlines()
-    assert detail_lines[-2].endswith("— new parent detail")
-    assert detail_lines[-1].endswith("— new child detail")
+    assert detail_lines[-2].endswith("  new parent detail")
+    assert detail_lines[-1].endswith("  new child detail")
 
     progress.activity("stage", AgentActivity(AgentActivityKind.THINKING))
     progress.child_activity(
@@ -814,8 +1051,8 @@ def test_latest_detail_or_activity_replaces_the_rendered_parent_and_child_state(
         AgentActivityKind.WRITING, "answer.json"
     )
     activity_lines = stream.getvalue().splitlines()
-    assert activity_lines[-2].endswith("— thinking")
-    assert activity_lines[-1].endswith("— writing: answer.json")
+    assert activity_lines[-2].endswith("  thinking")
+    assert activity_lines[-1].endswith("  writing answer.json")
 
 
 def test_activity_api_rejects_values_outside_the_neutral_contract() -> None:

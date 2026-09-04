@@ -322,9 +322,10 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
         input="y\n",
     )
     assert approved.exit_code == 0, approved.output
-    assert approved.output.startswith("running Estimate and decision")
+    assert approved.output.startswith("⠋ Estimate and decision")
     assert "DUMMY DATA" in approved.output
-    assert "completed Estimate and decision — approved" in approved.output
+    assert "✔ Estimate and decision" in approved.output
+    assert "approved" in approved.output
     assert "Recorded execution estimate approved" in approved.output
     assert approved.output.index("summary:") < approved.output.index(
         "Execution operation"
@@ -435,11 +436,12 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
     )
 
     assert result.exit_code == 1
-    assert "completed Estimate and decision — declined" in result.output
+    assert "✔ Estimate and decision" in result.output
+    assert "declined" in result.output
     assert result.output.index("[y/N]: n") < result.output.index(
-        "completed Estimate and decision — declined"
+        "✔ Estimate and decision"
     )
-    assert result.output.index("completed Estimate and decision — declined") < (
+    assert result.output.index("✔ Estimate and decision") < (
         result.output.index("summary:")
     )
     assert "Aborted!" in result.output
@@ -611,9 +613,8 @@ def test_push_option_publishes_completed_project_branch_non_force(
 
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
-    assert "completed Push project branch — Pushed project/push-success" in (
-        result.output
-    )
+    assert "✔ Push project branch" in result.output
+    assert "Pushed project/push-success" in result.output
     assert f"Pushed project/{name} to origin." in result.output
     assert result.output.index("summary:") < result.output.index(
         "Execution operation"
@@ -649,7 +650,7 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
 
     assert result.exit_code == 1
     assert ": completed" in result.output
-    assert "failed Push project branch" in result.output
+    assert "✖ Push project branch" in result.output
     assert "Local execution completed, but push" in result.output
     assert "origin" in result.output
     assert result.output.index("summary:") < result.output.index(
@@ -833,10 +834,10 @@ raise SystemExit(
     real_process_harness.assert_tree_absent("execute-push")
     assert real_process_harness.wait_for_marker("push-token") == "bound"
     assert real_process_harness.wait_for_marker("push-activity") == "bound"
-    assert output.count("running Push project branch") >= 2
-    assert "command: git push origin refs/heads/project/push-interrupt" in output
-    assert "stopped Push project branch" in output
-    assert "failed Push project branch" not in output
+    assert output.count("⠋ Push project branch") >= 2
+    assert "running git push origin refs/heads/project/push-interrupt" in output
+    assert "■ Push project branch" in output
+    assert "✖ Push project branch" not in output
     assert "summary:" in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
@@ -1041,9 +1042,8 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
     assert "Pushed" not in result.output
-    assert "completed Open rollup pull request — Opened rollup pull request" in (
-        result.output
-    )
+    assert "✔ Open rollup pull request" in result.output
+    assert "Opened rollup pull request" in result.output
     assert "Opened rollup pull request" in result.output
     assert args_path.read_text(encoding="utf-8").splitlines() == [
         "pr",
@@ -1182,8 +1182,8 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     )
 
     assert result.exit_code == 0, result.output
-    assert "completed Push project branch" in result.output
-    assert "completed Open rollup pull request" in result.output
+    assert "✔ Push project branch" in result.output
+    assert "✔ Open rollup pull request" in result.output
     assert result.output.index("Pushed project/") < result.output.index(
         "Opened rollup pull request"
     )
@@ -1341,10 +1341,10 @@ raise SystemExit(
     assert real_process_harness.wait_for_marker("pr-token") == "bound"
     observed_command = real_process_harness.wait_for_marker("pr-command")
     assert command_text in observed_command
-    assert output.count("running Open rollup pull request") >= 2
-    assert f"command: {observed_command}" in output
-    assert "stopped Open rollup pull request" in output
-    assert "failed Open rollup pull request" not in output
+    assert output.count("⠋ Open rollup pull request") >= 2
+    assert f"running {observed_command}" in output
+    assert "■ Open rollup pull request" in output
+    assert "✖ Open rollup pull request" not in output
     assert "summary:" in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output

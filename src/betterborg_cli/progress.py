@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from typing import TextIO
 from rich.cells import cell_len, chop_cells
 from rich.console import Console, Group
 from rich.live import Live
+from rich.spinner import Spinner
 from rich.text import Text
 
 
@@ -151,6 +153,21 @@ class ProgressError(ValueError):
 Clock = Callable[[], float]
 
 _MAX_LIVE_ROWS = 8
+_LABEL_COLUMN_WIDTH = 21
+_DOTS_FRAME = "⠋"
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_STATE_GLYPHS = {
+    StageState.PENDING: "◦",
+    StageState.COMPLETED: "✔",
+    StageState.FAILED: "✖",
+    StageState.STOPPED: "■",
+}
+_STATE_STYLES = {
+    StageState.PENDING: "dim",
+    StageState.COMPLETED: "green",
+    StageState.FAILED: "red",
+    StageState.STOPPED: "dim cyan",
+}
 
 
 class RunProgress:
@@ -188,7 +205,7 @@ class RunProgress:
         self._cancelling = False
         self._closed = False
         self._suspension_depth = 0
-        self._queued_lines: list[str] = []
+        self._queued_lines: list[Text] = []
         self._lock = threading.RLock()
         for spec in stages:
             self.declare(spec)
@@ -464,7 +481,7 @@ class RunProgress:
             if self._cancelling:
                 return False
             self._cancelling = True
-            self._emit("stopping...")
+            self._emit(Text("stopping…", style="dim cyan"))
             self._refresh_transient()
             return True
 
@@ -682,7 +699,7 @@ class RunProgress:
     ) -> None:
         self._emit(_format_terminal_line(record, parent_label=parent_label))
 
-    def _emit(self, line: str) -> None:
+    def _emit(self, line: Text) -> None:
         if not self._enabled:
             return
         if self._suspension_depth:
@@ -705,9 +722,7 @@ class RunProgress:
             if not lines:
                 self._stop_live()
                 return
-            renderable = Group(
-                *(Text(self._truncate(line), no_wrap=True) for line in lines)
-            )
+            renderable = Group(*(self._live_renderable(line) for line in lines))
             if self._live is None:
                 self._live = Live(
                     renderable,
@@ -736,8 +751,8 @@ class RunProgress:
                 self._write_plain(line)
             self._next_heartbeat_at = now + self._heartbeat_interval
 
-    def _live_lines(self) -> list[str]:
-        lines: list[str] = []
+    def _live_lines(self) -> list[Text]:
+        lines: list[Text] = []
         for stage in self._stages.values():
             if stage.state is not StageState.RUNNING:
                 continue
@@ -750,11 +765,18 @@ class RunProgress:
             if child_state.earlier_attempt_count:
                 count = child_state.earlier_attempt_count
                 noun = "attempt" if count == 1 else "attempts"
-                lines.append(f"{stage.label}: … {count} earlier {noun}")
+                label = _normalize_cell(stage.label)
+                lines.append(
+                    Text.assemble(
+                        (f"{label}: … ", "dim"),
+                        (str(count), "dim"),
+                        (f" earlier {noun}", "dim"),
+                    )
+                )
         return self._bound_live_lines(lines)
 
-    def _active_lines(self) -> list[str]:
-        lines: list[str] = []
+    def _active_lines(self) -> list[Text]:
+        lines: list[Text] = []
         for stage in self._stages.values():
             if stage.state is StageState.RUNNING:
                 lines.append(self._format_running_line(stage))
@@ -766,19 +788,22 @@ class RunProgress:
         return lines
 
     @staticmethod
-    def _bound_live_lines(lines: list[str]) -> list[str]:
+    def _bound_live_lines(lines: list[Text]) -> list[Text]:
         if len(lines) <= _MAX_LIVE_ROWS:
             return lines
         hidden = len(lines) - (_MAX_LIVE_ROWS - 1)
-        return [*lines[: _MAX_LIVE_ROWS - 1], f"… {hidden} more running"]
+        return [
+            *lines[: _MAX_LIVE_ROWS - 1],
+            Text(f"… {hidden} more running", style="dim"),
+        ]
 
     def _format_child_live_line(
         self, child: ChildRecord, *, parent_label: str
-    ) -> str:
+    ) -> Text:
         if child.state is StageState.RUNNING:
             return self._format_running_line(child, parent_label=parent_label)
         if child.state is StageState.PENDING:
-            return f"pending {parent_label}: {child.label}"
+            return _format_pending_line(child, parent_label=parent_label)
         return _format_terminal_line(child, parent_label=parent_label)
 
     def _format_running_line(
@@ -786,23 +811,28 @@ class RunProgress:
         record: StageRecord | ChildRecord,
         *,
         parent_label: str | None = None,
-    ) -> str:
-        label = record.label
-        if parent_label is not None:
-            label = f"{parent_label}: {label}"
+    ) -> Text:
+        label = _format_label(record, parent_label=parent_label)
         elapsed = self._elapsed(record)
-        line = f"running {label} ({0.0 if elapsed is None else elapsed:.1f}s)"
-        if record._activity_is_latest and record.activity is not None:
-            activity = record.activity.kind
-            if record.activity.detail:
-                detail = record.activity.detail.replace("\r\n", " ")
-                detail = detail.replace("\r", " ").replace("\n", " ")
-                activity += f": {detail}"
-            line += f" — {activity}"
-        elif record.detail:
-            line += f" — {record.detail}"
+        work = _format_current_work(record)
         if self._cancelling:
-            line += " [stopping]"
+            work = "stopping…"
+        line = Text(_DOTS_FRAME, style="cyan")
+        line.append(" ")
+        line.append(label)
+        line.append(" " * _column_gap(label))
+        line.append(_format_duration(elapsed), style="dim")
+        line.append("  ")
+        line.append(work)
+        return line
+
+    def _live_renderable(self, line: Text) -> Text | Spinner:
+        line = self._truncate(line)
+        if line.plain.startswith(_DOTS_FRAME):
+            spinner_text = line[2:]
+            spinner_text.no_wrap = True
+            return Spinner("dots", text=spinner_text, style="cyan")
+        line.no_wrap = True
         return line
 
     def _reset_heartbeat(self) -> None:
@@ -830,49 +860,121 @@ class RunProgress:
             self._console = Console(**options)
         return self._console
 
-    def _write_permanent(self, line: str) -> None:
+    def _write_permanent(self, line: Text) -> None:
         line = self._truncate(line)
         if self._interactive:
-            self._output_console().print(Text(line), soft_wrap=True)
+            self._output_console().print(line, soft_wrap=True)
         else:
             self._write_plain(line)
 
-    def _write_plain(self, line: str) -> None:
-        self._stream.write(self._truncate(line) + "\n")
+    def _write_plain(self, line: Text) -> None:
+        self._stream.write(self._truncate(line).plain + "\n")
         self._stream.flush()
 
-    def _truncate(self, line: str) -> str:
-        if self._width is None or cell_len(line) <= self._width:
+    def _truncate(self, line: Text) -> Text:
+        if self._width is None or cell_len(line.plain) <= self._width:
             return line
         if self._width == 1:
-            return "…"
-        return chop_cells(line, self._width - 1)[0] + "…"
+            return Text("…", style=line.style)
+        prefix = chop_cells(line.plain, self._width - 1)[0]
+        truncated = line[: len(prefix)]
+        truncated.append("…")
+        return truncated
 
 
 def _format_terminal_line(
     record: StageRecord | ChildRecord, *, parent_label: str | None = None
-) -> str:
-    label = record.label
-    if parent_label is not None:
-        label = f"{parent_label}: {label}"
-    duration = (
-        "—"
-        if record.duration_seconds is None
-        else f"{record.duration_seconds:.1f}s"
+) -> Text:
+    label = _format_label(record, parent_label=parent_label)
+    glyph = _STATE_GLYPHS[record.state]
+    line = Text(glyph, style=_STATE_STYLES[record.state])
+    line.append(" ")
+    line.append(label)
+    line.append(" " * _column_gap(label))
+    line.append(_format_duration(record.duration_seconds), style="dim")
+    result_parts = []
+    if record.result is not None:
+        result_parts.append(_normalize_cell(str(record.result)))
+    if record.retained:
+        result_parts.append("reused from earlier run")
+    if result_parts:
+        line.append("  ")
+        line.append(" · ".join(result_parts))
+    return line
+
+
+def _format_pending_line(
+    record: ChildRecord, *, parent_label: str | None = None
+) -> Text:
+    label = _format_label(record, parent_label=parent_label)
+    return Text(
+        f"{_STATE_GLYPHS[StageState.PENDING]} {label}",
+        style=_STATE_STYLES[StageState.PENDING],
     )
-    result = "" if record.result is None else f" — {record.result}"
-    retained = " [retained]" if record.retained else ""
-    return f"{record.state.value} {label}{result} ({duration}){retained}"
 
 
-def _format_summary_line(records: Iterable[StageRecord]) -> str:
+def _format_label(
+    record: StageRecord | ChildRecord, *, parent_label: str | None = None
+) -> str:
+    label = _normalize_cell(record.label)
+    if parent_label is not None:
+        label = f"{_normalize_cell(parent_label)}: {label}"
+    return label
+
+
+def _column_gap(label: str) -> int:
+    return max(2, _LABEL_COLUMN_WIDTH - cell_len(label) + 2)
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    whole_seconds = int(seconds)
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _format_current_work(record: StageRecord | ChildRecord) -> str:
+    if record._activity_is_latest and record.activity is not None:
+        return _format_activity(record.activity)
+    if record.detail is not None:
+        detail = _normalize_cell(record.detail)
+        if detail.strip():
+            return detail
+    return "thinking"
+
+
+def _format_activity(activity: AgentActivity) -> str:
+    if activity.kind is AgentActivityKind.THINKING:
+        return "thinking"
+    detail = "" if activity.detail is None else _normalize_cell(activity.detail)
+    if not detail.strip():
+        return "thinking"
+    if activity.kind is AgentActivityKind.READING:
+        return f"reading {detail}"
+    if activity.kind is AgentActivityKind.SEARCHING:
+        return f'searching "{detail}"'
+    if activity.kind is AgentActivityKind.COMMAND:
+        return f"running {detail}"
+    return f"writing {detail}"
+
+
+def _normalize_cell(value: str) -> str:
+    return _CONTROL_RE.sub(" ", value)
+
+
+def _format_summary_line(records: Iterable[StageRecord]) -> Text:
     records = tuple(records)
     counts = Counter(record.state for record in records)
     retained = sum(record.retained for record in records)
-    return (
+    return Text(
         f"summary: {counts[StageState.COMPLETED]} completed, "
         f"{counts[StageState.FAILED]} failed, "
-        f"{counts[StageState.STOPPED]} stopped — {retained} retained"
+        f"{counts[StageState.STOPPED]} stopped — {retained} retained",
+        style="dim",
     )
 
 

@@ -408,8 +408,8 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     assert "Borg 'approved-plan' is ready to execute." in result.output
     assert ".betterborg/plans/approved-plan.md" in result.output
     assert ".betterborg/tasks/approved-plan/" in result.output
-    project_manager_line = result.output.index("completed Project Manager")
-    supervisor_line = result.output.index("completed Supervisor")
+    project_manager_line = result.output.index("✔ Project Manager")
+    supervisor_line = result.output.index("✔ Supervisor")
     assert project_manager_line < supervisor_line
     assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
     assert project_manager is not supervisor
@@ -528,10 +528,10 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
 
     assert resumed.exit_code == 0, resumed.output
     assert "ready to execute" in resumed.output
-    assert "completed Project Manager" in resumed.output
-    assert "[retained]" in resumed.output
-    assert resumed.output.index("completed Project Manager") < resumed.output.index(
-        "completed Supervisor"
+    assert "✔ Project Manager" in resumed.output
+    assert "reused from earlier run" in resumed.output
+    assert resumed.output.index("✔ Project Manager") < resumed.output.index(
+        "✔ Supervisor"
     )
     assert selected_stages == [
         AgentStage.PM,
@@ -731,7 +731,7 @@ def test_plan_approve_publication_cancellation_reports_retained_approval(
 
     assert resumed.exit_code == 0, resumed.output
     assert "ready to execute" in resumed.output
-    assert "completed Supervisor" in resumed.output
+    assert "✔ Supervisor" in resumed.output
     assert len(adapter.calls) == 2
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "cancel-publication")
@@ -786,8 +786,8 @@ def test_plan_approve_post_commit_cancellation_keeps_ready_outcome(
 
     assert result.exit_code == 0, result.output
     assert "ready to execute" in result.output
-    assert "completed Supervisor" in result.output
-    assert "stopped Supervisor" not in result.output
+    assert "✔ Supervisor" in result.output
+    assert "■ Supervisor" not in result.output
     assert len(adapter.calls) == 2
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "post-commit-cancel")

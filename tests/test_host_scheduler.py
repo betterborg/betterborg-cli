@@ -666,7 +666,7 @@ def test_scheduler_durably_cancels_when_progress_output_fails(
 
     class FailingCancellationStream(StringIO):
         def write(self, value: str) -> int:
-            if "stopping..." in value:
+            if "stopping…" in value:
                 raise OSError("progress output unavailable")
             return super().write(value)
 

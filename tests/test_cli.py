@@ -176,7 +176,7 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
     assert observed["cancelled"] is True
     assert observed["acknowledged_state"] is StageState.RUNNING
     assert observed["acknowledgement"] == (
-        f"{observed['before_interrupt']}stopping...\n"
+        f"{observed['before_interrupt']}stopping…\n"
     )
     assert observed["terminal_state"] is terminal_state
     run = observed["run"]
@@ -235,7 +235,7 @@ def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
     assert observed["suspended_output"] == observed["before_interrupt"]
     assert observed["terminal_output"] == observed["before_interrupt"]
     assert stream.getvalue().startswith(
-        f"{observed['before_interrupt']}stopping...\n"
+        f"{observed['before_interrupt']}stopping…\n"
     )
     assert "stopped" in stream.getvalue()
 
@@ -297,7 +297,7 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     assert run.progress.cancelling
     assert run.progress.closed
     assert stream.getvalue().splitlines() == [
-        "stopping...",
+        "stopping…",
         "summary: 0 completed, 0 failed, 0 stopped — 0 retained",
     ]
 
@@ -616,7 +616,8 @@ def test_main_surfaces_reconciliation_failure_after_sigint(
     assert run.progress.cancelling
     assert run.progress.stages["work"].state is StageState.FAILED
     assert captured.out == ""
-    assert "failed Work — durability reconciliation failed" in captured.err
+    assert "✖ Work" in captured.err
+    assert "durability reconciliation failed" in captured.err
     assert captured.err.endswith("Error: could not reconcile interruption\n")
 
 

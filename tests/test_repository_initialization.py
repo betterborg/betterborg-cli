@@ -244,9 +244,9 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
         "betterborg create theme-ci --prd "
         ".betterborg/prds/improvements/theme-ci.md\n"
     ) in first.output
-    prompts_complete = "completed Generate role prompts — 3 prompts"
-    drafts_started = "running Draft improvement PRDs"
-    drafts_complete = "completed Draft improvement PRDs — 1 PRD"
+    prompts_complete = "✔ Generate role prompts"
+    drafts_started = "⠋ Draft improvement PRDs"
+    drafts_complete = "✔ Draft improvement PRDs"
     assert first.output.count(drafts_complete) == 1
     assert first.output.index(prompts_complete) < first.output.index(drafts_started)
     assert first.output.index(drafts_started) < first.output.index(drafts_complete)
@@ -254,8 +254,8 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     second = cli_runner.invoke(cli, ["init", "--yes"])
 
     assert second.exit_code == 0, second.output
-    assert "completed Discover evidence" in second.output
-    assert "completed Analyze repository" in second.output
+    assert "✔ Discover evidence" in second.output
+    assert "✔ Analyze repository" in second.output
     assert second.output.endswith(
         f"Repository already initialized: {config.repository_id}\n"
     )
@@ -583,8 +583,10 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         f"Analyzed repository {config.repository_id}: score 4.00/5 "
         "(previous 3.00/5, delta +1.00).\n"
     )
-    assert "completed Discover evidence — 1 evidence files" in result.output
-    assert "completed Analyze repository — score 4.00/5" in result.output
+    assert "✔ Discover evidence" in result.output
+    assert "1 evidence files" in result.output
+    assert "✔ Analyze repository" in result.output
+    assert "score 4.00/5" in result.output
     assert load_repository_config(paths).repository_id == config.repository_id
     assert confirmed_path.read_text(encoding="utf-8") == confirmed_body
     assert not paths.improvement_prds_dir.joinpath("theme-ci.md").exists()
@@ -911,9 +913,10 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     assert progress.stages["analyze"].state is StageState.PENDING
     assert progress.closed
     output = progress_stream.getvalue()
-    assert "stopping..." in output
-    assert "stopped Discover evidence — interrupted" in output
-    assert "failed Discover evidence" not in output
+    assert "stopping…" in output
+    assert "■ Discover evidence" in output
+    assert "interrupted" in output
+    assert "✖ Discover evidence" not in output
     assert output.endswith(
         "summary: 0 completed, 0 failed, 1 stopped — 0 retained\n"
     )
@@ -1042,12 +1045,13 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
     assert progress.stages["improvement-prds"].result == "interrupted"
     assert progress.closed
     output = progress_stream.getvalue()
-    assert output.index("completed Generate role prompts — 3 prompts") < output.index(
-        "running Draft improvement PRDs"
+    assert output.index("✔ Generate role prompts") < output.index(
+        "⠋ Draft improvement PRDs"
     )
-    assert "stopped Draft improvement PRDs — interrupted" in output
-    assert "failed Draft improvement PRDs" not in output
-    assert "completed Draft improvement PRDs" not in output
+    assert "■ Draft improvement PRDs" in output
+    assert "interrupted" in output
+    assert "✖ Draft improvement PRDs" not in output
+    assert "✔ Draft improvement PRDs" not in output
     assert len(adapter.calls) == 4
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
