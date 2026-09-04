@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from io import StringIO
 from typing import Any
 
@@ -667,7 +668,7 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
 
     expected = "✔ Stage                  0:02  cached · reused from earlier run"
     assert plain.getvalue().strip() == expected
-    assert _terminal_text(rich.getvalue()).strip() == expected
+    assert _terminal_text(rich.getvalue()).splitlines()[-1] == expected
 
 
 @pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
@@ -755,12 +756,12 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
 
     plain_lines = plain.getvalue().splitlines()
     rich_lines = _terminal_text(rich.getvalue()).splitlines()
-    assert rich_lines == plain_lines
-    assert len(rich_lines) == 1
+    assert rich_lines[-1:] == plain_lines
+    assert len(plain_lines) == 1
     if expected is not None:
-        assert rich_lines == [expected]
+        assert rich_lines[-1] == expected
     if width is not None:
-        assert cell_len(rich_lines[0]) <= width
+        assert cell_len(rich_lines[-1]) <= width
 
 
 @pytest.mark.parametrize(
@@ -880,7 +881,199 @@ def test_rich_live_output_uses_bounded_dynamic_child_projection(
     assert "✔ Plan: Attempt 2" not in output
     assert "✔ Plan: Attempt 3        —  retry · reused from earlier run" in output
     assert "◦ Plan: Attempt 4" in output
-    assert "Plan: … 2 earlier attempts" in output
+    assert "… 2 earlier attempts" in output
+
+
+def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    clock = FakeClock()
+    stream = TTYStringIO()
+    progress = RunProgress(
+        stream=stream,
+        clock=clock,
+        startup_label="Preparing run",
+        startup_pending=("Draft improvement PRDs",),
+    )
+
+    initial = [line.plain for line in progress._live_lines()]
+    assert initial == [
+        "⠋ Preparing run          0:00  thinking",
+        "  ◦ Draft improvement PRDs",
+    ]
+    assert "Draft improvement PRDs" in _terminal_text(stream.getvalue())
+    assert progress.stages == {}
+
+    progress.declare(
+        StageSpec("Draft improvement PRDs", "Draft improvement PRDs")
+    )
+    progress.start("Draft improvement PRDs")
+
+    adopted = [line.plain for line in progress._live_lines()]
+    assert adopted == ["⠋ Draft improvement PRDs  0:00  thinking"]
+
+    plain = StringIO()
+    RunProgress(
+        stream=plain,
+        startup_label="Preparing run",
+        startup_pending=("Draft improvement PRDs",),
+    )
+    assert plain.getvalue() == ""
+
+
+def test_preview_replacement_validates_cohort_before_changing_projection() -> None:
+    progress = RunProgress(stream=StringIO())
+    original = (
+        StageSpec("preflight", "Preflight"),
+        StageSpec("task-1", "Task 1"),
+    )
+    progress.preview_pending(original, cohort_keys=("task-1",))
+    original_frame = [line.plain for line in progress._live_lines()]
+
+    with pytest.raises(ValueError, match="duplicate stage keys"):
+        progress.preview_pending(
+            (StageSpec("duplicate", "One"), StageSpec("duplicate", "Two"))
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        progress.preview_pending(original, cohort_keys=("task-1", "task-1"))
+    with pytest.raises(ValueError, match="must be members"):
+        progress.preview_pending(original, cohort_keys=("missing",))
+
+    assert [line.plain for line in progress._live_lines()] == original_frame
+    assert progress.stages == {}
+
+
+def test_projection_snapshot_is_frozen_and_stable_after_record_updates() -> None:
+    clock = FakeClock()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")], stream=StringIO(), clock=clock
+    )
+    progress.start("stage")
+    snapshot = progress._projection_snapshot()
+
+    clock.advance(5)
+    progress.update("stage", "new work")
+
+    frozen_frame = [
+        line.plain for line in progress._project_live_lines(snapshot)
+    ]
+    current_frame = [line.plain for line in progress._live_lines()]
+    assert frozen_frame == ["⠋ Stage                  0:00  thinking"]
+    assert current_frame == ["⠋ Stage                  0:05  new work"]
+    with pytest.raises(FrozenInstanceError):
+        snapshot.cancelling = True
+
+
+def test_focused_counts_are_independent_from_visible_previews_and_adoption() -> None:
+    progress = RunProgress(stream=StringIO())
+    task_specs = tuple(
+        StageSpec(f"task-{number}", f"Task {number}") for number in range(14)
+    )
+    specs = (StageSpec("preflight", "Preflight"), *task_specs)
+    task_keys = tuple(spec.key for spec in task_specs)
+    progress.preview_pending(specs, cohort_keys=task_keys)
+
+    for spec in task_specs[:3]:
+        progress.declare(spec)
+        progress.seed_completed(spec.key, "done")
+    for spec in task_specs[3:5]:
+        progress.declare(spec)
+        progress.start(spec.key)
+    for spec in task_specs[5:]:
+        progress.declare(spec)
+
+    frame = [line.plain for line in progress._live_lines()]
+    assert "  ◦ Preflight" in frame
+    assert "3 done · 2 running · 9 pending" in frame
+    frame_text = "\n".join(frame)
+    assert all(f"◦ {spec.label}" not in frame_text for spec in task_specs[5:])
+
+    progress.declare(StageSpec("preflight", "Preflight"))
+    adopted = [line.plain for line in progress._live_lines()]
+    assert adopted.count("  ◦ Preflight") == 1
+    assert "3 done · 2 running · 9 pending" in adopted
+
+
+def test_outside_record_keeps_live_permanent_and_summary_participation() -> None:
+    stream = StringIO()
+    progress = RunProgress([StageSpec("outside", "Outside")], stream=stream)
+    task_specs = tuple(
+        StageSpec(f"task-{number}", f"Task {number}") for number in range(9)
+    )
+    progress.preview_pending(task_specs)
+
+    progress.start("outside")
+    assert [line.plain for line in progress._live_lines()][0].startswith(
+        "⠋ Outside"
+    )
+    progress.complete("outside", "kept")
+    progress.close()
+
+    assert progress.stages["outside"].state is StageState.COMPLETED
+    assert len(progress.stages) == 1
+    assert stream.getvalue().splitlines()[-2:] == [
+        "✔ Outside                0:00  kept",
+        "1 of 1 stage finished in 0:00; none failed or stopped.",
+    ]
+    assert progress._live_lines() == []
+
+
+def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> None:
+    progress = RunProgress(stream=StringIO())
+    previews = tuple(
+        StageSpec(f"pending-{number}", f"Pending {number}")
+        for number in range(12)
+    )
+    progress.preview_pending(previews, cohort_keys=())
+    progress.declare(StageSpec("active", "Active"))
+    progress.start("active")
+
+    named_frame = [line.plain for line in progress._live_lines()]
+    assert len(named_frame) == 8
+    assert named_frame[0].startswith("⠋ Active")
+    assert named_frame[1] == "  ◦ Pending 0"
+
+    progress.preview_pending(previews[:9])
+    for number in range(9):
+        key = f"running-{number}"
+        progress.declare(StageSpec(key, f"Running {number}"))
+        progress.start(key)
+
+    counted_frame = [line.plain for line in progress._live_lines()]
+    assert len(counted_frame) == 10
+    assert counted_frame[-2] == ""
+    assert counted_frame[-1] == "0 done · 0 running · 9 pending"
+
+    progress.begin_cancellation()
+    cancelling_frame = [line.plain for line in progress._live_lines()]
+    assert len(cancelling_frame) == 10
+    assert cancelling_frame[-2:] == ["", "stopping…"]
+
+
+def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:
+    progress = RunProgress(
+        [StageSpec("plan", "Plan")],
+        stream=StringIO(),
+        attempt_history_limit=2,
+    )
+    for number in range(1, 5):
+        key = f"attempt-{number}"
+        progress.declare_child("plan", ChildSpec(key, f"Attempt {number}"))
+        progress.seed_child_completed("plan", key, "retry")
+    progress.preview_pending(
+        tuple(
+            StageSpec(f"task-{number}", f"Task {number}")
+            for number in range(9)
+        )
+    )
+    progress.start("plan")
+
+    frame = [line.plain for line in progress._live_lines()]
+    assert "… 2 earlier attempts" in frame
+    assert len(frame) <= 10
+    assert len(frame[:-2]) <= 8
 
 
 def test_rich_live_output_is_bounded_for_many_running_stages(
@@ -897,7 +1090,7 @@ def test_rich_live_output_is_bounded_for_many_running_stages(
     with progress.suspend():
         for number in range(12):
             progress.start(f"stage-{number}")
-    initial_frame = _terminal_text(stream.getvalue())
+    initial_frame = "\n".join(line.plain for line in progress._live_lines())
 
     assert all(f"Stage {number}" in initial_frame for number in range(7))
     assert "Stage 7" not in initial_frame
@@ -1062,7 +1255,7 @@ def test_ascii_stream_degrades_live_ellipsis_activity_and_truncation(
     output = _terminal_text(stream.getvalue())
     assert "* Pl\\xe4n" in output
     assert "writing fa\\xe7ade \\u2615" in output
-    assert "Pl\\xe4n: ... 2 earlier attempts" in output
+    assert "... 2 earlier attempts" in output
     assert "stopping..." in output
 
     truncated_stream = ASCIIOnlyStringIO()

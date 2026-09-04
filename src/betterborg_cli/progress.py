@@ -146,6 +146,42 @@ class ChildRenderState:
     earlier_attempt_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RecordSnapshot:
+    """Immutable rendering state copied from one authoritative record."""
+
+    key: str
+    label: str
+    state: StageState
+    detail: str | None
+    activity: AgentActivity | None
+    result: str | None
+    duration_seconds: float | None
+    retained: bool
+    _activity_is_latest: bool
+    dynamic: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _StageSnapshot:
+    """Immutable rendering state for a parent and its declared children."""
+
+    record: _RecordSnapshot
+    children: tuple[_RecordSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionSnapshot:
+    """One atomic view of authoritative records and display-only previews."""
+
+    stages: tuple[_StageSnapshot, ...]
+    previews: tuple[StageSpec, ...]
+    cohort_keys: frozenset[str]
+    startup_label: str | None
+    elapsed_seconds: float
+    cancelling: bool
+
+
 class ProgressError(ValueError):
     """Raised when a requested progress lifecycle operation is illegal."""
 
@@ -198,6 +234,8 @@ class RunProgress:
         machine_readable: bool = False,
         attempt_history_limit: int = 2,
         heartbeat_interval: float = 30.0,
+        startup_label: str | None = None,
+        startup_pending: tuple[str, ...] = (),
     ) -> None:
         if width is not None and width <= 0:
             raise ValueError("width must be positive")
@@ -205,6 +243,8 @@ class RunProgress:
             raise ValueError("attempt_history_limit must be at least one")
         if heartbeat_interval <= 0 or not math.isfinite(heartbeat_interval):
             raise ValueError("heartbeat_interval must be a finite positive value")
+        if startup_label is not None:
+            _require_text(startup_label, "startup label")
         self._stream = sys.stderr if stream is None else stream
         self._clock = clock
         self._started_at = self._clock()
@@ -217,13 +257,24 @@ class RunProgress:
         self._live: Live | None = None
         self._next_heartbeat_at: float | None = None
         self._stages: dict[str, StageRecord] = {}
+        self._preview_specs: tuple[StageSpec, ...] = ()
+        self._cohort_keys: frozenset[str] = frozenset()
+        self._startup_label = startup_label
         self._cancelling = False
         self._closed = False
         self._suspension_depth = 0
         self._queued_lines: list[Text] = []
         self._lock = threading.RLock()
+        self._initializing = True
         for spec in stages:
             self.declare(spec)
+        startup_specs = tuple(StageSpec(label, label) for label in startup_pending)
+        previews, cohort_keys = self._validated_preview(startup_specs, None)
+        self._preview_specs = previews
+        self._cohort_keys = cohort_keys
+        self._initializing = False
+        if self._interactive:
+            self._refresh_transient()
 
     @property
     def stages(self) -> Mapping[str, StageRecord]:
@@ -272,7 +323,29 @@ class RunProgress:
                 }
             )
             self._stages[spec.key] = record
+            self._preview_specs = tuple(
+                preview
+                for preview in self._preview_specs
+                if preview.key != spec.key
+            )
+            if not self._initializing:
+                self._refresh_transient()
             return record
+
+    def preview_pending(
+        self,
+        specs: tuple[StageSpec, ...],
+        *,
+        cohort_keys: tuple[str, ...] | None = None,
+    ) -> None:
+        """Atomically replace display-only pending stages and count membership."""
+
+        with self._lock:
+            self._require_open()
+            previews, selected_keys = self._validated_preview(specs, cohort_keys)
+            self._preview_specs = previews
+            self._cohort_keys = selected_keys
+            self._refresh_transient()
 
     def start(self, stage_key: str) -> StageRecord:
         """Start a fresh parent timer exactly once."""
@@ -496,6 +569,7 @@ class RunProgress:
             if self._cancelling:
                 return False
             self._cancelling = True
+            self._startup_label = None
             self._emit(Text("stopping…", style="dim cyan"))
             self._refresh_transient()
             return True
@@ -545,6 +619,9 @@ class RunProgress:
                 )
             if self._suspension_depth:
                 raise ProgressError("cannot close progress while output is suspended")
+            self._preview_specs = ()
+            self._cohort_keys = frozenset()
+            self._startup_label = None
             self._stop_live()
             elapsed_seconds = max(0.0, self._clock() - self._started_at)
             self._emit(
@@ -608,6 +685,36 @@ class RunProgress:
         except KeyError as exc:
             raise ProgressError(f"unknown stage {stage_key!r}") from exc
 
+    def _validated_preview(
+        self,
+        specs: tuple[StageSpec, ...],
+        cohort_keys: tuple[str, ...] | None,
+    ) -> tuple[tuple[StageSpec, ...], frozenset[str]]:
+        candidates = tuple(specs)
+        if any(not isinstance(spec, StageSpec) for spec in candidates):
+            raise TypeError("pending previews must be StageSpec instances")
+        spec_keys = tuple(spec.key for spec in candidates)
+        available_keys = set(spec_keys)
+        if len(available_keys) != len(spec_keys):
+            raise ValueError("pending previews have duplicate stage keys")
+
+        selected = spec_keys if cohort_keys is None else tuple(cohort_keys)
+        if any(not isinstance(key, str) or not key for key in selected):
+            raise ValueError("cohort keys must be non-empty strings")
+        if len(set(selected)) != len(selected):
+            raise ValueError("cohort keys must be unique")
+        unknown = [key for key in selected if key not in available_keys]
+        if unknown:
+            raise ValueError(
+                "cohort keys must be members of pending previews: "
+                + ", ".join(repr(key) for key in unknown)
+            )
+
+        previews = tuple(
+            spec for spec in candidates if spec.key not in self._stages
+        )
+        return previews, frozenset(selected)
+
     def _child(self, stage_key: str, child_key: str) -> tuple[StageRecord, ChildRecord]:
         parent = self._stage(stage_key)
         try:
@@ -621,6 +728,7 @@ class RunProgress:
         self._require_pending(record, name)
         record.state = StageState.RUNNING
         record.started_at = self._clock()
+        self._startup_label = None
 
     def _seed_record(
         self,
@@ -633,6 +741,7 @@ class RunProgress:
         record.result = result
         record.duration_seconds = duration_seconds
         record.retained = True
+        self._startup_label = None
 
     def _finish_record(
         self,
@@ -648,7 +757,11 @@ class RunProgress:
         record.finished_at = finished_at
         record.duration_seconds = max(0.0, finished_at - record.started_at)
 
-    def _elapsed(self, record: StageRecord | ChildRecord) -> float | None:
+    def _elapsed(
+        self, record: StageRecord | ChildRecord | _RecordSnapshot
+    ) -> float | None:
+        if isinstance(record, _RecordSnapshot):
+            return record.duration_seconds
         if record.duration_seconds is not None or record.state in TERMINAL_STATES:
             return record.duration_seconds
         if record.started_at is None:
@@ -776,28 +889,160 @@ class RunProgress:
             self._next_heartbeat_at = now + self._heartbeat_interval
 
     def _live_lines(self) -> list[Text]:
-        lines: list[Text] = []
-        for stage in self._stages.values():
-            if stage.state is not StageState.RUNNING:
-                continue
-            lines.append(self._format_running_line(stage))
-            child_state = self.child_render_state(stage.key)
-            lines.extend(
-                self._format_child_live_line(child, parent_label=stage.label)
-                for child in child_state.children
+        return self._project_live_lines(self._projection_snapshot())
+
+    def _projection_snapshot(self) -> _ProjectionSnapshot:
+        with self._lock:
+            now = self._clock()
+            stages = tuple(
+                _StageSnapshot(
+                    record=self._record_snapshot(stage, now),
+                    children=tuple(
+                        self._record_snapshot(child, now)
+                        for child in stage._children.values()
+                    ),
+                )
+                for stage in self._stages.values()
             )
-            if child_state.earlier_attempt_count:
-                count = child_state.earlier_attempt_count
-                noun = "attempt" if count == 1 else "attempts"
-                label = _normalize_cell(stage.label)
-                lines.append(
-                    Text.assemble(
-                        (f"{label}: … ", "dim"),
-                        (str(count), "dim"),
-                        (f" earlier {noun}", "dim"),
+            return _ProjectionSnapshot(
+                stages=stages,
+                previews=self._preview_specs,
+                cohort_keys=self._cohort_keys,
+                startup_label=self._startup_label,
+                elapsed_seconds=max(0.0, now - self._started_at),
+                cancelling=self._cancelling,
+            )
+
+    def _record_snapshot(
+        self, record: StageRecord | ChildRecord, now: float
+    ) -> _RecordSnapshot:
+        duration = record.duration_seconds
+        if duration is None and record.state is StageState.RUNNING:
+            if record.started_at is None:
+                raise AssertionError("running record has no start time")
+            duration = max(0.0, now - record.started_at)
+        return _RecordSnapshot(
+            key=record.key,
+            label=record.label,
+            state=record.state,
+            detail=record.detail,
+            activity=record.activity,
+            result=None if record.result is None else str(record.result),
+            duration_seconds=duration,
+            retained=record.retained,
+            _activity_is_latest=record._activity_is_latest,
+            dynamic=isinstance(record, ChildRecord) and record.dynamic,
+        )
+
+    def _project_live_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
+        running_lines: list[Text] = []
+        pending_lines: list[Text] = []
+        stages_by_key = {stage.record.key: stage for stage in snapshot.stages}
+        aggregate_cohort = len(snapshot.cohort_keys) > _MAX_LIVE_ROWS
+
+        if snapshot.startup_label is not None:
+            running_lines.append(
+                self._format_startup_line(
+                    snapshot.startup_label, snapshot.elapsed_seconds
+                )
+            )
+
+        for stage in snapshot.stages:
+            record = stage.record
+            if record.state is StageState.RUNNING:
+                running_lines.append(
+                    self._format_running_line(
+                        record, cancelling=snapshot.cancelling
                     )
                 )
-        return self._bound_live_lines(lines)
+                children, earlier_attempt_count = self._snapshot_children(stage)
+                running_lines.extend(
+                    self._format_child_live_line(
+                        child,
+                        parent_label=record.label,
+                        cancelling=snapshot.cancelling,
+                    )
+                    for child in children
+                )
+                if earlier_attempt_count:
+                    noun = "attempt" if earlier_attempt_count == 1 else "attempts"
+                    running_lines.append(
+                        Text(
+                            f"… {earlier_attempt_count} earlier {noun}",
+                            style="dim",
+                        )
+                    )
+            elif record.state is StageState.PENDING and not (
+                aggregate_cohort and record.key in snapshot.cohort_keys
+            ):
+                pending_lines.append(_format_pending_stage_line(record.label))
+
+        pending_lines.extend(
+            _format_pending_stage_line(spec.label)
+            for spec in snapshot.previews
+            if not (aggregate_cohort and spec.key in snapshot.cohort_keys)
+        )
+
+        work_lines = self._bound_live_lines(running_lines + pending_lines)
+        footer: Text | None = None
+        if snapshot.cancelling:
+            footer = Text("stopping…", style="dim cyan")
+        elif aggregate_cohort:
+            footer = self._format_cohort_counts(snapshot, stages_by_key)
+        if footer is None:
+            return work_lines
+        return [*work_lines, Text(""), footer]
+
+    def _snapshot_children(
+        self, stage: _StageSnapshot
+    ) -> tuple[tuple[_RecordSnapshot, ...], int]:
+        fixed = [child for child in stage.children if not child.dynamic]
+        attempts = [child for child in stage.children if child.dynamic]
+        active = [child for child in attempts if child.state not in TERMINAL_STATES]
+        active_keys = {child.key for child in active}
+        remaining_slots = max(self._attempt_history_limit - len(active), 0)
+        latest_terminal = [
+            child for child in attempts if child.state in TERMINAL_STATES
+        ][-remaining_slots:]
+        if remaining_slots == 0:
+            latest_terminal = []
+        visible_keys = active_keys | {child.key for child in latest_terminal}
+        visible_attempts = [
+            child for child in attempts if child.key in visible_keys
+        ]
+        visible = tuple(fixed + visible_attempts)
+        return visible, len(attempts) - len(visible_attempts)
+
+    def _format_cohort_counts(
+        self,
+        snapshot: _ProjectionSnapshot,
+        stages_by_key: Mapping[str, _StageSnapshot],
+    ) -> Text:
+        preview_keys = {spec.key for spec in snapshot.previews}
+        states = [
+            stages_by_key[key].record.state
+            if key in stages_by_key
+            else StageState.PENDING
+            for key in snapshot.cohort_keys
+            if key in stages_by_key or key in preview_keys
+        ]
+        counts = Counter(states)
+        done = sum(counts[state] for state in TERMINAL_STATES)
+        return Text(
+            f"{done} done · {counts[StageState.RUNNING]} running · "
+            f"{counts[StageState.PENDING]} pending",
+            style="dim",
+        )
+
+    def _format_startup_line(self, label: str, elapsed: float) -> Text:
+        normalized = _normalize_cell(label)
+        line = Text(_DOTS_FRAME, style="cyan")
+        line.append(" ")
+        line.append(normalized)
+        line.append(" " * _column_gap(normalized))
+        line.append(_format_duration(elapsed), style="dim")
+        line.append("  thinking")
+        return line
 
     def _active_lines(self) -> list[Text]:
         lines: list[Text] = []
@@ -822,24 +1067,33 @@ class RunProgress:
         ]
 
     def _format_child_live_line(
-        self, child: ChildRecord, *, parent_label: str
+        self,
+        child: ChildRecord | _RecordSnapshot,
+        *,
+        parent_label: str,
+        cancelling: bool | None = None,
     ) -> Text:
         if child.state is StageState.RUNNING:
-            return self._format_running_line(child, parent_label=parent_label)
+            return self._format_running_line(
+                child,
+                parent_label=parent_label,
+                cancelling=cancelling,
+            )
         if child.state is StageState.PENDING:
             return _format_pending_line(child, parent_label=parent_label)
         return _format_terminal_line(child, parent_label=parent_label)
 
     def _format_running_line(
         self,
-        record: StageRecord | ChildRecord,
+        record: StageRecord | ChildRecord | _RecordSnapshot,
         *,
         parent_label: str | None = None,
+        cancelling: bool | None = None,
     ) -> Text:
         label = _format_label(record, parent_label=parent_label)
         elapsed = self._elapsed(record)
         work = _format_current_work(record)
-        if self._cancelling:
+        if self._cancelling if cancelling is None else cancelling:
             work = "stopping…"
         line = Text(_DOTS_FRAME, style="cyan")
         line.append(" ")
@@ -917,7 +1171,9 @@ class RunProgress:
 
 
 def _format_terminal_line(
-    record: StageRecord | ChildRecord, *, parent_label: str | None = None
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+    *,
+    parent_label: str | None = None,
 ) -> Text:
     label = _format_label(record, parent_label=parent_label)
     glyph = _STATE_GLYPHS[record.state]
@@ -942,7 +1198,7 @@ def _format_child_terminal_line(child: ChildRecord, *, branch: str) -> Text:
 
 
 def _format_pending_line(
-    record: ChildRecord, *, parent_label: str | None = None
+    record: ChildRecord | _RecordSnapshot, *, parent_label: str | None = None
 ) -> Text:
     label = _format_label(record, parent_label=parent_label)
     return Text(
@@ -951,8 +1207,17 @@ def _format_pending_line(
     )
 
 
+def _format_pending_stage_line(label: str) -> Text:
+    return Text(
+        f"  {_STATE_GLYPHS[StageState.PENDING]} {_normalize_cell(label)}",
+        style=_STATE_STYLES[StageState.PENDING],
+    )
+
+
 def _format_label(
-    record: StageRecord | ChildRecord, *, parent_label: str | None = None
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+    *,
+    parent_label: str | None = None,
 ) -> str:
     label = _normalize_cell(record.label)
     if parent_label is not None:
@@ -975,7 +1240,9 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
-def _format_current_work(record: StageRecord | ChildRecord) -> str:
+def _format_current_work(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
     if record._activity_is_latest and record.activity is not None:
         return _format_activity(record.activity)
     if record.detail is not None:
