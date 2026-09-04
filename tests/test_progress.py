@@ -656,6 +656,7 @@ def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() ->
 def test_permanent_lines_match_in_plain_and_rich_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     plain = StringIO()
     rich = TTYStringIO()
@@ -766,7 +767,7 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
 
 @pytest.mark.parametrize(
     ("environment", "interactive"),
-    [({}, True), ({"NO_COLOR": "1"}, True), ({"TERM": "dumb"}, False)],
+    [({}, True), ({"NO_COLOR": "1"}, False), ({"TERM": "dumb"}, False)],
 )
 def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
     monkeypatch: pytest.MonkeyPatch,
@@ -921,6 +922,44 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
         startup_pending=("Draft improvement PRDs",),
     )
     assert plain.getvalue() == ""
+
+
+def test_no_color_tty_uses_escape_free_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("TERM", raising=False)
+    stream = TTYStringIO()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        startup_label="Preparing run",
+        startup_pending=("Future stage",),
+    )
+
+    assert progress._live is None
+    assert stream.getvalue() == ""
+
+    progress.start("stage")
+    assert stream.getvalue() == "⠋ Stage                  0:00  thinking\n"
+    assert "\x1b" not in stream.getvalue()
+
+
+def test_close_does_not_restart_live_for_pending_declarations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = TTYStringIO()
+    progress = RunProgress(
+        [StageSpec("pending", "Pending")], stream=stream, width=120
+    )
+
+    assert progress._live is not None
+    progress.close()
+
+    assert progress._live is None
+    assert progress.stages["pending"].state is StageState.PENDING
 
 
 def test_preview_replacement_validates_cohort_before_changing_projection() -> None:
@@ -1079,6 +1118,7 @@ def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:
 def test_rich_live_output_is_bounded_for_many_running_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = TTYStringIO()
     progress = RunProgress(
@@ -1233,6 +1273,7 @@ def test_ascii_stream_degrades_rows_dynamic_text_and_spacing() -> None:
 def test_ascii_stream_degrades_live_ellipsis_activity_and_truncation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = ASCIIOnlyStringIO(interactive=True)
     progress = RunProgress(

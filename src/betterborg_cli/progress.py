@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TextIO
+from typing import TextIO, TypeVar
 
 from rich.cells import cell_len, chop_cells
 from rich.console import Console, Group
@@ -180,6 +180,11 @@ class _ProjectionSnapshot:
     startup_label: str | None
     elapsed_seconds: float
     cancelling: bool
+
+
+_ChildRenderRecord = TypeVar(
+    "_ChildRenderRecord", ChildRecord, _RecordSnapshot
+)
 
 
 class ProgressError(ValueError):
@@ -535,23 +540,12 @@ class RunProgress:
 
         with self._lock:
             parent = self._stage(stage_key)
-            fixed = [child for child in parent._children.values() if not child.dynamic]
-            attempts = [child for child in parent._children.values() if child.dynamic]
-            active = [child for child in attempts if child.state not in TERMINAL_STATES]
-            active_keys = {child.key for child in active}
-            remaining_slots = max(self._attempt_history_limit - len(active), 0)
-            latest_terminal = [
-                child for child in attempts if child.state in TERMINAL_STATES
-            ][-remaining_slots:]
-            if remaining_slots == 0:
-                latest_terminal = []
-            visible_keys = active_keys | {child.key for child in latest_terminal}
-            visible_attempts = [
-                child for child in attempts if child.key in visible_keys
-            ]
+            children, earlier_attempt_count = _select_render_children(
+                parent._children.values(), self._attempt_history_limit
+            )
             return ChildRenderState(
-                children=tuple(fixed + visible_attempts),
-                earlier_attempt_count=len(attempts) - len(visible_attempts),
+                children=children,
+                earlier_attempt_count=earlier_attempt_count,
             )
 
     def refresh(self) -> None:
@@ -624,9 +618,10 @@ class RunProgress:
             self._startup_label = None
             self._stop_live()
             elapsed_seconds = max(0.0, self._clock() - self._started_at)
-            self._emit(
-                _format_summary_line(self._stages.values(), elapsed_seconds)
-            )
+            if self._enabled:
+                self._write_permanent(
+                    _format_summary_line(self._stages.values(), elapsed_seconds)
+                )
             self._closed = True
 
     def _seed_stage(
@@ -955,7 +950,9 @@ class RunProgress:
                         record, cancelling=snapshot.cancelling
                     )
                 )
-                children, earlier_attempt_count = self._snapshot_children(stage)
+                children, earlier_attempt_count = _select_render_children(
+                    stage.children, self._attempt_history_limit
+                )
                 running_lines.extend(
                     self._format_child_live_line(
                         child,
@@ -992,26 +989,6 @@ class RunProgress:
         if footer is None:
             return work_lines
         return [*work_lines, Text(""), footer]
-
-    def _snapshot_children(
-        self, stage: _StageSnapshot
-    ) -> tuple[tuple[_RecordSnapshot, ...], int]:
-        fixed = [child for child in stage.children if not child.dynamic]
-        attempts = [child for child in stage.children if child.dynamic]
-        active = [child for child in attempts if child.state not in TERMINAL_STATES]
-        active_keys = {child.key for child in active}
-        remaining_slots = max(self._attempt_history_limit - len(active), 0)
-        latest_terminal = [
-            child for child in attempts if child.state in TERMINAL_STATES
-        ][-remaining_slots:]
-        if remaining_slots == 0:
-            latest_terminal = []
-        visible_keys = active_keys | {child.key for child in latest_terminal}
-        visible_attempts = [
-            child for child in attempts if child.key in visible_keys
-        ]
-        visible = tuple(fixed + visible_attempts)
-        return visible, len(attempts) - len(visible_attempts)
 
     def _format_cohort_counts(
         self,
@@ -1334,12 +1311,30 @@ def _format_summary_line(
 
 
 def _is_interactive(stream: TextIO) -> bool:
-    if os.environ.get("TERM", "").casefold() == "dumb":
+    if "NO_COLOR" in os.environ or os.environ.get("TERM", "").casefold() == "dumb":
         return False
     try:
         return bool(stream.isatty())
     except (AttributeError, OSError):
         return False
+
+
+def _select_render_children(
+    children: Iterable[_ChildRenderRecord], history_limit: int
+) -> tuple[tuple[_ChildRenderRecord, ...], int]:
+    """Select fixed children and one bounded window of dynamic attempts."""
+
+    records = tuple(children)
+    fixed = [child for child in records if not child.dynamic]
+    attempts = [child for child in records if child.dynamic]
+    active = [child for child in attempts if child.state not in TERMINAL_STATES]
+    active_keys = {child.key for child in active}
+    remaining_slots = max(history_limit - len(active), 0)
+    terminal = [child for child in attempts if child.state in TERMINAL_STATES]
+    latest_terminal = terminal[-remaining_slots:] if remaining_slots else []
+    visible_keys = active_keys | {child.key for child in latest_terminal}
+    visible_attempts = [child for child in attempts if child.key in visible_keys]
+    return tuple(fixed + visible_attempts), len(attempts) - len(visible_attempts)
 
 
 def _require_activity(activity: AgentActivity) -> AgentActivity:
