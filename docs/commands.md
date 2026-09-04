@@ -186,7 +186,7 @@ end with output like:
 ```text
 stopping…
 ■ Analyze repository     0:12  interrupted
-summary: 1 completed, 0 failed, 1 stopped — 0 retained
+1 of 2 stages finished in 0:12; 0 failed and 1 stopped.
 ```
 
 If cooperative cleanup has not finished after one second, Betterborg requests
