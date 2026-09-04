@@ -1336,7 +1336,11 @@ def _format_summary_line(
 
 
 def _is_interactive(stream: TextIO) -> bool:
-    if "NO_COLOR" in os.environ or os.environ.get("TERM", "").casefold() == "dumb":
+    if (
+        "CI" in os.environ
+        or "NO_COLOR" in os.environ
+        or os.environ.get("TERM", "").casefold() == "dumb"
+    ):
         return False
     try:
         return bool(stream.isatty())

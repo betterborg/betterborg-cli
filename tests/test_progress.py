@@ -134,6 +134,7 @@ def test_completed_row_uses_exact_canonical_alignment() -> None:
 def test_terminal_state_glyphs_and_rich_styles_remain_distinct_without_colour(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     raw_outputs: dict[str, str] = {}
@@ -656,6 +657,7 @@ def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() ->
 def test_permanent_lines_match_in_plain_and_rich_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     plain = StringIO()
@@ -677,6 +679,7 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
     monkeypatch: pytest.MonkeyPatch,
     stream_type: type[StringIO],
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = stream_type()
@@ -744,6 +747,7 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
     width: int | None,
     expected: str | None,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     plain = StringIO()
@@ -767,13 +771,19 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
 
 @pytest.mark.parametrize(
     ("environment", "interactive"),
-    [({}, True), ({"NO_COLOR": "1"}, False), ({"TERM": "dumb"}, False)],
+    [
+        ({}, True),
+        ({"CI": "true"}, False),
+        ({"NO_COLOR": "1"}, False),
+        ({"TERM": "dumb"}, False),
+    ],
 )
 def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
     monkeypatch: pytest.MonkeyPatch,
     environment: dict[str, str],
     interactive: bool,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     for key, value in environment.items():
@@ -858,6 +868,7 @@ def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
 def test_rich_live_output_uses_bounded_dynamic_child_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = TTYStringIO()
@@ -888,6 +899,7 @@ def test_rich_live_output_uses_bounded_dynamic_child_projection(
 def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     clock = FakeClock()
@@ -924,11 +936,15 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
     assert plain.getvalue() == ""
 
 
-def test_no_color_tty_uses_escape_free_output(
+@pytest.mark.parametrize("environment_name", ["CI", "NO_COLOR"])
+def test_non_redraw_environment_tty_uses_escape_free_output(
     monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
 ) -> None:
-    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setenv(environment_name, "1")
     stream = TTYStringIO()
     progress = RunProgress(
         [StageSpec("stage", "Stage")],
@@ -948,6 +964,7 @@ def test_no_color_tty_uses_escape_free_output(
 def test_close_does_not_restart_live_for_pending_declarations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = TTYStringIO()
@@ -1148,6 +1165,7 @@ def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:
 def test_rich_live_output_is_bounded_for_many_running_stages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = TTYStringIO()
@@ -1303,6 +1321,7 @@ def test_ascii_stream_degrades_rows_dynamic_text_and_spacing() -> None:
 def test_ascii_stream_degrades_live_ellipsis_activity_and_truncation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     stream = ASCIIOnlyStringIO(interactive=True)
