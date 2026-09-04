@@ -886,6 +886,46 @@ def test_autonomous_render_failure_is_raised_once_and_gates_reconciliation(
     progress.stop_display()
 
 
+def test_consumed_render_failure_is_not_rearmed_during_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = FailingStringIO(interactive=True)
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        heartbeat_interval=0.03,
+    )
+    progress.start("stage")
+    worker = progress._cadence_worker
+    live = progress._live
+    assert worker is not None
+    assert live is not None
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+
+    def fail_during_stop() -> None:
+        stop_entered.set()
+        assert stop_release.wait(timeout=2)
+        raise RuntimeError("renderer teardown failed")
+
+    monkeypatch.setattr(live, "stop", fail_during_stop)
+    stream.fail_next_write()
+    assert stop_entered.wait(timeout=2)
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        progress.raise_if_render_failed()
+    stop_release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    progress.raise_if_render_failed()
+    progress.fail("stage", "progress heartbeat failed")
+    progress.stop_display()
+
+
 def test_suspension_entry_teardown_failure_restores_suspension_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

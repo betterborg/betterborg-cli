@@ -1337,7 +1337,7 @@ class RunProgress:
                     self._ensure_cadence_worker()
 
     def _latch_render_failure(self, error: BaseException) -> None:
-        if self._render_failure is None:
+        if not self._render_failed:
             self._render_failure = error
         self._render_failed = True
         if self._cadence_stop is not None:
