@@ -154,7 +154,7 @@ def test_planning_survives_an_architect_result_that_misses_the_schema(
         assert result.plan == _plan()
         assert result.borg.state is BorgState.TECH_REVIEW_WORKING
         assert len(adapter.calls) == 3
-        assert "does not match pattern" in adapter.calls[1].user_prompt
+        assert '"^q[1-9][0-9]?$"' in adapter.calls[1].user_prompt
         attempts = store.list_planning_attempts(borg.id)
         assert [attempt.phase for attempt in attempts] == [
             "architect_questions",

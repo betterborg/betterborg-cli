@@ -7,12 +7,14 @@ shape every native CLI adapter has. Planning then stops on a repository the
 operator has already trusted, because it runs in a worktree Betterborg itself
 generated and that worktree is a workspace of its own. A turn whose result
 misses the schema by one field ends the run outright, however well the rest of
-it went. Separately, a Compose stack created during preflight can outlive the
-run that created it, and enough survivors exhaust Docker's address pool until
-nothing on the machine can create a network.
+it went, and the retry that would rescue it is told which field was wrong
+without being told what would have been right. Separately, a Compose stack
+created during preflight can outlive the run that created it, and enough
+survivors exhaust Docker's address pool until nothing on the machine can
+create a network.
 
 Together these block every unattended use: CI, cron, a queue worker, and a
-benchmark container. The work here is five independent changes, each closing
+benchmark container. The work here is six independent changes, each closing
 one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
@@ -203,5 +205,59 @@ time.
 - The retried attempt carries the previous validation error.
 - A schema miss does not wait for the transient backoff.
 - Planning survives a first architect result that misses the schema.
+
+**Status**: Complete
+
+## Stage 6: A rejected result says what would have been accepted
+
+**Goal**: A validation error names the constraint the value violated, so the
+agent correcting it knows what to produce.
+
+A rejected string reports that it does not match a pattern without saying
+which pattern; a rejected length says the string is too short without saying
+the bound; a rejected number, array length, enum member and branch are the
+same. The agent is told which field is wrong and nothing about what would be
+right, so correcting the result is guesswork. Retrying an uninformative
+correction spends turns without changing the odds, which is how a value that
+misses a pattern by its shape rather than by chance exhausts a whole budget.
+
+The values that describe a constraint come from the schema, which Betterborg
+wrote. Reporting them tells the agent only what it was already asked for, and
+keeps the property that makes these messages safe to send to a provider: the
+rejected value itself is never quoted.
+
+A constraint is rendered as JSON, because JSON is what the agent has to send
+back; a Python rendering would offer it True and None, neither of which it can
+use. A schema value that cannot be rendered as JSON describes a constraint no
+agent could satisfy, so it is refused when the schema is validated rather than
+described in a correction.
+
+A constraint carries no length bound of its own, so a long one is shortened by
+dropping whole members and saying how many were dropped. A value with no
+members to drop, a pattern or a bound, is shown whole however long it runs. A
+value cut part way through reads as a shorter value that the schema would
+reject just as surely, and an abbreviated pattern is not even a pattern, which
+would leave the message worse than the silence it replaced.
+
+**Success Criteria**:
+- A violated constraint is reported with the value it required, for patterns,
+  string and array lengths, numeric bounds, enum membership, and the branches
+  of a rejected anyOf or oneOf.
+- A constraint is rendered as the JSON the agent is being asked to produce.
+- The rejected value is still never quoted, and neither is any part of the
+  payload beyond the property names already reported.
+- A message stays a single line, whatever a constraint holds and whatever the
+  payload named, and a shortened constraint shows whole members only and says
+  how many it left out.
+
+**Tests**:
+- Each constraint's message names its required value.
+- A payload value that violates a constraint does not appear in the message.
+- An agent correcting a rejected pattern receives the pattern.
+- A constraint too long to show keeps whole members and reports the remainder.
+- A constraint with no members to drop is shown whole.
+- A rejected branch names the alternatives it required.
+- A payload property name cannot split a message across lines.
+- A constraint that is not JSON is refused as a broken schema.
 
 **Status**: Complete
