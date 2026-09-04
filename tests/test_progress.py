@@ -9,8 +9,9 @@ from io import StringIO
 from typing import Any
 
 import pytest
-from progress_test_support import FakeClock, TTYStringIO
+from progress_test_support import ASCIIOnlyStringIO, FakeClock, TTYStringIO
 from rich.cells import cell_len
+from rich.text import Text
 
 from betterborg_cli.progress import (
     AgentActivity,
@@ -928,6 +929,117 @@ def test_width_truncation_and_run_summary_are_canonical() -> None:
     assert summary_stream.getvalue().splitlines()[-1] == (
         "summary: 1 completed, 1 failed, 0 stopped — 2 retained"
     )
+
+
+@pytest.mark.parametrize(
+    ("token", "substitution"),
+    [
+        ("✔", "[OK]"),
+        ("✖", "[X]"),
+        ("■", "[-]"),
+        ("◦", "[.]"),
+        *((frame, "*") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        ("│", "|"),
+        ("├", "+-"),
+        ("└", r"\-"),
+        ("·", "-"),
+        ("…", "..."),
+        ("—", "-"),
+    ],
+)
+def test_ascii_stream_substitutes_every_canonical_token(
+    token: str, substitution: str
+) -> None:
+    stream = ASCIIOnlyStringIO()
+    progress = RunProgress(stream=stream)
+
+    progress._write_plain(Text(f"before {token} after"))
+
+    assert stream.getvalue() == f"before {substitution} after\n"
+
+
+def test_ascii_stream_degrades_rows_dynamic_text_and_spacing() -> None:
+    stream = ASCIIOnlyStringIO()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "tree",
+                "Résumé",
+                (ChildSpec("first", "Café"), ChildSpec("second", "Jalapeño")),
+            ),
+            StageSpec("failed", "Failed"),
+            StageSpec("stopped", "Stopped"),
+        ],
+        stream=stream,
+    )
+    progress.seed_child_completed(
+        "tree", "first", "142 files · 1.8 MB", duration_seconds=1
+    )
+    progress.seed_child_completed(
+        "tree", "second", "3 done · 2 running · 9 pending", duration_seconds=2
+    )
+    progress.seed_completed("tree", "naïve ☕", duration_seconds=3)
+    progress.seed_failed("failed", "touché")
+    progress.start("stopped")
+    progress.stop("stopped", "arrêt")
+
+    assert stream.getvalue().splitlines() == [
+        "[OK] R\\xe9sum\\xe9                 0:03  na\\xefve \\u2615 "
+        "- reused from earlier run",
+        "+- [OK] Caf\\xe9                   0:01  142 files - 1.8 MB "
+        "- reused from earlier run",
+        r"\- [OK] Jalape\xf1o               0:02  "
+        "3 done - 2 running - 9 pending - reused from earlier run",
+        "[X] Failed                 -  touch\\xe9 - reused from earlier run",
+        "* Stopped                0:00  thinking",
+        "[-] Stopped                0:00  arr\\xeat",
+    ]
+
+
+def test_ascii_stream_degrades_live_ellipsis_activity_and_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TERM", raising=False)
+    stream = ASCIIOnlyStringIO(interactive=True)
+    progress = RunProgress(
+        [StageSpec("plan", "Plän")],
+        stream=stream,
+        width=120,
+        attempt_history_limit=2,
+    )
+    for number in range(1, 5):
+        key = f"attempt-{number}"
+        progress.declare_child("plan", ChildSpec(key, f"Attémpt {number}"))
+        progress.seed_child_completed("plan", key, "résult")
+
+    progress.start("plan")
+    progress.activity(
+        "plan", AgentActivity(AgentActivityKind.WRITING, "façade ☕")
+    )
+    progress.begin_cancellation()
+
+    output = _terminal_text(stream.getvalue())
+    assert "* Pl\\xe4n" in output
+    assert "writing fa\\xe7ade \\u2615" in output
+    assert "Pl\\xe4n: ... 2 earlier attempts" in output
+    assert "stopping..." in output
+
+    truncated_stream = ASCIIOnlyStringIO()
+    truncated = RunProgress(
+        [StageSpec("stage", "A long label")], stream=truncated_stream, width=1
+    )
+    truncated.seed_completed("stage", "result", 1)
+    assert truncated_stream.getvalue() == "...\n"
+
+
+def test_utf8_stream_preserves_canonical_tokens_and_dynamic_text() -> None:
+    canonical_text = "✔ ✖ ■ ◦ ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ │ ├ └ · … — café ☕"
+    stream = StringIO()
+    progress = RunProgress(stream=stream)
+
+    progress._write_plain(Text(canonical_text))
+
+    assert stream.getvalue() == f"{canonical_text}\n"
 
 
 def test_disabled_mode_suppresses_transient_permanent_and_summary_output() -> None:

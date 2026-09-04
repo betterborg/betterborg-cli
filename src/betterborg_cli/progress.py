@@ -26,7 +26,7 @@ from rich.cells import cell_len, chop_cells
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
-from rich.text import Text
+from rich.text import Span, Text
 
 
 class StageState(StrEnum):
@@ -154,8 +154,22 @@ Clock = Callable[[], float]
 
 _MAX_LIVE_ROWS = 8
 _LABEL_COLUMN_WIDTH = 21
-_DOTS_FRAME = "⠋"
+_DOTS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_DOTS_FRAME = _DOTS_FRAMES[0]
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_TOKEN_SUBSTITUTIONS = {
+    "✔": "[OK]",
+    "✖": "[X]",
+    "■": "[-]",
+    "◦": "[.]",
+    **dict.fromkeys(_DOTS_FRAMES, "*"),
+    "│": "|",
+    "├": "+-",
+    "└": r"\-",
+    "·": "-",
+    "…": "...",
+    "—": "-",
+}
 _STATE_GLYPHS = {
     StageState.PENDING: "◦",
     StageState.COMPLETED: "✔",
@@ -834,7 +848,9 @@ class RunProgress:
 
     def _live_renderable(self, line: Text) -> Text | Spinner:
         line = self._truncate(line)
-        if line.plain.startswith(_DOTS_FRAME):
+        is_spinner = line.plain.startswith(_DOTS_FRAME)
+        line = self._stream_safe(line)
+        if is_spinner and _can_encode(_DOTS_FRAMES, self._stream_encoding()):
             spinner_text = line[2:]
             spinner_text.no_wrap = True
             return Spinner("dots", text=spinner_text, style="cyan")
@@ -867,15 +883,23 @@ class RunProgress:
         return self._console
 
     def _write_permanent(self, line: Text) -> None:
-        line = self._truncate(line)
         if self._interactive:
+            line = self._stream_safe(self._truncate(line))
             self._output_console().print(line, soft_wrap=True)
         else:
             self._write_plain(line)
 
     def _write_plain(self, line: Text) -> None:
-        self._stream.write(self._truncate(line).plain + "\n")
+        line = self._stream_safe(self._truncate(line))
+        self._stream.write(line.plain + "\n")
         self._stream.flush()
+
+    def _stream_safe(self, line: Text) -> Text:
+        return _degrade_text(line, self._stream_encoding())
+
+    def _stream_encoding(self) -> str:
+        encoding = getattr(self._stream, "encoding", None)
+        return encoding if isinstance(encoding, str) and encoding else "utf-8"
 
     def _truncate(self, line: Text) -> Text:
         if self._width is None or cell_len(line.plain) <= self._width:
@@ -974,6 +998,47 @@ def _format_activity(activity: AgentActivity) -> str:
 
 def _normalize_cell(value: str) -> str:
     return _CONTROL_RE.sub(" ", value)
+
+
+def _degrade_text(text: Text, encoding: str) -> Text:
+    if _can_encode(text.plain, encoding):
+        return text
+
+    parts: list[str] = []
+    offsets = [0]
+    for character in text.plain:
+        replacement = character
+        if not _can_encode(character, encoding):
+            replacement = _TOKEN_SUBSTITUTIONS.get(character)
+            if replacement is None:
+                replacement = character.encode(
+                    encoding, errors="backslashreplace"
+                ).decode(encoding)
+        parts.append(replacement)
+        offsets.append(offsets[-1] + len(replacement))
+
+    spans = [
+        Span(offsets[span.start], offsets[span.end], span.style)
+        for span in text.spans
+    ]
+    return Text(
+        "".join(parts),
+        style=text.style,
+        justify=text.justify,
+        overflow=text.overflow,
+        no_wrap=text.no_wrap,
+        end=text.end,
+        tab_size=text.tab_size,
+        spans=spans,
+    )
+
+
+def _can_encode(value: str, encoding: str) -> bool:
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _format_summary_line(records: Iterable[StageRecord]) -> Text:

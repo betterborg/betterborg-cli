@@ -23,3 +23,22 @@ class TTYStringIO(StringIO):
 
     def isatty(self) -> bool:
         return True
+
+
+class ASCIIOnlyStringIO(StringIO):
+    """An in-memory stream that rejects every non-ASCII write."""
+
+    def __init__(self, *, interactive: bool = False) -> None:
+        super().__init__()
+        self._interactive = interactive
+
+    @property
+    def encoding(self) -> str:
+        return "ascii"
+
+    def isatty(self) -> bool:
+        return self._interactive
+
+    def write(self, value: str) -> int:
+        value.encode(self.encoding)
+        return super().write(value)
