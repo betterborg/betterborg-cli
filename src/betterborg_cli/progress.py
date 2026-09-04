@@ -930,57 +930,70 @@ class RunProgress:
         )
 
     def _project_live_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
-        running_lines: list[Text] = []
-        pending_lines: list[Text] = []
+        projected_lines: list[tuple[Text, StageState | None]] = []
         stages_by_key = {stage.record.key: stage for stage in snapshot.stages}
         aggregate_cohort = len(snapshot.cohort_keys) > _MAX_LIVE_ROWS
 
         if snapshot.startup_label is not None:
-            running_lines.append(
-                self._format_startup_line(
-                    snapshot.startup_label, snapshot.elapsed_seconds
+            projected_lines.append(
+                (
+                    self._format_startup_line(
+                        snapshot.startup_label, snapshot.elapsed_seconds
+                    ),
+                    StageState.RUNNING,
                 )
             )
 
         for stage in snapshot.stages:
             record = stage.record
             if record.state is StageState.RUNNING:
-                running_lines.append(
-                    self._format_running_line(
-                        record, cancelling=snapshot.cancelling
+                projected_lines.append(
+                    (
+                        self._format_running_line(
+                            record, cancelling=snapshot.cancelling
+                        ),
+                        StageState.RUNNING,
                     )
                 )
                 children, earlier_attempt_count = _select_render_children(
                     stage.children, self._attempt_history_limit
                 )
-                running_lines.extend(
-                    self._format_child_live_line(
-                        child,
-                        parent_label=record.label,
-                        cancelling=snapshot.cancelling,
+                projected_lines.extend(
+                    (
+                        self._format_child_live_line(
+                            child,
+                            parent_label=record.label,
+                            cancelling=snapshot.cancelling,
+                        ),
+                        child.state,
                     )
                     for child in children
                 )
                 if earlier_attempt_count:
                     noun = "attempt" if earlier_attempt_count == 1 else "attempts"
-                    running_lines.append(
-                        Text(
-                            f"… {earlier_attempt_count} earlier {noun}",
-                            style="dim",
+                    projected_lines.append(
+                        (
+                            Text(
+                                f"… {earlier_attempt_count} earlier {noun}",
+                                style="dim",
+                            ),
+                            None,
                         )
                     )
             elif record.state is StageState.PENDING and not (
                 aggregate_cohort and record.key in snapshot.cohort_keys
             ):
-                pending_lines.append(_format_pending_stage_line(record.label))
+                projected_lines.append(
+                    (_format_pending_stage_line(record.label), StageState.PENDING)
+                )
 
-        pending_lines.extend(
-            _format_pending_stage_line(spec.label)
+        projected_lines.extend(
+            (_format_pending_stage_line(spec.label), StageState.PENDING)
             for spec in snapshot.previews
             if not (aggregate_cohort and spec.key in snapshot.cohort_keys)
         )
 
-        work_lines = self._bound_live_lines(running_lines + pending_lines)
+        work_lines = self._bound_live_lines(projected_lines)
         footer: Text | None = None
         if snapshot.cancelling:
             footer = Text("stopping…", style="dim cyan")
@@ -1034,13 +1047,25 @@ class RunProgress:
         return lines
 
     @staticmethod
-    def _bound_live_lines(lines: list[Text]) -> list[Text]:
-        if len(lines) <= _MAX_LIVE_ROWS:
-            return lines
-        hidden = len(lines) - (_MAX_LIVE_ROWS - 1)
+    def _bound_live_lines(
+        lines: list[tuple[Text, StageState | None]],
+    ) -> list[Text]:
+        prioritized = sorted(
+            lines, key=lambda line: line[1] is not StageState.RUNNING
+        )
+        if len(prioritized) <= _MAX_LIVE_ROWS:
+            return [line for line, _state in prioritized]
+        visible = prioritized[: _MAX_LIVE_ROWS - 1]
+        hidden = prioritized[_MAX_LIVE_ROWS - 1 :]
+        hidden_states = {state for _line, state in hidden}
+        suffix = ""
+        if hidden_states == {StageState.RUNNING}:
+            suffix = " running"
+        elif hidden_states == {StageState.PENDING}:
+            suffix = " pending"
         return [
-            *lines[: _MAX_LIVE_ROWS - 1],
-            Text(f"… {hidden} more running", style="dim"),
+            *(line for line, _state in visible),
+            Text(f"… {len(hidden)} more{suffix}", style="dim"),
         ]
 
     def _format_child_live_line(

@@ -1066,6 +1066,11 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
         for number in range(12)
     )
     progress.preview_pending(previews, cohort_keys=())
+
+    pending_only_frame = [line.plain for line in progress._live_lines()]
+    assert len(pending_only_frame) == 8
+    assert pending_only_frame[-1] == "… 5 more pending"
+
     progress.declare(StageSpec("active", "Active"))
     progress.start("active")
 
@@ -1089,6 +1094,31 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
     cancelling_frame = [line.plain for line in progress._live_lines()]
     assert len(cancelling_frame) == 10
     assert cancelling_frame[-2:] == ["", "stopping…"]
+
+
+def test_projection_prioritizes_later_active_stage_over_inactive_children() -> None:
+    progress = RunProgress(
+        [
+            StageSpec(
+                "first",
+                "First",
+                tuple(
+                    ChildSpec(f"child-{number}", f"Child {number}")
+                    for number in range(7)
+                ),
+            ),
+            StageSpec("second", "Second"),
+        ],
+        stream=StringIO(),
+    )
+    progress.start("first")
+    progress.start("second")
+
+    frame = [line.plain for line in progress._live_lines()]
+    assert len(frame) == 8
+    assert frame[0].startswith("⠋ First")
+    assert frame[1].startswith("⠋ Second")
+    assert frame[-1] == "… 2 more pending"
 
 
 def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:
