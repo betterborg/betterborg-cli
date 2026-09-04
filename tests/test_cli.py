@@ -3,6 +3,7 @@
 import io
 import multiprocessing
 import os
+import re
 import runpy
 import selectors
 import signal
@@ -296,10 +297,13 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     assert run.cancellation.is_set()
     assert run.progress.cancelling
     assert run.progress.closed
-    assert stream.getvalue().splitlines() == [
-        "stopping…",
-        "summary: 0 completed, 0 failed, 0 stopped — 0 retained",
-    ]
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 2
+    assert lines[0] == "stopping…"
+    assert re.fullmatch(
+        r"0 of 0 stages finished in \d+:\d{2}; none failed or stopped\.",
+        lines[1],
+    )
 
 
 def test_json_init_reconciles_cancellation_on_run_control_reporter(

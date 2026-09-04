@@ -904,7 +904,7 @@ def test_rich_live_output_is_bounded_for_many_running_stages(
     assert "… 5 more running" in initial_frame
 
 
-def test_width_truncation_and_run_summary_are_canonical() -> None:
+def test_width_truncation_is_canonical() -> None:
     stream = StringIO()
     progress = RunProgress(
         [StageSpec("cached", "A very long retained stage")],
@@ -918,16 +918,57 @@ def test_width_truncation_and_run_summary_are_canonical() -> None:
     assert all(len(line) <= 24 for line in lines)
     assert all(line.endswith("…") for line in lines)
 
-    summary_stream = StringIO()
-    summary = RunProgress(
-        [StageSpec("done", "Done"), StageSpec("failed", "Failed")],
-        stream=summary_stream,
+
+
+def test_run_summary_counts_only_participating_stages() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [
+            *(StageSpec(f"done-{number}", f"Done {number}") for number in range(4)),
+            StageSpec("not-started", "Not started"),
+        ],
+        stream=stream,
+        clock=clock,
     )
-    summary.seed_completed("done", "cached")
-    summary.seed_failed("failed", "cached failure")
-    summary.close()
-    assert summary_stream.getvalue().splitlines()[-1] == (
-        "summary: 1 completed, 1 failed, 0 stopped — 2 retained"
+    for number in range(4):
+        progress.seed_completed(f"done-{number}", "cached")
+    clock.advance(134)
+
+    progress.close()
+
+    assert stream.getvalue().splitlines()[-1] == (
+        "4 of 4 stages finished in 2:14; none failed or stopped."
+    )
+    pending = progress.stages["not-started"]
+    assert pending.state is StageState.PENDING
+    assert pending.started_at is None
+    assert pending.finished_at is None
+    assert pending.duration_seconds is None
+
+
+def test_mixed_run_summary_names_failed_and_stopped_counts() -> None:
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(
+        [
+            StageSpec("done", "Done"),
+            StageSpec("failed", "Failed"),
+            StageSpec("stopped", "Stopped"),
+        ],
+        stream=stream,
+        clock=clock,
+    )
+    progress.seed_completed("done", "cached")
+    progress.seed_failed("failed", "cached failure")
+    progress.start("stopped")
+    progress.stop("stopped", "cancelled")
+    clock.advance(60)
+
+    progress.close()
+
+    assert stream.getvalue().splitlines()[-1] == (
+        "1 of 3 stages finished in 1:00; 1 failed and 1 stopped."
     )
 
 

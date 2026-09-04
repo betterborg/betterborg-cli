@@ -327,7 +327,7 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
     assert "✔ Estimate and decision" in approved.output
     assert "approved" in approved.output
     assert "Recorded execution estimate approved" in approved.output
-    assert approved.output.index("summary:") < approved.output.index(
+    assert approved.output.index(" finished in ") < approved.output.index(
         "Execution operation"
     )
     assert len(calls) == 1
@@ -442,7 +442,7 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
         "✔ Estimate and decision"
     )
     assert result.output.index("✔ Estimate and decision") < (
-        result.output.index("summary:")
+        result.output.index(" finished in ")
     )
     assert "Aborted!" in result.output
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -616,7 +616,7 @@ def test_push_option_publishes_completed_project_branch_non_force(
     assert "✔ Push project branch" in result.output
     assert "Pushed project/push-success" in result.output
     assert f"Pushed project/{name} to origin." in result.output
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert _remote_project_sha(remote, name) == local_sha
@@ -653,7 +653,7 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
     assert "✖ Push project branch" in result.output
     assert "Local execution completed, but push" in result.output
     assert "origin" in result.output
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert result.output.index("Execution operation") < result.output.rindex(
@@ -838,7 +838,7 @@ raise SystemExit(
     assert "running git push origin refs/heads/project/push-interrupt" in output
     assert "■ Push project branch" in output
     assert "✖ Push project branch" not in output
-    assert "summary:" in output
+    assert " finished in " in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
     assert _project_branch_sha(committed_git_repo, name) == local_sha
@@ -1187,7 +1187,7 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     assert result.output.index("Pushed project/") < result.output.index(
         "Opened rollup pull request"
     )
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert args_path.exists()
@@ -1345,7 +1345,7 @@ raise SystemExit(
     assert f"running {observed_command}" in output
     assert "■ Open rollup pull request" in output
     assert "✖ Open rollup pull request" not in output
-    assert "summary:" in output
+    assert " finished in " in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
     assert _project_branch_sha(committed_git_repo, name) == local_sha

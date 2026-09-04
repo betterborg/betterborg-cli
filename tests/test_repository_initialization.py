@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -917,8 +918,9 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     assert "■ Discover evidence" in output
     assert "interrupted" in output
     assert "✖ Discover evidence" not in output
-    assert output.endswith(
-        "summary: 0 completed, 0 failed, 1 stopped — 0 retained\n"
+    assert re.fullmatch(
+        r"0 of 1 stage finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output.splitlines()[-1],
     )
     captured = capsys.readouterr()
     assert captured.out == ""

@@ -207,6 +207,7 @@ class RunProgress:
             raise ValueError("heartbeat_interval must be a finite positive value")
         self._stream = sys.stderr if stream is None else stream
         self._clock = clock
+        self._started_at = self._clock()
         self._width = width
         self._enabled = enabled and not machine_readable
         self._attempt_history_limit = attempt_history_limit
@@ -545,7 +546,10 @@ class RunProgress:
             if self._suspension_depth:
                 raise ProgressError("cannot close progress while output is suspended")
             self._stop_live()
-            self._emit(_format_summary_line(self._stages.values()))
+            elapsed_seconds = max(0.0, self._clock() - self._started_at)
+            self._emit(
+                _format_summary_line(self._stages.values(), elapsed_seconds)
+            )
             self._closed = True
 
     def _seed_stage(
@@ -1041,14 +1045,23 @@ def _can_encode(value: str, encoding: str) -> bool:
     return True
 
 
-def _format_summary_line(records: Iterable[StageRecord]) -> Text:
-    records = tuple(records)
-    counts = Counter(record.state for record in records)
-    retained = sum(record.retained for record in records)
+def _format_summary_line(
+    records: Iterable[StageRecord], elapsed_seconds: float
+) -> Text:
+    participating = tuple(
+        record for record in records if record.state is not StageState.PENDING
+    )
+    counts = Counter(record.state for record in participating)
+    stage_word = "stage" if len(participating) == 1 else "stages"
+    outcome = "none failed or stopped"
+    if counts[StageState.FAILED] or counts[StageState.STOPPED]:
+        outcome = (
+            f"{counts[StageState.FAILED]} failed and "
+            f"{counts[StageState.STOPPED]} stopped"
+        )
     return Text(
-        f"summary: {counts[StageState.COMPLETED]} completed, "
-        f"{counts[StageState.FAILED]} failed, "
-        f"{counts[StageState.STOPPED]} stopped — {retained} retained",
+        f"{counts[StageState.COMPLETED]} of {len(participating)} {stage_word} "
+        f"finished in {_format_duration(elapsed_seconds)}; {outcome}.",
         style="dim",
     )
 
