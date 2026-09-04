@@ -669,6 +669,65 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
     assert _terminal_text(rich.getvalue()).strip() == expected
 
 
+@pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
+def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    stream_type: type[StringIO],
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = stream_type()
+    clock = FakeClock()
+    progress = RunProgress(
+        [
+            StageSpec(
+                "stage",
+                "Parent",
+                (ChildSpec("first", "First"), ChildSpec("second", "Second")),
+            )
+        ],
+        stream=stream,
+        clock=clock,
+        width=120,
+    )
+    progress.start("stage")
+    progress.start_child("stage", "first")
+    stream.seek(0)
+    stream.truncate()
+
+    clock.advance(1)
+    progress.complete_child("stage", "first", "first result")
+
+    live_lines = [line.plain for line in progress._live_lines()]
+    assert any(line.startswith("✔ Parent: First") for line in live_lines)
+    child_output = _terminal_text(stream.getvalue())
+    assert "├ " not in child_output
+    assert "└ " not in child_output
+    assert "✔ First                  0:01  first result" not in (
+        child_output.splitlines()
+    )
+
+    progress.start_child("stage", "second")
+    clock.advance(2)
+    progress.fail_child("stage", "second", "second result")
+    stream.seek(0)
+    stream.truncate()
+
+    progress.complete("stage", "parent result")
+
+    expected = [
+        "✔ Parent                 0:03  parent result",
+        "├ ✔ First                  0:01  first result",
+        "└ ✖ Second                 0:02  second result",
+    ]
+    rendered = _terminal_text(stream.getvalue()).splitlines()
+    assert [line for line in rendered if line in expected] == expected
+
+    permanent_output = stream.getvalue()
+    progress.refresh()
+    assert stream.getvalue() == permanent_output
+
+
 @pytest.mark.parametrize(
     ("label", "width", "expected"),
     [

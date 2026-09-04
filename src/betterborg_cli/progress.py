@@ -405,7 +405,7 @@ class RunProgress:
             self._require_pending(child, f"child {child_key!r}")
             duration = _validate_duration(duration_seconds)
             self._seed_record(child, StageState.COMPLETED, result, duration)
-            self._emit_terminal(child, parent_label=parent.label)
+            self._refresh_transient()
             return child
 
     def complete_child(
@@ -548,7 +548,7 @@ class RunProgress:
             duration = _validate_duration(duration_seconds)
             self._require_terminal_children(record)
             self._seed_record(record, state, result, duration)
-            self._emit_terminal(record)
+            self._emit_terminal_tree(record)
             return record
 
     def _finish_stage(
@@ -563,7 +563,7 @@ class RunProgress:
             else:
                 self._require_terminal_children(record)
             self._finish_record(record, state, result)
-            self._emit_terminal(record)
+            self._emit_terminal_tree(record)
             self._refresh_transient()
             return record
 
@@ -580,7 +580,6 @@ class RunProgress:
             self._require_parent_nonterminal(parent)
             self._require_running(child, f"child {child_key!r}")
             self._finish_record(child, state, result)
-            self._emit_terminal(child, parent_label=parent.label)
             self._refresh_transient()
             return child
 
@@ -698,6 +697,13 @@ class RunProgress:
         self, record: StageRecord | ChildRecord, *, parent_label: str | None = None
     ) -> None:
         self._emit(_format_terminal_line(record, parent_label=parent_label))
+
+    def _emit_terminal_tree(self, parent: StageRecord) -> None:
+        self._emit_terminal(parent)
+        children = self.child_render_state(parent.key).children
+        for index, child in enumerate(children):
+            branch = "└" if index == len(children) - 1 else "├"
+            self._emit(_format_child_terminal_line(child, branch=branch))
 
     def _emit(self, line: Text) -> None:
         if not self._enabled:
@@ -901,6 +907,10 @@ def _format_terminal_line(
         line.append("  ")
         line.append(" · ".join(result_parts))
     return line
+
+
+def _format_child_terminal_line(child: ChildRecord, *, branch: str) -> Text:
+    return Text.assemble((branch, "dim"), " ", _format_terminal_line(child))
 
 
 def _format_pending_line(
