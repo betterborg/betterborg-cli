@@ -236,7 +236,7 @@ class SelectedAgent:
 
         same_workspace = run_paths.root == self.paths.root
         managed_worktree = (
-            run_paths.root.is_relative_to(self.paths.worktrees_dir.resolve())
+            self.paths.manages(run_paths.root)
             and run_identity.git_common_dir == selected_identity.git_common_dir
         )
         if not same_workspace and not managed_worktree:

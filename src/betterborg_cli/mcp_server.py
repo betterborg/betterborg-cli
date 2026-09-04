@@ -1362,16 +1362,27 @@ def _approve_plan(
     *,
     cancel: CancellationToken | None = None,
 ) -> tuple[Any, Any, Path, Any]:
+    from betterborg_cli import cli as cli_module
+
     config = load_repository_config(paths)
+    planning_trust = cli_module._managed_worktree_trust_requirement(paths)
     result = approve_plan_workflow(
         paths,
         config,
         name,
         pm_agent=lambda: select_agent(
-            config, AgentStage.PM, paths, interactive=False
+            config,
+            AgentStage.PM,
+            paths,
+            interactive=False,
+            trust_requirement=planning_trust,
         ),
         supervisor_agent=lambda: select_agent(
-            config, AgentStage.SUPERVISOR, paths, interactive=False
+            config,
+            AgentStage.SUPERVISOR,
+            paths,
+            interactive=False,
+            trust_requirement=planning_trust,
         ),
         cancel=cancel,
     )

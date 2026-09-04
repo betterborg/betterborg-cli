@@ -3,12 +3,15 @@
 Betterborg cannot complete a run without a terminal. Creating a Borg refuses to
 start unless stdin is a TTY, and the same command rejects an adapter whose
 read-only boundary is a sandbox rather than a tool allowlist, which is the
-shape every native CLI adapter has. Separately, a Compose stack created during
-preflight can outlive the run that created it, and enough survivors exhaust
-Docker's address pool until nothing on the machine can create a network.
+shape every native CLI adapter has. Planning then stops on a repository the
+operator has already trusted, because it runs in a worktree Betterborg itself
+generated and that worktree is a workspace of its own. Separately, a Compose
+stack created during preflight can outlive the run that created it, and enough
+survivors exhaust Docker's address pool until nothing on the machine can
+create a network.
 
 Together these block every unattended use: CI, cron, a queue worker, and a
-benchmark container. The work here is three independent changes, each closing
+benchmark container. The work here is four independent changes, each closing
 one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
@@ -119,5 +122,40 @@ belong to that work, not this one.
 - A failure before the project is recorded keeps its own error rather than
   raising over it from a teardown that has nothing to release.
 - The existing healthy-stack isolation test continues to pass.
+
+**Status**: Complete
+
+## Stage 4: Planning trusts the worktrees it manages
+
+**Goal**: `plan start` runs to completion on a trusted repository without
+asking the operator to trust a path Betterborg minted during the run.
+
+Planning materializes a managed worktree under the repository's worktrees
+directory and selects its agents against that worktree. Trust is an exact
+identity, keyed on the Git common directory together with the checkout path,
+so a generated worktree is a different workspace from the repository it came
+from. Its path carries identifiers minted during the run, so an unattended
+caller cannot trust it beforehand, and nothing runs between its creation and
+its use that could trust it. Execution already resolves exactly this: its
+coding, review and merge stages reuse the primary checkout's trust for the
+worktrees they run in. The architect, tech lead, PM and supervisor stages do
+not, so planning fails where execution would have succeeded.
+
+**Success Criteria**:
+- The planning stages reuse the primary checkout's trust when they run in a
+  worktree the repository manages.
+- That reuse is confined to worktrees under the repository's managed
+  worktrees directory; any other path is trusted on its own identity.
+- An untrusted repository still refuses to plan.
+- Analysis and requirements, which run in the checkout itself rather than a
+  worktree, keep trusting the path they run in.
+
+**Tests**:
+- Planning succeeds on a trusted repository whose planning worktree was never
+  trusted on its own.
+- Planning still refuses on an untrusted repository.
+- A run path outside the managed worktrees directory is not granted the
+  primary checkout's trust.
+- The existing execution trust behaviour continues to pass.
 
 **Status**: Complete

@@ -1363,7 +1363,7 @@ def _invoke_host_execution(
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
-    execution_trust = _execution_agent_trust_requirement(paths)
+    execution_trust = _managed_worktree_trust_requirement(paths)
     coding_agent = select_agent(
         config,
         AgentStage.CODING,
@@ -1503,13 +1503,27 @@ def _finish_execution_preflight(
         progress.complete("preflight", "ready")
 
 
-def _execution_agent_trust_requirement(primary_paths: RepoPaths):
-    """Reuse explicit primary-checkout trust for verified managed worktrees."""
+def _managed_worktree_trust_requirement(primary_paths: RepoPaths):
+    """Reuse explicit primary-checkout trust for the worktrees it manages.
 
-    def require_primary_workspace_trust(_run_paths: RepoPaths, **kwargs):
-        return require_workspace_trust(primary_paths, **kwargs)
+    A worktree Betterborg mints during a run carries identifiers no operator
+    could have trusted beforehand, so a run under the repository's managed
+    worktrees directory is held to the primary checkout's trust. Every other
+    path is trusted on its own identity.
 
-    return require_primary_workspace_trust
+    Containment alone is safe here because the run directory has already been
+    bound to the selected repository, which is where a checkout that merely
+    sits under the worktrees directory is rejected for belonging elsewhere.
+    """
+
+    def require_managed_worktree_trust(run_paths: RepoPaths, **kwargs):
+        managed = primary_paths.manages(run_paths.root)
+        return require_workspace_trust(
+            primary_paths if managed else run_paths,
+            **kwargs,
+        )
+
+    return require_managed_worktree_trust
 
 
 def _agent_billing_mode(adapter_name: str) -> BillingMode:
@@ -1751,6 +1765,7 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
+        planning_trust = _managed_worktree_trust_requirement(paths)
         progress = _repository_progress(False)
         workflow = approve_plan_workflow(
             paths,
@@ -1761,12 +1776,14 @@ def approve_plan(
                 AgentStage.PM,
                 paths,
                 interactive=_stdin_is_interactive(),
+                trust_requirement=planning_trust,
             ),
             supervisor_agent=lambda: select_agent(
                 config,
                 AgentStage.SUPERVISOR,
                 paths,
                 interactive=_stdin_is_interactive(),
+                trust_requirement=planning_trust,
             ),
             on_bound=mark_resumable,
             cancel=cancel,
@@ -1885,17 +1902,20 @@ def _continue_planning(
             }:
                 resumable = True
                 interactive = _stdin_is_interactive()
+                planning_trust = _managed_worktree_trust_requirement(paths)
                 architect_agent = select_agent(
                     config,
                     AgentStage.ARCHITECT,
                     paths,
                     interactive=interactive,
+                    trust_requirement=planning_trust,
                 )
                 tech_lead_agent = select_agent(
                     config,
                     AgentStage.TECH_LEAD,
                     paths,
                     interactive=interactive,
+                    trust_requirement=planning_trust,
                 )
                 planning_io = io or _interactive_io()
                 progress = _repository_progress(False)

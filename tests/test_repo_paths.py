@@ -214,3 +214,34 @@ def test_managed_ignore_interruption_preserves_prior_or_complete_canonical_bytes
     expected = canonical if interrupt_after_replacement else prior
     assert paths.gitignore.read_text(encoding="utf-8") == expected
     assert list(git_repo.glob(".gitignore.*.tmp")) == []
+
+
+def test_manages_accepts_only_paths_inside_the_worktrees_directory(
+    git_repo: Path,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+
+    assert paths.manages(paths.worktrees_dir / "planning" / "borg-run")
+    # A sibling whose name merely begins with the worktrees directory's own
+    # name is outside it, which a string-prefix test would get wrong.
+    adjacent = paths.worktrees_dir.parent / f"{paths.worktrees_dir.name}-elsewhere"
+    assert not paths.manages(adjacent)
+    assert not paths.manages(paths.root)
+    assert not paths.manages(git_repo.parent / "unrelated-checkout")
+
+
+def test_manages_resolves_a_symlink_out_of_the_worktrees_directory(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+    foreign = tmp_path / "foreign-checkout"
+    foreign.mkdir()
+    planted = paths.worktrees_dir / "planning"
+    planted.mkdir(parents=True)
+    link = planted / "looks-managed"
+    link.symlink_to(foreign, target_is_directory=True)
+
+    # Resolving first is what stops a symlink planted inside the worktrees
+    # directory from borrowing the repository's trust.
+    assert not paths.manages(link)

@@ -125,8 +125,9 @@ def _select_approval_agents(
         AgentStage.SUPERVISOR: supervisor,
     }
 
-    def select(_config, stage, _paths, *, interactive):
+    def select(_config, stage, _paths, *, interactive, trust_requirement):
         assert interactive is True
+        assert trust_requirement is not None
         selected_stages.append(stage)
         return adapters[stage]
 

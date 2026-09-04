@@ -4,17 +4,23 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
-from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime import (
+    ApiAgentRole,
+    CancellationToken,
+    SelectedAgent,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
@@ -748,6 +754,110 @@ def test_plan_start_proceeds_from_an_adopted_borg(
         assert borg.state is BorgState.PLAN_APPROVAL_PENDING
 
 
+def test_plan_start_reuses_repository_trust_for_its_managed_worktree(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    host_capable_adapter,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = host_capable_adapter()
+    architect_adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter = host_capable_adapter().queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "managed-trust")
+    state_home = repository.root.parent / f".{repository.root.name}-state"
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: pytest.fail("the seeded PRD needs no answers"),
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=state_home,
+    )
+    _select_trust_bound_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "managed-trust", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan approval pending" in result.output
+    planning_root = paths.worktrees_dir / "planning"
+    worktrees = [
+        call.cwd
+        for call in (*architect_adapter.calls, *tech_lead_adapter.calls)
+    ]
+    assert len(worktrees) == 3
+    assert all(worktree.is_relative_to(planning_root) for worktree in worktrees)
+    trusted = json.loads(
+        (state_home / "betterborg" / "trusted-workspaces.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        entry["repository_path"] for entry in trusted["workspaces"].values()
+    ] == [str(paths.root)]
+
+
+def test_plan_start_still_refuses_an_untrusted_repository(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, _paths = planning_cli_repository(committed_git_repo, "untrusted-plan")
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "untrusted-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(
+        cli_module,
+        "select_agent",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an untrusted repository must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "untrusted-plan"])
+
+    assert result.exit_code == 1
+    assert "workspace is not trusted on this machine" in result.output
+    assert str(repository.root) in result.output
+
+
+def test_managed_worktree_trust_is_confined_to_the_worktrees_directory(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        cli_module,
+        "require_workspace_trust",
+        lambda run_paths, **_kwargs: observed.append(run_paths.root),
+    )
+    requirement = cli_module._managed_worktree_trust_requirement(paths)
+    managed = paths.worktrees_dir / "planning" / "borg-run"
+    adjacent = paths.worktrees_dir.parent / f"{paths.worktrees_dir.name}-elsewhere"
+    unrelated = paths.root.parent / "other-checkout"
+
+    for candidate in (managed, adjacent, unrelated):
+        requirement(SimpleNamespace(root=candidate))
+
+    assert observed == [paths.root, adjacent, unrelated]
+
+
 def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(cli, ["plan", "--help"])
 
@@ -791,10 +901,34 @@ def _select_planning_agents(
         AgentStage.TECH_LEAD: tech_lead,
     }
 
-    def select(_config, stage, _paths, *, interactive):
+    def select(_config, stage, _paths, *, interactive, trust_requirement):
         assert interactive is True
+        assert trust_requirement is not None
         selected_stages.append(stage)
         return adapters[stage]
 
     monkeypatch.setattr(cli_module, "select_agent", select)
     return selected_stages
+
+
+def _select_trust_bound_planning_agents(
+    monkeypatch: MonkeyPatch,
+    *,
+    architect: MockAdapter,
+    tech_lead: MockAdapter,
+) -> None:
+    """Wrap planning adapters in the trust policy the CLI selects them under."""
+    adapters = {
+        AgentStage.ARCHITECT: architect,
+        AgentStage.TECH_LEAD: tech_lead,
+    }
+
+    def select(_config, stage, selected_paths, **policy):
+        return SelectedAgent(
+            role=ApiAgentRole.PLANNING,
+            adapter=adapters[stage],
+            paths=selected_paths,
+            **policy,
+        )
+
+    monkeypatch.setattr(cli_module, "select_agent", select)

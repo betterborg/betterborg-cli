@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -692,6 +692,18 @@ def configure_interactive_cli(monkeypatch: MonkeyPatch):
         monkeypatch.setattr(cli_module, "_interactive_io", lambda: io)
 
     return configure
+
+
+@pytest.fixture
+def host_capable_adapter():
+    """Return a factory for a mock whose host access requires workspace trust."""
+    return _host_capable_adapter
+
+
+def _host_capable_adapter() -> MockAdapter:
+    adapter = MockAdapter(name="openai")
+    adapter.capabilities = replace(adapter.capabilities, host_capable=True)
+    return adapter
 
 
 def _write_repository_config(root: Path, repository: Repository) -> None:

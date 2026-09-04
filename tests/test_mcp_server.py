@@ -1183,6 +1183,38 @@ def _pm_tasks(plan: dict) -> dict:
     }
 
 
+def _seed_plan_awaiting_approval(
+    paths: RepoPaths,
+    repository,
+    name: str,
+    plan: dict,
+) -> None:
+    """Persist one completed architect plan and gate its Borg on approval."""
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, name)
+        assert borg is not None
+        attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_plan",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=plan,
+            summary="Ready for approval.",
+        )
+        store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.PLAN_APPROVAL_PENDING,
+        )
+
+
 def _published_runtime(
     root: Path,
     planning_cli_repository,
@@ -1840,29 +1872,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
 ) -> None:
     plan = planning_plan_response()
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-plan")
-    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        borg = store.get_borg_by_name(repository.id, "mcp-plan")
-        assert borg is not None
-        attempt = PlanningAttempt(
-            borg_id=borg.id,
-            phase="architect_plan",
-            round=1,
-            adapter="mock",
-            model="test-model",
-        )
-        store.append_planning_attempt(attempt)
-        store.complete_planning_attempt(
-            attempt.id,
-            status=PlanningAttemptStatus.COMPLETED,
-            result=plan,
-            summary="Ready for approval.",
-        )
-        store.compare_and_set_borg_state(
-            borg.id,
-            expected_state=borg.state,
-            expected_version=borg.state_version,
-            new_state=BorgState.PLAN_APPROVAL_PENDING,
-        )
+    _seed_plan_awaiting_approval(paths, repository, "mcp-plan", plan)
 
     project_manager = MockAdapter(name="openai").queue(
         MockResponse(payload=_pm_tasks(plan))
@@ -1928,6 +1938,74 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     assert "Approve the current plan" in requests[0].message
     assert not hasattr(mcp_server, "approve_task")
     assert not hasattr(mcp_server, "decompose")
+
+
+def test_plan_approval_reuses_repository_trust_for_its_managed_worktree(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    host_capable_adapter,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-trust")
+    _seed_plan_awaiting_approval(paths, repository, "mcp-trust", plan)
+    state_home = committed_git_repo.parent / "mcp-machine-state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    TrustStore().trust(WorkspaceIdentity.discover(paths))
+
+    project_manager = host_capable_adapter().queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = host_capable_adapter().queue(
+        MockResponse(
+            payload={
+                "decision": "approve",
+                "summary": "The task is ready.",
+                "findings": [],
+            }
+        )
+    )
+    adapters = {
+        AgentStage.PM: project_manager,
+        AgentStage.SUPERVISOR: supervisor,
+    }
+
+    def select(_config, stage, selected_paths, **policy):
+        return SelectedAgent(
+            role=ApiAgentRole.PLANNING,
+            adapter=adapters[stage],
+            paths=selected_paths,
+            **policy,
+        )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
+    )
+    monkeypatch.setattr(mcp_server, "select_agent", select)
+
+    result = _structured(
+        _call_tool("plan", {"name": "mcp-trust", "action": "approve"})
+    )
+
+    assert result["status"] == BorgState.READY_TO_EXECUTE.value
+    planning_root = paths.worktrees_dir / "planning"
+    worktrees = [
+        call.cwd for call in (*project_manager.calls, *supervisor.calls)
+    ]
+    assert len(worktrees) == 2
+    assert all(worktree.is_relative_to(planning_root) for worktree in worktrees)
+    trusted = json.loads(
+        (state_home / "betterborg" / "trusted-workspaces.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        entry["repository_path"] for entry in trusted["workspaces"].values()
+    ] == [str(paths.root)]
 
 
 def test_task_list_matches_runtime_projection_and_execute_uses_host_service(

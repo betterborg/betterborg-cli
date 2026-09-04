@@ -56,6 +56,15 @@ class RepoPaths:
         """Return the tracked repository score report path."""
         return self.tracked_dir / "score.md"
 
+    def manages(self, path: Path) -> bool:
+        """Return whether ``path`` lies in the worktrees this repository mints.
+
+        Both sides are resolved so a symlink cannot smuggle a foreign checkout
+        in, and so a sibling whose name merely begins with the worktrees
+        directory's own name stays outside.
+        """
+        return Path(path).resolve().is_relative_to(self.worktrees_dir.resolve())
+
     @classmethod
     def discover(
         cls,
