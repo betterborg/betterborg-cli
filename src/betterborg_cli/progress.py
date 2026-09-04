@@ -278,6 +278,7 @@ class RunProgress:
         self._render_failure: BaseException | None = None
         self._render_failed = False
         self._display_stopped = False
+        self._display_stop_complete = threading.Event()
         self._closing = False
         self._stages: dict[str, StageRecord] = {}
         self._preview_specs: tuple[StageSpec, ...] = ()
@@ -577,10 +578,7 @@ class RunProgress:
         """Consume and raise the first autonomous renderer failure, if any."""
 
         with self._lock:
-            failure = self._render_failure
-            self._render_failure = None
-        if failure is not None:
-            raise failure
+            self._raise_if_render_failed_locked()
 
     def begin_cancellation(self) -> bool:
         """Acknowledge cancellation once without changing any record state."""
@@ -679,14 +677,21 @@ class RunProgress:
 
         with self._lock:
             if self._display_stopped:
-                return
-            self._display_stopped = True
-            self._preview_specs = ()
-            self._cohort_keys = frozenset()
-            self._startup_label = None
-            self._queued_lines = []
-            detached = self._detach_display()
-        self._teardown_display(detached)
+                detached = None
+            else:
+                self._display_stopped = True
+                self._preview_specs = ()
+                self._cohort_keys = frozenset()
+                self._startup_label = None
+                self._queued_lines = []
+                detached = self._detach_display()
+        if detached is None:
+            self._display_stop_complete.wait()
+            return
+        try:
+            self._teardown_display(detached)
+        finally:
+            self._display_stop_complete.set()
 
     def _seed_stage(
         self,
@@ -710,6 +715,8 @@ class RunProgress:
     ) -> StageRecord:
         with self._lock:
             record = self._stage(stage_key)
+            if state is StageState.COMPLETED:
+                self._raise_if_render_failed_locked()
             self._require_open()
             self._require_running(record, f"stage {stage_key!r}")
             if state is StageState.STOPPED:
@@ -1342,6 +1349,12 @@ class RunProgress:
         self._render_failed = True
         if self._cadence_stop is not None:
             self._cadence_stop.set()
+
+    def _raise_if_render_failed_locked(self) -> None:
+        failure = self._render_failure
+        self._render_failure = None
+        if failure is not None:
+            raise failure
 
     def _detach_display(self) -> _DetachedDisplay:
         live = self._detach_live()

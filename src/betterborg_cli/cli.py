@@ -1032,8 +1032,14 @@ def _run_execution_follow_up(
         result = action()
         if progress is not None:
             progress.raise_if_render_failed()
+            progress.complete(stage_key, result)
+        else:
+            click.echo(result)
     except BaseException as error:
-        if progress is not None:
+        if (
+            progress is not None
+            and progress.stages[stage_key].state is StageState.RUNNING
+        ):
             detail = str(error).strip() or type(error).__name__
             if isinstance(error, KeyboardInterrupt | click.Abort) or (
                 cancel is not None and cancel.is_set()
@@ -1045,10 +1051,7 @@ def _run_execution_follow_up(
     finally:
         if force_registration is not None:
             force_registration.unregister()
-    if progress is not None:
-        progress.complete(stage_key, result)
-    else:
-        click.echo(result)
+
 
 def _push_project_base(git: SafeGit, name: str) -> str:
     """Publish completed local work while leaving its branch untouched on failure."""

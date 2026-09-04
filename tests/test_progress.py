@@ -847,6 +847,63 @@ def test_display_teardown_waits_without_holding_reporter_lock(
         assert progress._cadence_worker is None
 
 
+def test_concurrent_stop_display_calls_wait_for_shared_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=WaitableStringIO(interactive=True),
+    )
+    progress.start("stage")
+    live = progress._live
+    assert live is not None
+    original_stop = live.stop
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+
+    def blocking_stop() -> None:
+        stop_entered.set()
+        assert stop_release.wait(timeout=2)
+        original_stop()
+
+    monkeypatch.setattr(live, "stop", blocking_stop)
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def dispose(finished: threading.Event) -> None:
+        try:
+            progress.stop_display()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    first = threading.Thread(target=dispose, args=(first_finished,))
+    first.start()
+    assert stop_entered.wait(timeout=1)
+
+    second = threading.Thread(target=dispose, args=(second_finished,))
+    second.start()
+    assert not second_finished.wait(timeout=0.03)
+    assert not first_finished.is_set()
+    assert progress._lock.acquire(timeout=0.1)
+    progress._lock.release()
+
+    stop_release.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert first_finished.is_set()
+    assert second_finished.is_set()
+    assert errors == []
+    assert progress._live is None
+    assert progress._cadence_worker is None
+
+
 @pytest.mark.parametrize("interactive", [False, True])
 def test_autonomous_render_failure_is_raised_once_and_gates_reconciliation(
     monkeypatch: pytest.MonkeyPatch,

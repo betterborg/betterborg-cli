@@ -17,6 +17,7 @@ from uuid import uuid4
 import click
 import pytest
 from click.testing import CliRunner
+from progress_test_support import FailingStringIO
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
@@ -687,12 +688,22 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
-def test_follow_up_heartbeat_failure_fails_stage_and_propagates() -> None:
-    class FailingProgress(RunProgress):
-        def raise_if_render_failed(self) -> None:
-            raise RuntimeError("progress heartbeat failed")
+def test_follow_up_worker_failure_between_check_and_completion_propagates() -> None:
+    stream = FailingStringIO()
 
-    progress = FailingProgress(stream=StringIO())
+    class CompletionRaceProgress(RunProgress):
+        def raise_if_render_failed(self) -> None:
+            super().raise_if_render_failed()
+            stream.fail_next_write()
+            worker = self._cadence_worker
+            assert worker is not None
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+    progress = CompletionRaceProgress(
+        stream=stream,
+        heartbeat_interval=0.01,
+    )
 
     def action() -> str:
         return "published"
@@ -708,6 +719,28 @@ def test_follow_up_heartbeat_failure_fails_stage_and_propagates() -> None:
     stage = progress.stages["push-project"]
     assert stage.state is StageState.FAILED
     assert stage.result == "progress heartbeat failed"
+    RunProgress.raise_if_render_failed(progress)
+
+
+def test_follow_up_completion_output_failure_preserves_completed_stage() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream)
+
+    def action() -> str:
+        stream.fail_next_write()
+        return "published"
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        cli_module._run_execution_follow_up(
+            progress,
+            "push-project",
+            "Push project branch",
+            action,
+        )
+
+    stage = progress.stages["push-project"]
+    assert stage.state is StageState.COMPLETED
+    assert stage.result == "published"
 
 
 def test_push_interrupt_reaps_tree_stops_stage_and_preserves_core_report(
