@@ -38,14 +38,6 @@ def _terminal_text(value: str) -> str:
     return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
-def _wait_for_worker_stop(progress: RunProgress, timeout: float = 2.0) -> None:
-    deadline = time.monotonic() + timeout
-    while progress._cadence_worker is not None:
-        if time.monotonic() >= deadline:
-            raise TimeoutError("cadence worker did not stop")
-        time.sleep(0.005)
-
-
 @pytest.mark.parametrize(
     ("method_name", "state", "glyph", "result", "duration", "rendered_duration"),
     [
@@ -868,19 +860,58 @@ def test_autonomous_render_failure_is_raised_once_and_gates_reconciliation(
         heartbeat_interval=0.03,
     )
     progress.start("stage")
-    before_failure = stream.getvalue()
+    worker = progress._cadence_worker
+    assert worker is not None
+    live = progress._live
+    assert (live is not None) is interactive
     stream.fail_next_write()
 
-    _wait_for_worker_stop(progress)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert progress._cadence_worker is None
+    if live is not None:
+        assert not live.is_started
+        assert "\x1b[?25h" in stream.getvalue()
 
     with pytest.raises(RuntimeError, match="progress heartbeat failed") as caught:
         progress.raise_if_render_failed()
     assert str(caught.value) == "progress heartbeat failed"
     progress.raise_if_render_failed()
+    output_after_failure = stream.getvalue()
     progress.fail("stage", "progress heartbeat failed")
     assert progress.stages["stage"].state is StageState.FAILED
-    assert stream.getvalue() == before_failure
+    assert stream.getvalue() == output_after_failure
     progress.stop_display()
+
+
+def test_suspension_entry_teardown_failure_restores_suspension_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = FailingStringIO(interactive=True)
+    progress = RunProgress([StageSpec("stage", "Stage")], stream=stream)
+    progress.start("stage")
+    live = progress._live
+    assert live is not None
+    original_stop = live.stop
+
+    def fail_during_stop() -> None:
+        stream.fail_next_write()
+        original_stop()
+
+    monkeypatch.setattr(live, "stop", fail_during_stop)
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        with progress.suspend():
+            pytest.fail("suspension body must not run after teardown failure")
+
+    assert progress._suspension_depth == 0
+    progress.raise_if_render_failed()
+    progress.fail("stage", "progress heartbeat failed")
+    progress.close()
+    assert progress.closed
 
 
 def test_suspension_flush_failure_latches_and_gates_remaining_output() -> None:

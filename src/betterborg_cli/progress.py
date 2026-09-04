@@ -608,9 +608,9 @@ class RunProgress:
                 detached = self._detach_display()
             else:
                 self._suspension_depth += 1
-        self._teardown_display(detached)
-        self.raise_if_render_failed()
         try:
+            self._teardown_display(detached)
+            self.raise_if_render_failed()
             yield self
         finally:
             with self._lock:
@@ -1315,7 +1315,9 @@ class RunProgress:
         except BaseException as error:
             with self._lock:
                 self._latch_render_failure(error)
-                self._detach_display()
+                detached = _DetachedDisplay(self._detach_live(), None, None)
+                self._next_heartbeat_at = None
+            self._teardown_display(detached)
             return False
 
     def _cadence_worker_finished(
@@ -1342,14 +1344,18 @@ class RunProgress:
             self._cadence_stop.set()
 
     def _detach_display(self) -> _DetachedDisplay:
-        live, self._live = self._live, None
-        self._live_empty = False
+        live = self._detach_live()
         worker, self._cadence_worker = self._cadence_worker, None
         stopped, self._cadence_stop = self._cadence_stop, None
         if stopped is not None:
             stopped.set()
         self._next_heartbeat_at = None
         return _DetachedDisplay(live, worker, stopped)
+
+    def _detach_live(self) -> Live | None:
+        live, self._live = self._live, None
+        self._live_empty = False
+        return live
 
     def _teardown_display(self, detached: _DetachedDisplay) -> None:
         if detached.live is not None:
