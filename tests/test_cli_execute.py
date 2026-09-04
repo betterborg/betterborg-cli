@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -689,17 +688,13 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
 
 
 def test_follow_up_heartbeat_failure_fails_stage_and_propagates() -> None:
-    refresh_attempted = Event()
-
     class FailingProgress(RunProgress):
-        def refresh(self) -> None:
-            refresh_attempted.set()
+        def raise_if_render_failed(self) -> None:
             raise RuntimeError("progress heartbeat failed")
 
     progress = FailingProgress(stream=StringIO())
 
     def action() -> str:
-        assert refresh_attempted.wait(1)
         return "published"
 
     with pytest.raises(RuntimeError, match="progress heartbeat failed"):
@@ -761,8 +756,8 @@ class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, heartbeat_interval=0.01, **kwargs)
 
-    def refresh(self):
-        super().refresh()
+    def _render_cadence_frame(self, stopped):
+        keep_running = super()._render_cadence_frame(stopped)
         stage = self.stages.get("push-project")
         if (
             stage is not None
@@ -772,6 +767,7 @@ class FastProgress(RunProgress):
             (marker_root / "push-heartbeat").write_text(
                 "refreshed", encoding="utf-8"
             )
+        return keep_running
 
 
 def runner(command, **kwargs):
@@ -1259,8 +1255,8 @@ class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, heartbeat_interval=0.01, **kwargs)
 
-    def refresh(self):
-        super().refresh()
+    def _render_cadence_frame(self, stopped):
+        keep_running = super()._render_cadence_frame(stopped)
         stage = self.stages.get("rollup-pr")
         if (
             stage is not None
@@ -1270,6 +1266,7 @@ class FastProgress(RunProgress):
             (marker_root / "pr-heartbeat").write_text(
                 "refreshed", encoding="utf-8"
             )
+        return keep_running
 
 
 def command_kind(command):

@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from io import StringIO
 from typing import Any
 
 import pytest
-from progress_test_support import ASCIIOnlyStringIO, FakeClock, TTYStringIO
+from progress_test_support import (
+    ASCIIOnlyStringIO,
+    BarrierStringIO,
+    FailingStringIO,
+    FakeClock,
+    TTYStringIO,
+    WaitableStringIO,
+)
 from rich.cells import cell_len
 from rich.text import Text
 
@@ -28,6 +36,14 @@ from betterborg_cli.progress import (
 
 def _terminal_text(value: str) -> str:
     return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
+
+
+def _wait_for_worker_stop(progress: RunProgress, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while progress._cadence_worker is not None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("cadence worker did not stop")
+        time.sleep(0.005)
 
 
 @pytest.mark.parametrize(
@@ -294,8 +310,12 @@ def test_control_normalization_cannot_expand_the_live_region() -> None:
             progress.start(f"stage-{number}")
 
     live_lines = progress._live_lines()
-    assert len(live_lines) == 8
-    assert all(len(line.plain.splitlines()) == 1 for line in live_lines)
+    assert len(live_lines) == 10
+    assert live_lines[-2].plain == ""
+    assert live_lines[-1].plain == "ctrl-c to stop"
+    assert all(
+        len(line.plain.splitlines()) == 1 for line in live_lines if line.plain
+    )
     assert all(
         not re.search(r"[\x00-\x1f\x7f-\x9f]", line.plain) for line in live_lines
     )
@@ -654,6 +674,239 @@ def test_plain_suspension_skips_stale_heartbeat_and_flushes_permanent_lines() ->
     )
 
 
+def test_plain_worker_emits_current_heartbeats_without_manual_refresh() -> None:
+    stream = WaitableStringIO()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        heartbeat_interval=0.03,
+    )
+    progress.start("stage")
+    progress.update("stage", "building index")
+
+    output = stream.wait_for(
+        lambda value: len(value.splitlines()) >= 2,
+    )
+
+    assert output.splitlines()[0].endswith("thinking")
+    assert output.splitlines()[1].endswith("building index")
+    progress.stop_display()
+    stopped_output = stream.getvalue()
+    time.sleep(0.06)
+    assert stream.getvalue() == stopped_output
+
+
+@pytest.mark.parametrize(
+    "environment", [{"NO_COLOR": "1"}, {"TERM": "dumb"}, {"CI": "1"}]
+)
+def test_non_redrawing_tty_uses_escape_free_autonomous_heartbeats(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    stream = WaitableStringIO(interactive=True)
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        heartbeat_interval=0.03,
+    )
+
+    progress.start("stage")
+    output = stream.wait_for(lambda value: len(value.splitlines()) >= 2)
+
+    assert progress._live is None
+    assert "\x1b" not in output
+    progress.stop_display()
+
+
+def test_rich_worker_refreshes_footer_and_cancellation_autonomously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")], stream=stream, width=100
+    )
+    progress.start("stage")
+    initial_writes = stream.write_count
+
+    stream.wait_for(
+        lambda _value: stream.write_count > initial_writes,
+        timeout=1,
+    )
+    assert progress.stages["stage"].state is StageState.RUNNING
+    rendered = _terminal_text(stream.getvalue())
+    assert "ctrl-c to stop" in rendered
+    assert any(frame in rendered for frame in "⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+    progress.begin_cancellation()
+    output = stream.wait_for(
+        lambda value: "stopping…" in _terminal_text(value), timeout=1
+    )
+    assert "stopping…" in _terminal_text(output)
+    assert progress.stages["stage"].state is StageState.RUNNING
+    progress.stop_display()
+    assert progress._live is None
+    assert progress._cadence_worker is None
+
+
+def test_nested_suspension_stops_cadence_and_flushes_once_in_order() -> None:
+    stream = WaitableStringIO()
+    progress = RunProgress(
+        [
+            StageSpec("active", "Active"),
+            StageSpec("one", "One"),
+            StageSpec("two", "Two"),
+        ],
+        stream=stream,
+        heartbeat_interval=0.02,
+    )
+    progress.start("active")
+    stream.wait_for(lambda value: len(value.splitlines()) >= 2)
+
+    with progress.suspend():
+        before = stream.getvalue()
+        progress.seed_completed("one", "first")
+        with progress.suspend():
+            progress.seed_failed("two", "second")
+            time.sleep(0.06)
+        assert stream.getvalue() == before
+
+    lines = stream.getvalue().splitlines()
+    assert sum("first" in line for line in lines) == 1
+    assert sum("second" in line for line in lines) == 1
+    assert lines.index(next(line for line in lines if "first" in line)) < lines.index(
+        next(line for line in lines if "second" in line)
+    )
+    progress.stop_display()
+
+
+@pytest.mark.parametrize("operation", ["suspend", "close", "stop_display"])
+def test_display_teardown_waits_without_holding_reporter_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = BarrierStringIO()
+    progress = RunProgress(
+        [] if operation == "close" else [StageSpec("stage", "Stage")],
+        stream=stream,
+        startup_label="Starting" if operation == "close" else None,
+    )
+    if operation != "close":
+        progress.start("stage")
+    assert progress._live is not None
+    original_stop = progress._live.stop
+    worker = progress._cadence_worker
+    assert worker is not None
+    original_join = worker.join
+    stop_lock_states: list[bool] = []
+    join_lock_states: list[bool] = []
+
+    def checked_stop() -> None:
+        stop_lock_states.append(progress._lock._is_owned())
+        original_stop()
+
+    def checked_join(timeout: float | None = None) -> None:
+        join_lock_states.append(progress._lock._is_owned())
+        original_join(timeout)
+
+    monkeypatch.setattr(progress._live, "stop", checked_stop)
+    monkeypatch.setattr(worker, "join", checked_join)
+    stream.hold_next_write()
+    assert stream.entered.wait(timeout=1)
+    finished = threading.Event()
+
+    def teardown() -> None:
+        if operation == "suspend":
+            with progress.suspend():
+                pass
+        else:
+            getattr(progress, operation)()
+        finished.set()
+
+    disposer = threading.Thread(
+        target=teardown
+    )
+    disposer.start()
+    assert not finished.wait(timeout=0.03)
+
+    stream.release.set()
+    disposer.join(timeout=1)
+
+    assert finished.is_set()
+    assert stop_lock_states == [False]
+    assert join_lock_states == [False]
+    if operation == "suspend":
+        assert progress._live is not None
+        progress.stop_display()
+    else:
+        assert progress._live is None
+        assert progress._cadence_worker is None
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_autonomous_render_failure_is_raised_once_and_gates_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    interactive: bool,
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = FailingStringIO(interactive=interactive)
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        heartbeat_interval=0.03,
+    )
+    progress.start("stage")
+    before_failure = stream.getvalue()
+    stream.fail_next_write()
+
+    _wait_for_worker_stop(progress)
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed") as caught:
+        progress.raise_if_render_failed()
+    assert str(caught.value) == "progress heartbeat failed"
+    progress.raise_if_render_failed()
+    progress.fail("stage", "progress heartbeat failed")
+    assert progress.stages["stage"].state is StageState.FAILED
+    assert stream.getvalue() == before_failure
+    progress.stop_display()
+
+
+def test_suspension_flush_failure_latches_and_gates_remaining_output() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(
+        [
+            StageSpec("active", "Active"),
+            StageSpec("queued", "Queued"),
+        ],
+        stream=stream,
+        heartbeat_interval=1,
+    )
+    progress.start("active")
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        with progress.suspend():
+            progress.seed_completed("queued", "cached")
+            stream.fail_next_flush()
+
+    output_after_failure = stream.getvalue()
+    progress.raise_if_render_failed()
+    progress.fail("active", "progress heartbeat failed")
+    assert stream.getvalue() == output_after_failure
+    progress.stop_display()
+
+
 def test_permanent_lines_match_in_plain_and_rich_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -668,10 +921,11 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
             [StageSpec("stage", "Stage")], stream=stream, width=120
         )
         progress.seed_completed("stage", "cached", 2.5)
+        progress.stop_display()
 
     expected = "✔ Stage                  0:02  cached · reused from earlier run"
     assert plain.getvalue().strip() == expected
-    assert _terminal_text(rich.getvalue()).splitlines()[-1] == expected
+    assert expected in _terminal_text(rich.getvalue())
 
 
 @pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
@@ -720,14 +974,18 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
     stream.truncate()
 
     progress.complete("stage", "parent result")
+    progress.stop_display()
 
     expected = [
         "✔ Parent                 0:03  parent result",
         "├ ✔ First                  0:01  first result",
         "└ ✖ Second                 0:02  second result",
     ]
-    rendered = _terminal_text(stream.getvalue()).splitlines()
-    assert [line for line in rendered if line in expected] == expected
+    rendered = _terminal_text(stream.getvalue())
+    assert all(rendered.count(line) == 1 for line in expected)
+    assert [rendered.index(line) for line in expected] == sorted(
+        rendered.index(line) for line in expected
+    )
 
     permanent_output = stream.getvalue()
     progress.refresh()
@@ -758,15 +1016,16 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
             [StageSpec("stage", label)], stream=stream, width=width
         )
         progress.seed_completed("stage", "cached", 2.5)
+        progress.stop_display()
 
     plain_lines = plain.getvalue().splitlines()
-    rich_lines = _terminal_text(rich.getvalue()).splitlines()
-    assert rich_lines[-1:] == plain_lines
+    rich_output = _terminal_text(rich.getvalue())
+    assert all(line in rich_output for line in plain_lines)
     assert len(plain_lines) == 1
     if expected is not None:
-        assert rich_lines[-1] == expected
+        assert expected in rich_output
     if width is not None:
-        assert cell_len(rich_lines[-1]) <= width
+        assert cell_len(plain_lines[-1]) <= width
 
 
 @pytest.mark.parametrize(
@@ -915,6 +1174,8 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
     assert initial == [
         "⠋ Preparing run          0:00  thinking",
         "  ◦ Draft improvement PRDs",
+        "",
+        "ctrl-c to stop",
     ]
     assert "Draft improvement PRDs" in _terminal_text(stream.getvalue())
     assert progress.stages == {}
@@ -925,7 +1186,11 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
     progress.start("Draft improvement PRDs")
 
     adopted = [line.plain for line in progress._live_lines()]
-    assert adopted == ["⠋ Draft improvement PRDs  0:00  thinking"]
+    assert adopted == [
+        "⠋ Draft improvement PRDs  0:00  thinking",
+        "",
+        "ctrl-c to stop",
+    ]
 
     plain = StringIO()
     RunProgress(
@@ -1016,8 +1281,16 @@ def test_projection_snapshot_is_frozen_and_stable_after_record_updates() -> None
         line.plain for line in progress._project_live_lines(snapshot)
     ]
     current_frame = [line.plain for line in progress._live_lines()]
-    assert frozen_frame == ["⠋ Stage                  0:00  thinking"]
-    assert current_frame == ["⠋ Stage                  0:05  new work"]
+    assert frozen_frame == [
+        "⠋ Stage                  0:00  thinking",
+        "",
+        "ctrl-c to stop",
+    ]
+    assert current_frame == [
+        "⠋ Stage                  0:05  new work",
+        "",
+        "ctrl-c to stop",
+    ]
     with pytest.raises(FrozenInstanceError):
         snapshot.cancelling = True
 
@@ -1042,14 +1315,18 @@ def test_focused_counts_are_independent_from_visible_previews_and_adoption() -> 
 
     frame = [line.plain for line in progress._live_lines()]
     assert "  ◦ Preflight" in frame
-    assert "3 done · 2 running · 9 pending" in frame
+    assert frame[-1] == (
+        "3 done · 2 running · 9 pending  ·  ctrl-c to stop"
+    )
     frame_text = "\n".join(frame)
     assert all(f"◦ {spec.label}" not in frame_text for spec in task_specs[5:])
 
     progress.declare(StageSpec("preflight", "Preflight"))
     adopted = [line.plain for line in progress._live_lines()]
     assert adopted.count("  ◦ Preflight") == 1
-    assert "3 done · 2 running · 9 pending" in adopted
+    assert adopted[-1] == (
+        "3 done · 2 running · 9 pending  ·  ctrl-c to stop"
+    )
 
 
 def test_outside_record_keeps_live_permanent_and_summary_participation() -> None:
@@ -1085,16 +1362,18 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
     progress.preview_pending(previews, cohort_keys=())
 
     pending_only_frame = [line.plain for line in progress._live_lines()]
-    assert len(pending_only_frame) == 8
-    assert pending_only_frame[-1] == "… 5 more pending"
+    assert len(pending_only_frame) == 10
+    assert pending_only_frame[-3] == "… 5 more pending"
+    assert pending_only_frame[-2:] == ["", "ctrl-c to stop"]
 
     progress.declare(StageSpec("active", "Active"))
     progress.start("active")
 
     named_frame = [line.plain for line in progress._live_lines()]
-    assert len(named_frame) == 8
+    assert len(named_frame) == 10
     assert named_frame[0].startswith("⠋ Active")
     assert named_frame[1] == "  ◦ Pending 0"
+    assert named_frame[-2:] == ["", "ctrl-c to stop"]
 
     progress.preview_pending(previews[:9])
     for number in range(9):
@@ -1105,7 +1384,9 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
     counted_frame = [line.plain for line in progress._live_lines()]
     assert len(counted_frame) == 10
     assert counted_frame[-2] == ""
-    assert counted_frame[-1] == "0 done · 0 running · 9 pending"
+    assert counted_frame[-1] == (
+        "0 done · 0 running · 9 pending  ·  ctrl-c to stop"
+    )
 
     progress.begin_cancellation()
     cancelling_frame = [line.plain for line in progress._live_lines()]
@@ -1132,10 +1413,11 @@ def test_projection_prioritizes_later_active_stage_over_inactive_children() -> N
     progress.start("second")
 
     frame = [line.plain for line in progress._live_lines()]
-    assert len(frame) == 8
+    assert len(frame) == 10
     assert frame[0].startswith("⠋ First")
     assert frame[1].startswith("⠋ Second")
-    assert frame[-1] == "… 2 more pending"
+    assert frame[-3] == "… 2 more pending"
+    assert frame[-2:] == ["", "ctrl-c to stop"]
 
 
 def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:

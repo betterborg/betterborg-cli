@@ -17,7 +17,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import RLock
 from uuid import UUID
 
 import click
@@ -1022,9 +1022,6 @@ def _run_execution_follow_up(
     if progress is not None:
         progress.declare(StageSpec(stage_key, label))
         progress.start(stage_key)
-    heartbeat_stop = Event()
-    heartbeat_thread: Thread | None = None
-    heartbeat_errors: list[BaseException] = []
     force_registration = None
     try:
         if cancel is not None:
@@ -1032,22 +1029,9 @@ def _run_execution_follow_up(
             # command immediately so the first interrupt can still reconcile
             # the stage and emit the already-completed core report.
             force_registration = cancel.register(cancel.force)
+        result = action()
         if progress is not None:
-            heartbeat_thread = Thread(
-                target=_refresh_execution_follow_up,
-                args=(progress, heartbeat_stop, heartbeat_errors),
-                name=f"betterborg-{stage_key}-progress",
-                daemon=True,
-            )
-            heartbeat_thread.start()
-        try:
-            result = action()
-        finally:
-            heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join()
-        if heartbeat_errors:
-            raise heartbeat_errors[0]
+            progress.raise_if_render_failed()
     except BaseException as error:
         if progress is not None:
             detail = str(error).strip() or type(error).__name__
@@ -1059,31 +1043,12 @@ def _run_execution_follow_up(
                 progress.fail(stage_key, detail)
         raise
     finally:
-        heartbeat_stop.set()
-        if heartbeat_thread is not None and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         if force_registration is not None:
             force_registration.unregister()
     if progress is not None:
         progress.complete(stage_key, result)
     else:
         click.echo(result)
-
-
-def _refresh_execution_follow_up(
-    progress: RunProgress,
-    stopped: Event,
-    errors: list[BaseException],
-) -> None:
-    """Keep plain and interactive follow-up activity visibly current."""
-    while not stopped.wait(0.1):
-        try:
-            progress.refresh()
-        except BaseException as error:
-            errors.append(error)
-            stopped.set()
-            return
-
 
 def _push_project_base(git: SafeGit, name: str) -> str:
     """Publish completed local work while leaving its branch untouched on failure."""

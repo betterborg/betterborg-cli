@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -182,6 +183,15 @@ class _ProjectionSnapshot:
     cancelling: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _DetachedDisplay:
+    """Renderer resources detached while the reporter lock is held."""
+
+    live: Live | None
+    worker: threading.Thread | None
+    stopped: threading.Event | None
+
+
 _ChildRenderRecord = TypeVar(
     "_ChildRenderRecord", ChildRecord, _RecordSnapshot
 )
@@ -253,6 +263,7 @@ class RunProgress:
         self._stream = sys.stderr if stream is None else stream
         self._clock = clock
         self._started_at = self._clock()
+        self._spinner_started_at = time.monotonic()
         self._width = width
         self._enabled = enabled and not machine_readable
         self._attempt_history_limit = attempt_history_limit
@@ -260,7 +271,14 @@ class RunProgress:
         self._interactive = self._enabled and _is_interactive(self._stream)
         self._console: Console | None = None
         self._live: Live | None = None
+        self._live_empty = False
         self._next_heartbeat_at: float | None = None
+        self._cadence_worker: threading.Thread | None = None
+        self._cadence_stop: threading.Event | None = None
+        self._render_failure: BaseException | None = None
+        self._render_failed = False
+        self._display_stopped = False
+        self._closing = False
         self._stages: dict[str, StageRecord] = {}
         self._preview_specs: tuple[StageSpec, ...] = ()
         self._cohort_keys: frozenset[str] = frozenset()
@@ -279,7 +297,7 @@ class RunProgress:
         self._cohort_keys = cohort_keys
         self._initializing = False
         if self._interactive:
-            self._refresh_transient()
+            self._refresh_safely()
 
     @property
     def stages(self) -> Mapping[str, StageRecord]:
@@ -334,7 +352,7 @@ class RunProgress:
                 if preview.key != spec.key
             )
             if not self._initializing:
-                self._refresh_transient()
+                self._refresh_safely()
             return record
 
     def preview_pending(
@@ -350,7 +368,7 @@ class RunProgress:
             previews, selected_keys = self._validated_preview(specs, cohort_keys)
             self._preview_specs = previews
             self._cohort_keys = selected_keys
-            self._refresh_transient()
+            self._refresh_safely()
 
     def start(self, stage_key: str) -> StageRecord:
         """Start a fresh parent timer exactly once."""
@@ -359,7 +377,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_new_work_allowed()
             self._start_record(record, f"stage {stage_key!r}")
-            self._refresh_transient(started=record)
+            self._refresh_safely(started=record)
             return record
 
     def update(self, stage_key: str, detail: str | None) -> StageRecord:
@@ -370,7 +388,7 @@ class RunProgress:
             self._require_running(record, f"stage {stage_key!r}")
             record.detail = detail
             record._activity_is_latest = False
-            self._refresh_transient()
+            self._refresh_safely()
             return record
 
     def activity(self, stage_key: str, activity: AgentActivity) -> StageRecord:
@@ -381,7 +399,7 @@ class RunProgress:
             self._require_running(record, f"stage {stage_key!r}")
             record.activity = _require_activity(activity)
             record._activity_is_latest = True
-            self._refresh_transient()
+            self._refresh_safely()
             return record
 
     def seed_completed(
@@ -449,7 +467,7 @@ class RunProgress:
             self._require_new_work_allowed()
             self._require_running(parent, f"stage {stage_key!r}")
             self._start_record(child, f"child {child_key!r}")
-            self._refresh_transient(started=child, parent_label=parent.label)
+            self._refresh_safely(started=child, parent_label=parent.label)
             return child
 
     def update_child(
@@ -462,7 +480,7 @@ class RunProgress:
             self._require_running(child, f"child {child_key!r}")
             child.detail = detail
             child._activity_is_latest = False
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def child_activity(
@@ -478,7 +496,7 @@ class RunProgress:
             self._require_running(child, f"child {child_key!r}")
             child.activity = _require_activity(activity)
             child._activity_is_latest = True
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def seed_child_completed(
@@ -498,7 +516,7 @@ class RunProgress:
             self._require_pending(child, f"child {child_key!r}")
             duration = _validate_duration(duration_seconds)
             self._seed_record(child, StageState.COMPLETED, result, duration)
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def complete_child(
@@ -553,7 +571,16 @@ class RunProgress:
 
         with self._lock:
             self._require_open()
-            self._refresh_transient()
+            self._refresh_safely()
+
+    def raise_if_render_failed(self) -> None:
+        """Consume and raise the first autonomous renderer failure, if any."""
+
+        with self._lock:
+            failure = self._render_failure
+            self._render_failure = None
+        if failure is not None:
+            raise failure
 
     def begin_cancellation(self) -> bool:
         """Acknowledge cancellation once without changing any record state."""
@@ -565,18 +592,24 @@ class RunProgress:
             self._cancelling = True
             self._startup_label = None
             self._emit(Text("stopping…", style="dim cyan"))
-            self._refresh_transient()
+            self._refresh_safely()
             return True
 
     @contextmanager
     def suspend(self) -> Iterator[RunProgress]:
         """Queue permanent output until the outermost suspension exits."""
 
+        self.raise_if_render_failed()
+        detached = _DetachedDisplay(None, None, None)
         with self._lock:
             self._require_open()
             if self._suspension_depth == 0:
-                self._stop_live()
-            self._suspension_depth += 1
+                self._suspension_depth = 1
+                detached = self._detach_display()
+            else:
+                self._suspension_depth += 1
+        self._teardown_display(detached)
+        self.raise_if_render_failed()
         try:
             yield self
         finally:
@@ -585,16 +618,26 @@ class RunProgress:
                 if self._suspension_depth == 0:
                     queued, self._queued_lines = self._queued_lines, []
                     for line in queued:
-                        self._write_permanent(line)
-                    self._reset_heartbeat()
-                    self._refresh_transient()
+                        if self._render_failed or self._display_stopped:
+                            break
+                        try:
+                            self._write_permanent(line)
+                        except BaseException as error:
+                            self._latch_render_failure(error)
+                    if not self._render_failed and not self._display_stopped:
+                        self._reset_heartbeat()
+                        self._refresh_safely()
+        self.raise_if_render_failed()
 
     def close(self) -> None:
         """Close only after every started parent and child is terminal."""
 
+        detached = _DetachedDisplay(None, None, None)
         with self._lock:
             if self._closed:
                 return
+            if self._closing:
+                raise ProgressError("progress is already closing")
             running = [
                 f"stage {stage.key!r}"
                 for stage in self._stages.values()
@@ -616,13 +659,34 @@ class RunProgress:
             self._preview_specs = ()
             self._cohort_keys = frozenset()
             self._startup_label = None
-            self._stop_live()
+            self._closing = True
+            detached = self._detach_display()
+        self._teardown_display(detached)
+        with self._lock:
             elapsed_seconds = max(0.0, self._clock() - self._started_at)
-            if self._enabled:
-                self._write_permanent(
-                    _format_summary_line(self._stages.values(), elapsed_seconds)
-                )
+            if self._enabled and not self._render_failed and not self._display_stopped:
+                try:
+                    self._write_permanent(
+                        _format_summary_line(self._stages.values(), elapsed_seconds)
+                    )
+                except BaseException as error:
+                    self._latch_render_failure(error)
             self._closed = True
+            self._closing = False
+
+    def stop_display(self) -> None:
+        """Permanently dispose renderer resources without changing lifecycle."""
+
+        with self._lock:
+            if self._display_stopped:
+                return
+            self._display_stopped = True
+            self._preview_specs = ()
+            self._cohort_keys = frozenset()
+            self._startup_label = None
+            self._queued_lines = []
+            detached = self._detach_display()
+        self._teardown_display(detached)
 
     def _seed_stage(
         self,
@@ -654,7 +718,7 @@ class RunProgress:
                 self._require_terminal_children(record)
             self._finish_record(record, state, result)
             self._emit_terminal_tree(record)
-            self._refresh_transient()
+            self._refresh_safely()
             return record
 
     def _finish_child(
@@ -670,7 +734,7 @@ class RunProgress:
             self._require_parent_nonterminal(parent)
             self._require_running(child, f"child {child_key!r}")
             self._finish_record(child, state, result)
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def _stage(self, stage_key: str) -> StageRecord:
@@ -764,7 +828,7 @@ class RunProgress:
         return max(0.0, self._clock() - record.started_at)
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise ProgressError("progress is already closed")
 
     def _require_not_cancelling(self, action: str) -> None:
@@ -832,14 +896,36 @@ class RunProgress:
             self._emit(_format_child_terminal_line(child, branch=branch))
 
     def _emit(self, line: Text) -> None:
-        if not self._enabled:
+        if not self._enabled or self._render_failed or self._display_stopped:
             return
         if self._suspension_depth:
             self._queued_lines.append(line)
             return
-        if self._interactive:
-            self._refresh_transient()
-        self._write_permanent(line)
+        try:
+            if self._interactive:
+                snapshot = self._projection_snapshot()
+                if self._project_live_lines(snapshot):
+                    self._refresh_transient()
+            self._write_permanent(line)
+            if self._interactive:
+                self._refresh_transient()
+        except BaseException as error:
+            self._latch_render_failure(error)
+            self._render_failure = None
+            raise
+
+    def _refresh_safely(
+        self,
+        *,
+        started: StageRecord | ChildRecord | None = None,
+        parent_label: str | None = None,
+    ) -> None:
+        try:
+            self._refresh_transient(started=started, parent_label=parent_label)
+        except BaseException as error:
+            self._latch_render_failure(error)
+            self._render_failure = None
+            raise
 
     def _refresh_transient(
         self,
@@ -847,12 +933,22 @@ class RunProgress:
         started: StageRecord | ChildRecord | None = None,
         parent_label: str | None = None,
     ) -> None:
-        if not self._enabled or self._suspension_depth:
+        if (
+            not self._enabled
+            or self._suspension_depth
+            or self._render_failed
+            or self._display_stopped
+            or self._closing
+            or self._closed
+        ):
             return
+        snapshot = self._projection_snapshot()
         if self._interactive:
-            lines = self._live_lines()
+            lines = self._project_live_lines(snapshot)
             if not lines:
-                self._stop_live()
+                if self._live is not None and not self._live_empty:
+                    self._live.update(Text(""), refresh=True)
+                    self._live_empty = True
                 return
             renderable = Group(*(self._live_renderable(line) for line in lines))
             if self._live is None:
@@ -861,20 +957,27 @@ class RunProgress:
                     console=self._output_console(),
                     auto_refresh=False,
                     transient=True,
+                    redirect_stdout=False,
+                    redirect_stderr=False,
                 )
                 self._live.start(refresh=True)
             else:
                 self._live.update(renderable, refresh=True)
+            self._live_empty = False
+            self._ensure_cadence_worker()
             return
 
-        lines = self._active_lines()
+        lines = self._plain_active_lines(snapshot)
         if not lines:
             self._next_heartbeat_at = None
             return
         now = self._clock()
         if started is not None:
+            started_snapshot = self._record_snapshot(started, now)
             self._write_plain(
-                self._format_running_line(started, parent_label=parent_label)
+                self._format_running_line(
+                    started_snapshot, parent_label=parent_label
+                )
             )
             if self._next_heartbeat_at is None:
                 self._next_heartbeat_at = now + self._heartbeat_interval
@@ -882,6 +985,7 @@ class RunProgress:
             for line in lines:
                 self._write_plain(line)
             self._next_heartbeat_at = now + self._heartbeat_interval
+        self._ensure_cadence_worker()
 
     def _live_lines(self) -> list[Text]:
         return self._project_live_lines(self._projection_snapshot())
@@ -994,13 +1098,15 @@ class RunProgress:
         )
 
         work_lines = self._bound_live_lines(projected_lines)
-        footer: Text | None = None
+        if not work_lines and not aggregate_cohort and not snapshot.cancelling:
+            return []
         if snapshot.cancelling:
             footer = Text("stopping…", style="dim cyan")
         elif aggregate_cohort:
             footer = self._format_cohort_counts(snapshot, stages_by_key)
-        if footer is None:
-            return work_lines
+            footer.append("  ·  ctrl-c to stop")
+        else:
+            footer = Text("ctrl-c to stop", style="dim")
         return [*work_lines, Text(""), footer]
 
     def _format_cohort_counts(
@@ -1034,14 +1140,22 @@ class RunProgress:
         line.append("  thinking")
         return line
 
-    def _active_lines(self) -> list[Text]:
+    def _plain_active_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
         lines: list[Text] = []
-        for stage in self._stages.values():
-            if stage.state is StageState.RUNNING:
-                lines.append(self._format_running_line(stage))
+        for stage in snapshot.stages:
+            if stage.record.state is StageState.RUNNING:
+                lines.append(
+                    self._format_running_line(
+                        stage.record, cancelling=snapshot.cancelling
+                    )
+                )
             lines.extend(
-                self._format_running_line(child, parent_label=stage.label)
-                for child in stage._children.values()
+                self._format_running_line(
+                    child,
+                    parent_label=stage.record.label,
+                    cancelling=snapshot.cancelling,
+                )
+                for child in stage.children
                 if child.state is StageState.RUNNING
             )
         return lines
@@ -1113,21 +1227,142 @@ class RunProgress:
         if is_spinner and _can_encode(_DOTS_FRAMES, self._stream_encoding()):
             spinner_text = line[2:]
             spinner_text.no_wrap = True
-            return Spinner("dots", text=spinner_text, style="cyan")
+            spinner = Spinner("dots", text=spinner_text, style="cyan")
+            spinner.start_time = self._spinner_started_at
+            return spinner
         line.no_wrap = True
         return line
 
     def _reset_heartbeat(self) -> None:
         self._next_heartbeat_at = (
             self._clock() + self._heartbeat_interval
-            if self._active_lines()
+            if self._plain_active_lines(self._projection_snapshot())
             else None
         )
 
-    def _stop_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+    def _ensure_cadence_worker(self) -> None:
+        if self._cadence_worker is not None and self._cadence_worker.is_alive():
+            return
+        if not self._cadence_work_pending():
+            return
+        stopped = threading.Event()
+        progress_ref = weakref.ref(self, lambda _reference: stopped.set())
+        interval = 0.1 if self._interactive else self._heartbeat_interval
+        worker = threading.Thread(
+            target=_run_cadence_worker,
+            args=(progress_ref, stopped, interval),
+            name="betterborg-progress-renderer",
+            daemon=True,
+        )
+        self._cadence_stop = stopped
+        self._cadence_worker = worker
+        worker.start()
+
+    def _cadence_work_pending(self) -> bool:
+        snapshot = self._projection_snapshot()
+        if self._interactive:
+            return snapshot.startup_label is not None or any(
+                stage.record.state is StageState.RUNNING
+                or any(
+                    child.state is StageState.RUNNING
+                    for child in stage.children
+                )
+                for stage in snapshot.stages
+            )
+        return bool(self._plain_active_lines(snapshot))
+
+    def _render_cadence_frame(self, stopped: threading.Event) -> bool:
+        try:
+            with self._lock:
+                if (
+                    stopped is not self._cadence_stop
+                    or stopped.is_set()
+                    or self._suspension_depth
+                    or self._render_failed
+                    or self._display_stopped
+                    or self._closing
+                    or self._closed
+                ):
+                    return False
+                if not self._cadence_work_pending():
+                    return False
+                snapshot = self._projection_snapshot()
+                if self._interactive:
+                    lines = self._project_live_lines(snapshot)
+                    renderable = Group(
+                        *(self._live_renderable(line) for line in lines)
+                    )
+                    if self._live is None:
+                        self._live = Live(
+                            renderable,
+                            console=self._output_console(),
+                            auto_refresh=False,
+                            transient=True,
+                            redirect_stdout=False,
+                            redirect_stderr=False,
+                        )
+                        self._live.start(refresh=True)
+                    else:
+                        self._live.update(renderable, refresh=True)
+                    self._live_empty = False
+                else:
+                    for line in self._plain_active_lines(snapshot):
+                        self._write_plain(line)
+                    self._next_heartbeat_at = (
+                        self._clock() + self._heartbeat_interval
+                    )
+                return True
+        except BaseException as error:
+            with self._lock:
+                self._latch_render_failure(error)
+                self._detach_display()
+            return False
+
+    def _cadence_worker_finished(
+        self, worker: threading.Thread, stopped: threading.Event
+    ) -> None:
+        with self._lock:
+            if self._cadence_worker is worker and self._cadence_stop is stopped:
+                self._cadence_worker = None
+                self._cadence_stop = None
+                if (
+                    not self._suspension_depth
+                    and not self._render_failed
+                    and not self._display_stopped
+                    and not self._closing
+                    and not self._closed
+                ):
+                    self._ensure_cadence_worker()
+
+    def _latch_render_failure(self, error: BaseException) -> None:
+        if self._render_failure is None:
+            self._render_failure = error
+        self._render_failed = True
+        if self._cadence_stop is not None:
+            self._cadence_stop.set()
+
+    def _detach_display(self) -> _DetachedDisplay:
+        live, self._live = self._live, None
+        self._live_empty = False
+        worker, self._cadence_worker = self._cadence_worker, None
+        stopped, self._cadence_stop = self._cadence_stop, None
+        if stopped is not None:
+            stopped.set()
+        self._next_heartbeat_at = None
+        return _DetachedDisplay(live, worker, stopped)
+
+    def _teardown_display(self, detached: _DetachedDisplay) -> None:
+        if detached.live is not None:
+            try:
+                detached.live.stop()
+            except BaseException as error:
+                with self._lock:
+                    self._latch_render_failure(error)
+        if (
+            detached.worker is not None
+            and detached.worker is not threading.current_thread()
+        ):
+            detached.worker.join()
 
     def _output_console(self) -> Console:
         if self._console is None:
@@ -1170,6 +1405,29 @@ class RunProgress:
         truncated = line[: len(prefix)]
         truncated.append("…")
         return truncated
+
+
+def _run_cadence_worker(
+    progress_ref: weakref.ReferenceType[RunProgress],
+    stopped: threading.Event,
+    interval: float,
+) -> None:
+    """Refresh one reporter without retaining it after its owner releases it."""
+
+    worker = threading.current_thread()
+    try:
+        while not stopped.wait(interval):
+            progress = progress_ref()
+            if progress is None:
+                return
+            keep_running = progress._render_cadence_frame(stopped)
+            del progress
+            if not keep_running:
+                return
+    finally:
+        progress = progress_ref()
+        if progress is not None:
+            progress._cadence_worker_finished(worker, stopped)
 
 
 def _format_terminal_line(

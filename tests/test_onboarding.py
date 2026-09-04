@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from progress_test_support import FakeClock, TTYStringIO
+from progress_test_support import FailingStringIO, TTYStringIO
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.onboarding import OnboardingDispatcher, create_commands
@@ -271,20 +272,17 @@ def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     stream = TTYStringIO()
-    clock = FakeClock()
     progress = RunProgress(
         [StageSpec("active", "Active work")],
         stream=stream,
-        clock=clock,
-        heartbeat_interval=5,
+        heartbeat_interval=0.02,
     )
     progress.start("active")
     snapshots: list[tuple[str, str]] = []
 
     def wait_at_prompt(_message: str) -> str:
         before = stream.getvalue()
-        clock.now += 10
-        progress.refresh()
+        time.sleep(0.05)
         snapshots.append((before, stream.getvalue()))
         return "q"
 
@@ -303,6 +301,42 @@ def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
 
     assert result is None
     assert snapshots and all(before == after for before, after in snapshots)
+    progress.stop_display()
+
+
+def test_menu_suspension_propagates_the_first_renderer_failure(
+    onboarding_context,
+) -> None:
+    repository, store = onboarding_context
+    stream = FailingStringIO()
+    progress = RunProgress(
+        [StageSpec("active", "Active work")],
+        stream=stream,
+        heartbeat_interval=0.01,
+    )
+    progress.start("active")
+    stream.fail_next_write()
+    deadline = time.monotonic() + 1
+    while progress._cadence_worker is not None:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        OnboardingDispatcher(
+            repository,
+            store,
+            InteractiveIO(
+                prompt=lambda _message: pytest.fail("prompt must not run"),
+                confirm=lambda _message, _default: False,
+                write=lambda _message: pytest.fail("menu must not render"),
+            ),
+            RecordingCreator(),
+            _documents(repository.root),
+            progress=progress,
+        ).run()
+
+    progress.raise_if_render_failed()
+    progress.stop_display()
 
 
 def test_machine_handoff_commands_are_exact_and_mutation_free(
