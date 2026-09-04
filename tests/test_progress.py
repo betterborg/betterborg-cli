@@ -677,11 +677,13 @@ def test_plain_worker_emits_current_heartbeats_without_manual_refresh() -> None:
     progress.update("stage", "building index")
 
     output = stream.wait_for(
-        lambda value: len(value.splitlines()) >= 2,
+        lambda value: len(value.splitlines()) >= 4,
     )
 
     assert output.splitlines()[0].endswith("thinking")
-    assert output.splitlines()[1].endswith("building index")
+    assert all(
+        line.endswith("building index") for line in output.splitlines()[1:4]
+    )
     progress.stop_display()
     stopped_output = stream.getvalue()
     time.sleep(0.06)
@@ -729,13 +731,13 @@ def test_rich_worker_refreshes_footer_and_cancellation_autonomously(
     initial_writes = stream.write_count
 
     stream.wait_for(
-        lambda _value: stream.write_count > initial_writes,
+        lambda _value: stream.write_count >= initial_writes + 3,
         timeout=1,
     )
     assert progress.stages["stage"].state is StageState.RUNNING
     rendered = _terminal_text(stream.getvalue())
     assert "ctrl-c to stop" in rendered
-    assert any(frame in rendered for frame in "⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    assert sum(frame in rendered for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏") >= 3
 
     progress.begin_cancellation()
     output = stream.wait_for(
@@ -934,6 +936,38 @@ def test_suspension_flush_failure_latches_and_gates_remaining_output() -> None:
     output_after_failure = stream.getvalue()
     progress.raise_if_render_failed()
     progress.fail("active", "progress heartbeat failed")
+    assert stream.getvalue() == output_after_failure
+    progress.stop_display()
+
+
+def test_autonomous_plain_flush_failure_exits_worker_and_gates_output() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(
+        [StageSpec("stage", "Stage")],
+        stream=stream,
+        heartbeat_interval=0.03,
+    )
+    progress.start("stage")
+    worker = progress._cadence_worker
+    assert worker is not None
+    writes_before_failure = stream.write_count
+    stream.fail_next_flush()
+
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert progress._cadence_worker is None
+    assert stream.write_count == writes_before_failure + 1
+    output_after_failure = stream.getvalue()
+    time.sleep(0.06)
+    assert stream.getvalue() == output_after_failure
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed") as caught:
+        progress.raise_if_render_failed()
+    assert str(caught.value) == "progress heartbeat failed"
+    progress.raise_if_render_failed()
+    progress.fail("stage", "progress heartbeat failed")
+    assert progress.stages["stage"].state is StageState.FAILED
     assert stream.getvalue() == output_after_failure
     progress.stop_display()
 
