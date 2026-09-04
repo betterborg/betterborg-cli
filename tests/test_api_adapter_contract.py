@@ -25,7 +25,9 @@ from test_adapter_harness import (
 )
 
 import betterborg_cli.agent_runtime.api_http as api_http
+import betterborg_cli.agent_runtime.retry as agent_retry
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     AgentActivity,
     AgentActivityKind,
     AgentStatus,
@@ -1169,10 +1171,13 @@ def test_transient_exhaustion_is_cancelled_and_resumable(
     assert "transient retry exhausted" in (result.error or "")
 
 
-def test_schema_invalid_submission_fails_without_persisting_result(
+def test_schema_miss_is_corrected_in_the_same_turn_without_waiting(
     tmp_path: Path,
     harness: ApiAdapterHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr(agent_retry.time, "sleep", waits.append)
     transport = FakeApiTransport(
         [
             harness.response(
@@ -1183,7 +1188,51 @@ def test_schema_invalid_submission_fails_without_persisting_result(
                         call_id="submit",
                     )
                 ]
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "corrected"},
+                        call_id="resubmit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        transport=transport,
+    ).run(harness.spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "corrected"}
+    assert len(transport.payloads) == 2
+    correction = harness.extract_tool_output(transport.payloads[1])
+    assert "missing required property 'version'" in correction
+    assert not waits
+    assert json.loads(
+        (tmp_path / "result.json").read_text(encoding="utf-8")
+    ) == result.payload
+
+
+def test_schema_invalid_submission_fails_after_bounded_attempts(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed"},
+                        call_id=f"submit-{attempt}",
+                    )
+                ]
             )
+            for attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS)
         ]
     )
 
@@ -1195,6 +1244,8 @@ def test_schema_invalid_submission_fails_without_persisting_result(
     assert result.status == AgentStatus.FAILED
     assert "missing required property 'version'" in (result.error or "")
     assert not (tmp_path / "result.json").exists()
+    assert len(transport.payloads) == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert not transport.responses
 
 
 def test_credentials_are_redacted_from_errors_and_logs(

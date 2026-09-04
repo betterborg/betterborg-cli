@@ -5,13 +5,14 @@ start unless stdin is a TTY, and the same command rejects an adapter whose
 read-only boundary is a sandbox rather than a tool allowlist, which is the
 shape every native CLI adapter has. Planning then stops on a repository the
 operator has already trusted, because it runs in a worktree Betterborg itself
-generated and that worktree is a workspace of its own. Separately, a Compose
-stack created during preflight can outlive the run that created it, and enough
-survivors exhaust Docker's address pool until nothing on the machine can
-create a network.
+generated and that worktree is a workspace of its own. A turn whose result
+misses the schema by one field ends the run outright, however well the rest of
+it went. Separately, a Compose stack created during preflight can outlive the
+run that created it, and enough survivors exhaust Docker's address pool until
+nothing on the machine can create a network.
 
 Together these block every unattended use: CI, cron, a queue worker, and a
-benchmark container. The work here is four independent changes, each closing
+benchmark container. The work here is five independent changes, each closing
 one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
@@ -157,5 +158,50 @@ not, so planning fails where execution would have succeeded.
 - A run path outside the managed worktrees directory is not granted the
   primary checkout's trust.
 - The existing execution trust behaviour continues to pass.
+
+**Status**: Complete
+
+## Stage 5: A missed schema is retried, not fatal
+
+**Goal**: An agent turn whose structured result fails schema validation is
+retried automatically, so one malformed field does not end an unattended run.
+
+A turn's result is validated against a schema after the process has already
+exited, and a failure is terminal: the adapter reports the turn failed and the
+run stops with the validating error, telling a human to resume. The retry that
+does exist classifies process exit codes for transient service errors, so it
+never sees a schema miss, and its backoff is measured in minutes because it
+exists for rate limits rather than for a model that wrote `q01` where `q1` was
+required.
+
+The distinction matters because this failure is unlike the others here. They
+were deterministic: the same run failed the same way until the cause was
+fixed. A missed schema is a property of one sampled result, so it strikes some
+fraction of turns, and an unattended sweep loses that fraction outright while
+a human retrying by hand would very likely get a conforming result the second
+time.
+
+**Success Criteria**:
+- A turn whose result misses the schema is retried without human action, and
+  succeeds when a later attempt conforms.
+- The retry tells the agent what was wrong with the previous result, so the
+  attempt differs from the one that failed.
+- Retries are bounded, and a turn that never conforms still fails with the
+  validating error rather than looping.
+- A schema miss is retried promptly, not on the backoff that exists for
+  rate limits and service outages.
+- Every adapter that validates a structured result behaves the same way.
+- A result that cannot be read as a payload at all is a different failure and
+  stays fatal here; only a payload that was read and then missed the schema is
+  retried.
+
+**Tests**:
+- A turn whose first result misses the schema and whose second conforms
+  completes, and the run continues.
+- A turn that never conforms fails with the validating error, after the
+  bounded number of attempts and no more.
+- The retried attempt carries the previous validation error.
+- A schema miss does not wait for the transient backoff.
+- Planning survives a first architect result that misses the schema.
 
 **Status**: Complete

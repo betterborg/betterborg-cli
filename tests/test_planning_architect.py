@@ -117,6 +117,54 @@ def test_answers_product_questions_inline_and_persists_plan(
         assert attempts[-1].result == _plan()
 
 
+def test_planning_survives_an_architect_result_that_misses_the_schema(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q01",
+                        "question": "Which platforms are required at launch?",
+                    }
+                ],
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=_plan()))
+    database = committed_git_repo.parent / "architect-schema-retry.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "schema-retry"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert len(adapter.calls) == 3
+        assert "does not match pattern" in adapter.calls[1].user_prompt
+        attempts = store.list_planning_attempts(borg.id)
+        assert [attempt.phase for attempt in attempts] == [
+            "architect_questions",
+            "architect_plan",
+        ]
+        assert all(
+            attempt.status is PlanningAttemptStatus.COMPLETED for attempt in attempts
+        )
+
+
 def test_clarification_output_is_suspended_and_stops_active_architect(
     committed_git_repo: Path,
     persist_planning_context,

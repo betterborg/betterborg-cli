@@ -16,7 +16,9 @@ from test_adapter_harness import (
     write_native_output,
 )
 
+import betterborg_cli.agent_runtime.retry as agent_retry
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
@@ -440,9 +442,11 @@ def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None
     assert captured_command[captured_command.index("-s") + 1] == "read-only"
 
 
-def test_schema_invalid_result_fails_without_persisting_result(
+def test_schema_invalid_result_fails_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
+    calls = 0
+
     def runner(
         command: Sequence[str],
         _cwd: Path,
@@ -452,6 +456,8 @@ def test_schema_invalid_result_fails_without_persisting_result(
         _env: Mapping[str, str] | None,
         _on_line: Callable[[str], None] | None,
     ) -> int:
+        nonlocal calls
+        calls += 1
         log_path.write_text("{}\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
         return 0
@@ -462,6 +468,49 @@ def test_schema_invalid_result_fails_without_persisting_result(
     assert result.status == AgentStatus.FAILED
     assert "missing required property 'version'" in (result.error or "")
     assert not spec.result_path.exists()
+    assert calls == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert result.attempts == DEFAULT_SCHEMA_MAX_ATTEMPTS
+
+
+def test_schema_miss_is_retried_with_the_validating_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr(agent_retry.time, "sleep", waits.append)
+    prompts: list[str] = []
+    payloads: list[dict[str, str]] = [
+        {"status": "completed"},
+        {"status": "completed", "version": "corrected"},
+    ]
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
+    ) -> int:
+        prompts.append(stdin_text)
+        log_path.write_text(_usage_event(10, 0, 5), encoding="utf-8")
+        _write_invocation_result(command, payloads.pop(0))
+        return 0
+
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert result.payload == {"status": "completed", "version": "corrected"}
+    assert spec.user_prompt in prompts[0]
+    assert prompts[1].startswith(prompts[0])
+    assert "missing required property 'version'" in prompts[1]
+    assert not waits
+    assert json.loads(
+        spec.result_path.read_text(encoding="utf-8")
+    ) == result.payload
 
 
 def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> None:

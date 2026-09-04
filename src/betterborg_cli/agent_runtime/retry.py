@@ -1,4 +1,4 @@
-"""Bounded transient retry with cancellation-aware backoff."""
+"""Bounded retry for transient service errors and for missed result schemas."""
 
 from __future__ import annotations
 
@@ -14,9 +14,56 @@ from betterborg_cli.agent_runtime.base import (
     AgentUsage,
     CancellationToken,
 )
+from betterborg_cli.agent_runtime.structured import StructuredResultError
 
 DEFAULT_TRANSIENT_BACKOFF_SECONDS = 300.0
 DEFAULT_TRANSIENT_MAX_ATTEMPTS = 6
+DEFAULT_SCHEMA_MAX_ATTEMPTS = 3
+
+_SCHEMA_CORRECTION = """
+## Rejected result
+
+Your previous result did not satisfy the required JSON Schema:
+
+{error}
+
+Send a result that satisfies every schema constraint above.
+""".strip()
+
+
+@dataclass(slots=True)
+class SchemaRetry:
+    """Bounded, immediate retry of a result that missed its schema.
+
+    A missed schema is a property of one sampled result rather than a service
+    fault, so the next attempt starts at once: the transient backoff exists for
+    rate limits and outages and would buy nothing here. Each retry carries the
+    validating error, so the agent is told what to correct instead of being
+    asked the same question again. Every adapter shares this budget and this
+    wording; only the transport that delivers the correction differs.
+
+    The correction reaches a fresh process on some transports, so it names the
+    failing constraint rather than quoting a rejected result the agent may not
+    be able to see, while still saying that an earlier attempt of this turn
+    ran, which a process inheriting that attempt's worktree needs to know.
+
+    A caller that repairs malformed output itself multiplies its own budget by
+    this one, which is bounded but paid in whole turns.
+    """
+
+    max_attempts: int = DEFAULT_SCHEMA_MAX_ATTEMPTS
+    attempts: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+
+    def correction(self, error: StructuredResultError) -> str | None:
+        """Return what to tell the agent, or ``None`` once attempts run out."""
+        self.attempts += 1
+        if self.attempts >= self.max_attempts:
+            return None
+        return _SCHEMA_CORRECTION.format(error=error)
 
 
 @dataclass(frozen=True, slots=True)

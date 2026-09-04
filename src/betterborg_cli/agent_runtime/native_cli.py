@@ -8,7 +8,7 @@ import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ from betterborg_cli.agent_runtime.base import (
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.process import ProcessRunner, run_streamed
-from betterborg_cli.agent_runtime.retry import run_with_transient_retry
+from betterborg_cli.agent_runtime.retry import SchemaRetry, run_with_transient_retry
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
@@ -131,6 +131,8 @@ class NativeCliAdapter:
         environment = {**os.environ, **spec.env}
         attempt_usage: list[AgentUsage | None] = []
         attempts = 0
+        prompt = invocation.stdin_text
+        schema_retry = SchemaRetry()
 
         def run_once() -> int:
             nonlocal attempts
@@ -169,109 +171,125 @@ class NativeCliAdapter:
                 return None
             return self._classify_transient_error(spec.log_path, exit_code)
 
-        try:
-            outcome = run_with_transient_retry(
-                run_once,
-                classify_transient_error,
-                cancel=cancel,
-                backoff_seconds=self.transient_backoff_seconds,
-                max_attempts=self.transient_max_attempts,
-            )
-        except OSError as error:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                error=f"unable to start {self.provider_label} process: {error}",
-                attempts=attempts,
-            )
+        # A missed schema restarts the invocation with the validating error
+        # appended to the prompt, so the next process is asked to correct the
+        # rejected result rather than answer the same question again.
+        while True:
+            try:
+                outcome = run_with_transient_retry(
+                    run_once,
+                    classify_transient_error,
+                    cancel=cancel,
+                    backoff_seconds=self.transient_backoff_seconds,
+                    max_attempts=self.transient_max_attempts,
+                )
+            except OSError as error:
+                return self._result(
+                    spec,
+                    start,
+                    AgentStatus.FAILED,
+                    error=(
+                        f"unable to start {self.provider_label} process: {error}"
+                    ),
+                    attempts=attempts,
+                )
 
-        usage = combine_agent_usage(attempt_usage)
-        if outcome.cancelled or (cancel is not None and cancel.is_set()):
-            return self._cancelled(
-                spec,
-                start,
-                attempts=outcome.attempts,
-                usage=usage,
+            usage = combine_agent_usage(attempt_usage)
+            if outcome.cancelled or (cancel is not None and cancel.is_set()):
+                return self._cancelled(
+                    spec,
+                    start,
+                    attempts=attempts,
+                    usage=usage,
+                )
+            if outcome.exhausted:
+                return self._cancelled(
+                    spec,
+                    start,
+                    attempts=attempts,
+                    usage=usage,
+                    exit_code=outcome.exit_code,
+                    error=f"transient retry exhausted: {outcome.transient_reason}",
+                )
+            extracted = (
+                invocation.load_payload()
+                if outcome.exit_code == 0
+                or invocation.accept_payload_on_nonzero_exit
+                else NativePayload()
             )
-        if outcome.exhausted:
-            return self._cancelled(
-                spec,
-                start,
-                attempts=outcome.attempts,
-                usage=usage,
-                exit_code=outcome.exit_code,
-                error=f"transient retry exhausted: {outcome.transient_reason}",
-            )
-        extracted = (
-            invocation.load_payload()
-            if outcome.exit_code == 0 or invocation.accept_payload_on_nonzero_exit
-            else NativePayload()
-        )
-        if outcome.exit_code != 0 and extracted.payload is None:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=outcome.exit_code,
-                error=self._terminal_error(spec.log_path, outcome.exit_code),
-                usage=usage,
-                attempts=outcome.attempts,
-            )
+            if outcome.exit_code != 0 and extracted.payload is None:
+                return self._result(
+                    spec,
+                    start,
+                    AgentStatus.FAILED,
+                    exit_code=outcome.exit_code,
+                    error=self._terminal_error(spec.log_path, outcome.exit_code),
+                    usage=usage,
+                    attempts=attempts,
+                )
 
-        if extracted.payload is None:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=outcome.exit_code,
-                error=(
-                    extracted.error
-                    or self._terminal_error(spec.log_path, outcome.exit_code)
-                ),
-                usage=usage,
-                attempts=outcome.attempts,
-            )
-        payload = extracted.payload
-        try:
-            validate_structured_result(payload, spec.schema)
-        except StructuredResultError as error:
-            return self._result(
-                spec,
-                start,
-                AgentStatus.FAILED,
-                exit_code=outcome.exit_code,
-                error=f"structured result validation failed: {error}",
-                usage=usage,
-                attempts=outcome.attempts,
-            )
+            if extracted.payload is None:
+                return self._result(
+                    spec,
+                    start,
+                    AgentStatus.FAILED,
+                    exit_code=outcome.exit_code,
+                    error=(
+                        extracted.error
+                        or self._terminal_error(spec.log_path, outcome.exit_code)
+                    ),
+                    usage=usage,
+                    attempts=attempts,
+                )
+            payload = extracted.payload
+            try:
+                validate_structured_result(payload, spec.schema)
+            except StructuredResultError as error:
+                correction = schema_retry.correction(error)
+                if correction is not None:
+                    invocation = replace(
+                        invocation,
+                        stdin_text=f"{prompt}\n\n{correction}",
+                    )
+                    continue
+                return self._result(
+                    spec,
+                    start,
+                    AgentStatus.FAILED,
+                    exit_code=outcome.exit_code,
+                    error=f"structured result validation failed: {error}",
+                    usage=usage,
+                    attempts=attempts,
+                )
 
-        try:
-            spec.result_path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as error:
+            try:
+                spec.result_path.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as error:
+                return self._result(
+                    spec,
+                    start,
+                    AgentStatus.FAILED,
+                    exit_code=outcome.exit_code,
+                    payload=payload,
+                    error=(
+                        f"unable to persist {self.provider_label} result: {error}"
+                    ),
+                    usage=usage,
+                    attempts=attempts,
+                )
             return self._result(
                 spec,
                 start,
-                AgentStatus.FAILED,
+                AgentStatus.COMPLETED,
                 exit_code=outcome.exit_code,
                 payload=payload,
-                error=f"unable to persist {self.provider_label} result: {error}",
+                result_path=spec.result_path,
                 usage=usage,
-                attempts=outcome.attempts,
+                attempts=attempts,
             )
-        return self._result(
-            spec,
-            start,
-            AgentStatus.COMPLETED,
-            exit_code=outcome.exit_code,
-            payload=payload,
-            result_path=spec.result_path,
-            usage=usage,
-            attempts=outcome.attempts,
-        )
 
     @staticmethod
     def _has_valid_payload(

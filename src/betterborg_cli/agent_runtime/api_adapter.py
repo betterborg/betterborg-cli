@@ -24,7 +24,7 @@ from betterborg_cli.agent_runtime.base import (
     ForceTarget,
     combine_agent_usage,
 )
-from betterborg_cli.agent_runtime.retry import run_with_transient_retry
+from betterborg_cli.agent_runtime.retry import SchemaRetry, run_with_transient_retry
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
@@ -77,6 +77,13 @@ ApiRequestFactory = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class SchemaCorrection:
+    """A rejected submission handed back to the turn loop that produced it."""
+
+    message: str
+
+
 @dataclass(slots=True)
 class _RequestState:
     response: Mapping[str, Any] | None = None
@@ -94,6 +101,7 @@ class ApiRunContext:
     attempts: int = 0
     model: str = field(init=False)
     usage: list[AgentUsage] = field(default_factory=list)
+    schema_retry: SchemaRetry = field(default_factory=SchemaRetry)
 
     def __post_init__(self) -> None:
         self.model = self.spec.model
@@ -171,14 +179,26 @@ class ApiRunContext:
         if isinstance(response_model, str) and response_model:
             self.model = response_model
 
-    def complete(self, payload: Mapping[str, Any]) -> AgentResult:
-        """Validate, redact, and persist a provider-submitted structured result."""
+    def complete(
+        self, payload: Mapping[str, Any]
+    ) -> AgentResult | SchemaCorrection:
+        """Validate, redact, and persist a provider-submitted structured result.
+
+        A submission that misses the schema comes back as a correction while
+        the retry budget lasts, so the turn loop can return the validating
+        error to the agent and let it submit again in the same conversation.
+        The error describes the redacted payload, so feeding it back cannot
+        return a credential to the provider.
+        """
         redacted = self.redactor.value(dict(payload))
         if not isinstance(redacted, dict):
             raise AssertionError("redacting an object must preserve its shape")
         try:
             validate_structured_result(redacted, self.spec.schema)
         except StructuredResultError as error:
+            correction = self.schema_retry.correction(error)
+            if correction is not None:
+                return SchemaCorrection(correction)
             return self.result(
                 AgentStatus.FAILED,
                 error=f"structured result validation failed: {error}",

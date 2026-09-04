@@ -11,6 +11,7 @@ import pytest
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime.retry import DEFAULT_SCHEMA_MAX_ATTEMPTS
 from betterborg_cli.planning import (
     NonProgressingTaskRepairError,
     ProjectManagerError,
@@ -354,7 +355,8 @@ def test_pm_retries_malformed_output_with_persisted_feedback(
         return _pm_payload(plan)
 
     adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=malformed))
+    for _attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS):
+        adapter.queue(MockResponse(payload=malformed))
     adapter.queue(MockResponse(dynamic=repaired_batch))
     database = committed_git_repo.parent / "pm-retry.sqlite3"
     with SqliteStore.open(database) as store:
@@ -372,7 +374,7 @@ def test_pm_retries_malformed_output_with_persisted_feedback(
         ).run()
 
         assert result.borg.state is BorgState.SUPERVISOR_WORKING
-        assert len(adapter.calls) == 2
+        assert len(adapter.calls) == DEFAULT_SCHEMA_MAX_ATTEMPTS + 1
         attempts = store.list_planning_attempts(borg.id)
         assert [item.status for item in attempts] == [
             PlanningAttemptStatus.FAILED,

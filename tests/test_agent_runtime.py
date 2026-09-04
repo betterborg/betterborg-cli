@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
@@ -137,6 +138,72 @@ def test_mock_rejects_schema_invalid_payload(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "missing required property 'status'" in (result.error or "")
     assert not (tmp_path / "result.json").exists()
+
+
+def test_mock_retries_schema_miss_with_the_validating_error(
+    tmp_path: Path,
+) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"count": -1}))
+    adapter.queue(MockResponse(payload={"status": "completed"}))
+    spec = _spec(tmp_path)
+
+    result = adapter.run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed"}
+    assert len(adapter.calls) == 2
+    assert adapter.calls[0].user_prompt == spec.user_prompt
+    assert adapter.calls[1].user_prompt.startswith(spec.user_prompt)
+    assert "missing required property 'status'" in adapter.calls[1].user_prompt
+
+
+def test_mock_bills_every_attempt_of_a_schema_retried_turn(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    adapter.queue(
+        MockResponse(
+            payload={"count": -1},
+            usage=AgentUsage(tokens_input=2, tokens_output=3),
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={"status": "completed"},
+            usage=AgentUsage(tokens_input=5, tokens_output=7),
+        )
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    # The real adapters combine usage across attempts, so a turn that was
+    # retried costs both attempts here too.
+    assert result.status == AgentStatus.COMPLETED
+    assert result.usage is not None
+    assert result.usage.tokens_input == 7
+    assert result.usage.tokens_output == 10
+
+
+def test_mock_schema_miss_fails_after_bounded_attempts(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    for attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS + 1):
+        adapter.queue(
+            MockResponse(
+                payload={"count": -1},
+                usage=AgentUsage(tokens_input=attempt + 1),
+            )
+        )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.FAILED
+    assert "missing required property 'status'" in (result.error or "")
+    assert len(adapter.calls) == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert len(adapter.responses) == 1
+    # A turn that never conforms is still billed for every attempt it made.
+    assert result.usage is not None
+    assert result.usage.tokens_input == sum(
+        range(1, DEFAULT_SCHEMA_MAX_ATTEMPTS + 1)
+    )
 
 
 def test_mock_honors_preexisting_cancellation_without_consuming_response(

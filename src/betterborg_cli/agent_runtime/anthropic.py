@@ -12,6 +12,7 @@ from betterborg_cli.agent_runtime.api_adapter import (
     AbortableApiRequest,
     ApiCredentialRedactor,
     ApiRunContext,
+    SchemaCorrection,
 )
 from betterborg_cli.agent_runtime.api_http import (
     MultiprocessUrlRequest,
@@ -326,7 +327,30 @@ class AnthropicAdapter:
                         AgentStatus.FAILED,
                         error="submit_result input must be an object",
                     )
-                return runtime.complete(candidate)
+                submitted = runtime.complete(candidate)
+                if not isinstance(submitted, SchemaCorrection):
+                    return submitted
+                submission_id = submissions[0].get("id")
+                if not isinstance(submission_id, str) or not submission_id:
+                    return runtime.result(
+                        AgentStatus.FAILED,
+                        error="Anthropic tool call is missing an id",
+                    )
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": submission_id,
+                                "content": submitted.message,
+                                "is_error": True,
+                            }
+                        ],
+                    }
+                )
+                continue
 
             if not tool_uses:
                 return runtime.result(

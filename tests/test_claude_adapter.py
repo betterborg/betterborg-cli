@@ -16,7 +16,9 @@ from test_adapter_harness import (
     write_native_output,
 )
 
+import betterborg_cli.agent_runtime.retry as agent_retry
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
@@ -455,9 +457,11 @@ def test_read_only_tool_allowlist_uses_plan_mode(tmp_path: Path) -> None:
     ] == "Glob,Read,Grep"
 
 
-def test_schema_invalid_result_fails_without_persisting_result(
+def test_schema_invalid_result_fails_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
+    calls = 0
+
     def runner(
         _command: Sequence[str],
         _cwd: Path,
@@ -467,6 +471,8 @@ def test_schema_invalid_result_fails_without_persisting_result(
         _env: Mapping[str, str] | None,
         on_line: Callable[[str], None] | None,
     ) -> int:
+        nonlocal calls
+        calls += 1
         write_native_output(
             log_path,
             _envelope({"status": "completed"}),
@@ -480,6 +486,52 @@ def test_schema_invalid_result_fails_without_persisting_result(
     assert result.status == AgentStatus.FAILED
     assert "missing required property 'version'" in (result.error or "")
     assert not spec.result_path.exists()
+    assert calls == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert result.attempts == DEFAULT_SCHEMA_MAX_ATTEMPTS
+
+
+def test_schema_miss_is_retried_with_the_validating_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr(agent_retry.time, "sleep", waits.append)
+    prompts: list[str] = []
+    responses = [
+        _envelope({"status": "completed"}, usage={"input_tokens": 2}),
+        _envelope(
+            {"status": "completed", "version": "corrected"},
+            usage={"input_tokens": 3},
+        ),
+    ]
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        prompts.append(stdin_text)
+        write_native_output(log_path, responses.pop(0), on_line)
+        return 0
+
+    spec = claude_spec(tmp_path)
+    result = ClaudeAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert result.payload == {"status": "completed", "version": "corrected"}
+    assert result.usage == AgentUsage(tokens_input=5)
+    assert prompts[0] == spec.user_prompt
+    assert prompts[1].startswith(spec.user_prompt)
+    assert "missing required property 'version'" in prompts[1]
+    assert not waits
+    assert json.loads(
+        spec.result_path.read_text(encoding="utf-8")
+    ) == result.payload
 
 
 def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> None:
