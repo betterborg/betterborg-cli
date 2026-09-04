@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import multiprocessing
 import os
@@ -31,6 +32,7 @@ from betterborg_cli.host_execution import (
     HostSecret,
     HostService,
     HostWorktreeManager,
+    compose_project_name,
     package_manager_cache_environment,
     service_url_environment,
 )
@@ -827,11 +829,7 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
     results_lock = threading.Lock()
 
     def run_compose(*args, **kwargs):
-        for name in ("cancel", "terminate_on_cancel", "deadline"):
-            kwargs.pop(name, None)
-        kwargs["capture_output"] = True
-        kwargs["text"] = True
-        result = subprocess.run(*args, **kwargs)
+        result = _run_real_compose(*args, **kwargs)
         with results_lock:
             compose_results.append(result)
         return result
@@ -851,6 +849,7 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
                 try:
                     stacks.append(future.result())
                 except BaseException as error:
+                    stacks.append(None)
                     errors.append(error)
             if errors:
                 loopback_failures = [
@@ -905,12 +904,20 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
         for name in (*first.network_names, *second.network_names):
             assert _docker_resource_names("network", name) == {name}
         assert set(first.network_names).isdisjoint(second.network_names)
+        first_volumes = _project_resource_names("volume", first.project_name)
+        second_volumes = _project_resource_names(
+            "volume", second.project_name
+        )
+        assert first_volumes and second_volumes
         for stack in (first, second):
             assert _compose_container_services(stack.project_name) == {"healthy"}
             assert _compose_container_images(stack.project_name) == set(
                 stack.image_names
             )
-            assert all(_docker_image_exists(image) for image in stack.image_names)
+            assert all(
+                _docker_resource_exists("image", image)
+                for image in stack.image_names
+            )
             assert _compose_published_host_ips(stack.project_name) == {
                 "127.0.0.1"
             }
@@ -944,10 +951,26 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
             }
 
         assert _compose_container_services(first.project_name) == set()
-        assert not any(_docker_image_exists(image) for image in first.image_names)
-        assert all(_docker_image_exists(image) for image in second.image_names)
+        assert not any(
+            _docker_resource_exists("image", image) for image in first.image_names
+        )
+        assert all(
+            _docker_resource_exists("image", image) for image in second.image_names
+        )
         assert _http_body(second.environment["SERVICE_URL"]) == "healthy\n"
         assert _compose_container_services(second.project_name) == {"healthy"}
+        # A successful teardown releases the stack's network and volume as well
+        # as its containers and images, and leaves the other claim's untouched.
+        assert not any(
+            _docker_resource_exists("network", name) for name in first.network_names
+        )
+        assert all(
+            _docker_resource_exists("network", name) for name in second.network_names
+        )
+        assert _project_resource_names("volume", first.project_name) == set()
+        assert (
+            _project_resource_names("volume", second.project_name) == second_volumes
+        )
         assert {
             "compose.starting",
             "compose.ready",
@@ -964,13 +987,182 @@ def test_jobs_two_compose_stacks_are_healthy_distinct_and_isolated(
         wait_timeout = starting.payload["command"].index("--wait-timeout")
         assert int(starting.payload["command"][wait_timeout + 1]) > 0
     finally:
-        for stack, claim in zip(stacks, claims, strict=False):
-            if stack is None or not _compose_container_services(stack.project_name):
+        for stack, claim in zip(stacks, claims, strict=True):
+            if stack is None:
                 continue
-            with SqliteStore.open(fixture.database) as store:
-                fixture.compose_manager(None).stop_claimed_stack(
-                    store, stack, claim, fixture.owner_token
+            # A stack torn down above still reaches the release, and a failure
+            # tearing one down must not cost the others theirs.
+            try:
+                with contextlib.suppress(Exception):
+                    if _compose_container_services(stack.project_name):
+                        with SqliteStore.open(fixture.database) as store:
+                            fixture.compose_manager(None).stop_claimed_stack(
+                                store, stack, claim, fixture.owner_token
+                            )
+            finally:
+                with contextlib.suppress(Exception):
+                    _release_project_resources(stack.project_name)
+
+
+def test_failed_compose_startup_releases_every_created_resource(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture(task_count=2)
+    _prepare_compose_fixture(fixture)
+    plan = _compose_plan(fixture.repository)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        if "ps" in tuple(argv):
+            return subprocess.CompletedProcess(argv, 1, "", "forced health failure")
+        return _run_real_compose(argv, **kwargs)
+
+    projects: list[str] = []
+    try:
+        with SqliteStore.open(fixture.database) as store:
+            claims = (fixture.claim(store), fixture.claim(store))
+            for claim in claims:
+                projects.append(compose_project_name(claim))
+                with pytest.raises(ComposeStackError, match="must report healthy"):
+                    fixture.compose_manager(runner).start_claimed_stack(
+                        store, plan, claim, fixture.owner_token
+                    )
+
+        for project_name in projects:
+            _assert_project_released(project_name)
+    finally:
+        for project_name in projects:
+            with contextlib.suppress(Exception):
+                _release_project_resources(project_name)
+
+
+def test_startup_failure_releases_resources_when_blocking_the_task_fails(
+    execution_preflight_fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = execution_preflight_fixture()
+    _prepare_compose_fixture(fixture)
+    plan = _compose_plan(fixture.repository)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        if "ps" in tuple(argv):
+            return subprocess.CompletedProcess(argv, 1, "", "forced health failure")
+        return _run_real_compose(argv, **kwargs)
+
+    project_name = ""
+    try:
+        with SqliteStore.open(fixture.database) as store:
+            claim = fixture.claim(store)
+            project_name = compose_project_name(claim)
+
+            def refuse(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+                raise RuntimeError("task phase changed before transition")
+
+            monkeypatch.setattr(store, "transition_task_runtime", refuse)
+
+            # Blocking the task runs inside the handler that also tears the
+            # project down. A failure there must not cost the teardown, and
+            # matching both halves keeps the test honest if blocking ever
+            # stops being reached for a freshly claimed task.
+            with pytest.raises(
+                ComposeStackError,
+                match=r"must report healthy(?s:.)*blocking the task also failed",
+            ):
+                fixture.compose_manager(runner).start_claimed_stack(
+                    store, plan, claim, fixture.owner_token
                 )
+
+        _assert_project_released(project_name)
+    finally:
+        if project_name:
+            _release_project_resources(project_name)
+
+
+def test_interrupted_compose_startup_releases_every_created_resource(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    _prepare_compose_fixture(fixture)
+    plan = _compose_plan(fixture.repository)
+    cancel = CancellationToken()
+
+    created: set[str] = set()
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        result = _run_real_compose(argv, **kwargs)
+        if "up" in tuple(argv):
+            created.update(_project_resource_names("network", project_name))
+            cancel.cancel()
+        return result
+
+    project_name = ""
+    try:
+        with SqliteStore.open(fixture.database) as store:
+            claim = fixture.claim(store)
+            project_name = compose_project_name(claim)
+            with pytest.raises(KeyboardInterrupt):
+                fixture.compose_manager(runner).start_claimed_stack(
+                    store, plan, claim, fixture.owner_token, cancel=cancel
+                )
+
+        # A cancelled "up" that never created anything would satisfy the
+        # raises clause and leave nothing to release, passing vacuously.
+        assert created
+        _assert_project_released(project_name)
+    finally:
+        if project_name:
+            _release_project_resources(project_name)
+
+
+def test_unexpected_startup_failure_releases_every_created_resource(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    _prepare_compose_fixture(fixture)
+    plan = _compose_plan(fixture.repository)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        if "port" in tuple(argv):
+            raise RuntimeError("startup failed outside Compose")
+        return _run_real_compose(argv, **kwargs)
+
+    project_name = ""
+    try:
+        with SqliteStore.open(fixture.database) as store:
+            claim = fixture.claim(store)
+            project_name = compose_project_name(claim)
+            with pytest.raises(RuntimeError, match="outside Compose"):
+                fixture.compose_manager(runner).start_claimed_stack(
+                    store, plan, claim, fixture.owner_token
+                )
+
+        _assert_project_released(project_name)
+    finally:
+        if project_name:
+            _release_project_resources(project_name)
+
+
+def test_startup_failure_before_the_project_is_recorded_keeps_its_own_error(
+    execution_preflight_fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = execution_preflight_fixture()
+    _prepare_compose_fixture(fixture)
+    plan = _compose_plan(fixture.repository)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+
+        def refuse(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "add_compose_resource", refuse)
+
+        # Nothing was recorded, so there is no project to tear down. Tearing one
+        # down anyway raises over the failure the caller actually needs to see.
+        with pytest.raises(RuntimeError, match="database is locked"):
+            fixture.compose_manager(FakeComposeRunner()).start_claimed_stack(
+                store, plan, claim, fixture.owner_token
+            )
 
 
 def test_expired_compose_cleanup_timeout_blocks_reclaim_until_retry(
@@ -1764,7 +1956,7 @@ def _compose_plan(repository: Path) -> HostPreflightPlan:
             ),
         ),
         compose_profiles=(),
-        compose_networks=("fixture",),
+        compose_networks=("default", "fixture"),
         compose_volumes=("fixture-data",),
         compose_build_services=("healthy",),
     )
@@ -1951,6 +2143,23 @@ def _http_body(url: str) -> str:
         return response.read().decode("utf-8")
 
 
+def _run_real_compose(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+    """Run a Compose command for real, dropping reaping-only arguments."""
+    for name in ("cancel", "terminate_on_cancel", "deadline"):
+        kwargs.pop(name, None)
+    kwargs["capture_output"] = True
+    kwargs["text"] = True
+    return subprocess.run(*args, **kwargs)
+
+
+def _assert_project_released(project_name: str) -> None:
+    """Assert one Compose project owns no network, volume or container."""
+    for kind in ("network", "volume"):
+        assert _project_resource_names(kind, project_name) == set()
+    assert _compose_container_services(project_name) == set()
+    assert _project_image_names(project_name) == set()
+
+
 def _docker_resource_names(kind: str, name: str) -> set[str]:
     result = subprocess.run(
         ["docker", kind, "inspect", name, "--format", "{{.Name}}"],
@@ -1997,16 +2206,103 @@ def _compose_container_images(project_name: str) -> set[str]:
     return set(result.stdout.splitlines()) - {""}
 
 
-def _docker_image_exists(image: str) -> bool:
+def _docker_resource_exists(kind: str, name: str) -> bool:
     return (
         subprocess.run(
-            ["docker", "image", "inspect", image],
+            ["docker", kind, "inspect", name],
             check=False,
             capture_output=True,
             text=True,
         ).returncode
         == 0
     )
+
+
+def _project_resource_names(kind: str, project_name: str) -> set[str]:
+    """Return the networks or volumes one Compose project still owns."""
+    result = subprocess.run(
+        [
+            "docker",
+            kind,
+            "ls",
+            "--filter",
+            f"name={project_name}",
+            "--format",
+            "{{.Name}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # The filter matches substrings, so a sibling "<project>-sanity" project
+    # would answer to the base project's name. Keep only this project's own.
+    return {
+        name
+        for name in result.stdout.splitlines()
+        if name.startswith(f"{project_name}_")
+    }
+
+
+def _project_image_names(project_name: str) -> set[str]:
+    """Return the claim-owned image tags one Compose project still holds."""
+    result = subprocess.run(
+        [
+            "docker",
+            "images",
+            "--filter",
+            f"reference=betterborg/{project_name}-*",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.splitlines()) - {""}
+
+
+def _release_project_resources(project_name: str) -> None:
+    """Remove whatever a project left behind, so that one failing leak test
+    cannot starve later runs of Docker's address pool."""
+    # Containers first: Docker refuses to remove a network with a live
+    # endpoint, so leaving them would silently defeat the removals below.
+    containers = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if containers:
+        subprocess.run(
+            ["docker", "rm", "--force", *containers],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    for kind in ("network", "volume"):
+        names = _project_resource_names(kind, project_name)
+        if names:
+            subprocess.run(
+                ["docker", kind, "rm", *sorted(names)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+    images = _project_image_names(project_name)
+    if images:
+        subprocess.run(
+            ["docker", "image", "rm", *sorted(images)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 def _compose_published_host_ips(project_name: str) -> set[str]:

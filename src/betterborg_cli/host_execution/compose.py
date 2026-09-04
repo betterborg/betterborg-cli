@@ -399,47 +399,75 @@ class HostComposeManager:
                 ) from error
             except ComposeStackError as error:
                 if cancel is not None and cancel.is_set():
-                    cleanup = self._stop_project_locked(
-                        store,
-                        stack,
-                        command_owner=None,
-                        cancel=cancel,
-                        activity=activity,
+                    cleanup = (
+                        self._stop_project_locked(
+                            store,
+                            stack,
+                            command_owner=None,
+                            cancel=cancel,
+                            activity=activity,
+                        )
+                        if persisted
+                        else None
                     )
                     interrupted = KeyboardInterrupt()
-                    if cleanup.error is not None:
+                    if cleanup is not None and cleanup.error is not None:
                         interrupted.add_note(
                             f"Compose cleanup failed: {cleanup.error}"
                         )
                     raise interrupted from error
+                # The caller needs the startup failure, so a failure to block
+                # the task is reported alongside it rather than raised over it.
+                block_error: Exception | None = None
                 try:
                     self._block_task(store, claim, owner_token, str(error))
                 except ExecutionOwnershipError:
                     pass
-                cleanup = self._stop_project_locked(
-                    store,
-                    stack,
-                    command_owner=None,
-                    cancel=cancel,
-                    activity=activity,
-                )
+                except Exception as failure:  # noqa: BLE001
+                    block_error = failure
+                finally:
+                    # Teardown belongs in the finally because an exception from
+                    # an except clause escapes this clause's siblings, teardown
+                    # included. Releasing what startup created outranks
+                    # reporting why blocking the task failed.
+                    cleanup = (
+                        self._stop_project_locked(
+                            store,
+                            stack,
+                            command_owner=None,
+                            cancel=cancel,
+                            activity=activity,
+                        )
+                        if persisted
+                        else None
+                    )
                 message = str(error)
-                if cleanup.error is not None:
+                if block_error is not None:
+                    message = f"{message}; blocking the task also failed: {block_error}"
+                if cleanup is not None and cleanup.error is not None:
                     message = f"{message}; cleanup also failed: {cleanup.error}"
                 raise ComposeStackError(
                     message,
                     project_name=error.project_name,
                     command=error.command,
                 ) from error
-            except KeyboardInterrupt as error:
-                cleanup = self._stop_project_locked(
-                    store,
-                    stack,
-                    command_owner=None,
-                    cancel=cancel,
-                    activity=activity,
+            # Interruption and every failure the branches above do not name
+            # still created the project, so teardown owns this exit too. A
+            # failure before the project was recorded has nothing to tear down,
+            # and tearing down anyway would raise over the original error.
+            except BaseException as error:
+                cleanup = (
+                    self._stop_project_locked(
+                        store,
+                        stack,
+                        command_owner=None,
+                        cancel=cancel,
+                        activity=activity,
+                    )
+                    if persisted
+                    else None
                 )
-                if cleanup.error is not None:
+                if cleanup is not None and cleanup.error is not None:
                     error.add_note(f"Compose cleanup failed: {cleanup.error}")
                 raise
         return stack
@@ -1119,12 +1147,30 @@ def _cleanup_compose_model(
     marker preserves Compose's default project/service image identity.  A
     claim-owned image name is retained only for validated build services so
     ``down --rmi all`` removes those exact tags without touching shared images.
+    Every owned network and volume is also attached to each service because
+    ``down`` releases only the resources its services reference; declaring
+    them alone leaves them behind after teardown, each surviving network
+    holding one of Docker's address-pool subnets.
+    Naming the networks explicitly also suppresses the implicit ``default``
+    Compose would otherwise add, so the project's default network is released
+    only because the discovered topology carries ``default`` whenever a service
+    uses it.
     """
     service_models: dict[str, dict[str, object]] = {
-        service: {"build": {"context": "."}} for service in services
+        service: {
+            "build": {"context": "."},
+            "networks": dict.fromkeys(networks),
+        }
+        for service in services
     }
     for service, image in images.items():
         service_models[service]["image"] = image
+    if volumes:
+        for service_model in service_models.values():
+            service_model["volumes"] = [
+                {"type": "volume", "source": key, "target": f"/{key}"}
+                for key in volumes
+            ]
     model: dict[str, object] = {
         "services": service_models,
         "networks": {

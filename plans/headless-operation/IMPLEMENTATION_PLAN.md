@@ -3,9 +3,9 @@
 Betterborg cannot complete a run without a terminal. Creating a Borg refuses to
 start unless stdin is a TTY, and the same command rejects an adapter whose
 read-only boundary is a sandbox rather than a tool allowlist, which is the
-shape every native CLI adapter has. Separately, Compose stacks created during
-preflight can survive a failed run, and enough survivors exhaust Docker's
-address pool until nothing on the machine can create a network.
+shape every native CLI adapter has. Separately, a Compose stack created during
+preflight can outlive the run that created it, and enough survivors exhaust
+Docker's address pool until nothing on the machine can create a network.
 
 Together these block every unattended use: CI, cron, a queue worker, and a
 benchmark container. The work here is three independent changes, each closing
@@ -74,29 +74,50 @@ from an interviewed one to everything downstream.
 
 **Status**: Complete
 
-## Stage 3: Preflight releases every Compose network it creates
+## Stage 3: Preflight releases every Compose resource it creates
 
 **Goal**: A Compose stack created during preflight is torn down on every exit
 path, including failure and interruption, so repeated runs cannot accumulate
-networks.
+networks or volumes.
 
-Teardown already exists and removes volumes, orphans and project images. What
-is missing is that some exit path does not reach it, so a run that fails partway
-leaves its project behind. The failure is silent and cumulative: each leftover
-consumes one of Docker's predefined subnets, and once they are gone every later
-run fails to create a network for reasons that appear unrelated.
+Teardown runs a secret-free cleanup model through `compose down`, and that
+model declares the claim-owned networks and volumes without attaching them to
+any service. Compose releases only the resources its services reference, so
+every teardown, success included, returns zero while leaving the project's
+volume behind, and its network too wherever the repository names one. A
+service that declares no network is normalized onto the implicit default, so
+that one network is referenced and released; a named network no cleanup
+service joins is the case that survives. A failure the startup path does not
+name by type reaches no teardown at all and leaves the whole stack running.
+The failure is silent and cumulative: each leftover consumes one of Docker's
+predefined subnets, and once they are gone every later run fails to create a
+network for reasons that appear unrelated.
 
-**Success Criteria**:
+Teardown can only release what preflight discovered. The topology is read from
+the repository once, while startup runs against the task worktree's copy of the
+same file, so a task branch that adds a network or volume to it creates a
+resource the cleanup model never names. Closing that gap means revalidating the
+worktree's topology, which is a wider change than teardown and carries the more
+serious half of the same problem: a branch can also introduce a writable bind
+mount or a host network mode that the discovered topology never checked. Both
+belong to that work, not this one.
+
+**Success Criteria**, each for the topology preflight discovered:
 - A preflight that fails after starting a stack leaves no Compose project,
   network or volume behind.
 - The same holds when the run is interrupted rather than failing.
 - Repeated failing runs do not increase the number of Docker networks.
-- Successful runs continue to tear down as they do now.
+- A successful run releases its network and volume along with its containers
+  and images.
 
 **Tests**:
-- A preflight forced to fail after its stack starts leaves the Docker network
-  count unchanged from before the run.
-- The same assertion for an interruption path.
+- Two preflights forced to fail after their stacks start each leave their
+  project owning no network, volume, container or image.
+- The same assertion for an interruption path, and for a failure the startup
+  path does not name by type.
+- A failure while blocking the task still releases the started stack.
+- A failure before the project is recorded keeps its own error rather than
+  raising over it from a teardown that has nothing to release.
 - The existing healthy-stack isolation test continues to pass.
 
-**Status**: Not Started
+**Status**: Complete
