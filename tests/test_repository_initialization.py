@@ -1302,6 +1302,40 @@ def test_init_shows_animated_startup_account_before_bootstrap_selection(
     assert outcome == 0
 
 
+@pytest.mark.parametrize("help_option", ["-h", "--help"])
+def test_main_init_help_disposes_reporter_without_progress_output(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    help_option: str,
+) -> None:
+    arguments = ["init", help_option]
+    expected = CliRunner().invoke(cli, arguments, prog_name="betterborg")
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    assert expected.exit_code == 0
+    assert exit_code == 0
+    assert captured.out == expected.output
+    assert captured.err == ""
+    assert len(reporters) == 1
+    progress = reporters[0]
+    assert not progress.records
+    assert not progress.closed
+    assert progress._display_stopped
+    assert progress._cadence_worker is None
+    assert stream.getvalue() == ""
+
+
 def test_default_branch_keeps_detached_head_classification(
     committed_git_repo: Path,
 ) -> None:
