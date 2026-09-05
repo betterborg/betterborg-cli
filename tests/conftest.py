@@ -128,12 +128,14 @@ class RealProcessHarness:
         source: str,
         *arguments: str,
         name: str = "wrapper",
+        pipe_stdin: bool = False,
     ) -> subprocess.Popen[str]:
         """Launch a generated Python wrapper in a separately killable session."""
         script = self.root / f"{name}.py"
         script.write_text(source, encoding="utf-8")
         process = subprocess.Popen(
             [sys.executable, str(script), *arguments],
+            stdin=subprocess.PIPE if pipe_stdin else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

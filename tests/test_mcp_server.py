@@ -2406,7 +2406,9 @@ def test_stdio_stdout_contains_only_protocol_json() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery required")
-def test_blocked_stdio_sigint_has_no_cli_progress_output(tmp_path: Path) -> None:
+def test_blocked_stdio_sigint_has_no_cli_progress_output(
+    real_process_harness,
+) -> None:
     initialize = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -2417,9 +2419,6 @@ def test_blocked_stdio_sigint_has_no_cli_progress_output(tmp_path: Path) -> None
             "clientInfo": {"name": "pytest", "version": "1"},
         },
     }
-    worker_started = tmp_path / "worker-started"
-    cancellation_received = tmp_path / "cancellation-received"
-    worker_completed = tmp_path / "worker-completed"
     server_script = r'''
 from __future__ import annotations
 
@@ -2429,90 +2428,77 @@ from pathlib import Path
 from betterborg_cli import cli as cli_module
 from betterborg_cli import mcp_server
 
-worker_started = Path(sys.argv[1])
-cancellation_received = Path(sys.argv[2])
-worker_completed = Path(sys.argv[3])
+root = Path(sys.argv[1])
 
 
 def analyze(_io, *, cancel):
-    worker_started.write_text("started", encoding="utf-8")
+    (root / "mcp-worker-started").write_text("started", encoding="utf-8")
     try:
         if not cancel.wait(timeout=5):
             raise AssertionError("blocked MCP work did not receive cancellation")
-        cancellation_received.write_text("cancelled", encoding="utf-8")
+        (root / "mcp-cancellation-received").write_text(
+            "cancelled", encoding="utf-8"
+        )
     finally:
-        worker_completed.write_text("completed", encoding="utf-8")
+        (root / "mcp-worker-completed").write_text("completed", encoding="utf-8")
 
 
 mcp_server._analyze = analyze
 raise SystemExit(cli_module.main(["mcp"], prog_name="betterborg"))
 '''
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            server_script,
-            str(worker_started),
-            str(cancellation_received),
-            str(worker_completed),
-        ],
-        text=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    process = real_process_harness.launch_python(
+        server_script,
+        str(real_process_harness.root),
+        name="blocked-mcp",
+        pipe_stdin=True,
     )
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
-    try:
-        process.stdin.write(json.dumps(initialize) + "\n")
-        process.stdin.flush()
-        ready, _, _ = select.select([process.stdout], [], [], 5)
-        assert ready, "MCP server did not answer initialize"
-        response_line = process.stdout.readline()
+    process.stdin.write(json.dumps(initialize) + "\n")
+    process.stdin.flush()
+    ready, _, _ = select.select([process.stdout], [], [], 5)
+    assert ready, "MCP server did not answer initialize"
+    response_line = process.stdout.readline()
 
-        process.stdin.write(
-            json.dumps(
-                {"jsonrpc": "2.0", "method": "notifications/initialized"}
-            )
-            + "\n"
+    process.stdin.write(
+        json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
         )
-        process.stdin.write(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": "analyze", "arguments": {}},
-                }
-            )
-            + "\n"
+        + "\n"
+    )
+    process.stdin.write(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "analyze", "arguments": {}},
+            }
         )
-        process.stdin.flush()
-        deadline = time.monotonic() + 5
-        while not worker_started.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not worker_started.exists():
-            process.terminate()
-            unexpected_stdout, unexpected_stderr = process.communicate(timeout=5)
-            pytest.fail(
-                "MCP analyze worker did not start; "
-                f"stdout={unexpected_stdout!r}, stderr={unexpected_stderr!r}"
-            )
+        + "\n"
+    )
+    process.stdin.flush()
+    real_process_harness.wait_for_marker("mcp-worker-started")
 
-        process.send_signal(signal.SIGINT)
-        remaining_stdout, stderr = process.communicate(timeout=5)
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+    real_process_harness.signal(process, signal.SIGINT)
+    process.stdin.close()
+    returncode = real_process_harness.wait_for_exit(process)
+    remaining_stdout = process.stdout.read()
+    stderr = process.stderr.read()
 
     response = json.loads(response_line)
-    assert process.returncode == 130, stderr
+    assert returncode == 130, stderr
     assert response["id"] == 1
     assert response["jsonrpc"] == "2.0"
-    assert cancellation_received.read_text(encoding="utf-8") == "cancelled"
-    assert worker_completed.read_text(encoding="utf-8") == "completed"
+    assert (
+        real_process_harness.wait_for_marker("mcp-cancellation-received")
+        == "cancelled"
+    )
+    assert (
+        real_process_harness.wait_for_marker("mcp-worker-completed")
+        == "completed"
+    )
     assert remaining_stdout == ""
     protocol_output = response_line + remaining_stdout
     assert "progress" not in protocol_output.casefold()

@@ -194,6 +194,30 @@ def _dispose_unobserved_progress_after_return(
         progress.stop_display()
 
 
+def _progress_for_invocation(
+    invocation: RootInvocation,
+    *,
+    machine_readable: bool,
+) -> RunProgress | None:
+    """Construct the reporter selected for one classified root invocation."""
+
+    if invocation.command_name == "mcp":
+        return None
+    progress_kwargs: dict[str, object] = {
+        "machine_readable": machine_readable
+    }
+    if (
+        invocation.command_name == "init"
+        and not invocation.eager_exit
+        and not machine_readable
+    ):
+        progress_kwargs.update(
+            startup_label=_INIT_STARTUP_LABEL,
+            startup_pending=_INIT_STARTUP_PENDING,
+        )
+    return RunProgress(**progress_kwargs)
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.pass_context
 def cli(context: click.Context) -> None:
@@ -223,21 +247,10 @@ def main(
     requested_arguments = arguments if arguments is not None else sys.argv[1:]
     invocation = _root_invocation(requested_arguments)
     machine_readable = "--json" in requested_arguments
-    progress: RunProgress | None = None
-    if invocation.command_name != "mcp":
-        progress_kwargs: dict[str, object] = {
-            "machine_readable": machine_readable
-        }
-        if (
-            invocation.command_name == "init"
-            and not invocation.eager_exit
-            and not machine_readable
-        ):
-            progress_kwargs.update(
-                startup_label=_INIT_STARTUP_LABEL,
-                startup_pending=_INIT_STARTUP_PENDING,
-            )
-        progress = RunProgress(**progress_kwargs)
+    progress = _progress_for_invocation(
+        invocation,
+        machine_readable=machine_readable,
+    )
     run = CliRunContext(
         CancellationToken(),
         progress,
@@ -428,19 +441,10 @@ def _repository_progress(machine_readable: bool) -> RunProgress | None:
     if invocation.command_name == "mcp":
         return None
     if not run.progress_configured:
-        progress_kwargs: dict[str, object] = {
-            "machine_readable": machine_readable
-        }
-        if (
-            invocation.command_name == "init"
-            and not invocation.eager_exit
-            and not machine_readable
-        ):
-            progress_kwargs.update(
-                startup_label=_INIT_STARTUP_LABEL,
-                startup_pending=_INIT_STARTUP_PENDING,
-            )
-        run.progress = RunProgress(**progress_kwargs)
+        run.progress = _progress_for_invocation(
+            invocation,
+            machine_readable=machine_readable,
+        )
         run.progress_configured = True
     return run.progress
 
