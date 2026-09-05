@@ -23,6 +23,7 @@ from progress_test_support import (
     FailingStringIO,
     FakeClock,
     WaitableStringIO,
+    terminal_screen,
     terminal_text,
 )
 
@@ -1060,12 +1061,11 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
             assert tuple(spec.label for spec in snapshot.previews) == follow_up_labels
             assert len(snapshot.stages) == task_count + 2
             if expected_live_account is not None:
-                expected_completed = (
-                    "✔ auth-refactor    2:14  merged",
-                    "✔ rate-limiter     3:02  merged",
-                    "✔ config-loader    1:48  merged",
-                )
-                expected_live = (
+                expected_literal_account = (
+                    "✔ auth-refactor    2:14  merged\n"
+                    "✔ rate-limiter     3:02  merged\n"
+                    "✔ config-loader    1:48  merged\n"
+                    "\n"
                     "  3 done · 2 running · 9 pending\n"
                     "  ⠋ webhook-retry   0:41  review (pass 2/3)\n"
                     "      └ reading src/webhook/retry.go\n"
@@ -1074,27 +1074,16 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
                     "\n"
                     "  ctrl-c to stop"
                 )
-                actual_live = "\n".join(
-                    line.plain for line in progress._live_lines()
-                )
-                assert actual_live == expected_live
                 output = stream.wait_for(
-                    lambda value: expected_live_account in terminal_text(value)
+                    lambda value: expected_literal_account
+                    in terminal_screen(value)
                 )
                 rendered = terminal_text(output)
-                actual_completed = tuple(
-                    line for line in expected_completed if line in rendered
-                )
-                expected_account = "\n".join(
-                    (*expected_completed, "", expected_live)
-                )
-                actual_account = "\n".join(
-                    (*actual_completed, "", actual_live)
-                )
-                assert actual_account == expected_account
-                assert "✔ Estimate and decision" in rendered
-                assert "✔ Preflight" in rendered
-                assert expected_live_account in rendered
+                visible = terminal_screen(output)
+                assert expected_literal_account in visible
+                assert "✔ Estimate and decision" in visible
+                assert "✔ Preflight" in visible
+                assert expected_live_account in visible
                 assert "5 done · 2 running · 9 pending" not in rendered
         finally:
             release_scheduler.set()
@@ -1131,6 +1120,180 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         for adopted, projected in zip(
             adopted_follow_ups, projected_follow_ups, strict=True
         )
+    )
+
+
+def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_progress = RunProgress
+    actual_scheduler_config = HostSchedulerConfig
+
+    def run_reporter(*, interactive: bool) -> tuple[str, ...]:
+        name = "reporter-parity-run"
+        mode = "interactive" if interactive else "plain"
+        run_root = committed_git_repo.parent / f"reporter-parity-{mode}-repo"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(committed_git_repo), str(run_root)],
+            check=True,
+        )
+        _repository, paths, _borg, _approval, _fixture, publication = (
+            _seed_executable_generation(
+                run_root,
+                planning_cli_repository,
+                approved_task_generation,
+                name=name,
+                task_titles=("reporter-parity",),
+            )
+        )
+        config_path = paths.tracked_dir / "config.toml"
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8")
+            + "\n[execution]\njobs = 1\nreview_passes = 3\n",
+            encoding="utf-8",
+        )
+        stream = WaitableStringIO(interactive=interactive)
+        progress_clock = FakeClock()
+        progress_ref: dict[str, RunProgress] = {}
+        task = publication.files[0].task
+        plan = HostPreflightPlan(
+            repository_root=run_root,
+            commands=(),
+            prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
+            materialize_commands=(),
+            environment_files=(),
+            executables=(),
+            required_secret_names=(),
+            compose_files=(),
+            services=(),
+        )
+
+        def progress_factory(**kwargs) -> RunProgress:
+            progress = real_progress(
+                stream=stream if kwargs.get("enabled", True) else StringIO(),
+                clock=progress_clock,
+                width=100,
+                **kwargs,
+            )
+            if kwargs.get("enabled", True):
+                progress_ref["progress"] = progress
+            return progress
+
+        class ReadyPreflight:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.validated_result = None
+
+            def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
+                self.validated_result = plan
+                return plan
+
+        class PreparedWorktrees:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def prepare_current_task_worktrees(self, *_args, **_kwargs):
+                return [SimpleNamespace(task_id=task.id, path=run_root)]
+
+            def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
+                return False
+
+        class CleanCompose:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
+                return ()
+
+        class DeterministicRuntime:
+            def __init__(self, runtime_plan, **_kwargs) -> None:
+                self.plan = runtime_plan
+
+            def with_secret_values(self, _secret_values):
+                return self
+
+            def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
+                return ("prepared",)
+
+            def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+                progress = progress_ref["progress"]
+                progress_clock.now = 65.0
+                progress.stages[context.stage_key].started_at = 0.0
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.DONE,
+                )
+                return TaskRuntimeStatus.DONE
+
+        with monkeypatch.context() as run_patch:
+            run_patch.delenv("CI", raising=False)
+            run_patch.delenv("NO_COLOR", raising=False)
+            run_patch.delenv("TERM", raising=False)
+            run_patch.setattr(cli_module, "RunProgress", progress_factory)
+            run_patch.setattr(cli_module, "HostPreflight", ReadyPreflight)
+            run_patch.setattr(
+                cli_module,
+                "select_agent",
+                lambda *_args, **_kwargs: SimpleNamespace(
+                    name="mock", model="test-model", effort=None
+                ),
+            )
+            run_patch.setattr(
+                cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
+            )
+            run_patch.setattr(cli_module, "HostComposeManager", CleanCompose)
+            run_patch.setattr(cli_module, "HostWorktreeManager", PreparedWorktrees)
+            run_patch.setattr(
+                cli_module, "HostCodingPhase", lambda *_a, **_k: object()
+            )
+            run_patch.setattr(
+                cli_module, "HostReviewFixPhase", lambda *_a, **_k: object()
+            )
+            run_patch.setattr(
+                cli_module, "HostMergePhase", lambda *_a, **_k: object()
+            )
+            run_patch.setattr(
+                cli_module, "HostSanityPhase", lambda *_a, **_k: object()
+            )
+            run_patch.setattr(cli_module, "HostTaskRuntime", DeterministicRuntime)
+            run_patch.setattr(
+                cli_module,
+                "HostSchedulerConfig",
+                lambda *, jobs, review_passes: actual_scheduler_config(
+                    jobs=jobs,
+                    review_passes=review_passes,
+                    poll_interval_seconds=0.005,
+                ),
+            )
+            _trust(cli_runner, run_root, run_patch)
+            result = cli_runner.invoke(
+                cli,
+                ["execute", name, "--auto-execute"],
+            )
+
+        assert result.exit_code == 0, result.output
+        labels = ("Estimate and decision", "Preflight", "reporter-parity")
+        rows: list[str] = []
+        for line in terminal_text(stream.getvalue()).splitlines():
+            for label in labels:
+                marker = f"✔ {label}"
+                if marker in line:
+                    rows.append(line[line.index(marker) :])
+                    break
+        assert len(rows) == len(labels)
+        return tuple(rows)
+
+    interactive_rows = run_reporter(interactive=True)
+    plain_rows = run_reporter(interactive=False)
+
+    assert plain_rows == interactive_rows
+    assert plain_rows == (
+        "✔ Estimate and decision  0:00  bypassed",
+        "✔ Preflight              0:00  ready",
+        "✔ reporter-parity        1:05  merged",
     )
 
 

@@ -15,6 +15,58 @@ def terminal_text(value: str) -> str:
     return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
+def terminal_screen(value: str) -> str:
+    """Replay the ANSI controls Rich uses and return the visible screen."""
+
+    lines = [""]
+    row = 0
+    column = 0
+    index = 0
+    control = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+
+    def ensure_row() -> None:
+        while len(lines) <= row:
+            lines.append("")
+
+    while index < len(value):
+        match = control.match(value, index)
+        if match is not None:
+            parameters, _intermediate, command = match.groups()
+            if command == "A":
+                amount = int(parameters or "1")
+                row = max(0, row - amount)
+            elif command == "K":
+                ensure_row()
+                if parameters in {"", "0", "2"}:
+                    lines[row] = ""
+                    column = 0
+            index = match.end()
+            continue
+
+        character = value[index]
+        index += 1
+        if character == "\r":
+            column = 0
+        elif character == "\n":
+            row += 1
+            column = 0
+            ensure_row()
+        elif character == "\x1b":
+            continue
+        else:
+            ensure_row()
+            line = lines[row]
+            if len(line) < column:
+                line += " " * (column - len(line))
+            if column == len(line):
+                lines[row] = line + character
+            else:
+                lines[row] = line[:column] + character + line[column + 1 :]
+            column += 1
+
+    return "\n".join(line.rstrip() for line in lines).rstrip()
+
+
 class FakeClock:
     """A manually advanced monotonic clock."""
 

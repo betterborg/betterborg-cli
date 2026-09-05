@@ -295,6 +295,7 @@ class RunProgress:
             tuple[StageRecord | ChildRecord, str | None]
         ] = []
         self._queued_lines: list[Text] = []
+        self._has_permanent_output = False
         self._lock = threading.RLock()
         self._initializing = True
         for spec in stages:
@@ -1019,7 +1020,7 @@ class RunProgress:
                     self._live.update(Text(""), refresh=True)
                     self._live_empty = True
                 return
-            renderable = Group(*(self._live_renderable(line) for line in lines))
+            renderable = Group(*self._interactive_live_renderables(lines))
             if self._live is None:
                 self._live = Live(
                     renderable,
@@ -1465,9 +1466,7 @@ class RunProgress:
                 snapshot = self._projection_snapshot()
                 if self._interactive:
                     lines = self._project_live_lines(snapshot)
-                    renderable = Group(
-                        *(self._live_renderable(line) for line in lines)
-                    )
+                    renderable = Group(*self._interactive_live_renderables(lines))
                     if self._live is None:
                         self._live = Live(
                             renderable,
@@ -1589,8 +1588,16 @@ class RunProgress:
         if self._interactive:
             line = self._stream_safe(self._truncate(line))
             self._output_console().print(line, soft_wrap=True)
+            self._has_permanent_output = True
         else:
             self._write_plain(line)
+
+    def _interactive_live_renderables(self, lines: list[Text]) -> list[Text | Spinner]:
+        renderables: list[Text | Spinner] = []
+        if self._has_permanent_output:
+            renderables.append(Text(""))
+        renderables.extend(self._live_renderable(line) for line in lines)
+        return renderables
 
     def _write_plain(self, line: Text) -> None:
         line = self._stream_safe(self._truncate(line))
