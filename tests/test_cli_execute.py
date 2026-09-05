@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
@@ -17,7 +20,7 @@ from uuid import uuid4
 import click
 import pytest
 from click.testing import CliRunner
-from progress_test_support import FailingStringIO, TTYStringIO
+from progress_test_support import FailingStringIO, FakeClock, WaitableStringIO
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
@@ -28,7 +31,14 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.cli import CliRunContext, cli
-from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
+from betterborg_cli.host_execution import (
+    HostCommand,
+    HostExecutionResult,
+    HostPreflightPlan,
+    HostSchedulerConfig,
+    HostTaskScheduler,
+    ScheduledTaskContext,
+)
 from betterborg_cli.planning import TaskPublisher
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repository_config import AgentStage
@@ -37,7 +47,12 @@ from betterborg_cli.store import (
     ExecutionRunStatus,
     PlanApproval,
     SqliteStore,
+    TaskRuntimeStatus,
 )
+
+
+def _terminal_text(value: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
 def _task_body(round_number: int) -> dict[str, object]:
@@ -64,6 +79,7 @@ def _seed_executable_generation(
     *,
     name: str = "execute-gate",
     round_number: int = 1,
+    task_count: int = 1,
     approval: PlanApproval | None = None,
 ):
     if approval is None:
@@ -104,11 +120,17 @@ def _seed_executable_generation(
                 },
             )
             store.append_plan_approval(approval)
+        bodies = []
+        for position in range(1, task_count + 1):
+            body = _task_body(round_number)
+            body["stem"] = f"{round_number:02d}-execute-gate-{position:02d}"
+            body["title"] = f"Execute task {position}"
+            bodies.append(body)
         fixture = approved_task_generation(
             store,
             borg,
             approval,
-            body=_task_body(round_number),
+            body=bodies,
             round_number=round_number,
             task_ref=f"T-{round_number}",
         )
@@ -518,14 +540,16 @@ def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation
     assert preflight.result == "ready"
 
 
-def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
+@pytest.mark.parametrize("blocked_seam", ["configuration", "publication"])
+def test_execute_projects_the_first_live_frame_before_repository_setup_returns(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
     approved_task_generation,
     monkeypatch: pytest.MonkeyPatch,
+    blocked_seam: str,
 ) -> None:
-    name = "execution-preview"
+    name = f"execution-preview-{blocked_seam}"
     _repository, _paths, _borg, _approval, fixture, _publication = (
         _seed_executable_generation(
             committed_git_repo,
@@ -538,79 +562,52 @@ def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+    frames: list[tuple[RunProgress, tuple[str, ...]]] = []
+    real_progress = RunProgress
+    real_refresh = RunProgress._refresh_transient
 
-    class TrackingProgress(RunProgress):
-        def __init__(self) -> None:
-            self.previews: list[
-                tuple[tuple[StageSpec, ...], tuple[str, ...] | None]
-            ] = []
-            self.declarations: list[StageSpec] = []
-            self.rendered_frames: list[tuple[str, ...]] = []
-            super().__init__(stream=TTYStringIO())
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(stream=stream, width=100, **kwargs)
+        reporters.append(progress)
+        return progress
 
-        def _refresh_transient(self, *, started=None, parent_label=None) -> None:
-            frame = tuple(line.plain for line in self._live_lines())
-            if frame and not self._suspension_depth:
-                self.rendered_frames.append(frame)
-            super()._refresh_transient(started=started, parent_label=parent_label)
+    def observed_refresh(progress, *, started=None, parent_label=None) -> None:
+        frame = tuple(line.plain for line in progress._live_lines())
+        if frame and not progress._suspension_depth:
+            frames.append((progress, frame))
+        real_refresh(progress, started=started, parent_label=parent_label)
 
-        def preview_pending(
-            self,
-            specs: tuple[StageSpec, ...],
-            *,
-            cohort_keys: tuple[str, ...] | None = None,
-        ) -> None:
-            self.previews.append((specs, cohort_keys))
-            super().preview_pending(specs, cohort_keys=cohort_keys)
-
-        def declare(self, spec: StageSpec):
-            self.declarations.append(spec)
-            return super().declare(spec)
-
-    progress = TrackingProgress()
-    run = CliRunContext(CancellationToken(), progress)
-
-    def assert_launch_projection() -> None:
-        frame = [line.plain for line in progress._live_lines()]
-        assert any("Estimate and decision" in line for line in frame)
-        assert "  ◦ Preflight" in frame
-        assert "  ◦ Push project branch" in frame
-        assert "  ◦ Open rollup pull request" in frame
-        assert tuple(progress.stages) == ("estimate-decision",)
-
+    entered = threading.Event()
+    release = threading.Event()
     actual_load_config = cli_module.load_repository_config
 
-    def observed_load_config(paths):
-        assert_launch_projection()
+    def blocked_load_config(paths):
+        entered.set()
+        assert release.wait(timeout=2)
         return actual_load_config(paths)
 
     actual_inspect = TaskPublisher.inspect_current_task_files
 
-    def observed_inspect(publisher, borg_id):
-        assert_launch_projection()
+    def blocked_inspect(publisher, borg_id):
+        entered.set()
+        assert release.wait(timeout=2)
         return actual_inspect(publisher, borg_id)
 
-    def observed_estimate(_name, _estimate):
-        frame = [line.plain for line in progress._live_lines()]
-        assert f"  ◦ {fixture.task.title}" in frame
-        assert "  ◦ Preflight" in frame
-        assert "  ◦ Push project branch" in frame
-        assert "  ◦ Open rollup pull request" in frame
-        assert tuple(progress.stages) == ("estimate-decision",)
-
-    def invoke_host(*_args, progress=None, **_kwargs):
-        assert progress is run.progress
-        frame = [line.plain for line in progress._live_lines()]
-        assert f"  ◦ {fixture.task.title}" in frame
-        assert any("Preflight" in line for line in frame)
-        assert "  ◦ Push project branch" in frame
-        assert "  ◦ Open rollup pull request" in frame
-        return _execution_result()
-
-    monkeypatch.setattr(cli_module, "load_repository_config", observed_load_config)
-    monkeypatch.setattr(TaskPublisher, "inspect_current_task_files", observed_inspect)
-    monkeypatch.setattr(cli_module, "_write_execution_estimate", observed_estimate)
-    monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke_host)
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(RunProgress, "_refresh_transient", observed_refresh)
+    if blocked_seam == "configuration":
+        monkeypatch.setattr(cli_module, "load_repository_config", blocked_load_config)
+    else:
+        monkeypatch.setattr(
+            TaskPublisher, "inspect_current_task_files", blocked_inspect
+        )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
     monkeypatch.setattr(
         cli_module,
         "_push_project_base",
@@ -622,14 +619,45 @@ def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
         lambda *_args, **_kwargs: "opened",
     )
 
-    result = cli_runner.invoke(
-        cli,
-        ["execute", name, "--auto-execute", "--push", "--pr"],
-        obj=run,
-    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", "--push", "--pr"],
+        )
+        assert entered.wait(timeout=2)
+        try:
+            progress = next(
+                reporter for reporter in reporters if reporter._enabled
+            )
+            rendered = stream.wait_for(
+                lambda value: all(
+                    label in _terminal_text(value)
+                    for label in (
+                        "Estimate and decision",
+                        "Preflight",
+                        "Push project branch",
+                        "Open rollup pull request",
+                    )
+                )
+            )
+            assert "  ◦ Preflight" in _terminal_text(rendered)
+            assert "  ◦ Push project branch" in _terminal_text(rendered)
+            assert "  ◦ Open rollup pull request" in _terminal_text(rendered)
+            assert tuple(progress.stages) == ("estimate-decision",)
+            assert tuple(
+                spec.label for spec in progress._projection_snapshot().previews
+            ) == (
+                "Preflight",
+                "Push project branch",
+                "Open rollup pull request",
+            )
+        finally:
+            release.set()
+        result = invocation.result(timeout=5)
 
     assert result.exit_code == 0, result.output
-    first_frame = progress.rendered_frames[0]
+    first_frame = next(frame for reporter, frame in frames if reporter is progress)
     estimate_line = next(
         line for line in first_frame if "Estimate and decision" in line
     )
@@ -639,28 +667,402 @@ def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
     assert "  ◦ Preflight" in first_frame
     assert "  ◦ Push project branch" in first_frame
     assert "  ◦ Open rollup pull request" in first_frame
-    assert len(progress.previews) == 2
-    launch_specs, launch_cohort = progress.previews[0]
-    publication_specs, publication_cohort = progress.previews[1]
-    assert launch_specs[0] is cli_module.EXECUTION_PREFLIGHT_STAGE
-    assert tuple(spec.key for spec in launch_specs[1:]) == (
-        "push-project",
-        "rollup-pr",
-    )
-    assert launch_cohort == ("push-project", "rollup-pr")
-    assert publication_specs[0] is cli_module.EXECUTION_PREFLIGHT_STAGE
-    assert publication_specs[-2] is launch_specs[1]
-    assert publication_specs[-1] is launch_specs[2]
     task_key = str(fixture.task.id)
-    assert publication_specs[1] == StageSpec(task_key, fixture.task.title)
-    assert publication_cohort == (task_key, "push-project", "rollup-pr")
-    assert progress.declarations[1] is cli_module.EXECUTION_PREFLIGHT_STAGE
-    assert progress.declarations[-2] is launch_specs[1]
-    assert progress.declarations[-1] is launch_specs[2]
     assert progress.stages["preflight"].state is StageState.COMPLETED
     assert progress.stages["push-project"].state is StageState.COMPLETED
     assert progress.stages["rollup-pr"].state is StageState.COMPLETED
     assert task_key not in progress.stages
+
+
+@pytest.mark.parametrize(
+    (
+        "task_count",
+        "completed_count",
+        "follow_up_arguments",
+        "expected_live_account",
+        "expected_summary_count",
+    ),
+    [
+        (1, 0, ("--push", "--pr"), None, 5),
+        (14, 3, (), "3 done · 2 running · 9 pending", 16),
+    ],
+)
+def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    task_count: int,
+    completed_count: int,
+    follow_up_arguments: tuple[str, ...],
+    expected_live_account: str | None,
+    expected_summary_count: int,
+) -> None:
+    name = f"execution-projection-{task_count}"
+    _repository, paths, borg, _approval, _fixture, publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+            task_count=task_count,
+        )
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n[execution]\njobs = 2\nreview_passes = 3\n",
+        encoding="utf-8",
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+
+    task_records = tuple(item.task for item in publication.files)
+    task_keys = tuple(str(task.id) for task in task_records)
+    task_labels = tuple(task.title for task in task_records)
+    if completed_count:
+        seeded_cancel = CancellationToken()
+        seeded = 0
+
+        def complete_seeded_task(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            nonlocal seeded
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.DONE,
+            )
+            seeded += 1
+            if seeded == completed_count:
+                seeded_cancel.cancel()
+            return TaskRuntimeStatus.DONE
+
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+            seeded_result = HostTaskScheduler(
+                store,
+                complete_seeded_task,
+                config=HostSchedulerConfig(
+                    jobs=1,
+                    poll_interval_seconds=0.005,
+                ),
+            ).run(
+                borg.id,
+                publication.generation.id,
+                cancel=seeded_cancel,
+            )
+            assert seeded_result.status is ExecutionRunStatus.CANCELLED
+            assert sum(
+                runtime.status is TaskRuntimeStatus.DONE
+                for runtime in store.list_task_runtimes(publication.generation.id)
+            ) == completed_count
+
+    stream = WaitableStringIO(interactive=True)
+    progress_clock = FakeClock()
+    progress_ref: dict[str, RunProgress] = {}
+    real_progress = RunProgress
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(
+            stream=stream if kwargs.get("enabled", True) else StringIO(),
+            clock=progress_clock,
+            width=100,
+            **kwargs,
+        )
+        if kwargs.get("enabled", True):
+            progress_ref["progress"] = progress
+        return progress
+
+    follow_up_labels = (
+        ("Push project branch", "Open rollup pull request")
+        if follow_up_arguments
+        else ()
+    )
+    setup_checkpoints: list[str] = []
+
+    def assert_setup_projection(checkpoint: str) -> None:
+        progress = progress_ref["progress"]
+        snapshot = progress._projection_snapshot()
+        stages = {stage.record.key: stage.record for stage in snapshot.stages}
+        assert stages["estimate-decision"].state is StageState.COMPLETED
+        assert stages["preflight"].state is StageState.COMPLETED
+        assert not set(task_keys).intersection(stages)
+        assert tuple(spec.label for spec in snapshot.previews) == (
+            *task_labels,
+            *follow_up_labels,
+        )
+        assert snapshot.cohort_keys == frozenset(
+            (*task_keys, *(spec.key for spec in snapshot.previews[-2:]))
+            if follow_up_arguments
+            else task_keys
+        )
+        setup_checkpoints.append(checkpoint)
+
+    actual_write_estimate = cli_module._write_execution_estimate
+    projected_follow_ups: tuple[StageSpec, ...] = ()
+
+    def observed_write_estimate(project_name, estimate) -> None:
+        nonlocal projected_follow_ups
+        progress = progress_ref["progress"]
+        snapshot = progress._projection_snapshot()
+        assert tuple(spec.label for spec in snapshot.previews) == (
+            "Preflight",
+            *task_labels,
+            *follow_up_labels,
+        )
+        assert tuple(progress.stages) == ("estimate-decision",)
+        projected_follow_ups = tuple(
+            spec for spec in snapshot.previews if spec.label in follow_up_labels
+        )
+        setup_checkpoints.append("decision")
+        actual_write_estimate(project_name, estimate)
+
+    plan = HostPreflightPlan(
+        repository_root=committed_git_repo,
+        commands=(),
+        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
+        materialize_commands=(),
+        environment_files=(),
+        executables=(),
+        required_secret_names=(),
+        compose_files=(),
+        services=(),
+    )
+
+    class ObservedPreflight:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.validated_result = None
+
+        def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
+            progress = progress_ref["progress"]
+            snapshot = progress._projection_snapshot()
+            assert snapshot.stages[-1].record.key == "preflight"
+            assert snapshot.stages[-1].record.state is StageState.RUNNING
+            assert tuple(spec.label for spec in snapshot.previews) == (
+                *task_labels,
+                *follow_up_labels,
+            )
+            setup_checkpoints.append("preflight-validation")
+            self.validated_result = plan
+            return plan
+
+    selected_stages: list[AgentStage] = []
+
+    def select_observed_agent(_config, stage, *_args, **_kwargs):
+        assert_setup_projection(f"agent-{stage.value}")
+        selected_stages.append(stage)
+        return SimpleNamespace(name="mock", model="test-model", effort=None)
+
+    class ObservedWorktrees:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def prepare_current_task_worktrees(self, *_args, **_kwargs):
+            assert_setup_projection("worktree-preparation")
+            return [
+                SimpleNamespace(task_id=task.id, path=committed_git_repo)
+                for task in task_records
+            ]
+
+        def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class ObservedCompose:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
+            return ()
+
+    active_lock = threading.Lock()
+    active_started = 0
+    target_active = min(2, task_count - completed_count)
+    scheduler_blocked = threading.Event()
+    release_scheduler = threading.Event()
+
+    class BlockingRuntime:
+        def __init__(self, runtime_plan, **_kwargs) -> None:
+            self.plan = runtime_plan
+
+        def with_secret_values(self, _secret_values):
+            return self
+
+        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
+            assert_setup_projection("cache-preparation")
+            return ("prepared",)
+
+        def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            nonlocal active_started
+            with active_lock:
+                active_started += 1
+                if active_started == target_active:
+                    scheduler_blocked.set()
+            assert release_scheduler.wait(timeout=3)
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.DONE,
+            )
+            return TaskRuntimeStatus.DONE
+
+    actual_reconcile = SqliteStore.reconcile_expired_execution_runs
+    stale_checks = 0
+
+    def observed_reconcile(store, *args, **kwargs):
+        nonlocal stale_checks
+        progress = progress_ref.get("progress")
+        if progress is not None and not set(task_keys).intersection(progress.stages):
+            stale_checks += 1
+            assert_setup_projection(f"stale-cleanup-{stale_checks}")
+        return actual_reconcile(store, *args, **kwargs)
+
+    actual_acquire = SqliteStore.acquire_execution_run
+
+    def observed_acquire(store, *args, **kwargs):
+        acquisition = actual_acquire(store, *args, **kwargs)
+        assert acquisition.acquired
+        assert_setup_projection("run-acquisition")
+        return acquisition
+
+    actual_follow_up = cli_module._run_execution_follow_up
+    adopted_follow_ups: list[StageSpec] = []
+
+    def observed_follow_up(progress, spec, action, **kwargs) -> None:
+        adopted_follow_ups.append(spec)
+        actual_follow_up(progress, spec, action, **kwargs)
+
+    actual_scheduler_config = HostSchedulerConfig
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(
+        cli_module, "_write_execution_estimate", observed_write_estimate
+    )
+    monkeypatch.setattr(cli_module, "HostPreflight", ObservedPreflight)
+    monkeypatch.setattr(cli_module, "select_agent", select_observed_agent)
+    monkeypatch.setattr(
+        cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(cli_module, "HostComposeManager", ObservedCompose)
+    monkeypatch.setattr(cli_module, "HostWorktreeManager", ObservedWorktrees)
+    monkeypatch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostReviewFixPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostMergePhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostSanityPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostTaskRuntime", BlockingRuntime)
+    monkeypatch.setattr(
+        cli_module,
+        "HostSchedulerConfig",
+        lambda *, jobs: actual_scheduler_config(
+            jobs=jobs,
+            poll_interval_seconds=0.005,
+        ),
+    )
+    monkeypatch.setattr(
+        SqliteStore, "reconcile_expired_execution_runs", observed_reconcile
+    )
+    monkeypatch.setattr(SqliteStore, "acquire_execution_run", observed_acquire)
+    monkeypatch.setattr(
+        cli_module, "_run_execution_follow_up", observed_follow_up
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", lambda *_args: "pushed")
+    monkeypatch.setattr(
+        cli_module,
+        "_open_rollup_pull_request",
+        lambda *_args, **_kwargs: "opened",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", *follow_up_arguments],
+        )
+        assert scheduler_blocked.wait(timeout=3)
+        try:
+            progress = progress_ref["progress"]
+            snapshot = progress._projection_snapshot()
+            task_stages = {
+                stage.record.key: stage.record
+                for stage in snapshot.stages
+                if stage.record.key in task_keys
+            }
+            assert len(task_stages) == task_count
+            assert sum(
+                stage.state is StageState.COMPLETED
+                for stage in task_stages.values()
+            ) == completed_count
+            assert sum(
+                stage.state is StageState.RUNNING
+                for stage in task_stages.values()
+            ) == target_active
+            retained = tuple(
+                progress.stages[key]
+                for key, stage in task_stages.items()
+                if stage.state is StageState.COMPLETED
+            )
+            pending = tuple(
+                progress.stages[key]
+                for key, stage in task_stages.items()
+                if stage.state is StageState.PENDING
+            )
+            assert all(
+                stage.retained
+                and stage.started_at is None
+                and stage.finished_at is None
+                for stage in retained
+            )
+            assert all(
+                not stage.retained
+                and stage.started_at is None
+                and stage.finished_at is None
+                for stage in pending
+            )
+            assert tuple(spec.label for spec in snapshot.previews) == follow_up_labels
+            assert len(snapshot.stages) == task_count + 2
+            if expected_live_account is not None:
+                output = stream.wait_for(
+                    lambda value: expected_live_account in _terminal_text(value)
+                )
+                rendered = _terminal_text(output)
+                assert "✔ Estimate and decision" in rendered
+                assert "✔ Preflight" in rendered
+                assert expected_live_account in rendered
+                assert "5 done · 2 running · 9 pending" not in rendered
+        finally:
+            release_scheduler.set()
+        result = invocation.result(timeout=10)
+
+    assert result.exit_code == 0, result.output
+    assert selected_stages == [AgentStage.CODING, AgentStage.REVIEW, AgentStage.MERGE]
+    assert setup_checkpoints == [
+        "decision",
+        "preflight-validation",
+        "agent-coding",
+        "agent-review",
+        "agent-merge",
+        "stale-cleanup-1",
+        "run-acquisition",
+        "stale-cleanup-2",
+        "worktree-preparation",
+        "cache-preparation",
+    ]
+    assert stale_checks == 2
+    assert len(progress.stages) == expected_summary_count
+    assert all(
+        stage.state is StageState.COMPLETED
+        for stage in progress.stages.values()
+    )
+    assert (
+        f"{expected_summary_count} of {expected_summary_count} stages finished "
+        "in 0:00; none failed or stopped."
+    ) in _terminal_text(stream.getvalue())
+    assert len(adopted_follow_ups) == len(projected_follow_ups)
+    assert all(
+        adopted is projected
+        for adopted, projected in zip(
+            adopted_follow_ups, projected_follow_ups, strict=True
+        )
+    )
 
 
 def test_execute_without_push_succeeds_without_a_remote(
