@@ -1449,6 +1449,7 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
     assert progress.stages["improvement-prds"].state is StageState.STOPPED
     assert progress.stages["improvement-prds"].result == "interrupted"
     assert progress.closed
+    assert progress._cadence_worker is None
     output = progress_stream.getvalue()
     assert output.index("✔ Generate role prompts") < output.index(
         "⠋ Draft improvement PRDs"
@@ -1457,6 +1458,13 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
     assert "interrupted" in output
     assert "✖ Draft improvement PRDs" not in output
     assert "✔ Draft improvement PRDs" not in output
+    assert len(
+        re.findall(
+            r"3 of 4 stages finished in \d+:\d{2}; "
+            r"0 failed and 1 stopped\.",
+            output,
+        )
+    ) == 1
     assert len(adapter.calls) == 4
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:

@@ -8,6 +8,7 @@ import runpy
 import selectors
 import signal
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -30,7 +31,7 @@ from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentStage
-from betterborg_cli.store import Repository, SqliteStore
+from betterborg_cli.store import Borg, BorgState, Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
 
 
@@ -785,6 +786,7 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
     def command(run: cli_module.CliRunContext) -> None:
         observed["run"] = run
         run.progress.declare(StageSpec("work", "Work"))
+        run.progress.declare(StageSpec("waiting", "Waiting"))
         run.progress.start("work")
         observed["before_interrupt"] = stream.getvalue()
         try:
@@ -814,6 +816,15 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
     run = observed["run"]
     assert isinstance(run, cli_module.CliRunContext)
     assert run.progress.closed
+    assert run.progress._cadence_worker is None
+    assert run.progress.stages["waiting"].state is StageState.PENDING
+    lines = stream.getvalue().splitlines()
+    expected_summary = (
+        "1 of 1 stage finished in 0:00; none failed or stopped."
+        if terminal_state is StageState.COMPLETED
+        else "0 of 1 stage finished in 0:00; 0 failed and 1 stopped."
+    )
+    assert lines.count(expected_summary) == 1
     assert "Error:" not in stream.getvalue()
 
 
@@ -872,7 +883,7 @@ def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
     assert "stopped" in stream.getvalue()
 
 
-def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
+def test_main_waits_for_first_sigint_dispatch_before_disposing_progress(
     monkeypatch: MonkeyPatch,
 ) -> None:
     stream = io.StringIO()
@@ -898,6 +909,7 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     @click.pass_obj
     def command(run: cli_module.CliRunContext) -> None:
         observed["run"] = run
+        run.progress.declare(StageSpec("waiting", "Waiting"))
         os.kill(os.getpid(), signal.SIGINT)
 
     def inspect_before_release() -> None:
@@ -927,14 +939,240 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     assert observed["closed_before_release"] is False
     assert run.cancellation.is_set()
     assert run.progress.cancelling
-    assert run.progress.closed
-    lines = stream.getvalue().splitlines()
-    assert len(lines) == 2
-    assert lines[0] == "stopping…"
-    assert re.fullmatch(
-        r"0 of 0 stages finished in \d+:\d{2}; none failed or stopped\.",
-        lines[1],
+    assert not run.progress.closed
+    assert run.progress._cadence_worker is None
+    assert run.progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue().splitlines() == ["stopping…"]
+
+
+@pytest.mark.parametrize(
+    ("command_name", "arguments", "expected_summary", "expected_error_type"),
+    (
+        (
+            "analyze",
+            ["analyze", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.Abort,
+        ),
+        (
+            "create",
+            ["create", "matrix", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.Abort,
+        ),
+        (
+            "init",
+            ["init", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.Abort,
+        ),
+        (
+            "plan-start",
+            ["plan", "start", "matrix", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.ClickException,
+        ),
+        (
+            "plan-change",
+            ["plan", "change", "matrix", "--note", "Refine it", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.ClickException,
+        ),
+        (
+            "plan-approve",
+            ["plan", "approve", "matrix", "--yes"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.ClickException,
+        ),
+        (
+            "execute",
+            ["execute", "matrix", "--auto-execute"],
+            "1 of 2 stages finished in 0:00; 0 failed and 1 stopped.",
+            click.Abort,
+        ),
+    ),
+    ids=(
+        "analyze",
+        "create",
+        "init",
+        "plan-start",
+        "plan-change",
+        "plan-approve",
+        "execute",
+    ),
+)
+def test_main_finalizes_reconciled_command_interruption_once(
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    command_name: str,
+    arguments: list[str],
+    expected_summary: str,
+    expected_error_type: type[BaseException],
+) -> None:
+    repository, paths = initialized_cli_repository
+    stream = io.StringIO()
+    reporters: list[RunProgress] = []
+    primary_interruptions: list[KeyboardInterrupt] = []
+    root_errors: list[BaseException] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=stream, clock=FakeClock(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def reconcile_interruption(
+        progress: RunProgress,
+        *,
+        completed_key: str | None = None,
+    ) -> KeyboardInterrupt:
+        if completed_key is None:
+            progress.declare(StageSpec("completed", "Completed"))
+            progress.start("completed")
+            progress.complete("completed", "durable")
+        else:
+            progress.complete(completed_key, "durable")
+        progress.declare(StageSpec("stopped", "Stopped"))
+        progress.start("stopped")
+        progress.declare(StageSpec("waiting", "Waiting"))
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except KeyboardInterrupt as error:
+            primary_interruptions.append(error)
+            progress.stop("stopped", "interrupted")
+            return error
+        raise AssertionError("SIGINT did not interrupt the command")
+
+    class StubRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def analyze(self) -> None:
+            raise reconcile_interruption(self.progress)
+
+        def initialize(self) -> None:
+            raise reconcile_interruption(self.progress)
+
+    class StubCreateService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def create(self, _name: str, _source: Path | None) -> None:
+            raise reconcile_interruption(self.progress)
+
+    class StubArchitectLoop:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def run(self) -> None:
+            raise reconcile_interruption(self.progress)
+
+    def interrupted_approval(
+        *_args, progress: RunProgress, **_kwargs
+    ) -> None:
+        interruption = reconcile_interruption(progress)
+        raise cli_module.SupervisorCancelled(
+            "approval retained; task publication pending"
+        ) from interruption
+
+    def interrupted_execution(
+        *_args, progress: RunProgress, **_kwargs
+    ) -> None:
+        raise reconcile_interruption(
+            progress,
+            completed_key="estimate-decision",
+        )
+
+    def capture_interrupted_exit(
+        control: cli_module.RunControl,
+        progress: RunProgress,
+    ) -> int:
+        error = sys.exception()
+        assert error is not None
+        root_errors.append(error)
+        return actual_interrupted_exit(control, progress)
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
     )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+
+    def echo(message=None, *_args, nl: bool = True, **_kwargs) -> None:
+        if message is not None:
+            stream.write(str(message))
+        if nl:
+            stream.write("\n")
+
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+    actual_interrupted_exit = cli_module._interrupted_exit_code
+    monkeypatch.setattr(
+        cli_module, "_interrupted_exit_code", capture_interrupted_exit
+    )
+
+    if command_name in {"analyze", "init"}:
+        monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+    elif command_name == "create":
+        monkeypatch.setattr(cli_module, "CreateService", StubCreateService)
+    elif command_name in {"plan-start", "plan-change"}:
+        state = (
+            BorgState.DRAFT
+            if command_name == "plan-start"
+            else BorgState.PLAN_APPROVAL_PENDING
+        )
+        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+            store.add_borg(
+                Borg(repository_id=repository.id, name="matrix", state=state)
+            )
+        monkeypatch.setattr(cli_module, "ArchitectLoop", StubArchitectLoop)
+    elif command_name == "plan-approve":
+        monkeypatch.setattr(
+            cli_module, "approve_plan_workflow", interrupted_approval
+        )
+    else:
+        monkeypatch.setattr(cli_module, "execute_workflow", interrupted_execution)
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    assert exit_code == 130
+    assert len(reporters) == 1
+    assert len(primary_interruptions) == 1
+    assert len(root_errors) == 1
+    assert isinstance(root_errors[0], expected_error_type)
+    if isinstance(root_errors[0], click.ClickException):
+        expected_messages = {
+            "plan-start": (
+                "Planning for Borg 'matrix' was interrupted. "
+                "Run 'betterborg plan start matrix' to resume."
+            ),
+            "plan-change": (
+                "Plan change for Borg 'matrix' was interrupted. "
+                "Run 'betterborg plan start matrix' to resume."
+            ),
+            "plan-approve": (
+                "Decomposition for Borg 'matrix' was interrupted "
+                "(approval retained; task publication pending). "
+                "Run 'betterborg plan approve matrix' to resume."
+            ),
+        }
+        assert root_errors[0].format_message() == expected_messages[command_name]
+    error: BaseException | None = root_errors[0]
+    while error is not None and error is not primary_interruptions[0]:
+        error = error.__cause__ or error.__context__
+    assert error is primary_interruptions[0]
+    progress = reporters[0]
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["waiting"].state is StageState.PENDING
+    lines = stream.getvalue().splitlines()
+    assert lines.count(expected_summary) == 1
+    assert lines[-1] == expected_summary
+    assert "Error:" not in stream.getvalue()
+    assert "Aborted!" not in stream.getvalue()
 
 
 def test_json_init_reconciles_cancellation_on_run_control_reporter(
