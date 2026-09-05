@@ -579,6 +579,77 @@ def test_an_assumption_survives_the_revision_that_does_not_revisit_it(
     ]
 
 
+def test_a_revision_that_names_its_assumptions_replaces_them_rather_than_adding(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The plan names the set it rests on, not every wording it has used.
+
+    A revision restating an assumption in different words is the same
+    decision, and keeping both wordings turns the section into a history of
+    the review. After a few rounds that buries the decisions it exists to
+    surface, and a reviewer reads the duplication as the defect it is.
+    """
+    initial_plan = planning_plan_response()
+    initial_plan["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    revised_plan = planning_plan_response(summary="Define the rollback behavior.")
+    # The same decision asked in different words, which is what defeats a
+    # merge that can only tell two entries apart by their question text.
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which directory holds the changelog?",
+            "assumption": "The repository root, beside the README.",
+        }
+    ]
+
+    database = committed_git_repo.parent / "tech-lead-restated.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-restated"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=revised_plan))
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Which directory holds the changelog?",
+            "assumption": "The repository root, beside the README.",
+        }
+    ]
+
+
 def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
     committed_git_repo: Path,
     persist_planning_context,
@@ -653,7 +724,7 @@ def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
 
     assert seen["current_plan"] is not None
     assert "Choose a concrete rollback strategy." in str(seen["plan_text"])
-    assert "a question raised by a plan is a question about that plan" in str(
+    assert "a question a plan raises is a question about that plan" in str(
         seen["user_prompt"]
     )
 

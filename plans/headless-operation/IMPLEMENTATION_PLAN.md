@@ -539,14 +539,22 @@ without the plan would have it decide from the requirements alone.
 The value of all of it is in the saying. A requirement the Architect settled
 for itself that reads like one it was given turns an honest gap into a false
 certainty, and the operator loses the one signal telling them where to look
-first. The plan therefore carries them from three sources: the ones the
-Architect names as its own, which only it knows it decided; the recorded
-rounds, which it cannot drop by leaving them out of a plan; and whatever the
-plan under revision already carried, because a revision addressing one finding
-has no reason to restate an assumption it is not revisiting. Carrying forward
-is unconditional, since a stale assumption sends a reader to look at settled
-ground while a dropped one leaves a decision nobody took reading like a
-requirement somebody gave, and the first is the cheaper mistake.
+first. So the plan carries them, drawn from the record of the rounds and from
+the Architect's own account of what it decided without asking.
+
+What the plan carries is the standing set, never a history of it. Planning is
+iterative: a review sends a plan back, the Architect reopens its own question,
+and the same ground is settled more than once. Three rules keep the section to
+the decisions actually in force. A later round supersedes what it re-answers,
+so the plan names the reading it was built on rather than the one it moved on
+from. A round a person answered retires its assumption outright, because their
+answer is a requirement and no other source may reinstate it. And a plan that
+names its assumptions has stated the whole set, so the plan it supersedes is
+not merged on top; that list stands in only where the new one is silent, which
+is the revision that addresses a finding without revisiting what it assumed.
+Without the last of these an assumption reworded between rounds survives in
+both wordings, and a section that is mostly restatement buries the decisions it
+exists to surface.
 
 What an attended run cannot do is originate one. Every requirement there was
 either read from the confirmed PRD or got by asking, so a plan claiming an
@@ -556,7 +564,8 @@ dropped.
 Starting a plan and changing one are the same lifecycle, and a revision is
 where the Architect first meets a requirement the original plan did not need.
 Both are run the same way, or a Borg planned without a terminal can only be
-revised with one.
+revised with one. The revision the review loop runs is the Architect the
+command never built itself, and it decides on the same terms as the rest.
 
 **Success Criteria**:
 - Run unattended, the Architect is instructed to decide rather than ask, and
@@ -564,30 +573,38 @@ revised with one.
 - A question asked regardless is answered by the Architect, against the plan
   that raised it where a plan raised it, and the stored round records what it
   assumed beside the question that prompted it.
-- The plan a reader receives names every requirement the run settled itself,
-  from all three sources, and a revision that does not mention an assumption
-  does not lose it.
+- The plan a reader receives names the requirements the run settled itself and
+  no more: the standing decision for each question, nothing a person has since
+  answered, and no restatement of what a revision reworded.
+- A revision that does not mention an assumption does not lose it.
 - Without the unattended option the existing behaviour is unchanged, including
   stopping when a prompt returns nothing and refusing an assumption a plan
   claims for itself.
 - The bounded round cap that governs question rounds still governs them, so an
   Architect that keeps asking still ends the run rather than looping.
-- Changing a plan runs unattended on the same terms as starting one.
+- Changing a plan, and revising one for the review, run unattended on the same
+  terms as starting one.
 
 **Tests**:
 - An unattended run's Architect turns carry the instruction to decide, and an
   attended run's carry neither half of it.
 - A plan run unattended names the requirements it settled for itself.
+- A question answered twice yields the later decision, not the one it
+  replaced; an answer a person gives retires the assumption entirely; and a
+  revision that names its assumptions replaces the superseded list rather than
+  adding to it.
 - A recorded round survives a plan that leaves it out, in the wording it was
-  asked in, and so does an assumption the revision does not mention.
+  asked in, and so does an assumption a silent revision does not mention.
 - A question round run unattended yields a plan with no prompt issued, its
   stored round marks the answer assumed, and a round raised by a plan is
-  decided with that plan in the workspace.
+  decided with that plan in the workspace while one raised by the questions
+  phase is not attributed to it.
 - An answer that repeats a question, skips one, or says nothing is refused,
   and an abandoned answers turn is not recovered for a later round.
 - Interactive planning still prompts, still stops on a cancelled prompt, and
   still drops an assumption its plan claims.
 - An Architect that asks past the round cap still ends the run.
-- A plan changed unattended assumes the questions its revision raises.
+- A plan changed unattended, and a plan the review sends back, both assume the
+  questions their revisions raise.
 
 **Status**: Not Started

@@ -701,7 +701,9 @@ class ArchitectLoop:
             round_number=self._turns.next_round(_ANSWERS_PHASE),
             schema=ARCHITECT_ANSWERS_SCHEMA,
             system_prompt=_ANSWERS_SYSTEM_PROMPT,
-            user_prompt=self._assumed_answers_prompt(question, plan is not None),
+            user_prompt=self._assumed_answers_prompt(
+                question, self._raised_by_a_plan(question)
+            ),
             current_plan=(
                 json.dumps(plan.result, indent=2, sort_keys=True)
                 if plan is not None
@@ -891,7 +893,7 @@ class ArchitectLoop:
         return _PLAN_SYSTEM_PROMPT + _UNATTENDED_PLAN_DIRECTIVE
 
     def _with_assumptions(
-        self, plan: dict[str, Any], superseded: dict[str, Any] | None = None
+        self, plan: dict[str, Any], superseded: dict[str, Any] | None
     ) -> dict[str, Any]:
         """Settle which assumptions the plan carries, rather than the plan.
 
@@ -899,29 +901,45 @@ class ArchitectLoop:
         Architect asked and then answered itself, which are recorded and so
         cannot be dropped by leaving them out of a plan. The Architect
         declares the requirements it decided in place of asking, which only it
-        knows it decided. And the plan this one supersedes contributes what it
-        already carried, because a revision that rewrites a plan to address a
-        finding has no reason to restate an assumption it is not revisiting,
-        and losing one there costs the reader the same warning as never making
-        it.
+        knows it decided. And the plan this one supersedes stands in when the
+        new one names none, because a revision rewriting a plan to address a
+        finding may not restate an assumption it is not revisiting, and losing
+        one there costs the reader the same warning as never making it.
 
-        Carrying forward is unconditional, so an assumption outlives the mode
-        of the run that revises it. A stale one sends a reader to look at
-        settled ground; a dropped one leaves a decision nobody took reading
-        like a requirement somebody gave. The first is the cheaper mistake.
+        What survives is the standing set, never a history of it. A revision
+        that names its assumptions has stated the whole set, so the superseded
+        list is not merged on top of it; an assumption reworded between rounds
+        would otherwise appear in both wordings, and a section that is mostly
+        restatement buries the decisions it exists to surface.
 
         What an attended run cannot do is originate one. A question there was
         answered by a person, so a plan claiming an assumption is describing a
         conversation that did not happen.
         """
         declared = self._declared_assumptions(plan) if self.unattended else []
-        carried = self._declared_assumptions(superseded or {})
-        stored = self._stored_assumptions()
+        # A plan that names its assumptions is stating the whole set it rests
+        # on, so the superseded list stands in only where the new one is
+        # silent. Merging both instead accumulates a history: a revision that
+        # rewords its own assumption keeps the old wording alongside the new,
+        # and after a few review rounds the section is mostly restatement.
+        carried = [] if declared else self._declared_assumptions(superseded or {})
+        stored, answered = self._stored_assumptions()
         assumptions: list[dict[str, str]] = []
         seen: set[str] = set()
         # Stored first: an assumption Betterborg recorded is the one whose
         # wording came from the question as asked.
-        for assumption in [*stored, *carried, *declared]:
+        for assumption in stored:
+            key = assumption["question"].casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            assumptions.append(assumption)
+        # A question that was put and answered belongs to the record, whether
+        # the record answers it or retires it. Without this, a plan carrying
+        # an assumption forward would reinstate one a person has since
+        # settled, and the carrying would outlive the answer.
+        seen |= answered
+        for assumption in [*carried, *declared]:
             key = assumption["question"].casefold()
             if key in seen:
                 continue
@@ -946,28 +964,62 @@ class ArchitectLoop:
                 assumptions.append({"question": question, "assumption": decision})
         return assumptions
 
-    def _stored_assumptions(self) -> list[dict[str, str]]:
-        """Pair every assumed answer with the question that prompted it."""
-        assumptions: list[dict[str, str]] = []
+    def _stored_assumptions(self) -> tuple[list[dict[str, str]], set[str]]:
+        """Pair the standing answer to each question with the question itself.
+
+        A question can be raised more than once, because an Architect
+        dissatisfied with its own earlier reading restates it as the plan's
+        open question. Rounds are read oldest first and each one supersedes
+        what it re-answers, so what surfaces is the decision the plan was
+        actually built on rather than the one it moved on from. A round a
+        person answered retires the assumption entirely: their answer is a
+        requirement, and listing it under decisions nobody confirmed sends
+        them to audit ground they themselves settled.
+
+        Returned beside the standing assumptions is every question the record
+        has answered at all, which is what lets the merge tell "no assumption
+        here" apart from "nothing known here".
+        """
+        standing: dict[str, dict[str, str]] = {}
+        answered: set[str] = set()
         for stored in self.store.list_planning_questions(self.borg_id):
             asked = {
                 str(item.get("id")): str(item.get("question") or "").strip()
                 for item in stored.questions
             }
             for answer in stored.answers or []:
-                if not answer.get("assumed"):
-                    continue
                 question = asked.get(str(answer.get("q_id")), "")
+                if not question:
+                    continue
+                key = question.casefold()
+                answered.add(key)
+                if not answer.get("assumed"):
+                    standing.pop(key, None)
+                    continue
                 assumption = str(answer.get("answer") or "").strip()
-                if question and assumption:
-                    assumptions.append(
-                        {"question": question, "assumption": assumption}
-                    )
-        return assumptions
+                if assumption:
+                    standing[key] = {
+                        "question": question,
+                        "assumption": assumption,
+                    }
+        return list(standing.values()), answered
+
+    def _raised_by_a_plan(self, question: PlanningQuestion) -> bool:
+        """Say whether a plan turn is what put this round on the table.
+
+        A questions-phase round during a change cycle also has a plan behind
+        it, and that plan is worth reading, but it did not raise the question
+        and telling the turn otherwise sends it looking for something that is
+        not there.
+        """
+        return any(
+            attempt.id == question.attempt_id
+            for attempt in self._turns.attempts(_PLAN_PHASE)
+        )
 
     @staticmethod
     def _assumed_answers_prompt(
-        question: PlanningQuestion, has_plan: bool = False
+        question: PlanningQuestion, raised_by_a_plan: bool
     ) -> str:
         lines = [
             "Nobody is available to answer these Architect questions, so "
@@ -977,11 +1029,11 @@ class ArchitectLoop:
             "once, by id.",
             "",
         ]
-        if has_plan:
+        if raised_by_a_plan:
             lines[0] += (
-                " The plan these questions were raised against is supplied "
-                "with this turn; read it first, because a question raised by "
-                "a plan is a question about that plan."
+                " These questions were raised by the plan supplied with this "
+                "turn; read it first, because a question a plan raises is a "
+                "question about that plan."
             )
         for item in question.questions:
             lines.append(f"- {item['id']}: {str(item['question']).strip()}")

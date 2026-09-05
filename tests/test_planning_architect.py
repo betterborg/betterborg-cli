@@ -389,6 +389,214 @@ def test_an_unattended_plan_carries_the_requirements_it_settled_itself(
         assert "Linux and macOS, because CI builds only those." in rendered
 
 
+def test_the_plan_names_the_decision_it_was_built_on_not_the_one_it_replaced(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """An Architect that reopens its own question has changed its mind.
+
+    The plan is then built on the second reading, so publishing the first
+    tells the operator the run rests on a decision it explicitly moved on
+    from, and buries the one it actually took.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required at launch?",
+                    }
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Linux only."}]})
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    reopened = dict(_plan())
+    reopened["open_questions"] = ["Which platforms are required at launch?"]
+    adapter.queue(MockResponse(payload=reopened))
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [
+                    {"q_id": "q1", "answer": "Linux and macOS; CI builds both."}
+                ]
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-superseded.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "superseded"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        # Both rounds stay on the record; only one of them is the standing
+        # decision.
+        assert [
+            (question.answers or [])[0]["answer"]
+            for question in store.list_planning_questions(borg.id)
+        ] == ["Linux only.", "Linux and macOS; CI builds both."]
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required at launch?",
+                "assumption": "Linux and macOS; CI builds both.",
+            }
+        ]
+        rendered = render_plan_markdown(result.plan)
+        assert "Linux and macOS; CI builds both." in rendered
+        assert "Linux only." not in rendered
+
+
+def test_an_answer_a_person_gives_retires_the_assumption_it_replaces(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Resuming at a terminal settles what the unattended run had to guess.
+
+    The record here holds both rounds: one the Architect assumed, and the
+    reopened one a person answered. Once a person has answered, the
+    requirement is given, and no source may put it back. The plan below both
+    declares it and carries it forward, which is exactly how it would return.
+    """
+    reinstating_plan = dict(_plan())
+    reinstating_plan["assumptions"] = [
+        {
+            "question": "Which platforms are required at launch?",
+            "assumption": "Linux only.",
+        }
+    ]
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=reinstating_plan))
+
+    database = committed_git_repo.parent / "architect-retired.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "retired"
+        )
+        asked = [
+            {"id": "q1", "question": "Which platforms are required at launch?"}
+        ]
+        for round_number, answer in (
+            (1, {"q_id": "q1", "answer": "Linux only.", "assumed": True}),
+            (2, {"q_id": "q1", "answer": "Linux and macOS."}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase="architect_questions",
+                    round=round_number,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result={"decision": "ask_more", "questions": asked},
+                )
+            )
+            question = PlanningQuestion(
+                borg_id=borg.id,
+                attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+                round=round_number,
+                questions=asked,
+            )
+            store.append_planning_question(question)
+            store.answer_planning_question(question.id, [answer])
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert "assumptions" not in result.plan
+        assert "## Assumptions" not in render_plan_markdown(result.plan)
+
+
+def test_a_question_the_questions_phase_raised_is_not_blamed_on_the_plan(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A plan under revision is context, not the source of every question.
+
+    Revising a plan means one already exists, and it is worth reading. But
+    the questions phase raises its own questions, and telling the turn a plan
+    raised one sends it hunting through that plan for something never there.
+    """
+    seen: dict[str, str] = {}
+
+    def assume_the_answer(spec):
+        seen["user_prompt"] = spec.user_prompt
+        return {"answers": [{"q_id": "q1", "answer": "Linux and macOS."}]}
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(MockResponse(dynamic=assume_the_answer))
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-revision-cycle.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "revision-cycle"
+        )
+        # A plan already reviewed and sent back: the shape a change cycle
+        # starts from, where a plan exists but has raised nothing yet.
+        for phase, result in (
+            ("architect_plan", _plan()),
+            ("tech_review", {"decision": "request_changes"}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase=phase,
+                    round=1,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result=result,
+                )
+            )
+
+        ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+    assert "q1: Which platforms are required?" in seen["user_prompt"]
+    assert "raises is a question about that plan" not in seen["user_prompt"]
+
+
 def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
     committed_git_repo: Path,
     persist_planning_context,

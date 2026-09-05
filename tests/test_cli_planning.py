@@ -653,6 +653,69 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         assert store.list_plan_change_requests(borg.id) == requests
 
 
+def test_plan_start_unattended_assumes_the_questions_a_review_revision_raises(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+) -> None:
+    """The Tech Lead's revision runs the Architect the command did not build.
+
+    A first plan that satisfies the Architect can still be sent back, and the
+    revision is where it meets a requirement the first pass never needed. That
+    Architect is constructed inside the review loop, so the run's own mode has
+    to reach it or the review is paid for and then thrown away at a prompt.
+    """
+    ambiguous_plan = planning_plan_response(summary="Stage the rollout.")
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(summary="Original plan."),
+        tech_lead_change_request_response("Define rollback behavior."),
+        ambiguous_plan,
+        {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
+        planning_plan_response(summary="Retry, then roll back."),
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    prompts: list[str] = []
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-review"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+
+    started = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-review", "--yes", "--unattended"]
+    )
+
+    assert started.exit_code == 0, started.output
+    assert prompts == []
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-review")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert store.list_planning_questions(borg.id)[-1].answers == [
+            {
+                "q_id": "q1",
+                "answer": "Retry twice, then roll back.",
+                "assumed": True,
+            }
+        ]
+
+
 def test_plan_change_unattended_assumes_the_questions_the_revision_raises(
     cli_runner: CliRunner,
     committed_git_repo: Path,
