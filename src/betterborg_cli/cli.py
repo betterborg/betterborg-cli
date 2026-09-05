@@ -233,6 +233,7 @@ def main(
         RunProgress(**progress_kwargs),
     )
     control = RunControl(run.cancellation, progress=run.progress).install()
+    progress_finalized_before_error = False
     try:
         try:
             result = cli.main(
@@ -248,12 +249,14 @@ def main(
             ):
                 return _interrupted_exit_code(control, run.progress)
             _finalize_progress_before_error(run.progress, error)
+            progress_finalized_before_error = True
             error.show()
             return error.exit_code
         except click.Abort as error:
             if control.interruption_requested or _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
             _finalize_progress_before_error(run.progress, error)
+            progress_finalized_before_error = True
             click.echo("Aborted!", err=True)
             return 1
         except OSError as error:
@@ -267,7 +270,8 @@ def main(
         return exit_code
     finally:
         try:
-            _dispose_unobserved_progress_after_return(run.progress)
+            if not progress_finalized_before_error:
+                _dispose_unobserved_progress_after_return(run.progress)
         finally:
             control.close()
 
@@ -296,6 +300,8 @@ def _finalize_progress_before_error(
                 )
         if progress_error is not error:
             error.add_note(f"progress finalization also failed: {progress_error}")
+
+
 def _caused_by_interruption(
     error: BaseException,
     *,
