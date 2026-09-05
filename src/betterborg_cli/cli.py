@@ -141,7 +141,7 @@ class CliRunContext:
     """Cancellation and reporting state shared by one root command invocation."""
 
     cancellation: CancellationToken
-    progress: RunProgress
+    progress: RunProgress | None
     progress_configured: bool = True
 
 
@@ -200,10 +200,15 @@ def cli(context: click.Context) -> None:
     """Work with Betterborg from the command line."""
 
     if context.obj is None:
+        invocation = _root_invocation(
+            (context.invoked_subcommand,)
+            if context.invoked_subcommand is not None
+            else ()
+        )
         context.obj = CliRunContext(
             CancellationToken(),
-            RunProgress(enabled=False),
-            progress_configured=False,
+            None,
+            progress_configured=invocation.command_name == "mcp",
         )
 
 
@@ -218,19 +223,25 @@ def main(
     requested_arguments = arguments if arguments is not None else sys.argv[1:]
     invocation = _root_invocation(requested_arguments)
     machine_readable = "--json" in requested_arguments
-    progress_kwargs: dict[str, object] = {"machine_readable": machine_readable}
-    if (
-        invocation.command_name == "init"
-        and not invocation.eager_exit
-        and not machine_readable
-    ):
-        progress_kwargs.update(
-            startup_label=_INIT_STARTUP_LABEL,
-            startup_pending=_INIT_STARTUP_PENDING,
-        )
+    progress: RunProgress | None = None
+    if invocation.command_name != "mcp":
+        progress_kwargs: dict[str, object] = {
+            "machine_readable": machine_readable
+        }
+        if (
+            invocation.command_name == "init"
+            and not invocation.eager_exit
+            and not machine_readable
+        ):
+            progress_kwargs.update(
+                startup_label=_INIT_STARTUP_LABEL,
+                startup_pending=_INIT_STARTUP_PENDING,
+            )
+        progress = RunProgress(**progress_kwargs)
     run = CliRunContext(
         CancellationToken(),
-        RunProgress(**progress_kwargs),
+        progress,
+        progress_configured=True,
     )
     control = RunControl(run.cancellation, progress=run.progress).install()
     progress_finalized_before_error = False
@@ -322,7 +333,10 @@ def _caused_by_interruption(
     return interruption_requested or _caused_by_interruption(cause)
 
 
-def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
+def _interrupted_exit_code(
+    control: RunControl,
+    progress: RunProgress | None,
+) -> int:
     """Map interruption only after strict progress reconciliation succeeds."""
 
     if control.interruption_requested:
@@ -332,6 +346,8 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
                 f"cancellation dispatch failed: {dispatch_error}"
             ).show()
             return 1
+    if progress is None:
+        return INTERRUPTED_EXIT_CODE
     try:
         if _progress_has_observed_work(progress):
             progress.close()
@@ -400,11 +416,31 @@ def _repository_progress(machine_readable: bool) -> RunProgress | None:
     context = click.get_current_context(silent=True)
     if context is None:
         return None
-    run = context.find_root().obj
+    root = context.find_root()
+    run = root.obj
     if not isinstance(run, CliRunContext):
         return None
+    invocation = _root_invocation(
+        (root.invoked_subcommand,)
+        if root.invoked_subcommand is not None
+        else ()
+    )
+    if invocation.command_name == "mcp":
+        return None
     if not run.progress_configured:
-        run.progress = RunProgress(machine_readable=machine_readable)
+        progress_kwargs: dict[str, object] = {
+            "machine_readable": machine_readable
+        }
+        if (
+            invocation.command_name == "init"
+            and not invocation.eager_exit
+            and not machine_readable
+        ):
+            progress_kwargs.update(
+                startup_label=_INIT_STARTUP_LABEL,
+                startup_pending=_INIT_STARTUP_PENDING,
+            )
+        run.progress = RunProgress(**progress_kwargs)
         run.progress_configured = True
     return run.progress
 
@@ -463,7 +499,11 @@ def _trusted_workspace_callback(function):
             interactive = _stdin_is_interactive() and not kwargs.get(
                 "json_output", False
             )
-            progress = run.progress if isinstance(run, CliRunContext) else None
+            progress = (
+                _repository_progress(bool(kwargs.get("json_output", False)))
+                if isinstance(run, CliRunContext)
+                else None
+            )
             with _suspend_progress(progress):
                 require_workspace_trust(
                     paths,
@@ -823,9 +863,8 @@ def show_plan(name: str, json_output: bool) -> None:
         raise click.ClickException(str(error)) from error
 
     run = click.get_current_context().find_root().obj
-    suspension = (
-        run.progress.suspend() if isinstance(run, CliRunContext) else nullcontext()
-    )
+    progress = run.progress if isinstance(run, CliRunContext) else None
+    suspension = _suspend_progress(progress)
     with suspension:
         if json_output:
             click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -2402,6 +2403,53 @@ def test_stdio_stdout_contains_only_protocol_json() -> None:
     assert all(response["jsonrpc"] == "2.0" for response in responses)
     assert "Processing request" not in "\n".join(map(json.dumps, responses))
     assert "Processing request" in stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery required")
+def test_blocked_stdio_sigint_has_no_cli_progress_output() -> None:
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1"},
+        },
+    }
+    process = subprocess.Popen(
+        [str(Path(sys.executable).with_name("betterborg")), "mcp"],
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    try:
+        process.stdin.write(json.dumps(initialize) + "\n")
+        process.stdin.flush()
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        assert ready, "MCP server did not answer initialize"
+        response_line = process.stdout.readline()
+
+        process.send_signal(signal.SIGINT)
+        remaining_stdout, stderr = process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    response = json.loads(response_line)
+    assert process.returncode == 130, stderr
+    assert response["id"] == 1
+    assert response["jsonrpc"] == "2.0"
+    assert remaining_stdout == ""
+    assert "progress" not in response_line.casefold()
+    assert "stopping…" not in stderr
+    assert "stage finished" not in stderr
+    assert "\x1b" not in stderr
 
 
 def test_stdio_stdout_contains_only_protocol_json_for_api_backed_tool(

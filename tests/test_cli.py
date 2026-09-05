@@ -206,6 +206,101 @@ def test_main_selects_startup_projection_only_for_direct_human_init(
         assert "startup_pending" not in construction[0]
 
 
+@pytest.mark.parametrize("root_dispatch", [False, True])
+def test_mcp_dispatch_never_constructs_progress(
+    monkeypatch: MonkeyPatch,
+    root_dispatch: bool,
+) -> None:
+    from betterborg_cli import mcp_server
+
+    runs: list[cli_module.CliRunContext] = []
+
+    def forbidden_progress(**_kwargs: object) -> RunProgress:
+        raise AssertionError("MCP dispatch constructed progress")
+
+    def run_server() -> None:
+        context = click.get_current_context().find_root()
+        run = context.obj
+        assert isinstance(run, cli_module.CliRunContext)
+        assert run.progress is None
+        assert cli_module._repository_progress(False) is None
+        runs.append(run)
+
+    monkeypatch.setattr(cli_module, "RunProgress", forbidden_progress)
+    monkeypatch.setattr(mcp_server, "run_stdio_server", run_server)
+
+    if root_dispatch:
+        assert cli_module.main(["mcp"], prog_name="betterborg") == 0
+    else:
+        result = CliRunner().invoke(cli, ["mcp"], prog_name="betterborg")
+        assert result.exit_code == 0, result.output
+
+    assert len(runs) == 1
+
+
+def test_direct_click_init_lazily_uses_root_invocation_startup(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    constructions: list[dict[str, object]] = []
+    command = cli.commands["init"]
+    original_callback = command.callback
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        constructions.append(kwargs)
+        return RunProgress(enabled=False, **kwargs)
+
+    def initialize(*, json_output: bool, explicit_trust: bool) -> None:
+        del explicit_trust
+        progress = cli_module._repository_progress(json_output)
+        assert progress is not None
+        progress.stop_display()
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(command, "callback", initialize)
+    try:
+        help_result = CliRunner().invoke(
+            cli,
+            ["init", "--help"],
+            prog_name="betterborg",
+        )
+        result = CliRunner().invoke(
+            cli,
+            ["init", "--yes"],
+            prog_name="betterborg",
+        )
+    finally:
+        command.callback = original_callback
+
+    assert help_result.exit_code == 0
+    assert result.exit_code == 0, result.output
+    assert constructions == [
+        {
+            "machine_readable": False,
+            "startup_label": "Starting betterborg init",
+            "startup_pending": (
+                "Discover evidence",
+                "Analyze repository",
+                "Generate role prompts",
+                "Draft improvement PRDs",
+            ),
+        }
+    ]
+
+
+def test_none_progress_is_safe_across_root_finalization_helpers() -> None:
+    events: list[str] = []
+
+    cli_module._finalize_progress_before_error(None, click.ClickException("bad"))
+    cli_module._dispose_unobserved_progress_after_return(None)
+    with cli_module._suspend_progress(None):
+        events.append("suspended")
+    cli_module._write_after_progress(None, lambda: events.append("written"))
+
+    control = cli_module.RunControl()
+    assert cli_module._interrupted_exit_code(control, None) == 130
+    assert events == ["suspended", "written"]
+
+
 def test_progress_observed_work_requires_a_nonpending_stage() -> None:
     progress = RunProgress(enabled=False)
 
