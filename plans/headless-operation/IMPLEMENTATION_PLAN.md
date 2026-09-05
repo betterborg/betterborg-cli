@@ -445,4 +445,4 @@ denies every sandboxed command equally, so one occurrence settles it.
 - The failure is not retried.
 - A run under the isolated declaration never trips the check.
 
-**Status**: Not Started
+**Status**: Complete

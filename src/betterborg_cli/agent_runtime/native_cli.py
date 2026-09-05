@@ -169,7 +169,7 @@ class NativeCliAdapter:
                 and self._has_valid_payload(invocation, spec)
             ):
                 return None
-            return self._classify_transient_error(spec.log_path, exit_code)
+            return self._classify_transient_error(spec, exit_code)
 
         # A missed schema restarts the invocation with the validating error and
         # the result it rejected appended to the prompt, so the next process
@@ -225,7 +225,7 @@ class NativeCliAdapter:
                     start,
                     AgentStatus.FAILED,
                     exit_code=outcome.exit_code,
-                    error=self._terminal_error(spec.log_path, outcome.exit_code),
+                    error=self._terminal_error(spec, outcome.exit_code),
                     usage=usage,
                     attempts=attempts,
                 )
@@ -238,7 +238,7 @@ class NativeCliAdapter:
                     exit_code=outcome.exit_code,
                     error=(
                         extracted.error
-                        or self._terminal_error(spec.log_path, outcome.exit_code)
+                        or self._terminal_error(spec, outcome.exit_code)
                     ),
                     usage=usage,
                     attempts=attempts,
@@ -370,11 +370,11 @@ class NativeCliAdapter:
         raise NotImplementedError
 
     def _classify_transient_error(
-        self, log_path: Path, exit_code: int
+        self, spec: AgentRunSpec, exit_code: int
     ) -> str | None:
         raise NotImplementedError
 
-    def _terminal_error(self, log_path: Path, exit_code: int) -> str:
+    def _terminal_error(self, spec: AgentRunSpec, exit_code: int) -> str:
         raise NotImplementedError
 
 

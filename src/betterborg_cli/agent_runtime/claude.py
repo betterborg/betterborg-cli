@@ -157,15 +157,16 @@ class ClaudeAdapter(NativeCliAdapter):
         return _extract_usage(log_path)
 
     def _classify_transient_error(
-        self, log_path: Path, exit_code: int
+        self, spec: AgentRunSpec, exit_code: int
     ) -> str | None:
+        log_path = spec.log_path
         return _classify_transient_error(
             log_path,
             allow_text_fallback=exit_code != 0,
         )
 
-    def _terminal_error(self, log_path: Path, exit_code: int) -> str:
-        return _terminal_error(log_path, exit_code)
+    def _terminal_error(self, spec: AgentRunSpec, exit_code: int) -> str:
+        return _terminal_error(spec.log_path, exit_code)
 
 
 def _write_system_prompt(directory: Path, system_prompt: str) -> Path:

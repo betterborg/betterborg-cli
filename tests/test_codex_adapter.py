@@ -23,6 +23,8 @@ from betterborg_cli.agent_runtime import (
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
+    AgentResult,
+    AgentRunSpec,
     AgentStatus,
     AgentUsage,
     ApiAgentRole,
@@ -579,6 +581,311 @@ def test_unrecognised_sandbox_declaration_names_the_accepted_values(
 
     assert "BETTERBORG_SANDBOX='sealed'" in str(error.value)
     assert "accepted values are auto, host" in str(error.value)
+
+
+# Captured verbatim from codex-cli 0.151.0 launched with ``-s read-only``
+# inside a container whose seccomp profile denies unprivileged user
+# namespaces. Bubblewrap refuses every command, Codex exits zero, and its
+# answer is composed without the repository it could never read.
+_BWRAP_NAMESPACE_REFUSAL = (
+    "bwrap: No permissions to create a new namespace, likely because the "
+    "kernel does not allow non-privileged user namespaces. On e.g. debian "
+    "this can be enabled with 'sysctl kernel.unprivileged_userns_clone=1'.\n"
+)
+_SANDBOX_COMMAND = "/bin/bash -lc 'ls /app | head -3'"
+_SANDBOX_FAILURE_LOG = native_event_stream(
+    {"type": "thread.started", "thread_id": "01a06ffe-340c-7a42-9cf6"},
+    {"type": "turn.started"},
+    _item_event(
+        "item.completed",
+        "agent_message",
+        id="item_0",
+        text="I will run that exact pipeline and report its output verbatim.",
+    ),
+    _item_event(
+        "item.started",
+        "command_execution",
+        id="item_1",
+        command=_SANDBOX_COMMAND,
+        aggregated_output="",
+        exit_code=None,
+        status="in_progress",
+    ),
+    _item_event(
+        "item.completed",
+        "command_execution",
+        id="item_1",
+        command=_SANDBOX_COMMAND,
+        aggregated_output=_BWRAP_NAMESPACE_REFUSAL,
+        exit_code=1,
+        status="failed",
+    ),
+    _item_event(
+        "item.completed",
+        "agent_message",
+        id="item_2",
+        text=_BWRAP_NAMESPACE_REFUSAL.strip(),
+    ),
+    _usage_event(25238, 22912, 124),
+)
+
+
+def _run_with_log(spec: AgentRunSpec, transcript: str) -> tuple[AgentResult, int]:
+    """Run Codex over a fixed log while a valid result is always produced."""
+    calls = 0
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "1.2.3"}
+        )
+        return 0
+
+    result = CodexAdapter(
+        ApiAgentRole.PLANNING,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+    ).run(spec)
+    return result, calls
+
+
+def test_sandbox_that_never_started_fails_a_zero_exit_run(tmp_path: Path) -> None:
+    spec = codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    result, calls = _run_with_log(spec, _SANDBOX_FAILURE_LOG)
+
+    assert result.status == AgentStatus.FAILED
+    assert result.exit_code == 0
+    assert result.payload is None
+    assert not spec.result_path.exists()
+    assert calls == 1
+
+
+def test_sandbox_failure_names_the_sandbox_and_the_setting(tmp_path: Path) -> None:
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+    error = result.error or ""
+
+    assert "Codex sandbox never started" in error
+    assert "bubblewrap could not create its namespace" in error
+    assert "BETTERBORG_SANDBOX=host" in error
+
+
+def test_sandbox_failure_is_not_retried(tmp_path: Path) -> None:
+    result, calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert not result.retryable
+    assert result.attempts == 1
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    (
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="/bin/bash -lc 'ls /nope'",
+                    aggregated_output=(
+                        "ls: cannot access '/nope': No such file or directory\n"
+                    ),
+                    exit_code=2,
+                    status="failed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="ordinary-nonzero-exit",
+        ),
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="cat tests/test_codex_adapter.py",
+                    aggregated_output=_BWRAP_NAMESPACE_REFUSAL,
+                    exit_code=0,
+                    status="completed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="launcher-text-read-by-a-command-that-succeeded",
+        ),
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="python -m pytest tests/test_codex_adapter.py",
+                    aggregated_output=(
+                        "FAILED tests/test_codex_adapter.py::test_sandbox\n"
+                        f"E   assert {_BWRAP_NAMESPACE_REFUSAL}"
+                    ),
+                    exit_code=1,
+                    status="failed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="launcher-text-quoted-by-a-command-that-failed",
+        ),
+        pytest.param(
+            native_event_stream({"type": "turn.started"}, _usage_event(10, 4, 3)),
+            id="no-command-output-at-all",
+        ),
+    ),
+)
+def test_logs_without_a_launcher_failure_still_complete(
+    tmp_path: Path, transcript: str
+) -> None:
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET), transcript
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "1.2.3"}
+    assert result.error is None
+
+
+def test_isolated_declaration_leaves_no_sandbox_to_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared-isolated run is not judged by a sandbox it never asked for."""
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "host")
+
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.error is None
+
+
+def _run_failing_with_log(
+    spec: AgentRunSpec, transcript: str, *, attempts: int = 3
+) -> tuple[AgentResult, int]:
+    """Run Codex over a fixed log with a non-zero exit and no result file."""
+    calls = 0
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        write_native_output(log_path, transcript, on_line)
+        return 1
+
+    result = CodexAdapter(
+        ApiAgentRole.PLANNING,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+        transient_max_attempts=attempts,
+    ).run(spec)
+    return result, calls
+
+
+def test_sandbox_failure_names_the_sandbox_on_a_non_zero_exit(
+    tmp_path: Path,
+) -> None:
+    """The cause is named however Codex exited, not only when it exited zero."""
+    result, calls = _run_failing_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert "Codex sandbox never started" in (result.error or "")
+    assert "BETTERBORG_SANDBOX=host" in (result.error or "")
+    assert calls == 1
+
+
+def test_sandbox_failure_beside_a_transient_marker_is_still_terminal(
+    tmp_path: Path,
+) -> None:
+    """A dead sandbox is not a network blip, however the log also reads.
+
+    Retrying spends the whole backoff to fail identically and then reports
+    the transient marker as the cause.
+    """
+    transcript = "\n".join(
+        (
+            _SANDBOX_FAILURE_LOG,
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "stream disconnected before completion",
+                }
+            ),
+        )
+    )
+
+    result, calls = _run_failing_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET), transcript
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert not result.retryable
+    assert "Codex sandbox never started" in (result.error or "")
+    assert calls == 1
+
+
+def test_unsandboxed_run_still_retries_a_transient_failure(
+    tmp_path: Path,
+) -> None:
+    """Silencing retries is scoped to the sandbox, not to transients."""
+    transcript = "\n".join(
+        (
+            _SANDBOX_FAILURE_LOG,
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "stream disconnected before completion",
+                }
+            ),
+        )
+    )
+
+    result, calls = _run_failing_with_log(codex_spec(tmp_path), transcript)
+
+    assert calls == 3
+    assert "Codex network transport failed" in (result.error or "")
+
+
+def test_unsandboxed_run_is_not_judged_by_a_sandbox_it_never_asked_for(
+    tmp_path: Path,
+) -> None:
+    """A phase Codex runs unsandboxed cannot have had a launcher fail.
+
+    Its commands run on the host, so launcher text in a failed command's
+    output was printed by that command rather than by a boundary of ours.
+    """
+    result, _calls = _run_with_log(codex_spec(tmp_path), _SANDBOX_FAILURE_LOG)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.error is None
 
 
 def test_schema_invalid_result_fails_after_bounded_attempts(
