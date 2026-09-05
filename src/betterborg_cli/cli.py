@@ -269,7 +269,10 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
             ).show()
             return 1
     try:
-        progress.close()
+        if _progress_has_observed_work(progress):
+            progress.close()
+        else:
+            progress.stop_display()
     except ProgressError as error:
         click.ClickException(str(error)).show()
         return 1

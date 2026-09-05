@@ -671,6 +671,7 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
     def command(run: cli_module.CliRunContext) -> None:
         observed["run"] = run
         run.progress.declare(StageSpec("work", "Work"))
+        run.progress.declare(StageSpec("waiting", "Waiting"))
         run.progress.start("work")
         observed["before_interrupt"] = stream.getvalue()
         try:
@@ -700,6 +701,15 @@ def test_main_sigint_acknowledges_without_terminalizing_active_work(
     run = observed["run"]
     assert isinstance(run, cli_module.CliRunContext)
     assert run.progress.closed
+    assert run.progress._cadence_worker is None
+    assert run.progress.stages["waiting"].state is StageState.PENDING
+    lines = stream.getvalue().splitlines()
+    expected_summary = (
+        "1 of 1 stage finished in 0:00; none failed or stopped."
+        if terminal_state is StageState.COMPLETED
+        else "0 of 1 stage finished in 0:00; 0 failed and 1 stopped."
+    )
+    assert lines.count(expected_summary) == 1
     assert "Error:" not in stream.getvalue()
 
 
@@ -758,7 +768,7 @@ def test_main_sigint_queues_acknowledgement_while_output_is_suspended(
     assert "stopped" in stream.getvalue()
 
 
-def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
+def test_main_waits_for_first_sigint_dispatch_before_disposing_progress(
     monkeypatch: MonkeyPatch,
 ) -> None:
     stream = io.StringIO()
@@ -784,6 +794,7 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     @click.pass_obj
     def command(run: cli_module.CliRunContext) -> None:
         observed["run"] = run
+        run.progress.declare(StageSpec("waiting", "Waiting"))
         os.kill(os.getpid(), signal.SIGINT)
 
     def inspect_before_release() -> None:
@@ -813,14 +824,72 @@ def test_main_waits_for_first_sigint_dispatch_before_closing_progress(
     assert observed["closed_before_release"] is False
     assert run.cancellation.is_set()
     assert run.progress.cancelling
-    assert run.progress.closed
-    lines = stream.getvalue().splitlines()
-    assert len(lines) == 2
-    assert lines[0] == "stopping…"
-    assert re.fullmatch(
-        r"0 of 0 stages finished in \d+:\d{2}; none failed or stopped\.",
-        lines[1],
-    )
+    assert not run.progress.closed
+    assert run.progress._cadence_worker is None
+    assert run.progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue().splitlines() == ["stopping…"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["analyze"],
+        ["create", "matrix"],
+        ["init"],
+        ["plan", "start", "matrix"],
+        ["plan", "change", "matrix"],
+        ["plan", "approve", "matrix"],
+        ["execute", "matrix"],
+    ),
+    ids=(
+        "analyze",
+        "create",
+        "init",
+        "plan-start",
+        "plan-change",
+        "plan-approve",
+        "execute",
+    ),
+)
+def test_main_finalizes_reconciled_command_interruption_once(
+    monkeypatch: MonkeyPatch,
+    arguments: list[str],
+) -> None:
+    stream = io.StringIO()
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = RunProgress(stream=stream, clock=FakeClock(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class StubRoot:
+        def main(self, **kwargs) -> None:
+            assert kwargs["args"] == arguments
+            progress = kwargs["obj"].progress
+            progress.declare(StageSpec("completed", "Completed"))
+            progress.start("completed")
+            progress.complete("completed", "durable")
+            progress.declare(StageSpec("stopped", "Stopped"))
+            progress.start("stopped")
+            progress.stop("stopped", "interrupted")
+            progress.declare(StageSpec("waiting", "Waiting"))
+            raise click.ClickException("command interrupted") from KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", StubRoot())
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    assert exit_code == 130
+    assert len(reporters) == 1
+    progress = reporters[0]
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue().splitlines().count(
+        "1 of 2 stages finished in 0:00; 0 failed and 1 stopped."
+    ) == 1
 
 
 def test_json_init_reconciles_cancellation_on_run_control_reporter(
