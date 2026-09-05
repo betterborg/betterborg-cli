@@ -47,6 +47,7 @@ from betterborg_cli.planning import TaskPublisher
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
+    ChildSpec,
     RunProgress,
     StageSpec,
     StageState,
@@ -1220,6 +1221,17 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
 
             def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
                 progress = progress_ref["progress"]
+                progress.declare_child(
+                    context.stage_key,
+                    ChildSpec("checks", "Checks"),
+                )
+                progress.start_child(context.stage_key, "checks")
+                progress_clock.now = 4.0
+                progress.complete_child(
+                    context.stage_key,
+                    "checks",
+                    "142 files",
+                )
                 progress_clock.now = 65.0
                 progress.stages[context.stage_key].started_at = 0.0
                 context.transition(
@@ -1275,16 +1287,13 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
             )
 
         assert result.exit_code == 0, result.output
-        labels = ("Estimate and decision", "Preflight", "reporter-parity")
-        rows: list[str] = []
-        for line in terminal_text(stream.getvalue()).splitlines():
-            for label in labels:
-                marker = f"✔ {label}"
-                if marker in line:
-                    rows.append(line[line.index(marker) :])
-                    break
-        assert len(rows) == len(labels)
-        return tuple(rows)
+        finished_rows = tuple(
+            line
+            for line in terminal_screen(stream.getvalue()).splitlines()
+            if line.startswith(("✔ ", "├ ✔ ", "└ ✔ "))
+        )
+        assert len(finished_rows) == 4
+        return finished_rows
 
     interactive_rows = run_reporter(interactive=True)
     plain_rows = run_reporter(interactive=False)
@@ -1294,6 +1303,7 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
         "✔ Estimate and decision  0:00  bypassed",
         "✔ Preflight              0:00  ready",
         "✔ reporter-parity        1:05  merged",
+        "└ ✔ Checks                 0:04  142 files",
     )
 
 

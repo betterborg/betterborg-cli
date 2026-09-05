@@ -18,6 +18,7 @@ from progress_test_support import (
     FakeClock,
     TTYStringIO,
     WaitableStringIO,
+    terminal_screen,
     terminal_text,
 )
 from rich.cells import cell_len
@@ -1215,13 +1216,10 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
         "└ ✔ Checks                 0:01  142 files · reused from earlier run",
     ]
     plain_rows = plain.getvalue().splitlines()
-    rich_output = terminal_text(rich.getvalue())
+    rich_rows = terminal_screen(rich.getvalue()).splitlines()
 
     assert plain_rows == expected
-    assert all(rich_output.count(row) == 1 for row in expected)
-    assert [rich_output.index(row) for row in expected] == sorted(
-        rich_output.index(row) for row in expected
-    )
+    assert rich_rows == plain_rows
 
 
 @pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
