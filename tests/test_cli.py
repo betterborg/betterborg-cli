@@ -34,6 +34,14 @@ from betterborg_cli.store import Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
 
 
+class TrackingProgress(RunProgress):
+    stop_display_calls = 0
+
+    def stop_display(self) -> None:
+        self.stop_display_calls += 1
+        super().stop_display()
+
+
 @pytest.fixture
 def initialized_cli_repository(
     committed_git_repo: Path,
@@ -215,13 +223,6 @@ def test_progress_observed_work_requires_a_nonpending_stage() -> None:
 def test_dispose_unobserved_progress_does_nothing_to_observed_reporter() -> None:
     stream = io.StringIO()
 
-    class TrackingProgress(RunProgress):
-        stop_display_calls = 0
-
-        def stop_display(self) -> None:
-            self.stop_display_calls += 1
-            super().stop_display()
-
     progress = TrackingProgress(stream=stream, clock=FakeClock())
     progress.declare(StageSpec("done", "Done"))
     progress.start("done")
@@ -238,13 +239,6 @@ def test_dispose_unobserved_progress_does_nothing_to_observed_reporter() -> None
 
 
 def test_dispose_unobserved_progress_does_nothing_to_closed_reporter() -> None:
-    class TrackingProgress(RunProgress):
-        stop_display_calls = 0
-
-        def stop_display(self) -> None:
-            self.stop_display_calls += 1
-            super().stop_display()
-
     progress = TrackingProgress(enabled=False)
     progress.close()
 
@@ -261,13 +255,6 @@ def test_main_normal_return_disposes_unobserved_progress_idempotently(
 ) -> None:
     reporters: list[RunProgress] = []
     stream = io.StringIO()
-
-    class TrackingProgress(RunProgress):
-        stop_display_calls = 0
-
-        def stop_display(self) -> None:
-            self.stop_display_calls += 1
-            super().stop_display()
 
     def progress_factory(**kwargs: object) -> RunProgress:
         progress = TrackingProgress(stream=stream, **kwargs)

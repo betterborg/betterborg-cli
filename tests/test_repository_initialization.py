@@ -1306,10 +1306,11 @@ def test_init_shows_animated_startup_account_before_bootstrap_selection(
 def test_main_init_help_disposes_reporter_without_progress_output(
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture,
+    cli_runner: CliRunner,
     help_option: str,
 ) -> None:
     arguments = ["init", help_option]
-    expected = CliRunner().invoke(cli, arguments, prog_name="betterborg")
+    expected = cli_runner.invoke(cli, arguments, prog_name="betterborg")
     stream = WaitableStringIO(interactive=True)
     reporters: list[RunProgress] = []
 
