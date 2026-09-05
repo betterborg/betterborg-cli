@@ -181,6 +181,19 @@ def _progress_has_observed_work(progress: RunProgress) -> bool:
     )
 
 
+def _dispose_unobserved_progress_after_return(
+    progress: RunProgress | None,
+) -> None:
+    """Dispose a no-work reporter without closing or summarizing it."""
+
+    if (
+        progress is not None
+        and not progress.closed
+        and not _progress_has_observed_work(progress)
+    ):
+        progress.stop_display()
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.pass_context
 def cli(context: click.Context) -> None:
@@ -249,9 +262,14 @@ def main(
             return 1
         if control.interruption_requested:
             return _interrupted_exit_code(control, run.progress)
-        return result if isinstance(result, int) else 0
+        exit_code = result if isinstance(result, int) else 0
+        _dispose_unobserved_progress_after_return(run.progress)
+        return exit_code
     finally:
-        control.close()
+        try:
+            _dispose_unobserved_progress_after_return(run.progress)
+        finally:
+            control.close()
 
 
 def _finalize_progress_before_error(

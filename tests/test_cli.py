@@ -35,6 +35,14 @@ from betterborg_cli.store import Borg, BorgState, Repository, SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, WorkspaceIdentity
 
 
+class TrackingProgress(RunProgress):
+    stop_display_calls = 0
+
+    def stop_display(self) -> None:
+        self.stop_display_calls += 1
+        super().stop_display()
+
+
 @pytest.fixture
 def initialized_cli_repository(
     committed_git_repo: Path,
@@ -211,6 +219,112 @@ def test_progress_observed_work_requires_a_nonpending_stage() -> None:
     progress.start("active")
     assert cli_module._progress_has_observed_work(progress) is True
     assert progress.stages["waiting"].state is StageState.PENDING
+
+
+def test_dispose_unobserved_progress_does_nothing_to_observed_reporter() -> None:
+    stream = io.StringIO()
+
+    progress = TrackingProgress(stream=stream, clock=FakeClock())
+    progress.declare(StageSpec("done", "Done"))
+    progress.start("done")
+    progress.complete("done", "complete")
+    output_before_disposal = stream.getvalue()
+
+    cli_module._dispose_unobserved_progress_after_return(progress)
+
+    assert progress.stop_display_calls == 0
+    assert not progress.closed
+    assert not progress._display_stopped
+    assert stream.getvalue() == output_before_disposal
+    assert "stage finished" not in stream.getvalue()
+
+
+def test_dispose_unobserved_progress_does_nothing_to_closed_reporter() -> None:
+    progress = TrackingProgress(enabled=False)
+    progress.close()
+
+    cli_module._dispose_unobserved_progress_after_return(progress)
+
+    assert progress.closed
+    assert progress.stop_display_calls == 0
+
+
+@pytest.mark.parametrize("pending_declaration", [False, True])
+def test_main_normal_return_disposes_unobserved_progress_idempotently(
+    monkeypatch: MonkeyPatch,
+    pending_declaration: bool,
+) -> None:
+    reporters: list[RunProgress] = []
+    stream = io.StringIO()
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = TrackingProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class StubRoot:
+        def main(self, **kwargs: object) -> int:
+            run = kwargs["obj"]
+            assert isinstance(run, cli_module.CliRunContext)
+            if pending_declaration:
+                run.progress.declare(StageSpec("waiting", "Waiting"))
+            return 0
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", StubRoot())
+
+    assert cli_module.main([], prog_name="betterborg") == 0
+    assert len(reporters) == 1
+    progress = reporters[0]
+    assert progress.stop_display_calls == 2
+    assert not progress.closed
+    assert progress._display_stopped
+    assert progress._cadence_worker is None
+    assert all(
+        record.state is StageState.PENDING
+        for record in progress.records.values()
+    )
+    assert stream.getvalue() == ""
+
+
+@pytest.mark.parametrize("pending_declaration", [False, True])
+def test_main_exit_zero_disposes_unobserved_progress_in_finally(
+    monkeypatch: MonkeyPatch,
+    pending_declaration: bool,
+) -> None:
+    reporters: list[RunProgress] = []
+    stream = io.StringIO()
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class StubRoot:
+        def main(self, **kwargs: object) -> None:
+            run = kwargs["obj"]
+            assert isinstance(run, cli_module.CliRunContext)
+            if pending_declaration:
+                run.progress.declare(StageSpec("waiting", "Waiting"))
+            raise click.exceptions.Exit(0)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", StubRoot())
+
+    with pytest.raises(click.exceptions.Exit) as exc_info:
+        cli_module.main([], prog_name="betterborg")
+
+    assert exc_info.value.exit_code == 0
+    assert len(reporters) == 1
+    progress = reporters[0]
+    assert not progress.closed
+    assert progress._display_stopped
+    assert progress._cadence_worker is None
+    assert all(
+        record.state is StageState.PENDING
+        for record in progress.records.values()
+    )
+    assert stream.getvalue() == ""
 
 
 def test_write_after_progress_closes_before_the_owed_report() -> None:
