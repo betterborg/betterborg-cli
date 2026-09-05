@@ -1097,6 +1097,14 @@ class RunProgress:
                 children, earlier_attempt_count = _select_render_children(
                     stage.children, self._attempt_history_limit
                 )
+                # Assign branches after applying the same active-row priority
+                # used by _bound_live_lines so the final child tree stays valid.
+                children = tuple(
+                    sorted(
+                        children,
+                        key=lambda child: child.state is StageState.PENDING,
+                    )
+                )
                 projected_lines.extend(
                     (
                         self._format_child_live_line(

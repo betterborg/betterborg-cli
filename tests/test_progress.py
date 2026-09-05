@@ -1257,6 +1257,48 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
     assert stream.getvalue() == permanent_output
 
 
+def test_live_child_connectors_follow_out_of_order_active_priority() -> None:
+    progress = RunProgress(
+        [
+            StageSpec(
+                "prompts",
+                "Generate role prompts",
+                (
+                    ChildSpec("coding", "coding"),
+                    ChildSpec("review", "review"),
+                    ChildSpec("merge", "merge"),
+                ),
+            )
+        ],
+        stream=StringIO(),
+        width=120,
+    )
+    progress.start("prompts")
+
+    progress.start_child("prompts", "merge")
+    merge_first = [line.plain for line in progress._live_lines()]
+    assert merge_first[1].startswith("      ├ merge")
+    assert merge_first[2:] == [
+        "      ├ coding   ◦",
+        "      └ review   ◦",
+        "",
+        "  ctrl-c to stop",
+    ]
+
+    progress.start_child("prompts", "coding")
+    coding_second = [line.plain for line in progress._live_lines()]
+    assert coding_second[1].startswith("      ├ coding")
+    assert coding_second[2].startswith("      ├ merge")
+    assert coding_second[3] == "      └ review   ◦"
+
+    progress.start_child("prompts", "review")
+    all_started = [line.plain for line in progress._live_lines()]
+    assert all_started[1].startswith("      ├ coding")
+    assert all_started[2].startswith("      ├ review")
+    assert all_started[3].startswith("      └ merge")
+    progress.stop_display()
+
+
 @pytest.mark.parametrize(
     ("label", "width", "expected"),
     [
