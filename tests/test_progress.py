@@ -18,6 +18,7 @@ from progress_test_support import (
     FakeClock,
     TTYStringIO,
     WaitableStringIO,
+    terminal_text,
 )
 from rich.cells import cell_len
 from rich.text import Text
@@ -32,10 +33,6 @@ from betterborg_cli.progress import (
     StageState,
     _format_duration,
 )
-
-
-def _terminal_text(value: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
 @pytest.mark.parametrize(
@@ -170,7 +167,7 @@ def test_terminal_state_glyphs_and_rich_styles_remain_distinct_without_colour(
     assert "\x1b[2m◦" in pending_stream.getvalue()
 
     stripped = {
-        resolution: _terminal_text(output)
+        resolution: terminal_text(output)
         for resolution, output in raw_outputs.items()
     }
     assert "✔ Stage" in stripped["complete"]
@@ -736,15 +733,15 @@ def test_rich_worker_refreshes_footer_and_cancellation_autonomously(
         timeout=1,
     )
     assert progress.stages["stage"].state is StageState.RUNNING
-    rendered = _terminal_text(stream.getvalue())
+    rendered = terminal_text(stream.getvalue())
     assert "ctrl-c to stop" in rendered
     assert sum(frame in rendered for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏") >= 3
 
     progress.begin_cancellation()
     output = stream.wait_for(
-        lambda value: "stopping…" in _terminal_text(value), timeout=1
+        lambda value: "stopping…" in terminal_text(value), timeout=1
     )
-    assert "stopping…" in _terminal_text(output)
+    assert "stopping…" in terminal_text(output)
     assert progress.stages["stage"].state is StageState.RUNNING
     progress.stop_display()
     assert progress._live is None
@@ -1192,7 +1189,7 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
 
     expected = "✔ Stage                  0:02  cached · reused from earlier run"
     assert plain.getvalue().strip() == expected
-    assert expected in _terminal_text(rich.getvalue())
+    assert expected in terminal_text(rich.getvalue())
 
 
 @pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
@@ -1227,7 +1224,7 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
 
     live_lines = [line.plain for line in progress._live_lines()]
     assert "      ├ First    ✔ 0:01" in live_lines
-    child_output = _terminal_text(stream.getvalue())
+    child_output = terminal_text(stream.getvalue())
     assert "✔ First                  0:01  first result" not in (
         child_output.splitlines()
     )
@@ -1246,7 +1243,7 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
         "├ ✔ First                  0:01  first result",
         "└ ✖ Second                 0:02  second result",
     ]
-    rendered = _terminal_text(stream.getvalue())
+    rendered = terminal_text(stream.getvalue())
     assert all(rendered.count(line) == 1 for line in expected)
     assert [rendered.index(line) for line in expected] == sorted(
         rendered.index(line) for line in expected
@@ -1326,7 +1323,7 @@ def test_long_permanent_lines_remain_one_canonical_terminal_line(
         progress.stop_display()
 
     plain_lines = plain.getvalue().splitlines()
-    rich_output = _terminal_text(rich.getvalue())
+    rich_output = terminal_text(rich.getvalue())
     assert all(line in rich_output for line in plain_lines)
     assert len(plain_lines) == 1
     if expected is not None:
@@ -1409,7 +1406,7 @@ def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
         "✖ Two                    0:10  second",
         "✖ Cached two             —  cached failure · reused from earlier run",
     ]
-    resumed = _terminal_text(stream.getvalue()) if interactive else stream.getvalue()
+    resumed = terminal_text(stream.getvalue()) if interactive else stream.getvalue()
     assert all(resumed.count(line) == 1 for line in permanent_lines)
     assert [resumed.index(line) for line in permanent_lines] == sorted(
         resumed.index(line) for line in permanent_lines
@@ -1425,7 +1422,7 @@ def test_nested_suspension_crosses_heartbeat_and_orders_concurrent_lines(
             "⠋ Active                 0:15  thinking"
         )
     else:
-        refreshed = _terminal_text(stream.getvalue())
+        refreshed = terminal_text(stream.getvalue())
         assert all(refreshed.count(line) == 1 for line in permanent_lines)
 
     progress.complete("active", "third")
@@ -1453,7 +1450,7 @@ def test_rich_live_output_uses_bounded_dynamic_child_projection(
     stream.truncate()
 
     progress.start("plan")
-    output = _terminal_text(stream.getvalue())
+    output = terminal_text(stream.getvalue())
 
     assert "✔ Plan: Attempt 1" not in output
     assert "✔ Plan: Attempt 2" not in output
@@ -1486,7 +1483,7 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
         "",
         "  ctrl-c to stop",
     ]
-    assert "Draft improvement PRDs" in _terminal_text(stream.getvalue())
+    assert "Draft improvement PRDs" in terminal_text(stream.getvalue())
     assert progress.stages == {}
 
     progress.declare(StageSpec("improvement-prds", "Draft improvement PRDs"))
@@ -1934,7 +1931,7 @@ def test_ascii_stream_degrades_live_ellipsis_activity_and_truncation(
     )
     progress.begin_cancellation()
 
-    output = _terminal_text(stream.getvalue())
+    output = terminal_text(stream.getvalue())
     assert "* Pl\\xe4n" in output
     assert "writing fa\\xe7ade \\u2615" in output
     assert "... 2 earlier attempts" in output

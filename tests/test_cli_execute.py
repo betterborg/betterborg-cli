@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import signal
 import subprocess
@@ -20,7 +19,12 @@ from uuid import uuid4
 import click
 import pytest
 from click.testing import CliRunner
-from progress_test_support import FailingStringIO, FakeClock, WaitableStringIO
+from progress_test_support import (
+    FailingStringIO,
+    FakeClock,
+    WaitableStringIO,
+    terminal_text,
+)
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
@@ -49,10 +53,6 @@ from betterborg_cli.store import (
     SqliteStore,
     TaskRuntimeStatus,
 )
-
-
-def _terminal_text(value: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
 def _task_body(round_number: int) -> dict[str, object]:
@@ -502,7 +502,8 @@ def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation
                 self.suspended = False
 
     token = CancellationToken()
-    progress = TrackingProgress(stream=StringIO())
+    stream = StringIO()
+    progress = TrackingProgress(stream=stream, clock=FakeClock())
     run = CliRunContext(token, progress)
     discovered_tokens: list[CancellationToken | None] = []
     host_contexts: list[tuple[CancellationToken | None, RunProgress | None]] = []
@@ -532,6 +533,9 @@ def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation
     assert host_contexts == [(token, progress)]
     assert progress.suspension_count == 3
     assert progress.closed
+    assert stream.getvalue().splitlines()[0] == (
+        "⠋ Estimate and decision  0:00  thinking"
+    )
     estimate = progress.stages["estimate-decision"]
     assert estimate.state is StageState.COMPLETED
     assert estimate.result == "approved"
@@ -632,7 +636,7 @@ def test_execute_projects_the_first_live_frame_before_repository_setup_returns(
             )
             rendered = stream.wait_for(
                 lambda value: all(
-                    label in _terminal_text(value)
+                    label in terminal_text(value)
                     for label in (
                         "Estimate and decision",
                         "Preflight",
@@ -641,9 +645,9 @@ def test_execute_projects_the_first_live_frame_before_repository_setup_returns(
                     )
                 )
             )
-            assert "  ◦ Preflight" in _terminal_text(rendered)
-            assert "  ◦ Push project branch" in _terminal_text(rendered)
-            assert "  ◦ Open rollup pull request" in _terminal_text(rendered)
+            assert "  ◦ Preflight" in terminal_text(rendered)
+            assert "  ◦ Push project branch" in terminal_text(rendered)
+            assert "  ◦ Open rollup pull request" in terminal_text(rendered)
             assert tuple(progress.stages) == ("estimate-decision",)
             assert tuple(
                 spec.label for spec in progress._projection_snapshot().previews
@@ -1021,9 +1025,9 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
             assert len(snapshot.stages) == task_count + 2
             if expected_live_account is not None:
                 output = stream.wait_for(
-                    lambda value: expected_live_account in _terminal_text(value)
+                    lambda value: expected_live_account in terminal_text(value)
                 )
-                rendered = _terminal_text(output)
+                rendered = terminal_text(output)
                 assert "✔ Estimate and decision" in rendered
                 assert "✔ Preflight" in rendered
                 assert expected_live_account in rendered
@@ -1055,7 +1059,7 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     assert (
         f"{expected_summary_count} of {expected_summary_count} stages finished "
         "in 0:00; none failed or stopped."
-    ) in _terminal_text(stream.getvalue())
+    ) in terminal_text(stream.getvalue())
     assert len(adopted_follow_ups) == len(projected_follow_ups)
     assert all(
         adopted is projected

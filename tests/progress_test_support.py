@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections.abc import Callable
 from io import StringIO
+
+
+def terminal_text(value: str) -> str:
+    """Return captured terminal output without ANSI controls or carriage returns."""
+
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value).replace("\r", "")
 
 
 class FakeClock:
