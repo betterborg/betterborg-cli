@@ -1111,28 +1111,77 @@ def _run_execution_follow_up(
             # command immediately so the first interrupt can still reconcile
             # the stage and emit the already-completed core report.
             force_registration = cancel.register(cancel.force)
-        result = action()
-        if progress is not None:
+        try:
+            result = action()
+        except BaseException as error:
+            if progress is not None:
+                _reconcile_execution_follow_up(
+                    progress,
+                    spec.key,
+                    error,
+                    stopped=(
+                        isinstance(error, KeyboardInterrupt | click.Abort)
+                        or (cancel is not None and cancel.is_set())
+                    ),
+                )
+            raise
+
+        if progress is None:
+            click.echo(result)
+            return
+
+        try:
             progress.raise_if_render_failed()
             progress.complete(spec.key, result)
-        else:
-            click.echo(result)
-    except BaseException as error:
-        if (
-            progress is not None
-            and progress.stages[spec.key].state is StageState.RUNNING
-        ):
-            detail = str(error).strip() or type(error).__name__
-            if isinstance(error, KeyboardInterrupt | click.Abort) or (
-                cancel is not None and cancel.is_set()
-            ):
-                progress.stop(spec.key, detail)
-            else:
-                progress.fail(spec.key, detail)
-        raise
+        except BaseException as error:
+            _reconcile_execution_follow_up(
+                progress,
+                spec.key,
+                error,
+                stopped=False,
+            )
+            raise
     finally:
         if force_registration is not None:
             force_registration.unregister()
+
+
+def _reconcile_execution_follow_up(
+    progress: RunProgress,
+    stage_key: str,
+    primary_error: BaseException,
+    *,
+    stopped: bool,
+) -> None:
+    """Settle one running follow-up without masking its primary exception."""
+    detail = str(primary_error).strip() or type(primary_error).__name__
+    transition = progress.stop if stopped else progress.fail
+    diagnostics: list[tuple[str, BaseException]] = []
+
+    if progress.stages[stage_key].state is StageState.RUNNING:
+        try:
+            transition(stage_key, detail)
+        except BaseException as error:
+            diagnostics.append(("reconciliation", error))
+            if progress.stages[stage_key].state is StageState.RUNNING:
+                try:
+                    transition(stage_key, detail)
+                except BaseException as retry_error:
+                    diagnostics.append(("reconciliation", retry_error))
+
+    try:
+        progress.raise_if_render_failed()
+    except BaseException as error:
+        diagnostics.append(("rendering", error))
+
+    attached: set[int] = set()
+    for boundary, error in diagnostics:
+        if error is primary_error or id(error) in attached:
+            continue
+        primary_error.add_note(
+            f"execution follow-up progress {boundary} also failed: {error}"
+        )
+        attached.add(id(error))
 
 
 def _push_project_base(git: SafeGit, name: str) -> str:

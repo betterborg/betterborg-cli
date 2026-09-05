@@ -692,6 +692,164 @@ def test_execute_projects_the_first_live_frame_before_repository_setup_returns(
     assert task_key not in progress.stages
 
 
+def test_execute_adopts_requested_follow_up_previews_in_action_order(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "follow-up-preview-adoption"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    progress = RunProgress(stream=stream, width=100, heartbeat_interval=0.01)
+    push_entered = threading.Event()
+    release_push = threading.Event()
+    pr_entered = threading.Event()
+    release_pr = threading.Event()
+    actions: list[str] = []
+
+    def blocked_push(_git, _name) -> str:
+        actions.append("push")
+        push_entered.set()
+        assert release_push.wait(timeout=2)
+        return "pushed"
+
+    def blocked_pr(*_args, **_kwargs) -> str:
+        actions.append("pr")
+        pr_entered.set()
+        assert release_pr.wait(timeout=2)
+        return "opened"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", blocked_push)
+    monkeypatch.setattr(cli_module, "_open_rollup_pull_request", blocked_pr)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", "--push", "--pr"],
+            obj=CliRunContext(CancellationToken(), progress),
+        )
+        assert push_entered.wait(timeout=2)
+        try:
+            push_frame = stream.wait_for(
+                lambda value: "  ◦ Open rollup pull request"
+                in terminal_screen(value)
+            )
+            assert "  ◦ Open rollup pull request" in terminal_screen(push_frame)
+            assert progress.stages["push-project"].state is StageState.RUNNING
+            assert "rollup-pr" not in progress.stages
+            preview_keys = tuple(
+                preview.key
+                for preview in progress._projection_snapshot().previews
+            )
+            assert preview_keys.count("rollup-pr") == 1
+            assert "push-project" not in preview_keys
+
+            release_push.set()
+            assert pr_entered.wait(timeout=2)
+            pr_frame = stream.wait_for(
+                lambda value: any(
+                    "Open rollup pull request" in line
+                    for line in terminal_screen(value).splitlines()
+                )
+            )
+            assert progress.stages["push-project"].state is StageState.COMPLETED
+            assert progress.stages["rollup-pr"].state is StageState.RUNNING
+            assert all(
+                preview.key != "rollup-pr"
+                for preview in progress._projection_snapshot().previews
+            )
+            assert sum(
+                "Open rollup pull request" in line
+                for line in terminal_screen(pr_frame).splitlines()
+            ) == 1
+        finally:
+            release_push.set()
+            release_pr.set()
+        result = invocation.result(timeout=5)
+
+    assert result.exit_code == 0, result.output
+    assert actions == ["push", "pr"]
+    assert progress.stages["push-project"].result == "pushed"
+    assert progress.stages["rollup-pr"].result == "opened"
+
+
+def test_failed_push_discards_undeclared_pr_preview(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "failed-push-skips-pr"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    pr_called = False
+
+    def rejected_push(_git, _name) -> str:
+        raise click.ClickException("push rejected")
+
+    def unexpected_pr(*_args, **_kwargs) -> str:
+        nonlocal pr_called
+        pr_called = True
+        return "opened"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", rejected_push)
+    monkeypatch.setattr(cli_module, "_open_rollup_pull_request", unexpected_pr)
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute", "--push", "--pr"],
+        obj=CliRunContext(CancellationToken(), progress),
+    )
+
+    assert result.exit_code == 1
+    assert result.output.encode().endswith(b"Error: push rejected\n")
+    assert not pr_called
+    assert "rollup-pr" not in progress.stages
+    assert progress._projection_snapshot().previews == ()
+    assert not any(
+        token in stream.getvalue()
+        for token in (
+            "✔ Open rollup pull request",
+            "✖ Open rollup pull request",
+            "■ Open rollup pull request",
+        )
+    )
+    assert (
+        "2 of 3 stages finished in 0:00; 1 failed and 0 stopped."
+        in stream.getvalue()
+    )
+
+
 @pytest.mark.parametrize(
     (
         "task_count",
@@ -1460,37 +1618,91 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
-def test_follow_up_worker_failure_between_check_and_completion_propagates() -> None:
+def test_follow_up_autonomous_render_failure_fails_successful_action_stage() -> None:
     stream = FailingStringIO()
-
-    class CompletionRaceProgress(RunProgress):
-        def raise_if_render_failed(self) -> None:
-            super().raise_if_render_failed()
-            stream.fail_next_write()
-            worker = self._cadence_worker
-            assert worker is not None
-            worker.join(timeout=2)
-            assert not worker.is_alive()
-
-    progress = CompletionRaceProgress(
+    progress = RunProgress(
         stream=stream,
         heartbeat_interval=0.01,
     )
+    action_entered = threading.Event()
+    release_action = threading.Event()
 
     def action() -> str:
+        action_entered.set()
+        assert release_action.wait(timeout=2)
         return "published"
 
-    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
-        cli_module._run_execution_follow_up(
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(
+            cli_module._run_execution_follow_up,
             progress,
             StageSpec("push-project", "Push project branch"),
             action,
         )
+        assert action_entered.wait(timeout=2)
+        worker = progress._cadence_worker
+        assert worker is not None
+        stream.fail_next_write()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        release_action.set()
+        with pytest.raises(
+            RuntimeError, match="progress heartbeat failed"
+        ) as caught:
+            running.result(timeout=2)
 
     stage = progress.stages["push-project"]
+    assert str(caught.value) == "progress heartbeat failed"
     assert stage.state is StageState.FAILED
     assert stage.result == "progress heartbeat failed"
-    RunProgress.raise_if_render_failed(progress)
+    assert progress._cadence_worker is None
+    progress.raise_if_render_failed()
+
+
+def test_follow_up_action_failure_wins_autonomous_render_failure_race() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    action_entered = threading.Event()
+    release_action = threading.Event()
+    action_error = click.ClickException("push rejected")
+
+    def action() -> str:
+        action_entered.set()
+        assert release_action.wait(timeout=2)
+        raise action_error
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(
+            cli_module._run_execution_follow_up,
+            progress,
+            StageSpec("push-project", "Push project branch"),
+            action,
+        )
+        assert action_entered.wait(timeout=2)
+        worker = progress._cadence_worker
+        assert worker is not None
+        stream.fail_next_write()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        release_action.set()
+        with pytest.raises(click.ClickException) as caught:
+            running.result(timeout=2)
+
+    stage = progress.stages["push-project"]
+    assert caught.value is action_error
+    assert stage.state is StageState.FAILED
+    assert stage.result == "push rejected"
+    assert caught.value.__notes__ == [
+        "execution follow-up progress rendering also failed: "
+        "progress heartbeat failed"
+    ]
+    expected = StringIO()
+    click.ClickException("push rejected").show(file=expected)
+    actual = StringIO()
+    caught.value.show(file=actual)
+    assert actual.getvalue().encode() == expected.getvalue().encode()
+    assert progress._cadence_worker is None
+    progress.raise_if_render_failed()
 
 
 def test_follow_up_completion_output_failure_preserves_completed_stage() -> None:
