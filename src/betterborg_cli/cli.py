@@ -229,7 +229,10 @@ def main(
                 obj=run,
             )
         except click.ClickException as error:
-            if _caused_by_interruption(error):
+            if _caused_by_interruption(
+                error,
+                interruption_requested=control.interruption_requested,
+            ):
                 return _interrupted_exit_code(control, run.progress)
             _finalize_progress_before_error(run.progress, error)
             error.show()
@@ -275,15 +278,24 @@ def _finalize_progress_before_error(
                 )
         if progress_error is not error:
             error.add_note(f"progress finalization also failed: {progress_error}")
-
-
-def _caused_by_interruption(error: BaseException) -> bool:
-    """Return whether Click directly wrapped an unsuppressed interrupt."""
+def _caused_by_interruption(
+    error: BaseException,
+    *,
+    interruption_requested: bool = False,
+) -> bool:
+    """Return whether Click wrapped an interrupt or reconciled cancellation."""
 
     cause = error.__cause__
     if cause is None and not error.__suppress_context__:
         cause = error.__context__
-    return isinstance(cause, KeyboardInterrupt)
+    if isinstance(cause, KeyboardInterrupt):
+        return True
+    if not isinstance(
+        cause,
+        ArchitectCancelled | SupervisorCancelled | TechLeadCancelled,
+    ):
+        return False
+    return interruption_requested or _caused_by_interruption(cause)
 
 
 def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
@@ -297,7 +309,10 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
             ).show()
             return 1
     try:
-        progress.close()
+        if _progress_has_observed_work(progress):
+            progress.close()
+        else:
+            progress.stop_display()
     except ProgressError as error:
         click.ClickException(str(error)).show()
         return 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -1857,7 +1858,9 @@ actual_safe_git = cli_module.SafeGit
 
 class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+        super().__init__(
+            *args, stream=sys.stdout, heartbeat_interval=0.01, **kwargs
+        )
 
     def _render_cadence_frame(self, stopped):
         keep_running = super()._render_cadence_frame(stopped)
@@ -1937,9 +1940,14 @@ raise SystemExit(
     assert "running git push origin refs/heads/project/push-interrupt" in output
     assert "■ Push project branch" in output
     assert "✖ Push project branch" not in output
-    assert " finished in " in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
+    summaries = re.findall(
+        r"2 of 3 stages finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output,
+    )
+    assert len(summaries) == 1, output
+    assert output.index(summaries[0]) < output.index(report)
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
@@ -2356,7 +2364,9 @@ actual_run_captured = cli_module.run_captured
 
 class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+        super().__init__(
+            *args, stream=sys.stdout, heartbeat_interval=0.01, **kwargs
+        )
 
     def _render_cadence_frame(self, stopped):
         keep_running = super()._render_cadence_frame(stopped)
@@ -2445,9 +2455,14 @@ raise SystemExit(
     assert f"running {observed_command}" in output
     assert "■ Open rollup pull request" in output
     assert "✖ Open rollup pull request" not in output
-    assert " finished in " in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
+    summaries = re.findall(
+        r"2 of 3 stages finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output,
+    )
+    assert len(summaries) == 1, output
+    assert output.index(summaries[0]) < output.index(report)
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
