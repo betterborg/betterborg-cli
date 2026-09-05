@@ -158,6 +158,86 @@ def test_mock_retries_schema_miss_with_the_validating_error(
     assert "missing required property 'status'" in adapter.calls[1].user_prompt
 
 
+def test_a_corrected_attempt_receives_the_result_the_last_one_sent(
+    tmp_path: Path,
+) -> None:
+    rejected = {"count": 3}
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload=rejected))
+    adapter.queue(MockResponse(payload={"status": "completed", "count": 3}))
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    # The whole rejected result comes back, so the agent repairs the field the
+    # failure names and keeps the fields it does not.
+    correction = adapter.calls[1].user_prompt
+    assert json.loads(correction.split("```json")[1].split("```")[0]) == rejected
+
+
+@pytest.mark.parametrize(
+    "unrenderable",
+    # json refuses a value two ways. A non-finite number is reachable today,
+    # because json.loads accepts the NaN literal and no native CLI validates
+    # its own output; the others stand for the types the annotation admits.
+    [float("nan"), {1, 2}, b"bytes"],
+)
+def test_a_result_that_is_not_json_still_corrects_without_crashing(
+    tmp_path: Path, unrenderable: object
+) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"status": "completed", "count": unrenderable}))
+    adapter.queue(MockResponse(payload={"status": "completed", "count": 1}))
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    correction = adapter.calls[1].user_prompt
+    assert "```json" not in correction
+    assert "Send a result that satisfies every schema constraint above." in correction
+
+
+def test_a_first_attempt_carries_no_rejected_result(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"count": 3}))
+    adapter.queue(MockResponse(payload={"status": "completed"}))
+    spec = _spec(tmp_path)
+
+    result = adapter.run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert adapter.calls[0].user_prompt == spec.user_prompt
+    assert "Rejected result" not in adapter.calls[0].user_prompt
+
+
+def test_a_rejected_result_reaches_the_prompt_and_not_the_error(
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["status", "summary"],
+        "properties": {
+            "status": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    adapter = MockAdapter()
+    for _attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS):
+        adapter.queue(MockResponse(payload={"summary": "the value it refused"}))
+
+    result = adapter.run(_spec(tmp_path, schema=schema))
+
+    # A validating error reaches logs, exceptions and stored state, so the
+    # rejected result travels in the prompt and nowhere else.
+    assert result.status == AgentStatus.FAILED
+    assert "missing required property 'status'" in (result.error or "")
+    assert "the value it refused" not in (result.error or "")
+    assert all(
+        "the value it refused" in call.user_prompt for call in adapter.calls[1:]
+    )
+
+
 def test_mock_bills_every_attempt_of_a_schema_retried_turn(tmp_path: Path) -> None:
     adapter = MockAdapter()
     adapter.queue(

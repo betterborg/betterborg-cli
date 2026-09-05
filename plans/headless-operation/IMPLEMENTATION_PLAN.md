@@ -14,10 +14,11 @@ survivors exhaust Docker's address pool until nothing on the machine can
 create a network.
 
 A plan that satisfies its schema can still fail the checks that follow it, and
-that failure ends the run too, although it names what it rejected. Together
-these block every unattended use: CI, cron, a queue worker, and a benchmark
-container. The work here is seven independent changes, each closing one of
-them.
+that failure ends the run too, although it names what it rejected. A retry that
+could rescue any of these is never shown the result it is correcting, so it
+writes a new one rather than repairing what it sent. Together these block every
+unattended use: CI, cron, a queue worker, and a benchmark container. The work
+here is eight independent changes, each closing one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -225,8 +226,8 @@ misses a pattern by its shape rather than by chance exhausts a whole budget.
 
 The values that describe a constraint come from the schema, which Betterborg
 wrote. Reporting them tells the agent only what it was already asked for, and
-keeps the property that makes these messages safe to send to a provider: the
-rejected value itself is never quoted.
+keeps the property that matters about a message: it reaches logs, exceptions
+and stored state, so the rejected value itself is never quoted in one.
 
 A constraint is rendered as JSON, because JSON is what the agent has to send
 back; a Python rendering would offer it True and None, neither of which it can
@@ -246,8 +247,8 @@ would leave the message worse than the silence it replaced.
   string and array lengths, numeric bounds, enum membership, and the branches
   of a rejected anyOf or oneOf.
 - A constraint is rendered as the JSON the agent is being asked to produce.
-- The rejected value is still never quoted, and neither is any part of the
-  payload beyond the property names already reported.
+- A message never quotes the rejected value, nor any part of the payload
+  beyond the property names already reported.
 - A message stays a single line, whatever a constraint holds and whatever the
   payload named, and a shortened constraint shows whole members only and says
   how many it left out.
@@ -313,5 +314,54 @@ that fraction outright. Correcting it costs one turn; failing it costs the run.
 - A cancelled run stops before it validates the plan it received.
 - Exhausting the bound fails with the last failure.
 - A plan that passes runs exactly one turn.
+
+**Status**: Complete
+
+## Stage 8: A correction shows the agent the result it sent
+
+**Goal**: An agent asked to correct a rejected result can see what it produced,
+so it repairs one field instead of producing another whole result.
+
+A native transport retries a rejected result by rebuilding the prompt as the
+original request plus the validation failure, in a fresh process. The agent is
+told which path was wrong and what was required, and is never shown the result
+it sent, so it cannot repair that result. It writes a new one from the same
+starting point, and each attempt is an independent sample from the distribution
+that produced the mistake. A constraint the agent tends to miss is missed
+again.
+
+The constraints this costs most are the ones the transport cannot carry. A
+native CLI that takes a schema drops the keywords its provider cannot express,
+so the properties and types come back right and the lengths, bounds and
+patterns are guarded by local validation alone. Those are exactly the
+rejections a retry has to repair, and exactly the ones it currently rerolls.
+
+Planning already answers this one layer up: a plan rejected by its contract is
+handed back through the channel a revision uses, so the agent revises what it
+wrote. The adapter has no equivalent and needs one.
+
+The result travelling back to the agent is the agent's own output returning to
+the provider that produced it, which discloses nothing new. It travels in the
+prompt, which leaves the rule about messages untouched.
+
+**Success Criteria**:
+- A correction carries the rejected result alongside the failure that rejected
+  it, in whatever form that result is already safe to keep: a transport that
+  redacts a submission carries back the redacted one.
+- A result that cannot be rendered as JSON is not quoted at all, and the
+  correction names the failure alone.
+- No validation message gains a payload value, and Betterborg writes the
+  correction to no log of its own.
+- A result that validates is unaffected, and a first attempt carries no
+  rejected result.
+- Every adapter that retries a missed schema carries back the result of the
+  attempt it is correcting.
+
+**Tests**:
+- A corrected attempt receives the result the previous attempt sent.
+- A first attempt carries no rejected result.
+- A validation message still names no payload value.
+- A result that cannot be rendered as JSON still corrects, without crashing.
+- The correction reaches the transport that carries it and no log of ours.
 
 **Status**: Complete

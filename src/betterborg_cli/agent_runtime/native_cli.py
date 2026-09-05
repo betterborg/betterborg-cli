@@ -171,9 +171,11 @@ class NativeCliAdapter:
                 return None
             return self._classify_transient_error(spec.log_path, exit_code)
 
-        # A missed schema restarts the invocation with the validating error
-        # appended to the prompt, so the next process is asked to correct the
-        # rejected result rather than answer the same question again.
+        # A missed schema restarts the invocation with the validating error and
+        # the result it rejected appended to the prompt, so the next process
+        # repairs what the last one sent rather than answering the same
+        # question again. The correction reaches the process over stdin, which
+        # this adapter never writes to the run log.
         while True:
             try:
                 outcome = run_with_transient_retry(
@@ -245,7 +247,7 @@ class NativeCliAdapter:
             try:
                 validate_structured_result(payload, spec.schema)
             except StructuredResultError as error:
-                correction = schema_retry.correction(error)
+                correction = schema_retry.correction(error, payload)
                 if correction is not None:
                     invocation = replace(
                         invocation,

@@ -513,6 +513,46 @@ def test_schema_miss_is_retried_with_the_validating_error(
     ) == result.payload
 
 
+def test_a_rejected_result_is_corrected_over_stdin_and_not_through_the_log(
+    tmp_path: Path,
+) -> None:
+    logged: list[str] = []
+    prompts: list[str] = []
+    payloads: list[dict[str, str]] = [
+        {"version": "written-by-the-first-attempt"},
+        {"status": "completed", "version": "corrected"},
+    ]
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
+    ) -> int:
+        prompts.append(stdin_text)
+        # The real runner truncates the log when it starts a process, so this
+        # reads before writing to capture what each attempt found.
+        logged.append(
+            log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        )
+        log_path.write_text(_usage_event(10, 0, 5), encoding="utf-8")
+        _write_invocation_result(command, payloads.pop(0))
+        return 0
+
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert "written-by-the-first-attempt" in prompts[1]
+    # The correction travels over stdin, and the log holds what the process
+    # wrote and nothing the adapter added to it.
+    assert spec.log_path.read_text(encoding="utf-8") == _usage_event(10, 0, 5)
+    assert logged == ["", _usage_event(10, 0, 5)]
+
+
 def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> None:
     cancel = CancellationToken()
     artifact = AgentArtifact(tmp_path / "partial.log", kind="log")

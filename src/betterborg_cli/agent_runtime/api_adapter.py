@@ -187,8 +187,10 @@ class ApiRunContext:
         A submission that misses the schema comes back as a correction while
         the retry budget lasts, so the turn loop can return the validating
         error to the agent and let it submit again in the same conversation.
-        The error describes the redacted payload, so feeding it back cannot
-        return a credential to the provider.
+        The correction describes and quotes the redacted payload, so it is safe
+        to place wherever the redacted payload is safe. It is not what keeps a
+        credential from the provider: the provider produced the submission, and
+        a transport that replays its own turn sends it back regardless.
         """
         redacted = self.redactor.value(dict(payload))
         if not isinstance(redacted, dict):
@@ -196,7 +198,7 @@ class ApiRunContext:
         try:
             validate_structured_result(redacted, self.spec.schema)
         except StructuredResultError as error:
-            correction = self.schema_retry.correction(error)
+            correction = self.schema_retry.correction(error, redacted)
             if correction is not None:
                 return SchemaCorrection(correction)
             return self.result(

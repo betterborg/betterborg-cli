@@ -193,7 +193,7 @@ class MockAdapter(AgentAdapter):
                     retryable=response.retryable,
                     resume_token=response.resume_token,
                 )
-                correction = schema_retry.correction(error)
+                correction = schema_retry.correction(error, response.payload)
                 with self._lock:
                     scripted = bool(self.responses)
                 if correction is None or not scripted:

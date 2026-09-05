@@ -1217,6 +1217,57 @@ def test_schema_miss_is_corrected_in_the_same_turn_without_waiting(
     ) == result.payload
 
 
+def test_a_correction_carries_back_the_redacted_rejected_submission(
+    tmp_path: Path,
+    harness: ApiAdapterHarness,
+) -> None:
+    credential = harness.credential
+    transport = FakeApiTransport(
+        [
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"version": credential},
+                        call_id="submit",
+                    )
+                ]
+            ),
+            harness.response(
+                [
+                    harness.tool_call(
+                        "submit_result",
+                        {"status": "completed", "version": "corrected"},
+                        call_id="resubmit",
+                    )
+                ]
+            ),
+        ]
+    )
+
+    result = harness.adapter(
+        ApiAgentRole.ANALYSIS,
+        api_key=credential,
+        transport=transport,
+    ).run(harness.spec(tmp_path))
+
+    # The submission handed back is the redacted one. That is not what keeps a
+    # credential from the provider, which produced it and, on Anthropic,
+    # replays its own turn regardless; it is what keeps the correction as safe
+    # as the payload already persisted.
+    assert result.status == AgentStatus.COMPLETED
+    correction = harness.extract_tool_output(transport.payloads[1])
+    submitted = json.loads(correction.split("```json")[1].split("```")[0])
+    assert submitted["version"] == "[REDACTED]"
+    assert credential not in correction
+    # This is the transport where Betterborg owns the log, so it is the one
+    # that can break the promise that the correction is never written to it.
+    log = harness.spec(tmp_path).log_path
+    logged = log.read_text(encoding="utf-8")
+    assert logged
+    assert "Rejected result" not in logged
+
+
 def test_schema_invalid_submission_fails_after_bounded_attempts(
     tmp_path: Path,
     harness: ApiAdapterHarness,
