@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -12,8 +13,14 @@ import pytest
 from planning_progress_test_support import BoundaryInterruptProgress
 
 from betterborg_cli.agent_runtime import CodexAdapter, select_agent
+from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
-from betterborg_cli.planning import ArchitectCancelled, ArchitectError, ArchitectLoop
+from betterborg_cli.planning import (
+    ARCHITECT_PLAN_CONTRACT_ROUND_CAP,
+    ArchitectCancelled,
+    ArchitectError,
+    ArchitectLoop,
+)
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_paths import RepoPaths
@@ -22,6 +29,7 @@ from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
+    PlanningFinding,
     PlanningQuestion,
     SqliteStore,
 )
@@ -749,7 +757,100 @@ def test_cancelled_and_failed_attempts_do_not_consume_question_round_cap(
         assert len(adapter.calls) == 3
 
 
-def test_invalid_plan_contract_fails_before_tech_review(
+def test_a_plan_that_passes_its_contract_costs_one_turn(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    def plan_without_a_rejected_predecessor(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert manifest["current_plan"] is None
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(dynamic=plan_without_a_rejected_predecessor))
+    database = committed_git_repo.parent / "architect-valid-plan.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "valid-plan"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert len(adapter.calls) == 2
+        assert "Rejected plan" not in adapter.calls[1].user_prompt
+        attempts = store.list_planning_attempts(borg.id)
+        assert [(attempt.phase, attempt.status) for attempt in attempts] == [
+            ("architect_questions", PlanningAttemptStatus.COMPLETED),
+            ("architect_plan", PlanningAttemptStatus.COMPLETED),
+        ]
+
+
+def test_planning_survives_a_plan_that_fails_its_contract(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+
+    def plan_after_correction(spec):
+        assert (
+            json.loads(
+                (spec.cwd / ".betterborg/plans/failed-contract.md").read_text(
+                    encoding="utf-8"
+                )
+            )
+            == invalid_plan
+        )
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=invalid_plan))
+    adapter.queue(MockResponse(dynamic=plan_after_correction))
+    database = committed_git_repo.parent / "architect-failed-contract.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "failed-contract"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert len(adapter.calls) == 3
+        assert "expected number 01" in adapter.calls[2].user_prompt
+        attempts = store.list_planning_attempts(borg.id)
+        assert [(attempt.phase, attempt.status) for attempt in attempts] == [
+            ("architect_questions", PlanningAttemptStatus.COMPLETED),
+            ("architect_plan", PlanningAttemptStatus.FAILED),
+            ("architect_plan", PlanningAttemptStatus.COMPLETED),
+        ]
+        assert [attempt.round for attempt in attempts[1:]] == [1, 2]
+
+
+def test_plan_correction_directs_a_whole_plan_pass(
     committed_git_repo: Path,
     persist_planning_context,
 ) -> None:
@@ -759,6 +860,185 @@ def test_invalid_plan_contract_fails_before_tech_review(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
     adapter.queue(MockResponse(payload=invalid_plan))
+    adapter.queue(MockResponse(payload=_plan()))
+    database = committed_git_repo.parent / "architect-whole-plan-pass.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "whole-plan-pass"
+        )
+
+        ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        correction = " ".join(adapter.calls[2].user_prompt.split())
+        assert "expected number 01" in correction
+        sweep = "re-check the whole plan for anything else these checks would reject"
+        assert sweep in correction
+        assert "they stop at the first value they reject" in correction
+        # The rejection here is a renumber, not a lookup, so the repair verb has
+        # to fit every check rather than only the three about grounding a path.
+        assert "ground" not in correction.lower()
+
+
+def test_a_cancelled_run_stops_before_it_validates_the_plan_it_received(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    cancel = CancellationToken()
+
+    class _CancelOnceTheTurnIsDone:
+        """Cancels once the turn is done, before the plan is validated."""
+
+        def __init__(self, inner: MockAdapter) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+        def run(self, spec: object, **kwargs: object) -> object:
+            result = self._inner.run(spec, **kwargs)
+            if len(self._inner.calls) == 2:
+                cancel.cancel()
+            return result
+
+    inner = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    inner.queue(MockResponse(payload=invalid_plan))
+    adapter = _CancelOnceTheTurnIsDone(inner)
+    database = committed_git_repo.parent / "architect-cancelled-correction.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "cancelled-correction"
+        )
+
+        # Without the check, this iteration's own validation materializes a
+        # worktree and the cancellation surfaces as a missing git repository.
+        with pytest.raises(ArchitectCancelled, match="cancelled"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                cancel=cancel,
+            ).run()
+
+        assert len(adapter.calls) == 2
+
+
+def test_a_correction_does_not_outlive_the_turn_it_was_built_for(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    ambiguous_plan = _plan()
+    ambiguous_plan["open_questions"] = [
+        "Should releases default to the stable or preview channel?"
+    ]
+
+    def plan_after_the_question_was_answered(spec):
+        prompt = " ".join(spec.user_prompt.split())
+        assert "Rejected plan" not in prompt
+        manifest = json.loads(
+            (
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        current = manifest["current_plan"]
+        assert current is not None
+        assert json.loads(
+            (spec.cwd / current).read_text(encoding="utf-8")
+        ) == ambiguous_plan
+        return _plan()
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=invalid_plan))
+    adapter.queue(MockResponse(payload=ambiguous_plan))
+    adapter.queue(MockResponse(dynamic=plan_after_the_question_was_answered))
+    database = committed_git_repo.parent / "architect-spent-correction.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "spent-correction"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(["Use the stable channel."]), []),
+        ).run()
+
+        assert result.plan == _plan()
+        assert len(adapter.calls) == 4
+
+
+def test_several_violations_are_correctable_within_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    placeholders = _three_phase_plan(
+        "<the domain module the manifest names>",
+        "<the service module the manifest names>",
+        "<the docs page the manifest names>",
+    )
+    grounded = _three_phase_plan("README.md", "README.md", "README.md")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=placeholders))
+    adapter.queue(MockResponse(payload=grounded))
+    database = committed_git_repo.parent / "architect-placeholder-paths.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "placeholder-paths"
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == grounded
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert len(adapter.calls) == 3
+        attempts = store.list_planning_attempts(borg.id)
+        assert [(attempt.phase, attempt.status) for attempt in attempts] == [
+            ("architect_questions", PlanningAttemptStatus.COMPLETED),
+            ("architect_plan", PlanningAttemptStatus.FAILED),
+            ("architect_plan", PlanningAttemptStatus.COMPLETED),
+        ]
+
+
+def test_invalid_plan_contract_fails_before_tech_review(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    invalid_plan = _plan()
+    invalid_plan["phases"][0]["name"] = "02-release-workflow"
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    for _round in range(ARCHITECT_PLAN_CONTRACT_ROUND_CAP):
+        adapter.queue(MockResponse(payload=invalid_plan))
     database = committed_git_repo.parent / "architect-invalid-plan.sqlite3"
 
     with SqliteStore.open(database) as store:
@@ -776,10 +1056,126 @@ def test_invalid_plan_contract_fails_before_tech_review(
             ).run()
 
         assert store.get_borg(borg.id).state is BorgState.ARCHITECT_WORKING
+        assert len(adapter.calls) == 1 + ARCHITECT_PLAN_CONTRACT_ROUND_CAP
         plan_attempt = store.list_planning_attempts(borg.id)[-1]
         assert plan_attempt.status is PlanningAttemptStatus.FAILED
         assert plan_attempt.result == invalid_plan
         assert "expected number 01" in plan_attempt.summary
+
+
+def test_exhausted_plan_corrections_report_the_last_failure(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    out_of_sequence = _plan()
+    out_of_sequence["phases"][0]["name"] = "02-release-workflow"
+    ungrounded = _plan()
+    ungrounded["phases"][0]["files_touched"] = [
+        {
+            "path": "<the release module the manifest names>",
+            "role": "modified",
+            "description": "A description where a repository path belongs.",
+        }
+    ]
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=out_of_sequence))
+    for _round in range(ARCHITECT_PLAN_CONTRACT_ROUND_CAP - 1):
+        adapter.queue(MockResponse(payload=ungrounded))
+    database = committed_git_repo.parent / "architect-last-failure.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "last-failure"
+        )
+
+        with pytest.raises(ArchitectError) as failure:
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+            ).run()
+
+        assert "is not a repository file" in str(failure.value)
+        assert "expected number 01" not in str(failure.value)
+        assert len(adapter.calls) == 1 + ARCHITECT_PLAN_CONTRACT_ROUND_CAP
+        plan_attempt = store.list_planning_attempts(borg.id)[-1]
+        assert plan_attempt.status is PlanningAttemptStatus.FAILED
+        assert plan_attempt.result == ungrounded
+
+
+def test_a_rejected_revision_is_corrected_against_its_persisted_findings(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    reviewed_plan = _plan()
+    rejected_revision = _plan()
+    rejected_revision["summary"] = "Document the tested rollback behavior."
+    rejected_revision["phases"][0]["name"] = "02-release-workflow"
+    corrected_revision = _plan()
+    corrected_revision["summary"] = "Document the tested rollback behavior."
+
+    def revise_the_reviewed_plan(spec):
+        assert _materialized_plan(spec, "revision-correction") == reviewed_plan
+        return rejected_revision
+
+    def correct_the_rejected_revision(spec):
+        assert _materialized_plan(spec, "revision-correction") == rejected_revision
+        assert [item["message"] for item in _materialized_findings(spec)] == [
+            "Define rollback behavior."
+        ]
+        return corrected_revision
+
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(dynamic=revise_the_reviewed_plan))
+    adapter.queue(MockResponse(dynamic=correct_the_rejected_revision))
+    database = committed_git_repo.parent / "architect-revision-correction.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, draft = persist_planning_context(
+            committed_git_repo, store, "revision-correction"
+        )
+        working = store.compare_and_set_borg_state(
+            draft.id,
+            expected_state=BorgState.DRAFT,
+            expected_version=draft.state_version,
+            new_state=BorgState.ARCHITECT_WORKING,
+        )
+        review = _seed_reviewed_plan(
+            store, working, reviewed_plan, "Define rollback behavior."
+        )
+
+        result = ArchitectLoop(
+            repository,
+            working,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan == corrected_revision
+        assert result.plan["summary"] != reviewed_plan["summary"]
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert len(adapter.calls) == 2
+        # The correcting turn of a revision carries both instructions: the
+        # revision still stands, and the plan to revise is now the rejected one.
+        correction = " ".join(adapter.calls[1].user_prompt.split())
+        assert "addressing every persisted Tech Lead finding" in correction
+        assert "That rejected plan is the current plan in your context" in correction
+        assert [item.attempt_id for item in store.list_planning_findings(draft.id)] == [
+            review.id
+        ]
+        attempts = store.list_planning_attempts(draft.id)
+        assert [(attempt.phase, attempt.status) for attempt in attempts] == [
+            ("architect_questions", PlanningAttemptStatus.COMPLETED),
+            ("architect_plan", PlanningAttemptStatus.COMPLETED),
+            ("tech_review", PlanningAttemptStatus.COMPLETED),
+            ("architect_plan", PlanningAttemptStatus.FAILED),
+            ("architect_plan", PlanningAttemptStatus.COMPLETED),
+        ]
 
 
 def test_plan_validation_rejects_untracked_source_the_architect_did_not_see(
@@ -800,7 +1196,8 @@ def test_plan_validation_rejects_untracked_source_the_architect_did_not_see(
     adapter = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
-    adapter.queue(MockResponse(dynamic=create_untracked_source))
+    for _round in range(ARCHITECT_PLAN_CONTRACT_ROUND_CAP):
+        adapter.queue(MockResponse(dynamic=create_untracked_source))
     database = committed_git_repo.parent / "architect-untracked-source.sqlite3"
 
     with SqliteStore.open(database) as store:
@@ -904,12 +1301,95 @@ def test_revalidates_a_durable_completed_plan_before_resuming(
         assert len(adapter.calls) == 0
 
 
+def _materialized_plan(spec, borg_name: str) -> dict:
+    return json.loads(
+        (spec.cwd / f".betterborg/plans/{borg_name}.md").read_text(encoding="utf-8")
+    )
+
+
+def _materialized_findings(spec) -> list[dict]:
+    return json.loads(
+        (
+            spec.cwd / ".betterborg/state/planning/context/findings.json"
+        ).read_text(encoding="utf-8")
+    )
+
+
+def _seed_reviewed_plan(
+    store: SqliteStore, borg, plan: dict[str, object], finding: str
+) -> PlanningAttempt:
+    """Persist a reviewed plan whose Tech Lead round requested a revision."""
+    review: PlanningAttempt | None = None
+    for offset, (phase, result) in enumerate(
+        (
+            ("architect_questions", {"decision": "ready_to_plan"}),
+            ("architect_plan", plan),
+            (
+                "tech_review",
+                {
+                    "decision": "request_changes",
+                    "summary": finding,
+                    "findings": [{"severity": "major", "message": finding}],
+                },
+            ),
+        )
+    ):
+        # Microsecond steps keep the seeded order stable while leaving every
+        # seeded attempt earlier than the ones this run appends.
+        started_at = borg.created_at + timedelta(microseconds=offset)
+        review = PlanningAttempt(
+            borg_id=borg.id,
+            phase=phase,
+            round=1,
+            adapter="openai",
+            model="test-model",
+            status=PlanningAttemptStatus.COMPLETED,
+            result=result,
+            started_at=started_at,
+            finished_at=started_at,
+        )
+        store.append_planning_attempt(review)
+    assert review is not None
+    store.append_planning_finding(
+        PlanningFinding(
+            borg_id=borg.id,
+            attempt_id=review.id,
+            round=1,
+            severity="major",
+            message=finding,
+        )
+    )
+    return review
+
+
 def _io(answers: Iterator[str], output: list[str]) -> InteractiveIO:
     return InteractiveIO(
         prompt=lambda _message: next(answers, None),
         confirm=lambda _message, _default: False,
         write=output.append,
     )
+
+
+def _three_phase_plan(*paths: str) -> dict[str, object]:
+    """Build a three-phase plan whose phases each modify one supplied path."""
+    plan = _plan()
+    template = plan["phases"][0]
+    names = ("01-release-groundwork", "02-release-workflow", "03-release-docs")
+    plan["phases"] = [
+        {
+            **template,
+            "name": name,
+            "files_touched": [
+                {
+                    "path": path,
+                    "role": "modified",
+                    "description": "The file this phase changes.",
+                }
+            ],
+        }
+        for name, path in zip(names, paths, strict=True)
+    ]
+    return plan
 
 
 def _plan() -> dict[str, object]:

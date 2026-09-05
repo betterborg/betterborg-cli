@@ -1,6 +1,7 @@
 """Repository-aware planning lifecycle and workspace primitives."""
 
 from betterborg_cli.planning.architect import (
+    ARCHITECT_PLAN_CONTRACT_ROUND_CAP,
     ARCHITECT_PLAN_SCHEMA,
     ARCHITECT_QUESTION_ROUND_CAP,
     ARCHITECT_QUESTIONS_SCHEMA,
@@ -70,6 +71,7 @@ from betterborg_cli.planning.worktree import (
 )
 
 __all__ = [
+    "ARCHITECT_PLAN_CONTRACT_ROUND_CAP",
     "ARCHITECT_PLAN_SCHEMA",
     "ARCHITECT_QUESTION_ROUND_CAP",
     "ARCHITECT_QUESTIONS_SCHEMA",

@@ -39,6 +39,11 @@ from betterborg_cli.store import (
 )
 
 ARCHITECT_QUESTION_ROUND_CAP = 3
+#: Plan turns spent proving one plan against the deterministic checks that
+#: follow its schema, the rejected turn included. A failed contract is a
+#: property of one sampled plan exactly as a missed schema is, so it carries
+#: the same budget as the schema retry it sits one layer above.
+ARCHITECT_PLAN_CONTRACT_ROUND_CAP = 3
 _QUESTIONS_PHASE = "architect_questions"
 _PLAN_PHASE = "architect_plan"
 
@@ -198,6 +203,20 @@ paths and contracts in the repository, include concrete test strategies and
 acceptance criteria, and do not modify files. Return only the required JSON
 object.
 """
+
+_PLAN_CONTRACT_CORRECTION = """
+## Rejected plan
+
+Your previous plan matched the schema but failed the deterministic checks that
+follow it:
+
+{error}
+
+That rejected plan is the current plan in your context. Fix what the failure
+names, then re-check the whole plan for anything else these checks would
+reject before returning it: they stop at the first value they reject, so a
+rejection usually means more remain. Return the whole plan again.
+""".strip()
 
 
 class ArchitectError(RuntimeError):
@@ -398,6 +417,9 @@ class ArchitectLoop:
             borg = self._answer_question_round(borg, question)
 
     def _run_plan(self) -> ArchitectResult:
+        rejected_plan: dict[str, Any] | None = None
+        correction: str | None = None
+        contract_rounds = 0
         while True:
             completed = self._completed_plan()
             if completed is not None:
@@ -411,30 +433,48 @@ class ArchitectLoop:
             revision = current_plan is not None and not self._plan_open_questions(
                 current_plan.result
             )
+            user_prompt = (
+                "Read .betterborg/state/planning/context/manifest.json and every "
+                "relevant referenced context file, then emit the implementation "
+                "plan. Resolve every answered product question and leave "
+                "open_questions empty unless a genuine uncertainty remains."
+            )
+            if revision:
+                user_prompt += (
+                    " Revise the current plan in place, addressing every "
+                    "persisted Tech Lead finding without regressing earlier "
+                    "corrections."
+                )
+            if correction is not None:
+                user_prompt += f"\n\n{correction}"
+            # A rejected plan supersedes the last completed one as the plan to
+            # revise, because the turn that follows it exists to correct it.
+            plan_to_revise = (
+                rejected_plan
+                if rejected_plan is not None
+                else current_plan.result
+                if current_plan is not None
+                else None
+            )
             attempt, payload = self._run_turn(
                 phase=_PLAN_PHASE,
                 round_number=self._turns.next_round(_PLAN_PHASE),
                 schema=ARCHITECT_PLAN_SCHEMA,
                 system_prompt=_PLAN_SYSTEM_PROMPT,
-                user_prompt=(
-                    "Read .betterborg/state/planning/context/manifest.json and every "
-                    "relevant referenced context file, then emit the implementation "
-                    "plan. Resolve every answered product question and leave "
-                    "open_questions empty unless a genuine uncertainty remains."
-                    + (
-                        " Revise the current plan in place, addressing every "
-                        "persisted Tech Lead finding without regressing earlier "
-                        "corrections."
-                        if revision
-                        else ""
-                    )
-                ),
+                user_prompt=user_prompt,
                 current_plan=(
-                    json.dumps(current_plan.result, indent=2, sort_keys=True)
-                    if current_plan is not None
+                    json.dumps(plan_to_revise, indent=2, sort_keys=True)
+                    if plan_to_revise is not None
                     else None
                 ),
             )
+            correction = None
+            rejected_plan = None
+            # Everything below this point materializes a worktree, and a token
+            # set during the turn would otherwise surface from git discovery as
+            # a missing repository rather than as the cancellation it is.
+            if self.cancel is not None and self.cancel.is_set():
+                raise ArchitectCancelled("Architect run cancelled")
             open_questions = self._plan_open_questions(payload)
             borg = self._turns.current_borg()
             if open_questions:
@@ -462,9 +502,14 @@ class ArchitectLoop:
                     result=payload,
                     summary=f"invalid plan contract: {error}",
                 )
-                raise ArchitectError(
-                    f"Architect plan failed deterministic validation: {error}"
-                ) from error
+                contract_rounds += 1
+                if contract_rounds >= ARCHITECT_PLAN_CONTRACT_ROUND_CAP:
+                    raise ArchitectError(
+                        f"Architect plan failed deterministic validation: {error}"
+                    ) from error
+                correction = _PLAN_CONTRACT_CORRECTION.format(error=error)
+                rejected_plan = payload
+                continue
 
             with self.store.transaction():
                 completed = self.store.complete_planning_attempt(
@@ -734,6 +779,7 @@ class ArchitectLoop:
 
 
 __all__ = [
+    "ARCHITECT_PLAN_CONTRACT_ROUND_CAP",
     "ARCHITECT_PLAN_SCHEMA",
     "ARCHITECT_QUESTION_ROUND_CAP",
     "ARCHITECT_QUESTIONS_SCHEMA",

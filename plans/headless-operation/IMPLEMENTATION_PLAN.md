@@ -13,9 +13,11 @@ created during preflight can outlive the run that created it, and enough
 survivors exhaust Docker's address pool until nothing on the machine can
 create a network.
 
-Together these block every unattended use: CI, cron, a queue worker, and a
-benchmark container. The work here is six independent changes, each closing
-one of them.
+A plan that satisfies its schema can still fail the checks that follow it, and
+that failure ends the run too, although it names what it rejected. Together
+these block every unattended use: CI, cron, a queue worker, and a benchmark
+container. The work here is seven independent changes, each closing one of
+them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -259,5 +261,57 @@ would leave the message worse than the silence it replaced.
 - A rejected branch names the alternatives it required.
 - A payload property name cannot split a message across lines.
 - A constraint that is not JSON is refused as a broken schema.
+
+**Status**: Complete
+
+## Stage 7: A plan that fails its contract is asked to fix it
+
+**Goal**: A plan the agent could correct is sent back for correction, so a
+recoverable mistake does not end the run.
+
+An Architect plan that satisfies the schema still has to pass the checks that
+follow it: that its phases are numbered in sequence, that a dependency names an
+earlier phase, that the paths it says a phase touches are files the repository
+contains, and a dozen rules like them. A plan that fails one of them is not
+resent. The attempt is marked failed, planning stops, and an operator is told
+to resume.
+
+The agent already has everything it needs to fix such a plan, because the
+failure names what it rejected. What it does not get is another turn. The
+retry that rescues a missed schema cannot reach this: that one lives in the
+adapter and answers a rejected payload, while this failure is raised by
+planning against a payload the adapter already accepted.
+
+These checks stop at the first value they reject, so a rejection usually means
+more remain. A correction that repaired only the value it was handed would
+spend the budget one violation at a time on a plan that was a single pass from
+valid, so it asks for a pass over the whole plan instead. What it must not do
+is restate the rules: the checks own them, and a second copy in a prompt would
+drift out of step with the first.
+
+A broken plan contract is a property of one sampled result, exactly as a missed
+schema is. Some fraction of runs produce one, and an unattended sweep loses
+that fraction outright. Correcting it costs one turn; failing it costs the run.
+
+**Success Criteria**:
+- A plan that fails a deterministic check is sent back with the failure, and
+  planning continues when a later plan passes.
+- The correction asks for a pass over the whole plan, in terms that fit every
+  check rather than only the one that rejected the plan.
+- The corrections are bounded within a run, and exhausting them fails with the
+  last failure rather than a summary of all of them. A resumed run plans afresh
+  and buys its own corrections, as it does for a missed schema.
+- A plan that passes is unaffected and costs no extra turn.
+
+**Tests**:
+- Planning survives a first plan that fails a deterministic check.
+- The correction the agent receives names the check that failed.
+- The correction asks for a whole-plan pass without naming a single check.
+- Several violations are correctable inside the bound.
+- A rejected revision is corrected against its persisted findings.
+- A correction does not outlive the turn it was built for.
+- A cancelled run stops before it validates the plan it received.
+- Exhausting the bound fails with the last failure.
+- A plan that passes runs exactly one turn.
 
 **Status**: Complete
