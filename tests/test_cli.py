@@ -209,6 +209,7 @@ def test_main_selects_startup_projection_only_for_direct_human_init(
 @pytest.mark.parametrize("root_dispatch", [False, True])
 def test_mcp_dispatch_never_constructs_progress(
     monkeypatch: MonkeyPatch,
+    cli_runner: CliRunner,
     root_dispatch: bool,
 ) -> None:
     from betterborg_cli import mcp_server
@@ -232,7 +233,7 @@ def test_mcp_dispatch_never_constructs_progress(
     if root_dispatch:
         assert cli_module.main(["mcp"], prog_name="betterborg") == 0
     else:
-        result = CliRunner().invoke(cli, ["mcp"], prog_name="betterborg")
+        result = cli_runner.invoke(cli, ["mcp"], prog_name="betterborg")
         assert result.exit_code == 0, result.output
 
     assert len(runs) == 1
@@ -240,6 +241,7 @@ def test_mcp_dispatch_never_constructs_progress(
 
 def test_direct_click_init_lazily_uses_root_invocation_startup(
     monkeypatch: MonkeyPatch,
+    cli_runner: CliRunner,
 ) -> None:
     constructions: list[dict[str, object]] = []
     command = cli.commands["init"]
@@ -258,12 +260,12 @@ def test_direct_click_init_lazily_uses_root_invocation_startup(
     monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
     monkeypatch.setattr(command, "callback", initialize)
     try:
-        help_result = CliRunner().invoke(
+        help_result = cli_runner.invoke(
             cli,
             ["init", "--help"],
             prog_name="betterborg",
         )
-        result = CliRunner().invoke(
+        result = cli_runner.invoke(
             cli,
             ["init", "--yes"],
             prog_name="betterborg",
