@@ -302,6 +302,80 @@ def test_write_after_progress_disposes_unobserved_work_without_summary() -> None
     assert stream.getvalue() == "report\n"
 
 
+def test_finalize_progress_before_error_closes_observed_failed_work() -> None:
+    stream = io.StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    progress.declare(StageSpec("failed", "Failed work"))
+    progress.start("failed")
+    progress.fail("failed", "command failed")
+    progress.declare(StageSpec("waiting", "Waiting"))
+    error = click.ClickException("command failed")
+
+    cli_module._finalize_progress_before_error(progress, error)
+
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue().endswith(
+        "0 of 1 stage finished in 0:00; 1 failed and 0 stopped.\n"
+    )
+    assert not hasattr(error, "__notes__")
+
+
+def test_finalize_progress_before_error_disposes_unobserved_work() -> None:
+    events: list[str] = []
+
+    class RecordingProgress(RunProgress):
+        def close(self) -> None:
+            events.append("close")
+            super().close()
+
+        def stop_display(self) -> None:
+            events.append("dispose")
+            super().stop_display()
+
+    stream = io.StringIO()
+    progress = RecordingProgress(stream=stream)
+    progress.declare(StageSpec("waiting", "Waiting"))
+
+    cli_module._finalize_progress_before_error(
+        progress, click.ClickException("command failed")
+    )
+
+    assert events == ["dispose"]
+    assert not progress.closed
+    assert progress._cadence_worker is None
+    assert stream.getvalue() == ""
+
+
+def test_finalize_progress_before_error_retains_close_failure_as_context() -> None:
+    events: list[str] = []
+    close_error = RuntimeError("progress close failed")
+
+    class CloseFailingProgress(RunProgress):
+        def close(self) -> None:
+            events.append("close")
+            raise close_error
+
+        def stop_display(self) -> None:
+            events.append("dispose")
+            super().stop_display()
+
+    progress = CloseFailingProgress(enabled=False)
+    progress.declare(StageSpec("failed", "Failed work"))
+    progress.start("failed")
+    progress.fail("failed", "command failed")
+    error = click.ClickException("command failed")
+
+    cli_module._finalize_progress_before_error(progress, error)
+
+    assert events == ["close", "dispose"]
+    assert progress._cadence_worker is None
+    assert error.__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+
+
 @pytest.mark.parametrize(
     "command_name",
     (
@@ -533,10 +607,18 @@ def test_init_prework_failures_leave_root_progress_unobserved(
 ) -> None:
     paths = RepoPaths.discover(committed_git_repo)
     stream = io.StringIO()
-    reporters: list[RunProgress] = []
 
-    def progress_factory(**kwargs: object) -> RunProgress:
-        progress = RunProgress(stream=stream, enabled=False, **kwargs)
+    class RecordingProgress(RunProgress):
+        stop_calls = 0
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[RecordingProgress] = []
+
+    def progress_factory(**kwargs: object) -> RecordingProgress:
+        progress = RecordingProgress(stream=stream, enabled=False, **kwargs)
         reporters.append(progress)
         return progress
 
@@ -586,11 +668,7 @@ def test_init_prework_failures_leave_root_progress_unobserved(
     else:  # pragma: no cover - the parameter table is exhaustive
         raise AssertionError(f"unknown failure fixture: {failure}")
 
-    try:
-        exit_code = cli_module.main(arguments, prog_name="betterborg")
-    finally:
-        for reporter in reporters:
-            reporter.stop_display()
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -603,6 +681,8 @@ def test_init_prework_failures_leave_root_progress_unobserved(
         for record in reporters[0].records.values()
     )
     assert cli_module._progress_has_observed_work(reporters[0]) is False
+    assert reporters[0].stop_calls == 1
+    assert reporters[0]._cadence_worker is None
     assert stream.getvalue() == ""
 
 
@@ -961,6 +1041,158 @@ def test_main_preserves_click_exception_formatting(
     assert exit_code == 1
     assert captured.out == ""
     assert captured.err == "Error: ordinary failure\n"
+
+
+@pytest.mark.parametrize("error_kind", ["click", "abort"])
+def test_main_finalizes_observed_failure_before_handled_error(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    error_kind: str,
+) -> None:
+    reporters: list[RunProgress] = []
+    primary_error: BaseException = (
+        click.ClickException("ordinary failure")
+        if error_kind == "click"
+        else click.Abort()
+    )
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(clock=FakeClock(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        run.progress.declare(StageSpec("failed", "Failed work"))
+        run.progress.start("failed")
+        run.progress.fail("failed", "ordinary failure")
+        run.progress.declare(StageSpec("waiting", "Waiting"))
+        raise primary_error
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    expected_error = (
+        "Error: ordinary failure\n" if error_kind == "click" else "Aborted!\n"
+    )
+    summary = "0 of 1 stage finished in 0:00; 1 failed and 0 stopped.\n"
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err.endswith(summary + expected_error)
+    assert captured.err.count("stage finished in") == 1
+    assert reporters[0].closed
+    assert reporters[0]._cadence_worker is None
+    assert reporters[0].stages["waiting"].state is StageState.PENDING
+    assert not hasattr(primary_error, "__notes__")
+
+
+@pytest.mark.parametrize("error_kind", ["click", "abort"])
+@pytest.mark.parametrize("pending", [False, True], ids=["zero-record", "pending"])
+def test_main_disposes_unobserved_progress_before_handled_error(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    error_kind: str,
+    pending: bool,
+) -> None:
+    class RecordingProgress(RunProgress):
+        close_calls = 0
+        stop_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[RecordingProgress] = []
+    primary_error: BaseException = (
+        click.ClickException("pre-work failure")
+        if error_kind == "click"
+        else click.Abort()
+    )
+
+    def progress_factory(**kwargs: object) -> RecordingProgress:
+        progress = RecordingProgress(**kwargs)
+        reporters.append(progress)
+        return progress
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        if pending:
+            run.progress.declare(StageSpec("waiting", "Waiting"))
+        raise primary_error
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    expected_error = (
+        "Error: pre-work failure\n" if error_kind == "click" else "Aborted!\n"
+    )
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == expected_error
+    assert reporters[0].close_calls == 0
+    assert reporters[0].stop_calls == 1
+    assert not reporters[0].closed
+    assert reporters[0]._cadence_worker is None
+
+
+def test_main_preserves_handled_error_when_progress_close_fails(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    events: list[str] = []
+    primary_error = click.ClickException("ordinary failure")
+
+    class CloseFailingProgress(RunProgress):
+        def close(self) -> None:
+            events.append("close")
+            raise RuntimeError("progress close failed")
+
+        def stop_display(self) -> None:
+            events.append("dispose")
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(**kwargs)
+        reporters.append(progress)
+        return progress
+
+    @click.command()
+    @click.pass_obj
+    def command(run: cli_module.CliRunContext) -> None:
+        run.progress.declare(StageSpec("failed", "Failed work"))
+        run.progress.start("failed")
+        run.progress.fail("failed", "ordinary failure")
+        raise primary_error
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    exit_code = cli_module.main([], prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    assert exit_code == primary_error.exit_code
+    assert captured.out == ""
+    assert captured.err.endswith("Error: ordinary failure\n")
+    assert "progress close failed" not in captured.err
+    assert primary_error.__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert events == ["close", "dispose"]
+    assert reporters[0]._cadence_worker is None
 
 
 @pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])

@@ -231,11 +231,13 @@ def main(
         except click.ClickException as error:
             if _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
+            _finalize_progress_before_error(run.progress, error)
             error.show()
             return error.exit_code
         except click.Abort as error:
             if control.interruption_requested or _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
+            _finalize_progress_before_error(run.progress, error)
             click.echo("Aborted!", err=True)
             return 1
         except OSError as error:
@@ -247,6 +249,32 @@ def main(
         return result if isinstance(result, int) else 0
     finally:
         control.close()
+
+
+def _finalize_progress_before_error(
+    progress: RunProgress | None,
+    error: BaseException,
+) -> None:
+    """Quiesce progress without displacing an authoritative command error."""
+
+    if progress is None:
+        return
+    try:
+        if _progress_has_observed_work(progress):
+            progress.close()
+            progress.raise_if_render_failed()
+        else:
+            progress.stop_display()
+    except BaseException as progress_error:
+        try:
+            progress.stop_display()
+        except BaseException as disposal_error:
+            if disposal_error is not progress_error:
+                progress_error.add_note(
+                    f"progress display disposal also failed: {disposal_error}"
+                )
+        if progress_error is not error:
+            error.add_note(f"progress finalization also failed: {progress_error}")
 
 
 def _caused_by_interruption(error: BaseException) -> bool:
