@@ -291,6 +291,9 @@ class RunProgress:
         self._cancelling = False
         self._closed = False
         self._suspension_depth = 0
+        self._suspended_starts: list[
+            tuple[StageRecord | ChildRecord, str | None]
+        ] = []
         self._queued_lines: list[Text] = []
         self._lock = threading.RLock()
         self._initializing = True
@@ -633,6 +636,10 @@ class RunProgress:
             with self._lock:
                 self._suspension_depth -= 1
                 if self._suspension_depth == 0:
+                    suspended_starts, self._suspended_starts = (
+                        self._suspended_starts,
+                        [],
+                    )
                     queued, self._queued_lines = self._queued_lines, []
                     for line in queued:
                         if self._render_failed or self._display_stopped:
@@ -644,7 +651,22 @@ class RunProgress:
                     if not self._render_failed and not self._display_stopped:
                         self._reset_heartbeat()
                         try:
-                            self._refresh_safely()
+                            if self._interactive:
+                                self._refresh_safely()
+                            else:
+                                running_starts = tuple(
+                                    (record, parent_label)
+                                    for record, parent_label in suspended_starts
+                                    if record.state is StageState.RUNNING
+                                )
+                                if running_starts:
+                                    for record, parent_label in running_starts:
+                                        self._refresh_safely(
+                                            started=record,
+                                            parent_label=parent_label,
+                                        )
+                                else:
+                                    self._refresh_safely()
                         except BaseException as error:
                             if not body_failed:
                                 raise
@@ -967,9 +989,12 @@ class RunProgress:
         started: StageRecord | ChildRecord | None = None,
         parent_label: str | None = None,
     ) -> None:
+        if self._suspension_depth:
+            if started is not None:
+                self._suspended_starts.append((started, parent_label))
+            return
         if (
             not self._enabled
-            or self._suspension_depth
             or self._render_failed
             or self._display_stopped
             or self._closing

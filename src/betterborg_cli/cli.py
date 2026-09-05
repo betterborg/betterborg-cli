@@ -910,14 +910,15 @@ def execute_borg(
     )
     progress = _repository_progress(False)
     if progress is not None:
-        progress.preview_pending(
-            (EXECUTION_PREFLIGHT_STAGE, *requested_follow_ups),
-            cohort_keys=tuple(spec.key for spec in requested_follow_ups),
-        )
-        progress.declare(
-            StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
-        )
-        progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
+        with progress.suspend():
+            progress.preview_pending(
+                (EXECUTION_PREFLIGHT_STAGE, *requested_follow_ups),
+                cohort_keys=tuple(spec.key for spec in requested_follow_ups),
+            )
+            progress.declare(
+                StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
+            )
+            progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
 
     def decide(estimate):
         suspension = progress.suspend() if progress is not None else nullcontext()

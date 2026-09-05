@@ -17,7 +17,7 @@ from uuid import uuid4
 import click
 import pytest
 from click.testing import CliRunner
-from progress_test_support import FailingStringIO
+from progress_test_support import FailingStringIO, TTYStringIO
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
@@ -508,7 +508,7 @@ def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation
     assert discovered_tokens
     assert all(observed is token for observed in discovered_tokens)
     assert host_contexts == [(token, progress)]
-    assert progress.suspension_count == 2
+    assert progress.suspension_count == 3
     assert progress.closed
     estimate = progress.stages["estimate-decision"]
     assert estimate.state is StageState.COMPLETED
@@ -535,14 +535,24 @@ def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
         )
     )
     _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
 
     class TrackingProgress(RunProgress):
         def __init__(self) -> None:
-            super().__init__(stream=StringIO())
             self.previews: list[
                 tuple[tuple[StageSpec, ...], tuple[str, ...] | None]
             ] = []
             self.declarations: list[StageSpec] = []
+            self.rendered_frames: list[tuple[str, ...]] = []
+            super().__init__(stream=TTYStringIO())
+
+        def _refresh_transient(self, *, started=None, parent_label=None) -> None:
+            frame = tuple(line.plain for line in self._live_lines())
+            if frame and not self._suspension_depth:
+                self.rendered_frames.append(frame)
+            super()._refresh_transient(started=started, parent_label=parent_label)
 
         def preview_pending(
             self,
@@ -619,6 +629,16 @@ def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
     )
 
     assert result.exit_code == 0, result.output
+    first_frame = progress.rendered_frames[0]
+    estimate_line = next(
+        line for line in first_frame if "Estimate and decision" in line
+    )
+    assert estimate_line[:3] in {
+        f"  {frame}" for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    }
+    assert "  ◦ Preflight" in first_frame
+    assert "  ◦ Push project branch" in first_frame
+    assert "  ◦ Open rollup pull request" in first_frame
     assert len(progress.previews) == 2
     launch_specs, launch_cohort = progress.previews[0]
     publication_specs, publication_cohort = progress.previews[1]
