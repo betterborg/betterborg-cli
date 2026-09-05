@@ -545,6 +545,16 @@ except RuntimeError as error:
         return len(fields) < 3 or fields[2] != "Z"
 
 
+@pytest.fixture(autouse=True)
+def undeclared_sandbox(monkeypatch: MonkeyPatch) -> None:
+    """Hold every test to the sandbox declaration it sets for itself.
+
+    The declaration is an operator's environment variable, so a machine that
+    genuinely sets it would otherwise change what unrelated tests assert.
+    """
+    monkeypatch.delenv("BETTERBORG_SANDBOX", raising=False)
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """Return Click's isolated command-line test runner."""

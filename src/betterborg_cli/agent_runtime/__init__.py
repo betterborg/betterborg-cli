@@ -46,7 +46,10 @@ from betterborg_cli.agent_runtime.base import (
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.claude import ClaudeAdapter
-from betterborg_cli.agent_runtime.codex import CodexAdapter
+from betterborg_cli.agent_runtime.codex import (
+    CodexAdapter,
+    SandboxSettingError,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.openai import (
     OPENAI_API_URL,
@@ -143,6 +146,7 @@ __all__ = [
     "PathContainmentError",
     "READ_ONLY_API_TOOLS",
     "RetryOutcome",
+    "SandboxSettingError",
     "SchemaRetry",
     "StructuredResultError",
     "SearchMatch",

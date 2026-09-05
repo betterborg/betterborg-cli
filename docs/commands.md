@@ -87,6 +87,27 @@ Provider credentials are environment-only. Keep `ANTHROPIC_API_KEY` and
 valid tracked configuration and `betterborg init` never writes them to this
 file.
 
+Codex runs a read-only phase under a read-only sandbox and every other phase
+with sandboxing off. Inside a container that is already the boundary, the
+read-only sandbox usually cannot start, because it is built from an
+unprivileged user namespace that such a container is normally refused. Set
+`BETTERBORG_SANDBOX=host` to declare the environment already isolated, and
+Codex then runs without a sandbox in every phase.
+
+Weigh what that gives up. Every read-only phase under Codex is held to reading
+by this sandbox alone, creating a Borg and generating prompts as much as
+analysis and planning, and what the sandbox denies is writing anywhere and
+reaching the network. It does not confine reads: under either setting Codex can
+read outside the workspace it was given. Set `host` only where something around
+Betterborg is genuinely the boundary. Claude is unaffected either way, because
+it is held to reading by a tool allowlist rather than by a sandbox.
+
+The variable accepts `auto` and `host`, in any case and with surrounding
+spaces. Unset is the default and an empty value is read the same way; any other
+value fails any run that would launch Codex. Like a credential it belongs to
+whoever starts Betterborg, so it is environment-only and not valid tracked
+Betterborg configuration.
+
 ## Host integrations
 
 ```console

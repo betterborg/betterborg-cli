@@ -16,9 +16,16 @@ create a network.
 A plan that satisfies its schema can still fail the checks that follow it, and
 that failure ends the run too, although it names what it rejected. A retry that
 could rescue any of these is never shown the result it is correcting, so it
-writes a new one rather than repairing what it sent. Together these block every
-unattended use: CI, cron, a queue worker, and a benchmark container. The work
-here is eight independent changes, each closing one of them.
+writes a new one rather than repairing what it sent.
+
+Under all of that sits a sandbox Betterborg cannot be talked out of. Codex is
+always asked for a sandbox of its own, and the read-only one needs a user
+namespace that the surrounding container is usually not allowed to create. No
+setting anywhere says the environment is already isolated. When that sandbox
+fails to start, Codex still exits zero and still answers, so the run carries on
+with a result written without the repository it could never read. Together
+these block every unattended use: CI, cron, a queue worker, and a benchmark
+container. The work here is ten independent changes, each closing one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -365,3 +372,77 @@ prompt, which leaves the rule about messages untouched.
 - The correction reaches the transport that carries it and no log of ours.
 
 **Status**: Complete
+
+## Stage 9: An operator can declare the environment already isolated
+
+**Goal**: An operator running Betterborg inside a container that is already
+sealed can say so, and Codex then runs without a second sandbox of its own.
+
+Codex is always launched with a sandbox: read-only for a read-only tool set,
+full access otherwise. On Linux the read-only one is bubblewrap, which has to
+create an unprivileged user namespace, and a container started under a default
+seccomp profile is refused that syscall. A benchmark task container is exactly
+where that refusal happens and also exactly where a second sandbox buys
+nothing, because the container is already the boundary.
+
+The setting has to come from whoever runs Betterborg and never from the
+repository being worked on. Tracked configuration is written by the repository
+under test, which is the party a sandbox defends against, and it is already
+treated that way: secrets and absolute machine paths are rejected there
+outright. An environment variable belongs to the operator who started the
+process, so that is the channel.
+
+**Success Criteria**:
+- With nothing set, Codex is sandboxed exactly as it is today.
+- An operator can declare the environment already isolated, and Codex then
+  skips its own sandbox whatever the tool set.
+- The declaration cannot be made by tracked repository configuration.
+- An unrecognised value stops the run and names what is accepted, rather than
+  quietly choosing either boundary.
+
+**Tests**:
+- An unset variable yields a read-only sandbox for a read-only tool set and
+  full access otherwise.
+- The isolated declaration yields full access for a read-only tool set.
+- Tracked configuration carrying the setting does not change the sandbox.
+- An unrecognised value fails, and the message names the accepted values.
+
+**Status**: Complete
+
+## Stage 10: A sandbox that cannot start fails the run
+
+**Goal**: A Codex run whose sandbox never initialised fails, instead of
+returning an answer composed without the repository.
+
+When bubblewrap cannot create its namespace, every command Codex runs under the
+sandbox fails with the same launcher error, and Codex reports it the only way
+it can, as failed command output the model then reads. The model says so in its
+answer, but Codex exits zero and produces a result, so neither path that could
+stop the run is on: transient classification inspects a non-zero exit only, and
+terminal extraction runs only when no payload arrives. The cost is not a crash
+but a plan whose confidence is unearned.
+
+The signal is unambiguous and already in the log Betterborg keeps. A command
+Codex ran failed, and its output is the sandbox launcher saying it could not
+build the namespace. A failure of that shape is never partial, because it
+denies every sandboxed command equally, so one occurrence settles it.
+
+**Success Criteria**:
+- A log carrying a sandbox launcher failure fails the run even when Codex
+  exited zero and returned a valid result.
+- The failure names the sandbox as the cause and points at the setting that
+  resolves it, rather than reporting the model's answer.
+- The failure is terminal, because a sandbox that cannot start will not start
+  on a retry.
+- A run whose commands failed on their own merits is unaffected.
+- A log carrying no command output at all is unaffected.
+
+**Tests**:
+- A Codex log holding the bubblewrap namespace failure fails a zero-exit run
+  that produced a schema-valid result.
+- The error names the sandbox and the setting that resolves it.
+- A log whose only failed command is an ordinary non-zero exit still succeeds.
+- The failure is not retried.
+- A run under the isolated declaration never trips the check.
+
+**Status**: Not Started

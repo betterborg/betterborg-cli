@@ -19,6 +19,7 @@ from test_adapter_harness import (
 import betterborg_cli.agent_runtime.retry as agent_retry
 from betterborg_cli.agent_runtime import (
     DEFAULT_SCHEMA_MAX_ATTEMPTS,
+    READ_ONLY_API_TOOLS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
@@ -28,7 +29,16 @@ from betterborg_cli.agent_runtime import (
     BillingMode,
     CancellationToken,
     CodexAdapter,
+    SandboxSettingError,
 )
+from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import (
+    CONFIG_FILENAME,
+    RepositoryConfigError,
+    load_repository_config,
+)
+
+_READ_ONLY_TOOL_SET = tuple(READ_ONLY_API_TOOLS)
 
 
 def _usage_event(
@@ -412,7 +422,8 @@ def test_native_command_validates_and_persists_result_metadata(
     assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
 
 
-def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None:
+def _launched_sandbox(tmp_path: Path, **changes: Any) -> str:
+    """Return the sandbox one completed Codex invocation was launched with."""
     captured_command: list[str] = []
 
     def runner(
@@ -431,15 +442,143 @@ def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None
         )
         return 0
 
-    spec = codex_spec(
-        tmp_path,
-        allowed_tools=("list_files", "read_file", "search_text"),
-    )
-
+    spec = codex_spec(tmp_path, **changes)
     result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
 
     assert result.status == AgentStatus.COMPLETED
-    assert captured_command[captured_command.index("-s") + 1] == "read-only"
+    return captured_command[captured_command.index("-s") + 1]
+
+
+@pytest.mark.parametrize(
+    ("allowed_tools", "expected"),
+    (
+        (_READ_ONLY_TOOL_SET, "read-only"),
+        ((), "danger-full-access"),
+    ),
+)
+def test_undeclared_sandbox_follows_the_tool_set(
+    tmp_path: Path, allowed_tools: tuple[str, ...], expected: str
+) -> None:
+    assert _launched_sandbox(tmp_path, allowed_tools=allowed_tools) == expected
+
+
+@pytest.mark.parametrize("declaration", ("auto", " AUTO ", "", "   "))
+def test_auto_declaration_follows_the_tool_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declaration: str
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", declaration)
+
+    sandbox = _launched_sandbox(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    assert sandbox == "read-only"
+
+
+@pytest.mark.parametrize("declaration", ("host", " HOST "))
+@pytest.mark.parametrize("allowed_tools", (_READ_ONLY_TOOL_SET, ()))
+def test_isolated_environment_declaration_drops_the_read_only_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declaration: str,
+    allowed_tools: tuple[str, ...],
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", declaration)
+
+    sandbox = _launched_sandbox(tmp_path, allowed_tools=allowed_tools)
+
+    assert sandbox == "danger-full-access"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "rejection"),
+    (
+        ('sandbox = "host"\n[repository]', "unknown root configuration key"),
+        ('[repository]', "unknown agents.defaults configuration key"),
+    ),
+)
+def test_tracked_configuration_cannot_declare_the_environment_isolated(
+    git_repo: Path, declaration: str, rejection: str
+) -> None:
+    """Pin that ``sandbox`` is not, and cannot become, a tracked config key.
+
+    The repository being worked on is the party a sandbox defends against, so
+    the declaration must be refused wherever a reader might expect to place it.
+    """
+    paths = RepoPaths.discover(git_repo)
+    paths.tracked_dir.mkdir()
+    (paths.tracked_dir / CONFIG_FILENAME).write_text(
+        f"""
+version = 1
+{declaration}
+id = "bd3b21f9-693b-4c58-b7cf-a90417809e1f"
+default_branch = "main"
+[agents.defaults]
+sandbox = "host"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RepositoryConfigError, match=rejection):
+        load_repository_config(paths)
+
+
+def _never_launched(*_args: object, **_kwargs: object) -> int:
+    raise AssertionError("Codex launched under a declaration it should refuse")
+
+
+def test_declaration_is_resolved_again_when_the_command_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adapter outlives its construction, so the launch path revalidates.
+
+    A long-lived process builds an adapter once and runs it per request, so
+    the declaration validated at construction is not necessarily the one in
+    force at launch.
+    """
+    adapter = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=_never_launched)
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "sealed")
+
+    with pytest.raises(SandboxSettingError, match="accepted values are auto, host"):
+        adapter.run(codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET))
+
+
+def test_run_environment_cannot_declare_the_environment_isolated(
+    tmp_path: Path,
+) -> None:
+    """The run spec's environment is repository-authored and must not decide.
+
+    It is built from the analyzer plan and merged over ours for the Codex
+    child. No read-only phase passes one today; this keeps a future one from
+    letting the repository under test choose its own sandbox.
+    """
+    sandbox = _launched_sandbox(
+        tmp_path,
+        allowed_tools=_READ_ONLY_TOOL_SET,
+        env={"BETTERBORG_SANDBOX": "host"},
+    )
+
+    assert sandbox == "read-only"
+
+
+def test_unrecognised_declaration_is_refused_when_the_adapter_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One refusal at selection, not one per command after preflight ran."""
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "hsot")
+
+    with pytest.raises(SandboxSettingError, match="accepted values are auto, host"):
+        CodexAdapter(ApiAgentRole.PLANNING)
+
+
+def test_unrecognised_sandbox_declaration_names_the_accepted_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "sealed")
+
+    with pytest.raises(SandboxSettingError) as error:
+        _launched_sandbox(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    assert "BETTERBORG_SANDBOX='sealed'" in str(error.value)
+    assert "accepted values are auto, host" in str(error.value)
 
 
 def test_schema_invalid_result_fails_after_bounded_attempts(

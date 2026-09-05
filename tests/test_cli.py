@@ -22,6 +22,7 @@ from pytest import MonkeyPatch
 from betterborg_cli import __version__
 from betterborg_cli import cli as cli_module
 from betterborg_cli import run_control as run_control_module
+from betterborg_cli.agent_runtime import SandboxSettingError
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
 from betterborg_cli.prd_session import InteractiveIO
@@ -662,6 +663,32 @@ def test_create_help_registers_required_positional_name(
     assert "--prd FILE" in result.output
     assert "--adopt" in result.output
     assert "--name" not in result.output
+
+
+def test_unrecognised_sandbox_declaration_reaches_the_operator_as_a_message(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A refused declaration is rendered, not raised at the operator."""
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise SandboxSettingError(
+            "BETTERBORG_SANDBOX='hsot' is not a sandbox setting; "
+            "accepted values are auto, host"
+        )
+
+    monkeypatch.setattr(cli_module, "select_agent", refuse)
+
+    result = cli_runner.invoke(cli, ["init", "--yes"])
+
+    assert result.exit_code == 1
+    assert result.output.endswith(
+        "Error: BETTERBORG_SANDBOX='hsot' is not a sandbox setting; "
+        "accepted values are auto, host\n"
+    )
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import tempfile
 from collections.abc import Iterator, Mapping
@@ -38,6 +39,10 @@ from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 _PROVIDER = "codex"
 _COMMAND_DETAIL_LIMIT = 160
+_SANDBOX_VARIABLE = "BETTERBORG_SANDBOX"
+_SANDBOX_AUTO = "auto"
+_SANDBOX_HOST = "host"
+_SANDBOX_SETTINGS = (_SANDBOX_AUTO, _SANDBOX_HOST)
 _READ_COMMANDS = frozenset({"cat", "head", "sed", "tail"})
 _SEARCH_COMMANDS = frozenset({"fd", "find", "grep", "ls", "rg", "tree"})
 _SHELL_COMMANDS = frozenset({"bash", "dash", "sh", "zsh"})
@@ -75,6 +80,10 @@ _OPENAI_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
 )
 
 
+class SandboxSettingError(ValueError):
+    """Raised when the operator declares a sandbox Betterborg cannot honour."""
+
+
 class _PromptSchemaFallback(ValueError):
     """The caller schema needs prompt-constrained output and local validation."""
 
@@ -98,6 +107,10 @@ class CodexAdapter(NativeCliAdapter):
             streaming=True,
             resumable=True,
             host_capable=True,
+            # True of the sandbox Codex is asked for, which an operator can
+            # decline: see _sandbox_setting. No gate may read this as proof a
+            # boundary is in force; require_read_only_agent deliberately does
+            # not.
             read_only_sandbox=True,
         ),
         init=False,
@@ -105,6 +118,9 @@ class CodexAdapter(NativeCliAdapter):
 
     def __post_init__(self) -> None:
         self._validate_native_configuration()
+        # Refuse a malformed declaration when the adapter is built, rather
+        # than at its first invocation.
+        _sandbox_setting()
 
     @contextmanager
     def _prepare_invocation(
@@ -202,9 +218,41 @@ class CodexAdapter(NativeCliAdapter):
 
 
 def _sandbox_for(spec: AgentRunSpec) -> str:
+    """Choose the sandbox Codex enforces for one run."""
+    # An operator who has declared the environment already isolated gets no
+    # second boundary: Codex builds its read-only sandbox from an unprivileged
+    # user namespace, which a sealed container is usually refused.
+    if _sandbox_setting() == _SANDBOX_HOST:
+        return "danger-full-access"
     if is_read_only_tool_set(spec.allowed_tools):
         return "read-only"
     return "danger-full-access"
+
+
+def _sandbox_setting() -> str:
+    """Read the operator's sandbox declaration from the process environment.
+
+    The declaration belongs to whoever started Betterborg, never to the
+    repository being worked on, so it arrives by environment variable rather
+    than as tracked configuration.
+
+    This reads the Betterborg process environment and deliberately not the
+    run spec's, which ``native_cli`` merges over ours for the child process. A
+    spec's environment is shaped by the analyzer plan, which the repository
+    under test drives, so reading ours keeps the sandbox choice out of its
+    reach however that environment is populated later.
+    """
+    declared = os.environ.get(_SANDBOX_VARIABLE, "")
+    setting = declared.strip().lower()
+    if not setting:
+        return _SANDBOX_AUTO
+    if setting not in _SANDBOX_SETTINGS:
+        accepted = ", ".join(_SANDBOX_SETTINGS)
+        raise SandboxSettingError(
+            f"{_SANDBOX_VARIABLE}={declared!r} is not a sandbox setting; "
+            f"accepted values are {accepted}"
+        )
+    return setting
 
 
 def _translate_event(event: Mapping[str, Any]) -> AgentActivity | None:
