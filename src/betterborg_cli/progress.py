@@ -1146,7 +1146,7 @@ class RunProgress:
                     projected_lines.append(
                         (
                             Text(
-                                f"      └ {_format_activity(record.activity)}",
+                                f"      └ {_format_record_activity(record)}",
                                 style="dim",
                             ),
                             StageState.RUNNING,
@@ -1727,12 +1727,32 @@ def _format_current_work(
     record: StageRecord | ChildRecord | _RecordSnapshot,
 ) -> str:
     if record._activity_is_latest and record.activity is not None:
-        return _format_activity(record.activity)
+        return _format_record_activity(record)
     if record.detail is not None:
         detail = _normalize_cell(record.detail)
         if detail.strip():
             return detail
     return "thinking"
+
+
+def _format_record_activity(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
+    """Format activity without repeating its current phase label."""
+    activity = record.activity
+    if activity is None:
+        return "thinking"
+    detail = activity.detail
+    current_work = record.detail
+    if detail is not None and current_work is not None:
+        label, separator, provider_detail = detail.partition(": ")
+        if separator and (
+            current_work == label
+            or current_work.startswith(f"{label} (")
+            or current_work.startswith(f"{label}:")
+        ):
+            activity = AgentActivity(activity.kind, provider_detail)
+    return _format_activity(activity)
 
 
 def _format_activity(activity: AgentActivity) -> str:

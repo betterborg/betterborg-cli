@@ -910,8 +910,9 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
                     resume_phase="review",
                     review_round=1,
                 )
-                assert context.activity is not None
-                context.activity(
+                activity_sink = context.activity_sink("review")
+                assert activity_sink is not None
+                activity_sink(
                     AgentActivity(
                         AgentActivityKind.READING,
                         "src/webhook/retry.go",
@@ -923,8 +924,9 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
                     TaskRuntimeStatus.CODING,
                     resume_phase="coding",
                 )
-                assert context.activity is not None
-                context.activity(AgentActivity(AgentActivityKind.THINKING))
+                activity_sink = context.activity_sink("coding")
+                assert activity_sink is not None
+                activity_sink(AgentActivity(AgentActivityKind.THINKING))
             with active_lock:
                 active_started += 1
                 if active_started == target_active:
