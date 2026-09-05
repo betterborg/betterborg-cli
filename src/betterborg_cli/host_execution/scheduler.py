@@ -509,7 +509,7 @@ class HostTaskScheduler:
                 )
         elif phase_label == TaskRuntimeStatus.FIX.value:
             pass_number = runtime.review_round
-            if 1 <= pass_number <= self._config.review_passes:
+            if 1 <= pass_number < self._config.review_passes:
                 return f"fix (pass {pass_number}/{self._config.review_passes})"
 
         detail = phase_label

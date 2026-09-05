@@ -1124,182 +1124,163 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     )
 
 
+@pytest.mark.parametrize("interactive", [False, True], ids=["plain", "interactive"])
 def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
     approved_task_generation,
     monkeypatch: pytest.MonkeyPatch,
+    interactive: bool,
 ) -> None:
     real_progress = RunProgress
     actual_scheduler_config = HostSchedulerConfig
-
-    def run_reporter(*, interactive: bool) -> tuple[str, ...]:
-        name = "reporter-parity-run"
-        mode = "interactive" if interactive else "plain"
-        run_root = committed_git_repo.parent / f"reporter-parity-{mode}-repo"
-        subprocess.run(
-            ["git", "clone", "--quiet", str(committed_git_repo), str(run_root)],
-            check=True,
+    name = "reporter-parity-run"
+    _repository, paths, _borg, _approval, _fixture, publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+            task_titles=("reporter-parity",),
         )
-        _repository, paths, _borg, _approval, _fixture, publication = (
-            _seed_executable_generation(
-                run_root,
-                planning_cli_repository,
-                approved_task_generation,
-                name=name,
-                task_titles=("reporter-parity",),
-            )
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n[execution]\njobs = 1\nreview_passes = 3\n",
+        encoding="utf-8",
+    )
+    stream = WaitableStringIO(interactive=interactive)
+    progress_clock = FakeClock()
+    progress_ref: dict[str, RunProgress] = {}
+    task = publication.files[0].task
+    plan = HostPreflightPlan(
+        repository_root=committed_git_repo,
+        commands=(),
+        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
+        materialize_commands=(),
+        environment_files=(),
+        executables=(),
+        required_secret_names=(),
+        compose_files=(),
+        services=(),
+    )
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(
+            stream=stream if kwargs.get("enabled", True) else StringIO(),
+            clock=progress_clock,
+            width=100,
+            **kwargs,
         )
-        config_path = paths.tracked_dir / "config.toml"
-        config_path.write_text(
-            config_path.read_text(encoding="utf-8")
-            + "\n[execution]\njobs = 1\nreview_passes = 3\n",
-            encoding="utf-8",
+        if kwargs.get("enabled", True):
+            progress_ref["progress"] = progress
+        return progress
+
+    class ReadyPreflight:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.validated_result = None
+
+        def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
+            self.validated_result = plan
+            return plan
+
+    class PreparedWorktrees:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def prepare_current_task_worktrees(self, *_args, **_kwargs):
+            return [SimpleNamespace(task_id=task.id, path=committed_git_repo)]
+
+        def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class CleanCompose:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
+            return ()
+
+    class DeterministicRuntime:
+        def __init__(self, runtime_plan, **_kwargs) -> None:
+            self.plan = runtime_plan
+
+        def with_secret_values(self, _secret_values):
+            return self
+
+        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
+            return ("prepared",)
+
+        def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            progress = progress_ref["progress"]
+            progress.declare_child(
+                context.stage_key,
+                ChildSpec("checks", "Checks"),
+            )
+            progress.start_child(context.stage_key, "checks")
+            progress_clock.now = 4.0
+            progress.complete_child(
+                context.stage_key,
+                "checks",
+                "142 files",
+            )
+            progress_clock.now = 65.0
+            progress.stages[context.stage_key].started_at = 0.0
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.DONE,
+            )
+            return TaskRuntimeStatus.DONE
+
+    with monkeypatch.context() as run_patch:
+        run_patch.delenv("CI", raising=False)
+        run_patch.delenv("NO_COLOR", raising=False)
+        run_patch.delenv("TERM", raising=False)
+        run_patch.setattr(cli_module, "RunProgress", progress_factory)
+        run_patch.setattr(cli_module, "HostPreflight", ReadyPreflight)
+        run_patch.setattr(
+            cli_module,
+            "select_agent",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                name="mock", model="test-model", effort=None
+            ),
         )
-        stream = WaitableStringIO(interactive=interactive)
-        progress_clock = FakeClock()
-        progress_ref: dict[str, RunProgress] = {}
-        task = publication.files[0].task
-        plan = HostPreflightPlan(
-            repository_root=run_root,
-            commands=(),
-            prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
-            materialize_commands=(),
-            environment_files=(),
-            executables=(),
-            required_secret_names=(),
-            compose_files=(),
-            services=(),
+        run_patch.setattr(
+            cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
+        )
+        run_patch.setattr(cli_module, "HostComposeManager", CleanCompose)
+        run_patch.setattr(cli_module, "HostWorktreeManager", PreparedWorktrees)
+        run_patch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
+        run_patch.setattr(
+            cli_module, "HostReviewFixPhase", lambda *_a, **_k: object()
+        )
+        run_patch.setattr(cli_module, "HostMergePhase", lambda *_a, **_k: object())
+        run_patch.setattr(cli_module, "HostSanityPhase", lambda *_a, **_k: object())
+        run_patch.setattr(cli_module, "HostTaskRuntime", DeterministicRuntime)
+        run_patch.setattr(
+            cli_module,
+            "HostSchedulerConfig",
+            lambda *, jobs, review_passes: actual_scheduler_config(
+                jobs=jobs,
+                review_passes=review_passes,
+                poll_interval_seconds=0.005,
+            ),
+        )
+        _trust(cli_runner, committed_git_repo, run_patch)
+        result = cli_runner.invoke(
+            cli,
+            ["execute", name, "--auto-execute"],
         )
 
-        def progress_factory(**kwargs) -> RunProgress:
-            progress = real_progress(
-                stream=stream if kwargs.get("enabled", True) else StringIO(),
-                clock=progress_clock,
-                width=100,
-                **kwargs,
-            )
-            if kwargs.get("enabled", True):
-                progress_ref["progress"] = progress
-            return progress
-
-        class ReadyPreflight:
-            def __init__(self, *_args, **_kwargs) -> None:
-                self.validated_result = None
-
-            def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
-                self.validated_result = plan
-                return plan
-
-        class PreparedWorktrees:
-            def __init__(self, *_args, **_kwargs) -> None:
-                pass
-
-            def prepare_current_task_worktrees(self, *_args, **_kwargs):
-                return [SimpleNamespace(task_id=task.id, path=run_root)]
-
-            def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
-                return False
-
-        class CleanCompose:
-            def __init__(self, *_args, **_kwargs) -> None:
-                pass
-
-            def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
-                return ()
-
-        class DeterministicRuntime:
-            def __init__(self, runtime_plan, **_kwargs) -> None:
-                self.plan = runtime_plan
-
-            def with_secret_values(self, _secret_values):
-                return self
-
-            def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
-                return ("prepared",)
-
-            def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
-                progress = progress_ref["progress"]
-                progress.declare_child(
-                    context.stage_key,
-                    ChildSpec("checks", "Checks"),
-                )
-                progress.start_child(context.stage_key, "checks")
-                progress_clock.now = 4.0
-                progress.complete_child(
-                    context.stage_key,
-                    "checks",
-                    "142 files",
-                )
-                progress_clock.now = 65.0
-                progress.stages[context.stage_key].started_at = 0.0
-                context.transition(
-                    TaskRuntimeStatus.CLAIMED,
-                    TaskRuntimeStatus.DONE,
-                )
-                return TaskRuntimeStatus.DONE
-
-        with monkeypatch.context() as run_patch:
-            run_patch.delenv("CI", raising=False)
-            run_patch.delenv("NO_COLOR", raising=False)
-            run_patch.delenv("TERM", raising=False)
-            run_patch.setattr(cli_module, "RunProgress", progress_factory)
-            run_patch.setattr(cli_module, "HostPreflight", ReadyPreflight)
-            run_patch.setattr(
-                cli_module,
-                "select_agent",
-                lambda *_args, **_kwargs: SimpleNamespace(
-                    name="mock", model="test-model", effort=None
-                ),
-            )
-            run_patch.setattr(
-                cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
-            )
-            run_patch.setattr(cli_module, "HostComposeManager", CleanCompose)
-            run_patch.setattr(cli_module, "HostWorktreeManager", PreparedWorktrees)
-            run_patch.setattr(
-                cli_module, "HostCodingPhase", lambda *_a, **_k: object()
-            )
-            run_patch.setattr(
-                cli_module, "HostReviewFixPhase", lambda *_a, **_k: object()
-            )
-            run_patch.setattr(
-                cli_module, "HostMergePhase", lambda *_a, **_k: object()
-            )
-            run_patch.setattr(
-                cli_module, "HostSanityPhase", lambda *_a, **_k: object()
-            )
-            run_patch.setattr(cli_module, "HostTaskRuntime", DeterministicRuntime)
-            run_patch.setattr(
-                cli_module,
-                "HostSchedulerConfig",
-                lambda *, jobs, review_passes: actual_scheduler_config(
-                    jobs=jobs,
-                    review_passes=review_passes,
-                    poll_interval_seconds=0.005,
-                ),
-            )
-            _trust(cli_runner, run_root, run_patch)
-            result = cli_runner.invoke(
-                cli,
-                ["execute", name, "--auto-execute"],
-            )
-
-        assert result.exit_code == 0, result.output
-        finished_rows = tuple(
-            line
-            for line in terminal_screen(stream.getvalue()).splitlines()
-            if line.startswith(("✔ ", "├ ✔ ", "└ ✔ "))
-        )
-        assert len(finished_rows) == 4
-        return finished_rows
-
-    interactive_rows = run_reporter(interactive=True)
-    plain_rows = run_reporter(interactive=False)
-
-    assert plain_rows == interactive_rows
-    assert plain_rows == (
+    assert result.exit_code == 0, result.output
+    finished_rows = tuple(
+        line
+        for line in terminal_screen(stream.getvalue()).splitlines()
+        if line.startswith(("✔ ", "├ ✔ ", "└ ✔ "))
+    )
+    assert finished_rows == (
         "✔ Estimate and decision  0:00  bypassed",
         "✔ Preflight              0:00  ready",
         "✔ reporter-parity        1:05  merged",

@@ -349,6 +349,7 @@ def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None
         (TaskRuntimeStatus.REVIEW, 2, "review (pass 3/3)"),
         (TaskRuntimeStatus.REVIEW, 3, "review: durable reason"),
         (TaskRuntimeStatus.FIX, 0, "fix: durable reason"),
+        (TaskRuntimeStatus.FIX, 3, "fix: durable reason"),
     ],
 )
 def test_scheduler_projects_durable_review_and_fix_passes(
