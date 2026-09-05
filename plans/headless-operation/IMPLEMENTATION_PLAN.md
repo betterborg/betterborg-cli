@@ -544,17 +544,21 @@ the Architect's own account of what it decided without asking.
 
 What the plan carries is the standing set, never a history of it. Planning is
 iterative: a review sends a plan back, the Architect reopens its own question,
-and the same ground is settled more than once. Three rules keep the section to
-the decisions actually in force. A later round supersedes what it re-answers,
-so the plan names the reading it was built on rather than the one it moved on
-from. A round a person answered retires its assumption outright, because their
-answer is a requirement and no other source may reinstate it. And a plan that
-names its assumptions has stated the whole set, so the plan it supersedes is
-not merged on top; that list stands in only where the new one is silent, which
-is the revision that addresses a finding without revisiting what it assumed.
-Without the last of these an assumption reworded between rounds survives in
-both wordings, and a section that is mostly restatement buries the decisions it
-exists to surface.
+and the same ground is settled more than once. One rule covers the record: the
+last round to answer a question is the one the plan was built on, so it is the
+one that surfaces. Where that round is a person's answer the question is
+settled and carries no assumption, and neither a plan carrying its list forward
+nor a plan declaring one may put the assumption back. Where the Architect has
+since reopened the question and decided it, the plan follows its reading and
+says so, because hiding a live assumption behind a superseded answer is the
+failure this section exists to prevent.
+
+The plan's own account is bounded by the same principle. A plan that names its
+assumptions has stated the whole set, so the plan it supersedes is not merged
+on top; that list stands in only where the new one is silent, which is the
+revision that addresses a finding without revisiting what it assumed. Without
+this an assumption reworded between rounds survives in both wordings, and a
+section that is mostly restatement buries the decisions it exists to surface.
 
 What an attended run cannot do is originate one. Every requirement there was
 either read from the confirmed PRD or got by asking, so a plan claiming an
@@ -581,7 +585,9 @@ command never built itself, and it decides on the same terms as the rest.
   stopping when a prompt returns nothing and refusing an assumption a plan
   claims for itself.
 - The bounded round cap that governs question rounds still governs them, so an
-  Architect that keeps asking still ends the run rather than looping.
+  Architect that keeps asking still ends the run rather than looping. It bounds
+  one planning cycle, so a Borg that spent its budget planning can still be
+  revised.
 - Changing a plan, and revising one for the review, run unattended on the same
   terms as starting one.
 
@@ -590,7 +596,7 @@ command never built itself, and it decides on the same terms as the rest.
   attended run's carry neither half of it.
 - A plan run unattended names the requirements it settled for itself.
 - A question answered twice yields the later decision, not the one it
-  replaced; an answer a person gives retires the assumption entirely; and a
+  replaced, whether the later answer is a person's or the Architect's; and a
   revision that names its assumptions replaces the superseded list rather than
   adding to it.
 - A recorded round survives a plan that leaves it out, in the wording it was
@@ -603,7 +609,8 @@ command never built itself, and it decides on the same terms as the rest.
   and an abandoned answers turn is not recovered for a later round.
 - Interactive planning still prompts, still stops on a cancelled prompt, and
   still drops an assumption its plan claims.
-- An Architect that asks past the round cap still ends the run.
+- An Architect that asks past the round cap still ends the run, and a new
+  cycle begins with its budget restored.
 - A plan changed unattended, and a plan the review sends back, both assume the
   questions their revisions raise.
 

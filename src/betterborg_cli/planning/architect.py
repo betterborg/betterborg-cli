@@ -22,6 +22,8 @@ from betterborg_cli.agent_runtime.selection import (
 from betterborg_cli.planning.plan_contracts import PlanValidationError
 from betterborg_cli.planning.turns import (
     DurablePlanningTurns,
+    completed_planning_phase_attempts,
+    current_planning_cycle_attempts,
     planning_attempt_duration,
     planning_attempt_result,
 )
@@ -685,11 +687,19 @@ class ArchitectLoop:
         self, question: PlanningQuestion
     ) -> list[dict[str, object]]:
         """Decide one round from the evidence, because nobody else can."""
-        if question.round > ARCHITECT_QUESTION_ROUND_CAP:
+        # Rounds spent by this planning cycle, not the round number, which
+        # counts every question the Borg has ever been asked. A Borg that
+        # spent its budget planning would otherwise be unrevisable for the
+        # rest of its life the moment a revision raised one question.
+        assumed = completed_planning_phase_attempts(
+            current_planning_cycle_attempts(self.store, self.borg_id),
+            _ANSWERS_PHASE,
+        )
+        if len(assumed) >= ARCHITECT_QUESTION_ROUND_CAP:
             raise ArchitectError(
                 "Architect asked past question round "
-                f"{ARCHITECT_QUESTION_ROUND_CAP}; an unattended run cannot "
-                "assume further answers"
+                f"{ARCHITECT_QUESTION_ROUND_CAP} of this planning cycle; an "
+                "unattended run cannot assume further answers"
             )
         # A round raised by a plan is a question about that plan, and the turn
         # answering it is a fresh agent with none of the reasoning that raised
@@ -924,21 +934,13 @@ class ArchitectLoop:
         # and after a few review rounds the section is mostly restatement.
         carried = [] if declared else self._declared_assumptions(superseded or {})
         stored, answered = self._stored_assumptions()
-        assumptions: list[dict[str, str]] = []
-        seen: set[str] = set()
-        # Stored first: an assumption Betterborg recorded is the one whose
-        # wording came from the question as asked.
-        for assumption in stored:
-            key = assumption["question"].casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            assumptions.append(assumption)
-        # A question that was put and answered belongs to the record, whether
-        # the record answers it or retires it. Without this, a plan carrying
-        # an assumption forward would reinstate one a person has since
-        # settled, and the carrying would outlive the answer.
-        seen |= answered
+        # The record leads, and it holds at most one standing assumption per
+        # question already. Every question it has answered is spoken for,
+        # whether it answers or retires: without that, a plan carrying an
+        # assumption forward would reinstate one a person has since settled,
+        # and the carrying would outlive the answer.
+        assumptions: list[dict[str, str]] = list(stored)
+        seen: set[str] = set(answered)
         for assumption in [*carried, *declared]:
             key = assumption["question"].casefold()
             if key in seen:

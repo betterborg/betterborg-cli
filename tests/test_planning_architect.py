@@ -29,6 +29,7 @@ from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.store import (
     BorgState,
+    PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningFinding,
@@ -597,6 +598,71 @@ def test_a_question_the_questions_phase_raised_is_not_blamed_on_the_plan(
     assert "raises is a question about that plan" not in seen["user_prompt"]
 
 
+def test_reopening_a_question_a_person_settled_makes_it_an_assumption_again(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Retirement is what the record last said, not a veto on later rounds.
+
+    A person's answer settles a question until the Architect reopens it and
+    decides differently, which is what an unattended revision of an attended
+    plan does. The plan then rests on the Architect's reading, so that is the
+    one to surface: suppressing it behind the older answer would hide a live
+    assumption behind a decision the plan no longer follows.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-reopened.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "reopened"
+        )
+        asked = [{"id": "q1", "question": "Which platforms are required?"}]
+        for round_number, answer in (
+            (1, {"q_id": "q1", "answer": "Linux only."}),
+            (2, {"q_id": "q1", "answer": "Linux and macOS.", "assumed": True}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase="architect_questions",
+                    round=round_number,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result={"decision": "ask_more", "questions": asked},
+                )
+            )
+            question = PlanningQuestion(
+                borg_id=borg.id,
+                attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+                round=round_number,
+                questions=asked,
+            )
+            store.append_planning_question(question)
+            store.answer_planning_question(question.id, [answer])
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required?",
+                "assumption": "Linux and macOS.",
+            }
+        ]
+
+
 def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
     committed_git_repo: Path,
     persist_planning_context,
@@ -780,6 +846,80 @@ def test_unattended_planning_ends_when_questions_pass_the_round_cap(
         current = store.get_borg(borg.id)
         assert current is not None
         assert current.state is BorgState.ARCHITECT_AWAITING_ANSWERS
+
+
+def test_a_new_cycle_gets_its_own_question_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Spending the budget planning must not cost a Borg every later revision.
+
+    The round number counts every question a Borg has ever been asked, so a
+    run that used its rounds and then went on to plan leaves a Borg whose next
+    unattended revision refuses its first question. The budget bounds a cycle,
+    and a change request starts a new one.
+    """
+    asked = [{"id": "q1", "question": "Which platforms are required?"}]
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(
+        MockResponse(payload={**_plan(), "open_questions": ["Which channel?"]})
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Stable."}]})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-new-cycle.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "new-cycle"
+        )
+        # A previous cycle that used every round it was given, then planned.
+        for round_number in range(1, ARCHITECT_QUESTION_ROUND_CAP + 1):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase="architect_answers",
+                    round=round_number,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result={"answers": [{"q_id": "q1", "answer": "Linux."}]},
+                )
+            )
+            question = PlanningQuestion(
+                borg_id=borg.id,
+                attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+                round=round_number,
+                questions=asked,
+            )
+            store.append_planning_question(question)
+            store.answer_planning_question(
+                question.id,
+                [{"q_id": "q1", "answer": "Linux.", "assumed": True}],
+            )
+        store.append_plan_change_request(
+            PlanChangeRequest(
+                borg_id=borg.id, round=1, note="Stage the rollout."
+            )
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert store.list_planning_questions(borg.id)[-1].answers == [
+            {"q_id": "q1", "answer": "Stable.", "assumed": True}
+        ]
 
 
 def test_assumed_answers_must_cover_every_question_in_their_round(
