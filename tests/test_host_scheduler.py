@@ -20,7 +20,6 @@ from betterborg_cli.host_execution import (
     HostSchedulerConfig,
     HostTaskScheduler,
     ScheduledTaskContext,
-    TaskActivitySink,
 )
 from betterborg_cli.progress import (
     AgentActivity,
@@ -258,18 +257,31 @@ def test_scheduler_limits_jobs_renews_claims_and_reports_active_operation(
         assert {claim.run_id for claim in claims} == {run.id}
 
 
-def test_scheduler_exposes_labelled_task_bound_activity_sinks(tmp_path: Path) -> None:
+def test_scheduler_forwards_only_the_activity_handoff_return_value(
+    tmp_path: Path,
+) -> None:
     database, borg, generation, records = _scheduler_fixture(
         tmp_path,
         task_refs=("task",),
         dependencies=(),
     )
-    reported: list[tuple[object, AgentActivity]] = []
+    raw = AgentActivity(AgentActivityKind.COMMAND, "bound secret activity")
+    masked = AgentActivity(AgentActivityKind.COMMAND, "bound [REDACTED] activity")
+    handed_off: list[tuple[object, AgentActivity]] = []
+    progress_received: list[AgentActivity] = []
 
-    def report(task_id, activity: AgentActivity) -> None:  # noqa: ANN001
-        reported.append((task_id, activity))
+    class RecordingProgress(RunProgress):
+        def activity(
+            self, stage_key: str, activity: AgentActivity
+        ) -> StageRecord:
+            progress_received.append(activity)
+            return super().activity(stage_key, activity)
 
-    task_reporter: TaskActivitySink = report
+    def handoff(task_id, activity: AgentActivity) -> AgentActivity:  # noqa: ANN001
+        handed_off.append((task_id, activity))
+        return masked
+
+    progress = RecordingProgress(stream=StringIO(), enabled=False)
 
     with SqliteStore.open(database) as store:
 
@@ -279,24 +291,32 @@ def test_scheduler_exposes_labelled_task_bound_activity_sinks(tmp_path: Path) ->
             activity_sink = context.activity_sink("coding")
             assert activity_sink is not None
             labelled_sink: ActivitySink = activity_sink
-            labelled_sink(
-                AgentActivity(AgentActivityKind.COMMAND, "bound activity")
-            )
+            labelled_sink(raw)
             assert "report" not in repr(context)
             context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
             return TaskRuntimeStatus.DONE
 
-        result = HostTaskScheduler(store, behavior, activity=task_reporter).run(
-            borg.id, generation.id
-        )
+        result = HostTaskScheduler(
+            store,
+            behavior,
+            activity_handoff=handoff,
+            progress=progress,
+        ).run(borg.id, generation.id)
 
     assert result.status is ExecutionRunStatus.COMPLETED
-    assert reported == [
+    labelled_raw = AgentActivity(
+        AgentActivityKind.COMMAND, "coding: bound secret activity"
+    )
+    assert handed_off == [
         (
             records["task"].id,
-            AgentActivity(AgentActivityKind.COMMAND, "coding: bound activity"),
+            labelled_raw,
         )
     ]
+    assert handed_off[0][1] is not masked
+    assert progress_received == [masked]
+    assert progress_received[0] is masked
+    assert "secret" not in repr(progress.stages[str(records["task"].id)])
 
 
 def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None:

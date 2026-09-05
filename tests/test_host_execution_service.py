@@ -59,6 +59,7 @@ from betterborg_cli.host_execution import (
     MergeTip,
     SafeGit,
 )
+from betterborg_cli.host_execution.service import _ExecutionActivityBinding
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
@@ -1151,6 +1152,35 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
         ]
     finally:
         store.close()
+
+
+def test_activity_binding_returns_masked_event_when_observer_fails() -> None:
+    task_id = uuid4()
+    observed: list[AgentActivity] = []
+
+    def failing_observer(
+        observed_task_id: UUID, activity: AgentActivity
+    ) -> None:
+        assert observed_task_id == task_id
+        observed.append(activity)
+        raise RuntimeError("observer unavailable")
+
+    binding = _ExecutionActivityBinding(
+        ("local-secret", "agent-secret"), failing_observer
+    )
+    raw = AgentActivity(
+        AgentActivityKind.READING,
+        "local local-secret and agent agent-secret",
+    )
+
+    masked = binding.emit(task_id, raw)
+
+    assert masked == AgentActivity(
+        AgentActivityKind.READING,
+        "local [REDACTED] and agent [REDACTED]",
+    )
+    assert masked is observed[0]
+    assert masked is not raw
 
 
 def test_cancellation_during_materialization_does_not_start_services(

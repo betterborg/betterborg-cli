@@ -182,7 +182,9 @@ class HostTaskScheduler:
         *,
         config: HostSchedulerConfig | None = None,
         clock: Callable[[], datetime] = _utcnow,
-        activity: TaskActivitySink | None = None,
+        activity_handoff: (
+            Callable[[UUID, AgentActivity], AgentActivity] | None
+        ) = None,
         progress: RunProgress | None = None,
         interruption_cleanup: Callable[[], None] | None = None,
     ) -> None:
@@ -190,7 +192,7 @@ class HostTaskScheduler:
         self._behavior = behavior
         self._config = config or HostSchedulerConfig()
         self._clock = clock
-        self._activity = activity
+        self._activity_handoff = activity_handoff
         self._progress = progress
         self._interruption_cleanup = interruption_cleanup
 
@@ -315,7 +317,8 @@ class HostTaskScheduler:
                             clock=self._clock,
                             activity=(
                                 partial(self._report_activity, claim.task_id)
-                                if self._activity is not None
+                                if self._activity_handoff is not None
+                                or self._progress is not None
                                 else None
                             ),
                             _transitioned=self._transition_progress,
@@ -440,9 +443,15 @@ class HostTaskScheduler:
             self._progress.update(stage.key, runtime.status.value)
 
     def _report_activity(self, task_id: UUID, activity: AgentActivity) -> None:
-        """Forward already-redacted activity to configured task observers."""
-        if self._activity is not None:
-            self._activity(task_id, activity)
+        """Hand off activity before forwarding only its returned projection."""
+        reported = activity
+        if self._activity_handoff is not None:
+            reported = self._activity_handoff(task_id, activity)
+        if self._progress is None:
+            return
+        stage = self._progress.stages.get(str(task_id))
+        if stage is not None and stage.state is StageState.RUNNING:
+            self._progress.activity(stage.key, reported)
 
     def _reconcile_interrupted_progress(
         self, run_id: UUID, generation_id: UUID
