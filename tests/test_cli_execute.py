@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -40,11 +41,16 @@ from betterborg_cli.host_execution import (
     HostExecutionResult,
     HostPreflightPlan,
     HostSchedulerConfig,
-    HostTaskScheduler,
     ScheduledTaskContext,
 )
 from betterborg_cli.planning import TaskPublisher
-from betterborg_cli.progress import RunProgress, StageSpec, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
@@ -80,6 +86,7 @@ def _seed_executable_generation(
     name: str = "execute-gate",
     round_number: int = 1,
     task_count: int = 1,
+    task_titles: tuple[str, ...] | None = None,
     approval: PlanApproval | None = None,
 ):
     if approval is None:
@@ -121,10 +128,16 @@ def _seed_executable_generation(
             )
             store.append_plan_approval(approval)
         bodies = []
+        if task_titles is not None and len(task_titles) != task_count:
+            raise ValueError("task titles must match the requested task count")
         for position in range(1, task_count + 1):
             body = _task_body(round_number)
             body["stem"] = f"{round_number:02d}-execute-gate-{position:02d}"
-            body["title"] = f"Execute task {position}"
+            body["title"] = (
+                task_titles[position - 1]
+                if task_titles is not None
+                else f"Execute task {position}"
+            )
             bodies.append(body)
         fixture = approved_task_generation(
             store,
@@ -704,6 +717,14 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     expected_summary_count: int,
 ) -> None:
     name = f"execution-projection-{task_count}"
+    long_execution_titles = (
+        "auth-refactor",
+        "rate-limiter",
+        "config-loader",
+        "webhook-retry",
+        "db-migration",
+        *(f"pending-task-{number}" for number in range(6, 15)),
+    )
     _repository, paths, borg, _approval, _fixture, publication = (
         _seed_executable_generation(
             committed_git_repo,
@@ -711,6 +732,7 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
             approved_task_generation,
             name=name,
             task_count=task_count,
+            task_titles=long_execution_titles if task_count == 14 else None,
         )
     )
     config_path = paths.tracked_dir / "config.toml"
@@ -727,42 +749,6 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     task_records = tuple(item.task for item in publication.files)
     task_keys = tuple(str(task.id) for task in task_records)
     task_labels = tuple(task.title for task in task_records)
-    if completed_count:
-        seeded_cancel = CancellationToken()
-        seeded = 0
-
-        def complete_seeded_task(
-            context: ScheduledTaskContext,
-        ) -> TaskRuntimeStatus:
-            nonlocal seeded
-            context.transition(
-                TaskRuntimeStatus.CLAIMED,
-                TaskRuntimeStatus.DONE,
-            )
-            seeded += 1
-            if seeded == completed_count:
-                seeded_cancel.cancel()
-            return TaskRuntimeStatus.DONE
-
-        with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            seeded_result = HostTaskScheduler(
-                store,
-                complete_seeded_task,
-                config=HostSchedulerConfig(
-                    jobs=1,
-                    poll_interval_seconds=0.005,
-                ),
-            ).run(
-                borg.id,
-                publication.generation.id,
-                cancel=seeded_cancel,
-            )
-            assert seeded_result.status is ExecutionRunStatus.CANCELLED
-            assert sum(
-                runtime.status is TaskRuntimeStatus.DONE
-                for runtime in store.list_task_runtimes(publication.generation.id)
-            ) == completed_count
-
     stream = WaitableStringIO(interactive=True)
     progress_clock = FakeClock()
     progress_ref: dict[str, RunProgress] = {}
@@ -899,13 +885,52 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
 
         def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
             nonlocal active_started
+            task_index = next(
+                index
+                for index, task in enumerate(task_records)
+                if task.id == context.claim.task_id
+            )
+            if task_index < completed_count:
+                durations = (134.0, 182.0, 108.0)
+                progress = progress_ref["progress"]
+                with active_lock:
+                    progress_clock.now = durations[task_index]
+                    progress.stages[context.stage_key].started_at = 0.0
+                    context.transition(
+                        TaskRuntimeStatus.CLAIMED,
+                        TaskRuntimeStatus.DONE,
+                    )
+                return TaskRuntimeStatus.DONE
+
+            if task_count == 14 and task_index == 3:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.REVIEW,
+                    resume_phase="review",
+                    review_round=1,
+                )
+                assert context.activity is not None
+                context.activity(
+                    AgentActivity(
+                        AgentActivityKind.READING,
+                        "src/webhook/retry.go",
+                    )
+                )
+            elif task_count == 14 and task_index == 4:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.CODING,
+                    resume_phase="coding",
+                )
+                assert context.activity is not None
+                context.activity(AgentActivity(AgentActivityKind.THINKING))
             with active_lock:
                 active_started += 1
                 if active_started == target_active:
                     scheduler_blocked.set()
             assert release_scheduler.wait(timeout=3)
             context.transition(
-                TaskRuntimeStatus.CLAIMED,
+                context.runtime.status,
                 TaskRuntimeStatus.DONE,
             )
             return TaskRuntimeStatus.DONE
@@ -956,8 +981,9 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     monkeypatch.setattr(
         cli_module,
         "HostSchedulerConfig",
-        lambda *, jobs: actual_scheduler_config(
+        lambda *, jobs, review_passes: actual_scheduler_config(
             jobs=jobs,
+            review_passes=review_passes,
             poll_interval_seconds=0.005,
         ),
     )
@@ -984,6 +1010,13 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         assert scheduler_blocked.wait(timeout=3)
         try:
             progress = progress_ref["progress"]
+            if task_count == 14:
+                with progress._lock:
+                    progress_clock.now = 72.0
+                    progress.stages[task_keys[3]].started_at = 31.0
+                    progress.stages[task_keys[4]].started_at = 0.0
+                    progress._spinner_started_at = time.monotonic()
+                progress.refresh()
             snapshot = progress._projection_snapshot()
             task_stages = {
                 stage.record.key: stage.record
@@ -1010,9 +1043,9 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
                 if stage.state is StageState.PENDING
             )
             assert all(
-                stage.retained
-                and stage.started_at is None
-                and stage.finished_at is None
+                not stage.retained
+                and stage.started_at is not None
+                and stage.finished_at is not None
                 for stage in retained
             )
             assert all(
@@ -1024,10 +1057,38 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
             assert tuple(spec.label for spec in snapshot.previews) == follow_up_labels
             assert len(snapshot.stages) == task_count + 2
             if expected_live_account is not None:
+                expected_completed = (
+                    "✔ auth-refactor    2:14  merged",
+                    "✔ rate-limiter     3:02  merged",
+                    "✔ config-loader    1:48  merged",
+                )
+                expected_live = (
+                    "  3 done · 2 running · 9 pending\n"
+                    "  ⠋ webhook-retry   0:41  review (pass 2/3)\n"
+                    "      └ reading src/webhook/retry.go\n"
+                    "  ⠋ db-migration    1:12  coding\n"
+                    "      └ thinking\n"
+                    "\n"
+                    "  ctrl-c to stop"
+                )
+                actual_live = "\n".join(
+                    line.plain for line in progress._live_lines()
+                )
+                assert actual_live == expected_live
                 output = stream.wait_for(
                     lambda value: expected_live_account in terminal_text(value)
                 )
                 rendered = terminal_text(output)
+                actual_completed = tuple(
+                    line for line in expected_completed if line in rendered
+                )
+                expected_account = "\n".join(
+                    (*expected_completed, "", expected_live)
+                )
+                actual_account = "\n".join(
+                    (*actual_completed, "", actual_live)
+                )
+                assert actual_account == expected_account
                 assert "✔ Estimate and decision" in rendered
                 assert "✔ Preflight" in rendered
                 assert expected_live_account in rendered
@@ -1058,7 +1119,8 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     )
     assert (
         f"{expected_summary_count} of {expected_summary_count} stages finished "
-        "in 0:00; none failed or stopped."
+        f"in {'1:12' if task_count == 14 else '0:00'}; "
+        "none failed or stopped."
     ) in terminal_text(stream.getvalue())
     assert len(adopted_follow_ups) == len(projected_follow_ups)
     assert all(
@@ -2335,6 +2397,9 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         assert review_config.review_effort == "review-effort"
         assert review_config.fix_effort == "review-effort"
         assert review_config.review_passes == config.execution.review_passes
+        assert service._scheduler_config.review_passes == (
+            config.execution.review_passes
+        )
         merge_config = service._runtime._merge._config
         assert merge_config.model == "selected-merge-model"
         assert merge_config.effort == "merge-effort"

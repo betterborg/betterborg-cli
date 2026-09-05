@@ -50,6 +50,7 @@ class HostSchedulerConfig:
     """Timing and concurrency limits for one execution scheduler."""
 
     jobs: int = 1
+    review_passes: int = 3
     lease_duration: timedelta = timedelta(minutes=2)
     heartbeat_interval: timedelta = timedelta(seconds=30)
     poll_interval_seconds: float = 0.02
@@ -57,6 +58,8 @@ class HostSchedulerConfig:
     def __post_init__(self) -> None:
         if self.jobs < 1:
             raise ValueError("scheduler jobs must be positive")
+        if self.review_passes < 1:
+            raise ValueError("scheduler review passes must be positive")
         if self.lease_duration <= timedelta(0):
             raise ValueError("scheduler lease duration must be positive")
         if not timedelta(0) < self.heartbeat_interval < self.lease_duration:
@@ -425,7 +428,13 @@ class HostTaskScheduler:
         stage = self._progress.stages.get(str(claim.task_id))
         if stage is not None and stage.state is StageState.PENDING:
             self._progress.start(stage.key)
-            self._progress.update(stage.key, claim.resume_phase)
+            runtime = self._store.get_task_runtime(claim.task_id)
+            if runtime is None:
+                raise KeyError(f"task runtime {claim.task_id} not found")
+            self._progress.update(
+                stage.key,
+                self._progress_detail(runtime, phase=claim.resume_phase),
+            )
 
     def _transition_progress(self, runtime: TaskRuntime) -> None:
         """Reflect one already-accepted durable task transition."""
@@ -440,7 +449,7 @@ class HostTaskScheduler:
         elif runtime.status in {TaskRuntimeStatus.FAILED, TaskRuntimeStatus.BLOCKED}:
             self._progress.fail(stage.key, result)
         else:
-            self._progress.update(stage.key, runtime.status.value)
+            self._progress.update(stage.key, self._progress_detail(runtime))
 
     def _report_activity(self, task_id: UUID, activity: AgentActivity) -> None:
         """Hand off activity before forwarding only its returned projection."""
@@ -484,8 +493,34 @@ class HostTaskScheduler:
             elif stage.state is StageState.RUNNING:
                 self._progress.stop(stage.key, "execution cancelled")
 
+    def _progress_detail(
+        self,
+        runtime: TaskRuntime,
+        *,
+        phase: str | None = None,
+    ) -> str:
+        """Project one durable active phase without changing its lifecycle."""
+        phase_label = runtime.status.value if phase is None else phase
+        if phase_label == TaskRuntimeStatus.REVIEW.value:
+            pass_number = runtime.review_round + 1
+            if 1 <= pass_number <= self._config.review_passes:
+                return (
+                    f"review (pass {pass_number}/{self._config.review_passes})"
+                )
+        elif phase_label == TaskRuntimeStatus.FIX.value:
+            pass_number = runtime.review_round
+            if 1 <= pass_number <= self._config.review_passes:
+                return f"fix (pass {pass_number}/{self._config.review_passes})"
+
+        detail = phase_label
+        if runtime.state_reason:
+            detail += f": {runtime.state_reason}"
+        return detail
+
     @staticmethod
     def _progress_result(runtime: TaskRuntime) -> str:
+        if runtime.status is TaskRuntimeStatus.DONE:
+            return "merged"
         result = runtime.status.value
         if runtime.state_reason:
             result += f": {runtime.state_reason}"

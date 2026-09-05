@@ -1483,7 +1483,10 @@ def _invoke_host_execution(
         runtime,
         worktree_manager=worktrees,
         compose_manager=compose,
-        scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
+        scheduler_config=HostSchedulerConfig(
+            jobs=config.execution.jobs,
+            review_passes=config.execution.review_passes,
+        ),
         progress=progress,
     )
     secrets = {

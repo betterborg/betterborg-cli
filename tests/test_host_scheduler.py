@@ -339,6 +339,224 @@ def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None
     assert result.status is ExecutionRunStatus.COMPLETED
 
 
+@pytest.mark.parametrize(
+    ("status", "review_round", "expected_detail"),
+    [
+        (TaskRuntimeStatus.REVIEW, 0, "review (pass 1/3)"),
+        (TaskRuntimeStatus.FIX, 1, "fix (pass 1/3)"),
+        (TaskRuntimeStatus.REVIEW, 1, "review (pass 2/3)"),
+        (TaskRuntimeStatus.FIX, 2, "fix (pass 2/3)"),
+        (TaskRuntimeStatus.REVIEW, 2, "review (pass 3/3)"),
+        (TaskRuntimeStatus.REVIEW, 3, "review: durable reason"),
+        (TaskRuntimeStatus.FIX, 0, "fix: durable reason"),
+    ],
+)
+def test_scheduler_projects_durable_review_and_fix_passes(
+    tmp_path: Path,
+    status: TaskRuntimeStatus,
+    review_round: int,
+    expected_detail: str,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    observed_runtime = None
+    event_count = 0
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            nonlocal observed_runtime, event_count
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.ENVIRONMENT,
+                resume_phase="environment",
+            )
+            context.transition(
+                TaskRuntimeStatus.ENVIRONMENT,
+                TaskRuntimeStatus.CODING,
+                resume_phase="coding",
+            )
+            runtime = context.transition(
+                TaskRuntimeStatus.CODING,
+                TaskRuntimeStatus.REVIEW,
+                resume_phase="review",
+                review_round=review_round if status is TaskRuntimeStatus.REVIEW else 0,
+                state_reason="durable reason",
+            )
+            if status is TaskRuntimeStatus.FIX:
+                runtime = context.transition(
+                    TaskRuntimeStatus.REVIEW,
+                    TaskRuntimeStatus.FIX,
+                    resume_phase="fix",
+                    review_round=review_round,
+                    state_reason="durable reason",
+                )
+
+            observed_runtime = runtime
+            event_count = len(store.list_execution_events(context.claim.run_id))
+            assert context.runtime == runtime
+            assert progress.stages[context.stage_key].detail == expected_detail
+            assert len(store.list_execution_events(context.claim.run_id)) == event_count
+
+            if status is TaskRuntimeStatus.FIX:
+                context.transition(
+                    TaskRuntimeStatus.FIX,
+                    TaskRuntimeStatus.REVIEW,
+                    resume_phase="review",
+                    review_round=review_round,
+                )
+            context.transition(
+                TaskRuntimeStatus.REVIEW,
+                TaskRuntimeStatus.MERGING,
+                resume_phase="merging",
+            )
+            context.transition(
+                TaskRuntimeStatus.MERGING,
+                TaskRuntimeStatus.DONE,
+                resume_phase="done",
+            )
+            return TaskRuntimeStatus.DONE
+
+        result = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(review_passes=3),
+            progress=progress,
+        ).run(borg.id, generation.id)
+
+        assert observed_runtime is not None
+        assert observed_runtime.status is status
+        assert observed_runtime.review_round == review_round
+        assert observed_runtime.state_reason == "durable reason"
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert progress.stages[str(records["task"].id)].result == "merged"
+
+
+@pytest.mark.parametrize(
+    ("resume_status", "review_round", "expected_detail"),
+    [
+        (TaskRuntimeStatus.REVIEW, 1, "review (pass 2/3)"),
+        (TaskRuntimeStatus.FIX, 2, "fix (pass 2/3)"),
+    ],
+)
+def test_scheduler_resumed_claim_uses_durable_review_pass(
+    tmp_path: Path,
+    resume_status: TaskRuntimeStatus,
+    review_round: int,
+    expected_detail: str,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+
+    with SqliteStore.open(database) as store:
+
+        def interrupt_in_phase(
+            context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.ENVIRONMENT,
+                resume_phase="environment",
+            )
+            context.transition(
+                TaskRuntimeStatus.ENVIRONMENT,
+                TaskRuntimeStatus.CODING,
+                resume_phase="coding",
+            )
+            context.transition(
+                TaskRuntimeStatus.CODING,
+                TaskRuntimeStatus.REVIEW,
+                resume_phase="review",
+                review_round=0,
+            )
+            if resume_status is TaskRuntimeStatus.FIX:
+                context.transition(
+                    TaskRuntimeStatus.REVIEW,
+                    TaskRuntimeStatus.FIX,
+                    resume_phase="fix",
+                    review_round=review_round,
+                )
+            else:
+                context.transition(
+                    TaskRuntimeStatus.REVIEW,
+                    TaskRuntimeStatus.FIX,
+                    resume_phase="fix",
+                    review_round=review_round,
+                )
+                context.transition(
+                    TaskRuntimeStatus.FIX,
+                    TaskRuntimeStatus.REVIEW,
+                    resume_phase="review",
+                    review_round=review_round,
+                )
+            cancel.cancel()
+            return resume_status
+
+        interrupted = HostTaskScheduler(store, interrupt_in_phase).run(
+            borg.id,
+            generation.id,
+            cancel=cancel,
+        )
+        assert interrupted.status is ExecutionRunStatus.CANCELLED
+        pending = store.get_task_runtime(records["task"].id)
+        assert pending is not None
+        assert pending.status is TaskRuntimeStatus.PENDING
+        assert pending.resume_phase == resume_status.value
+        assert pending.review_round == review_round
+
+        progress = RunProgress(stream=StringIO(), enabled=False)
+
+        def complete_resumed(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            stage = progress.stages[context.stage_key]
+            assert stage.detail == expected_detail
+            if resume_status is TaskRuntimeStatus.FIX:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.REVIEW,
+                    resume_phase="review",
+                )
+            else:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.MERGING,
+                    resume_phase="merging",
+                )
+                context.transition(
+                    TaskRuntimeStatus.MERGING,
+                    TaskRuntimeStatus.DONE,
+                    resume_phase="done",
+                )
+                return TaskRuntimeStatus.DONE
+            context.transition(
+                TaskRuntimeStatus.REVIEW,
+                TaskRuntimeStatus.MERGING,
+                resume_phase="merging",
+            )
+            context.transition(
+                TaskRuntimeStatus.MERGING,
+                TaskRuntimeStatus.DONE,
+                resume_phase="done",
+            )
+            return TaskRuntimeStatus.DONE
+
+        resumed = HostTaskScheduler(
+            store,
+            complete_resumed,
+            config=HostSchedulerConfig(review_passes=3),
+            progress=progress,
+        ).run(borg.id, generation.id)
+
+        assert resumed.status is ExecutionRunStatus.COMPLETED
+
+
 def test_scheduler_seeds_durable_rerun_before_claiming_pending_work(
     tmp_path: Path,
 ) -> None:
@@ -447,7 +665,7 @@ def test_scheduler_seeds_durable_rerun_before_claiming_pending_work(
         )
         assert (done.state, done.result, done.duration_seconds, done.started_at) == (
             StageState.COMPLETED,
-            "done",
+            "merged",
             1.5,
             None,
         )
@@ -464,7 +682,7 @@ def test_scheduler_seeds_durable_rerun_before_claiming_pending_work(
             blocked.started_at,
         ) == (StageState.FAILED, "blocked: durable block", 3.5, None)
         assert pending.state is StageState.COMPLETED
-        assert pending.result == "done"
+        assert pending.result == "merged"
         assert pending.started_at is not None
         assert claimed == [str(records["pending"].id)]
         rerun_claims = store.list_task_claims(rerun.operation_id)
@@ -771,7 +989,7 @@ def test_scheduler_sigint_durably_interrupts_before_keyboard_interrupt_escapes(
 @pytest.mark.parametrize(
     ("durable_status", "expected_stage_state", "expected_result"),
     [
-        (TaskRuntimeStatus.DONE, StageState.COMPLETED, "done"),
+        (TaskRuntimeStatus.DONE, StageState.COMPLETED, "merged"),
         (
             TaskRuntimeStatus.FAILED,
             StageState.FAILED,

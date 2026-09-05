@@ -1179,17 +1179,48 @@ def test_permanent_lines_match_in_plain_and_rich_modes(
     monkeypatch.delenv("TERM", raising=False)
     plain = StringIO()
     rich = TTYStringIO()
+    task_key = "4d0132f3-7206-4e64-893f-dbea0ef73394"
+    task_spec = StageSpec(
+        task_key,
+        "auth-refactor",
+        (ChildSpec("result", "Checks"),),
+    )
+    specs = (
+        task_spec,
+        *(
+            StageSpec(f"pending-{number}", f"Pending {number}")
+            for number in range(8)
+        ),
+    )
 
     for stream in (plain, rich):
-        progress = RunProgress(
-            [StageSpec("stage", "Stage")], stream=stream, width=120
+        progress = RunProgress(stream=stream, width=120)
+        progress.preview_pending(
+            specs,
+            cohort_keys=tuple(spec.key for spec in specs),
         )
-        progress.seed_completed("stage", "cached", 2.5)
+        progress.declare(task_spec)
+        progress.seed_child_completed(
+            task_key,
+            "result",
+            "142 files",
+            duration_seconds=1.5,
+        )
+        progress.seed_completed(task_key, "merged", 134.0)
         progress.stop_display()
 
-    expected = "✔ Stage                  0:02  cached · reused from earlier run"
-    assert plain.getvalue().strip() == expected
-    assert expected in terminal_text(rich.getvalue())
+    expected = [
+        "✔ auth-refactor    2:14  merged · reused from earlier run",
+        "└ ✔ Checks                 0:01  142 files · reused from earlier run",
+    ]
+    plain_rows = plain.getvalue().splitlines()
+    rich_output = terminal_text(rich.getvalue())
+
+    assert plain_rows == expected
+    assert all(rich_output.count(row) == 1 for row in expected)
+    assert [rich_output.index(row) for row in expected] == sorted(
+        rich_output.index(row) for row in expected
+    )
 
 
 @pytest.mark.parametrize("stream_type", [StringIO, TTYStringIO])
@@ -1622,18 +1653,16 @@ def test_focused_counts_are_independent_from_visible_previews_and_adoption() -> 
 
     frame = [line.plain for line in progress._live_lines()]
     assert "  ◦ Preflight" in frame
-    assert frame[-1] == (
-        "3 done · 2 running · 9 pending  ·  ctrl-c to stop"
-    )
+    assert frame[0] == "  3 done · 2 running · 9 pending"
+    assert frame[-1] == "  ctrl-c to stop"
     frame_text = "\n".join(frame)
     assert all(f"◦ {spec.label}" not in frame_text for spec in task_specs[5:])
 
     progress.declare(StageSpec("preflight", "Preflight"))
     adopted = [line.plain for line in progress._live_lines()]
     assert adopted.count("  ◦ Preflight") == 1
-    assert adopted[-1] == (
-        "3 done · 2 running · 9 pending  ·  ctrl-c to stop"
-    )
+    assert adopted[0] == "  3 done · 2 running · 9 pending"
+    assert adopted[-1] == "  ctrl-c to stop"
 
 
 def test_outside_record_keeps_live_permanent_and_summary_participation() -> None:
@@ -1645,7 +1674,7 @@ def test_outside_record_keeps_live_permanent_and_summary_participation() -> None
     progress.preview_pending(task_specs)
 
     progress.start("outside")
-    assert [line.plain for line in progress._live_lines()][0].startswith(
+    assert [line.plain for line in progress._live_lines()][1].startswith(
         "  ⠙ Outside"
     )
     progress.complete("outside", "kept")
@@ -1690,10 +1719,9 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
 
     counted_frame = [line.plain for line in progress._live_lines()]
     assert len(counted_frame) == 10
+    assert counted_frame[0] == "  0 done · 0 running · 9 pending"
     assert counted_frame[-2] == ""
-    assert counted_frame[-1] == (
-        "0 done · 0 running · 9 pending  ·  ctrl-c to stop"
-    )
+    assert counted_frame[-1] == "  ctrl-c to stop"
 
     progress.begin_cancellation()
     cancelling_frame = [line.plain for line in progress._live_lines()]

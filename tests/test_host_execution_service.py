@@ -967,7 +967,7 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             ("environment", "claimed"),
             ("environment", "environment"),
             ("coding", "coding"),
-            ("review", "review"),
+            ("review (pass 1/3)", "review"),
             ("merging", "merging"),
         ]
         assert displayed_completions == ["done"]

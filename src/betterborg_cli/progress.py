@@ -942,7 +942,17 @@ class RunProgress:
     def _emit_terminal(
         self, record: StageRecord | ChildRecord, *, parent_label: str | None = None
     ) -> None:
-        self._emit(_format_terminal_line(record, parent_label=parent_label))
+        self._emit(
+            _format_terminal_line(
+                record,
+                parent_label=parent_label,
+                compact=(
+                    isinstance(record, StageRecord)
+                    and len(self._cohort_keys) > _MAX_LIVE_ROWS
+                    and record.key in self._cohort_keys
+                ),
+            )
+        )
 
     def _emit_terminal_tree(self, parent: StageRecord) -> None:
         self._emit_terminal(parent)
@@ -1111,14 +1121,36 @@ class RunProgress:
         for stage in snapshot.stages:
             record = stage.record
             if record.state is StageState.RUNNING:
+                has_activity_detail = (
+                    record._activity_is_latest
+                    and record.activity is not None
+                    and record.detail is not None
+                    and record.detail.strip()
+                )
                 projected_lines.append(
                     (
                         self._format_live_running_line(
-                            record, cancelling=snapshot.cancelling
+                            record,
+                            cancelling=snapshot.cancelling,
+                            prefer_detail=has_activity_detail,
+                            compact=(
+                                aggregate_cohort
+                                and record.key in snapshot.cohort_keys
+                            ),
                         ),
                         StageState.RUNNING,
                     )
                 )
+                if has_activity_detail:
+                    projected_lines.append(
+                        (
+                            Text(
+                                f"      └ {_format_activity(record.activity)}",
+                                style="dim",
+                            ),
+                            StageState.RUNNING,
+                        )
+                    )
                 children, earlier_attempt_count = _select_render_children(
                     stage.children, self._attempt_history_limit
                 )
@@ -1171,14 +1203,23 @@ class RunProgress:
             if not (aggregate_cohort and spec.key in snapshot.cohort_keys)
         )
 
-        work_lines = self._bound_live_lines(projected_lines)
+        work_lines = self._bound_live_lines(
+            projected_lines,
+            limit=(
+                _MAX_LIVE_ROWS - 1
+                if aggregate_cohort and not snapshot.cancelling
+                else _MAX_LIVE_ROWS
+            ),
+        )
         if not work_lines and not aggregate_cohort and not snapshot.cancelling:
             return []
         if snapshot.cancelling:
             footer = Text("stopping…", style="dim cyan")
         elif aggregate_cohort:
-            footer = self._format_cohort_counts(snapshot, stages_by_key)
-            footer.append("  ·  ctrl-c to stop")
+            counts = Text("  ")
+            counts.append_text(self._format_cohort_counts(snapshot, stages_by_key))
+            work_lines.insert(0, counts)
+            footer = Text("  ctrl-c to stop", style="dim")
         else:
             footer = Text("  ctrl-c to stop", style="dim")
         return [*work_lines, Text(""), footer]
@@ -1237,14 +1278,16 @@ class RunProgress:
     @staticmethod
     def _bound_live_lines(
         lines: list[tuple[Text, StageState | None]],
+        *,
+        limit: int = _MAX_LIVE_ROWS,
     ) -> list[Text]:
         prioritized = sorted(
             lines, key=lambda line: line[1] is not StageState.RUNNING
         )
-        if len(prioritized) <= _MAX_LIVE_ROWS:
+        if len(prioritized) <= limit:
             return [line for line, _state in prioritized]
-        visible = prioritized[: _MAX_LIVE_ROWS - 1]
-        hidden = prioritized[_MAX_LIVE_ROWS - 1 :]
+        visible = prioritized[: limit - 1]
+        hidden = prioritized[limit - 1 :]
         hidden_states = {state for _line, state in hidden}
         suffix = ""
         if hidden_states == {StageState.RUNNING}:
@@ -1293,7 +1336,8 @@ class RunProgress:
         return line
 
     def _current_spinner_frame(
-        self, record: ChildRecord | _RecordSnapshot | None = None
+        self,
+        record: ChildRecord | _RecordSnapshot | None = None,
     ) -> str:
         elapsed = max(0.0, time.monotonic() - self._spinner_started_at)
         index = int(elapsed / 0.08)
@@ -1310,16 +1354,22 @@ class RunProgress:
         *,
         parent_label: str | None = None,
         cancelling: bool | None = None,
+        prefer_detail: bool = False,
+        label_column_width: int = _LABEL_COLUMN_WIDTH,
     ) -> Text:
         label = _format_label(record, parent_label=parent_label)
         elapsed = self._elapsed(record)
-        work = _format_current_work(record)
+        work = (
+            _normalize_cell(record.detail)
+            if prefer_detail and record.detail is not None
+            else _format_current_work(record)
+        )
         if self._cancelling if cancelling is None else cancelling:
             work = "stopping…"
         line = Text(_DOTS_FRAME, style="cyan")
         line.append(" ")
         line.append(label)
-        line.append(" " * _column_gap(label))
+        line.append(" " * _column_gap(label, width=label_column_width))
         line.append(_format_duration(elapsed), style="dim")
         line.append("  ")
         line.append(work)
@@ -1330,11 +1380,19 @@ class RunProgress:
         record: StageRecord | _RecordSnapshot,
         *,
         cancelling: bool,
+        prefer_detail: bool = False,
+        compact: bool = False,
     ) -> Text:
-        line = self._format_running_line(record, cancelling=cancelling)
+        line = self._format_running_line(
+            record,
+            cancelling=cancelling,
+            prefer_detail=prefer_detail,
+            label_column_width=14 if compact else _LABEL_COLUMN_WIDTH,
+        )
+        spinner = _DOTS_FRAME if compact else self._current_spinner_frame(record)
         return Text.assemble(
             "  ",
-            (self._current_spinner_frame(record), "cyan"),
+            (spinner, "cyan"),
             line[1:],
         )
 
@@ -1584,13 +1642,20 @@ def _format_terminal_line(
     record: StageRecord | ChildRecord | _RecordSnapshot,
     *,
     parent_label: str | None = None,
+    compact: bool = False,
 ) -> Text:
     label = _format_label(record, parent_label=parent_label)
     glyph = _STATE_GLYPHS[record.state]
     line = Text(glyph, style=_STATE_STYLES[record.state])
     line.append(" ")
     line.append(label)
-    line.append(" " * _column_gap(label))
+    line.append(
+        " "
+        * _column_gap(
+            label,
+            width=15 if compact else _LABEL_COLUMN_WIDTH,
+        )
+    )
     line.append(_format_duration(record.duration_seconds), style="dim")
     result = _terminal_result(record)
     if result:
@@ -1632,8 +1697,8 @@ def _format_label(
     return label
 
 
-def _column_gap(label: str) -> int:
-    return max(2, _LABEL_COLUMN_WIDTH - cell_len(label) + 2)
+def _column_gap(label: str, *, width: int = _LABEL_COLUMN_WIDTH) -> int:
+    return max(2, width - cell_len(label) + 2)
 
 
 def _child_column_gap(label: str) -> int:
