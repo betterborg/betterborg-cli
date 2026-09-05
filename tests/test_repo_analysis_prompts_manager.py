@@ -265,7 +265,7 @@ def test_role_children_run_concurrently_and_reconcile_durable_activity(
     permanent_tree = [
         line
         for line in permanent_output.splitlines()
-        if line.startswith("    ")
+        if line.startswith(("├ ✔ ", "└ ✔ "))
     ]
     for role in PROMPT_ROLES:
         assert sum(role in line for line in permanent_tree) == 1

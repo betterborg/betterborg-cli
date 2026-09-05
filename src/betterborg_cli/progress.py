@@ -1567,20 +1567,7 @@ def _format_terminal_line(
 
 
 def _format_child_terminal_line(child: ChildRecord, *, branch: str) -> Text:
-    label = _normalize_cell(child.label)
-    line = Text("    ")
-    line.append(branch, style="dim")
-    line.append(" ")
-    line.append(label)
-    line.append(" " * _child_column_gap(label))
-    line.append(_STATE_GLYPHS[child.state], style=_STATE_STYLES[child.state])
-    line.append(" ")
-    line.append(_format_duration(child.duration_seconds), style="dim")
-    result = _terminal_result(child)
-    if result:
-        line.append("  ")
-        line.append(result)
-    return line
+    return Text.assemble((branch, "dim"), " ", _format_terminal_line(child))
 
 
 def _terminal_result(

@@ -1243,8 +1243,8 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
 
     expected = [
         "✔ Parent                 0:03  parent result",
-        "    ├ First    ✔ 0:01  first result",
-        "    └ Second   ✖ 0:02  second result",
+        "├ ✔ First                  0:01  first result",
+        "└ ✖ Second                 0:02  second result",
     ]
     rendered = _terminal_text(stream.getvalue())
     assert all(rendered.count(line) == 1 for line in expected)
@@ -1858,9 +1858,9 @@ def test_ascii_stream_degrades_rows_dynamic_text_and_spacing() -> None:
     assert stream.getvalue().splitlines() == [
         "[OK] R\\xe9sum\\xe9                 0:03  na\\xefve \\u2615 "
         "- reused from earlier run",
-        "    +- Caf\\xe9     [OK] 0:01  142 files - 1.8 MB "
+        "+- [OK] Caf\\xe9                   0:01  142 files - 1.8 MB "
         "- reused from earlier run",
-        r"    \- Jalape\xf1o  [OK] 0:02  "
+        r"\- [OK] Jalape\xf1o               0:02  "
         "3 done - 2 running - 9 pending - reused from earlier run",
         "[X] Failed                 -  touch\\xe9 - reused from earlier run",
         "* Stopped                0:00  thinking",
