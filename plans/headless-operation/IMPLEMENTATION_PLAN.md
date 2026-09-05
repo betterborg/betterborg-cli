@@ -23,9 +23,21 @@ always asked for a sandbox of its own, and the read-only one needs a user
 namespace that the surrounding container is usually not allowed to create. No
 setting anywhere says the environment is already isolated. When that sandbox
 fails to start, Codex still exits zero and still answers, so the run carries on
-with a result written without the repository it could never read. Together
-these block every unattended use: CI, cron, a queue worker, and a benchmark
-container. The work here is ten independent changes, each closing one of them.
+with a result written without the repository it could never read.
+
+Betterborg also keeps its own configuration, prompts and score inside the
+repository it is working on, which is right for a team that owns that
+repository and wrong for an operator only passing through: the scaffolding
+becomes indistinguishable from the change under review.
+
+Last, the Architect may find the requirements genuinely ambiguous and ask,
+which is the right instinct and the correct thing to do with a terminal in
+front of it. Unattended there is nobody to answer, so a run that read its
+repository carefully and reasoned well stops anyway, on its best work.
+
+Together these block every unattended use, and spoil the output of the runs
+that do finish: CI, cron, a queue worker, and a benchmark container. The work
+here is twelve independent changes, each closing one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -446,3 +458,101 @@ denies every sandboxed command equally, so one occurrence settles it.
 - A run under the isolated declaration never trips the check.
 
 **Status**: Complete
+
+## Stage 11: Betterborg's own files can live outside the repository
+
+**Goal**: An operator working on a repository whose history they do not own can
+put Betterborg's tracked directory somewhere else, leaving that repository's
+working tree exactly as Betterborg found it.
+
+Betterborg keeps its configuration, prompts, PRDs and score inside the
+repository at `.betterborg`, and adds a managed block to that repository's
+`.gitignore` to hide its state directory. For a team that owns the repository
+this is the point: the configuration is reviewed and shared like any other
+checked-in file. For an operator pointed at a repository they are only passing
+through, it is wrong in both directions. Betterborg's scaffolding becomes
+indistinguishable from the change under review, and a diff meant to carry one
+piece of work carries a configuration file, three prompts, a PRD, a score and
+an edited `.gitignore` instead.
+
+Every path Betterborg writes already derives from a single tracked directory,
+and one line decides where that directory is. The relocation is that line. When
+the directory sits outside the repository there is nothing inside the
+repository left to ignore, so the managed `.gitignore` block stops being
+written rather than being written somewhere it does not belong.
+
+Like the sandbox declaration this belongs to the operator who started the
+process and not to the repository being worked on, and for the same reason.
+Betterborg already holds state this way: the trust store is located by
+`XDG_STATE_HOME` and is refused outright when it resolves inside the
+repository it vouches for. `BETTERBORG_HOME` names one repository's directory
+and follows both halves of that rule.
+
+One directory serves one repository. Configuration already carries the
+repository it belongs to, so a directory holding another repository's
+configuration is refused rather than quietly shared between them.
+
+**Success Criteria**:
+- With nothing set, the tracked directory stays at `.betterborg` inside the
+  repository and the managed ignore block is still written.
+- An operator can place the tracked directory elsewhere, and configuration,
+  prompts, PRDs, tasks, score, state and artifacts all follow it.
+- A repository worked on under a relocated directory ends with no Betterborg
+  file in its working tree and an unmodified `.gitignore`.
+- A relocated directory that resolves inside the repository is rejected,
+  because it would silently reintroduce what the setting exists to prevent.
+- A relocated directory already holding another repository's configuration is
+  refused, rather than serving both from one set of files.
+
+**Tests**:
+- An unset variable leaves every derived path where it is today.
+- A relocated directory moves configuration, prompts, PRDs, tasks, score,
+  state and artifacts together.
+- A run under a relocated directory writes no managed ignore block.
+- A relocated directory pointing inside the repository fails and says why.
+- A relocated directory belonging to another repository fails and says why.
+
+**Status**: Not Started
+
+## Stage 12: An unattended run answers the Architect rather than stopping
+
+**Goal**: Planning started unattended resolves the Architect's questions by
+deciding them, and says in the plan that it decided them.
+
+The Architect asks when the requirements do not settle something it needs, and
+that is the behaviour to keep: a run that invents a requirement silently is
+worse than one that stops. With a terminal the operator answers. Without one
+the prompt returns nothing and the run ends holding a plan it had already
+reasoned its way to, which is the most expensive way to fail.
+
+Someone has to decide. Unattended, the only party present is the Architect
+itself, so it answers its own question the way a careful engineer does when
+nobody is reachable: pick the reading the evidence best supports, say plainly
+that it was assumed rather than given, and carry on. The value of that is
+entirely in the saying. An assumed requirement that reads like a given one
+turns an honest gap into a false certainty, and the operator loses the one
+signal telling them where to look first.
+
+The question round is already durable, so the answers belong in it, marked as
+the Architect's own, beside the question that prompted them.
+
+**Success Criteria**:
+- Started unattended, a question round is answered by the Architect and
+  planning continues to a plan.
+- Each answer records that the Architect assumed it, and what it assumed, in
+  the stored round beside its question.
+- The resulting plan carries those assumptions where a reader meets them,
+  rather than only in the store.
+- Without the unattended option the existing behaviour is unchanged, including
+  stopping when a prompt returns nothing.
+- The bounded round cap that governs question rounds still governs them, so an
+  Architect that keeps asking still ends the run rather than looping.
+
+**Tests**:
+- A question round started unattended yields a plan, with no prompt issued.
+- The stored round carries the Architect's answer and marks it assumed.
+- The plan a reader receives names the assumptions it rests on.
+- Interactive planning still prompts, and still stops on a cancelled prompt.
+- An Architect that asks past the round cap still ends the run.
+
+**Status**: Not Started
