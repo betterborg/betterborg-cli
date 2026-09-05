@@ -518,6 +518,131 @@ def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation
     assert preflight.result == "ready"
 
 
+def test_execute_projects_launch_publication_and_reuses_follow_up_specs(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "execution-preview"
+    _repository, _paths, _borg, _approval, fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+        )
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+
+    class TrackingProgress(RunProgress):
+        def __init__(self) -> None:
+            super().__init__(stream=StringIO())
+            self.previews: list[
+                tuple[tuple[StageSpec, ...], tuple[str, ...] | None]
+            ] = []
+            self.declarations: list[StageSpec] = []
+
+        def preview_pending(
+            self,
+            specs: tuple[StageSpec, ...],
+            *,
+            cohort_keys: tuple[str, ...] | None = None,
+        ) -> None:
+            self.previews.append((specs, cohort_keys))
+            super().preview_pending(specs, cohort_keys=cohort_keys)
+
+        def declare(self, spec: StageSpec):
+            self.declarations.append(spec)
+            return super().declare(spec)
+
+    progress = TrackingProgress()
+    run = CliRunContext(CancellationToken(), progress)
+
+    def assert_launch_projection() -> None:
+        frame = [line.plain for line in progress._live_lines()]
+        assert any("Estimate and decision" in line for line in frame)
+        assert "  ◦ Preflight" in frame
+        assert "  ◦ Push project branch" in frame
+        assert "  ◦ Open rollup pull request" in frame
+        assert tuple(progress.stages) == ("estimate-decision",)
+
+    actual_load_config = cli_module.load_repository_config
+
+    def observed_load_config(paths):
+        assert_launch_projection()
+        return actual_load_config(paths)
+
+    actual_inspect = TaskPublisher.inspect_current_task_files
+
+    def observed_inspect(publisher, borg_id):
+        assert_launch_projection()
+        return actual_inspect(publisher, borg_id)
+
+    def observed_estimate(_name, _estimate):
+        frame = [line.plain for line in progress._live_lines()]
+        assert f"  ◦ {fixture.task.title}" in frame
+        assert "  ◦ Preflight" in frame
+        assert "  ◦ Push project branch" in frame
+        assert "  ◦ Open rollup pull request" in frame
+        assert tuple(progress.stages) == ("estimate-decision",)
+
+    def invoke_host(*_args, progress=None, **_kwargs):
+        assert progress is run.progress
+        frame = [line.plain for line in progress._live_lines()]
+        assert f"  ◦ {fixture.task.title}" in frame
+        assert any("Preflight" in line for line in frame)
+        assert "  ◦ Push project branch" in frame
+        assert "  ◦ Open rollup pull request" in frame
+        return _execution_result()
+
+    monkeypatch.setattr(cli_module, "load_repository_config", observed_load_config)
+    monkeypatch.setattr(TaskPublisher, "inspect_current_task_files", observed_inspect)
+    monkeypatch.setattr(cli_module, "_write_execution_estimate", observed_estimate)
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", invoke_host)
+    monkeypatch.setattr(
+        cli_module,
+        "_push_project_base",
+        lambda _git, _name: "pushed",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_open_rollup_pull_request",
+        lambda *_args, **_kwargs: "opened",
+    )
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute", "--push", "--pr"],
+        obj=run,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(progress.previews) == 2
+    launch_specs, launch_cohort = progress.previews[0]
+    publication_specs, publication_cohort = progress.previews[1]
+    assert launch_specs[0] is cli_module.EXECUTION_PREFLIGHT_STAGE
+    assert tuple(spec.key for spec in launch_specs[1:]) == (
+        "push-project",
+        "rollup-pr",
+    )
+    assert launch_cohort == ("push-project", "rollup-pr")
+    assert publication_specs[0] is cli_module.EXECUTION_PREFLIGHT_STAGE
+    assert publication_specs[-2] is launch_specs[1]
+    assert publication_specs[-1] is launch_specs[2]
+    task_key = str(fixture.task.id)
+    assert publication_specs[1] == StageSpec(task_key, fixture.task.title)
+    assert publication_cohort == (task_key, "push-project", "rollup-pr")
+    assert progress.declarations[1] is cli_module.EXECUTION_PREFLIGHT_STAGE
+    assert progress.declarations[-2] is launch_specs[1]
+    assert progress.declarations[-1] is launch_specs[2]
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["push-project"].state is StageState.COMPLETED
+    assert progress.stages["rollup-pr"].state is StageState.COMPLETED
+    assert task_key not in progress.stages
+
+
 def test_execute_without_push_succeeds_without_a_remote(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -711,8 +836,7 @@ def test_follow_up_worker_failure_between_check_and_completion_propagates() -> N
     with pytest.raises(RuntimeError, match="progress heartbeat failed"):
         cli_module._run_execution_follow_up(
             progress,
-            "push-project",
-            "Push project branch",
+            StageSpec("push-project", "Push project branch"),
             action,
         )
 
@@ -733,8 +857,7 @@ def test_follow_up_completion_output_failure_preserves_completed_stage() -> None
     with pytest.raises(RuntimeError, match="progress heartbeat failed"):
         cli_module._run_execution_follow_up(
             progress,
-            "push-project",
-            "Push project branch",
+            StageSpec("push-project", "Push project branch"),
             action,
         )
 

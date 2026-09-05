@@ -107,6 +107,7 @@ from betterborg_cli.store import (
     TaskRuntimeRow,
 )
 from betterborg_cli.workflow_service import (
+    EXECUTION_PREFLIGHT_STAGE,
     ExecutionDecisionRequest,
     approve_plan_workflow,
     execute_workflow,
@@ -896,8 +897,23 @@ def execute_borg(
     open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
+    requested_follow_ups = tuple(
+        spec
+        for requested, spec in (
+            (push_project, StageSpec("push-project", "Push project branch")),
+            (
+                open_pull_request,
+                StageSpec("rollup-pr", "Open rollup pull request"),
+            ),
+        )
+        if requested
+    )
     progress = _repository_progress(False)
     if progress is not None:
+        progress.preview_pending(
+            (EXECUTION_PREFLIGHT_STAGE, *requested_follow_ups),
+            cohort_keys=tuple(spec.key for spec in requested_follow_ups),
+        )
         progress.declare(
             StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
         )
@@ -954,6 +970,7 @@ def execute_borg(
             name,
             decide=decide,
             invoke_host=invoke_host,
+            requested_follow_ups=requested_follow_ups,
             cancel=cancel,
             progress=progress,
         )
@@ -996,7 +1013,9 @@ def execute_borg(
         and result.status is ExecutionRunStatus.COMPLETED
     ):
         try:
+            follow_up_specs = iter(requested_follow_ups)
             if push_project:
+                push_spec = next(follow_up_specs)
                 push_git = SafeGit(
                     paths.root,
                     cancel=cancel,
@@ -1008,12 +1027,12 @@ def execute_borg(
                 )
                 _run_execution_follow_up(
                     progress,
-                    "push-project",
-                    "Push project branch",
+                    push_spec,
                     lambda: _push_project_base(push_git, name),
                     cancel=cancel,
                 )
             if open_pull_request:
+                pull_request_spec = next(follow_up_specs)
                 approval = workflow.approval
                 plan = approval.manifest.get("plan") if approval is not None else None
                 if not isinstance(plan, dict):
@@ -1022,8 +1041,7 @@ def execute_borg(
                 prd_path = prd_session.prd_path if prd_session is not None else None
                 _run_execution_follow_up(
                     progress,
-                    "rollup-pr",
-                    "Open rollup pull request",
+                    pull_request_spec,
                     lambda: _open_rollup_pull_request(
                         paths.root,
                         name,
@@ -1076,16 +1094,15 @@ def _reconcile_execution_estimate(
 
 def _run_execution_follow_up(
     progress: RunProgress | None,
-    stage_key: str,
-    label: str,
+    spec: StageSpec,
     action: Callable[[], str],
     *,
     cancel: CancellationToken | None = None,
 ) -> None:
     """Run one optional delivery action under the shared stage lifecycle."""
     if progress is not None:
-        progress.declare(StageSpec(stage_key, label))
-        progress.start(stage_key)
+        progress.declare(spec)
+        progress.start(spec.key)
     force_registration = None
     try:
         if cancel is not None:
@@ -1096,21 +1113,21 @@ def _run_execution_follow_up(
         result = action()
         if progress is not None:
             progress.raise_if_render_failed()
-            progress.complete(stage_key, result)
+            progress.complete(spec.key, result)
         else:
             click.echo(result)
     except BaseException as error:
         if (
             progress is not None
-            and progress.stages[stage_key].state is StageState.RUNNING
+            and progress.stages[spec.key].state is StageState.RUNNING
         ):
             detail = str(error).strip() or type(error).__name__
             if isinstance(error, KeyboardInterrupt | click.Abort) or (
                 cancel is not None and cancel.is_set()
             ):
-                progress.stop(stage_key, detail)
+                progress.stop(spec.key, detail)
             else:
-                progress.fail(stage_key, detail)
+                progress.fail(spec.key, detail)
         raise
     finally:
         if force_registration is not None:
