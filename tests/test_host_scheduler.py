@@ -13,6 +13,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from progress_test_support import FailingStringIO
 
 from betterborg_cli.agent_runtime import AgentStatus, BillingMode, CancellationToken
 from betterborg_cli.host_execution import (
@@ -21,9 +22,11 @@ from betterborg_cli.host_execution import (
     HostTaskScheduler,
     ScheduledTaskContext,
 )
+from betterborg_cli.host_execution.service import _ExecutionActivityBinding
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
+    ProgressError,
     RunProgress,
     StageRecord,
     StageSpec,
@@ -147,6 +150,16 @@ def _wait_until(predicate, *, timeout: float = 2.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("condition was not reached before timeout")
+
+
+def _latch_autonomous_progress_failure(
+    progress: RunProgress, stream: FailingStringIO
+) -> None:
+    worker = progress._cadence_worker
+    assert worker is not None
+    stream.fail_next_write()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
 
 
 def test_scheduler_limits_jobs_renews_claims_and_reports_active_operation(
@@ -317,6 +330,272 @@ def test_scheduler_forwards_only_the_activity_handoff_return_value(
     assert progress_received == [masked]
     assert progress_received[0] is masked
     assert "secret" not in repr(progress.stages[str(records["task"].id)])
+
+
+def test_scheduler_reconciles_durable_completion_before_render_failure_escapes(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    started = threading.Event()
+    release = threading.Event()
+    observed: list[AgentActivity] = []
+
+    def failing_observer(task_id, activity: AgentActivity) -> None:  # noqa: ANN001
+        assert task_id == records["task"].id
+        observed.append(activity)
+        raise RuntimeError("observer unavailable")
+
+    binding = _ExecutionActivityBinding(("scheduler-secret",), failing_observer)
+    render_error: RuntimeError | None = None
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            assert release.wait(timeout=2)
+            assert context.activity is not None
+            context.activity(
+                AgentActivity(
+                    AgentActivityKind.READING,
+                    "reading scheduler-secret.py",
+                )
+            )
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return TaskRuntimeStatus.DONE
+
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            activity_handoff=binding.emit,
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            _latch_autonomous_progress_failure(progress, stream)
+            release.set()
+            with pytest.raises(
+                RuntimeError, match="progress heartbeat failed"
+            ) as caught:
+                running.result(timeout=2)
+            render_error = caught.value
+
+        run = store.list_execution_runs(borg.id)[0]
+        runtime = store.get_task_runtime(records["task"].id)
+        assert run.status is ExecutionRunStatus.COMPLETED
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.DONE
+        assert runtime.state_reason is None
+        assert progress.stages[str(records["task"].id)].state is StageState.COMPLETED
+
+    assert str(render_error) == "progress heartbeat failed"
+    assert observed == [
+        AgentActivity(AgentActivityKind.READING, "reading [REDACTED].py")
+    ]
+    assert "scheduler-secret" not in repr(progress.records)
+    assert "scheduler-secret" not in stream.getvalue()
+    progress.raise_if_render_failed()
+
+
+def test_scheduler_preserves_task_failure_when_rendering_also_fails(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    started = threading.Event()
+    release = threading.Event()
+
+    with SqliteStore.open(database) as store:
+
+        def failing_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            started.set()
+            assert release.wait(timeout=2)
+            raise ValueError("task implementation failed")
+
+        scheduler = HostTaskScheduler(
+            store,
+            failing_behavior,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            _latch_autonomous_progress_failure(progress, stream)
+            release.set()
+            with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+                running.result(timeout=2)
+
+        run = store.list_execution_runs(borg.id)[0]
+        runtime = store.get_task_runtime(records["task"].id)
+        assert run.status is ExecutionRunStatus.FAILED
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.FAILED
+        assert runtime.state_reason == (
+            "task behavior failed: task implementation failed"
+        )
+        stage = progress.stages[str(records["task"].id)]
+        assert stage.state is StageState.FAILED
+        assert stage.result == (
+            "failed: task behavior failed: task implementation failed"
+        )
+
+
+def test_scheduler_preserves_keyboard_interrupt_over_render_failure(
+    tmp_path: Path,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    started = threading.Event()
+    release = threading.Event()
+
+    with SqliteStore.open(database) as store:
+
+        def interrupted_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            started.set()
+            assert release.wait(timeout=2)
+            raise KeyboardInterrupt
+
+        scheduler = HostTaskScheduler(
+            store,
+            interrupted_behavior,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            _latch_autonomous_progress_failure(progress, stream)
+            release.set()
+            with pytest.raises(KeyboardInterrupt) as caught:
+                running.result(timeout=2)
+
+        run = store.list_execution_runs(borg.id)[0]
+        runtime = store.get_task_runtime(records["task"].id)
+        assert run.status is ExecutionRunStatus.CANCELLED
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.PENDING
+        assert progress.stages[str(records["task"].id)].state is StageState.STOPPED
+        assert caught.value.__notes__ == [
+            "execution progress rendering also failed: "
+            "progress heartbeat failed"
+        ]
+
+
+@pytest.mark.parametrize(
+    "durable_error",
+    [
+        ExecutionOwnershipError("ownership lost"),
+        OSError("durable finalization failed"),
+    ],
+)
+def test_scheduler_attaches_render_failure_to_durable_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_error: BaseException,
+) -> None:
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    started = threading.Event()
+    release = threading.Event()
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            assert release.wait(timeout=2)
+            context.transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.DONE)
+            return TaskRuntimeStatus.DONE
+
+        def fail_finalization(*_args, **_kwargs):  # noqa: ANN002, ANN003
+            raise durable_error
+
+        monkeypatch.setattr(store, "finish_execution_run", fail_finalization)
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            _latch_autonomous_progress_failure(progress, stream)
+            release.set()
+            with pytest.raises(type(durable_error)) as caught:
+                running.result(timeout=2)
+
+        runtime = store.get_task_runtime(records["task"].id)
+        assert caught.value is durable_error
+        assert runtime is not None
+        assert runtime.status is TaskRuntimeStatus.DONE
+        assert progress.stages[str(records["task"].id)].state is StageState.COMPLETED
+        assert durable_error.__notes__ == [
+            "execution progress rendering also failed: "
+            "progress heartbeat failed"
+        ]
+
+
+def test_scheduler_does_not_classify_lifecycle_progress_error_as_rendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    lifecycle_error = ProgressError("invalid progress lifecycle")
+
+    def fail_declaration(_spec: StageSpec) -> StageRecord:
+        raise lifecycle_error
+
+    monkeypatch.setattr(progress, "declare", fail_declaration)
+    with SqliteStore.open(database) as store:
+
+        def unexpected_behavior(
+            _context: ScheduledTaskContext,
+        ) -> TaskRuntimeStatus:
+            raise AssertionError("work must not start after lifecycle failure")
+
+        with pytest.raises(ProgressError) as caught:
+            HostTaskScheduler(
+                store,
+                unexpected_behavior,
+                progress=progress,
+            ).run(borg.id, generation.id)
+
+        run = store.list_execution_runs(borg.id)[0]
+        assert caught.value is lifecycle_error
+        assert run.status is ExecutionRunStatus.RUNNING
+        assert store.list_task_claims(run.id) == []
 
 
 def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None:
