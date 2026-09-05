@@ -514,10 +514,10 @@ configuration is refused rather than quietly shared between them.
 
 **Status**: Not Started
 
-## Stage 12: An unattended run answers the Architect rather than stopping
+## Stage 12: An unattended run decides rather than stopping
 
-**Goal**: Planning started unattended resolves the Architect's questions by
-deciding them, and says in the plan that it decided them.
+**Goal**: Planning run without a terminal settles the questions the Architect
+would otherwise ask, and says in the plan which requirements it settled.
 
 The Architect asks when the requirements do not settle something it needs, and
 that is the behaviour to keep: a run that invents a requirement silently is
@@ -525,34 +525,69 @@ worse than one that stops. With a terminal the operator answers. Without one
 the prompt returns nothing and the run ends holding a plan it had already
 reasoned its way to, which is the most expensive way to fail.
 
-Someone has to decide. Unattended, the only party present is the Architect
-itself, so it answers its own question the way a careful engineer does when
-nobody is reachable: pick the reading the evidence best supports, say plainly
-that it was assumed rather than given, and carry on. The value of that is
-entirely in the saying. An assumed requirement that reads like a given one
-turns an honest gap into a false certainty, and the operator loses the one
-signal telling them where to look first.
+Someone has to decide, and unattended the only party present is the Architect
+itself. It is told so before it asks, because with nobody to answer, a question
+buys nothing and costs the run: the judgement that would have gone into asking
+goes into deciding instead, on the reading the evidence best supports. A
+question it asks regardless is answered the same way rather than ending the
+run. The question round is already durable, so that answer belongs in it,
+marked as the Architect's own beside the question that prompted it. The turn
+that decides a round raised by a plan is given that plan, because it is a fresh
+agent holding none of the reasoning that raised the question, and a workspace
+without the plan would have it decide from the requirements alone.
 
-The question round is already durable, so the answers belong in it, marked as
-the Architect's own, beside the question that prompted them.
+The value of all of it is in the saying. A requirement the Architect settled
+for itself that reads like one it was given turns an honest gap into a false
+certainty, and the operator loses the one signal telling them where to look
+first. The plan therefore carries them from three sources: the ones the
+Architect names as its own, which only it knows it decided; the recorded
+rounds, which it cannot drop by leaving them out of a plan; and whatever the
+plan under revision already carried, because a revision addressing one finding
+has no reason to restate an assumption it is not revisiting. Carrying forward
+is unconditional, since a stale assumption sends a reader to look at settled
+ground while a dropped one leaves a decision nobody took reading like a
+requirement somebody gave, and the first is the cheaper mistake.
+
+What an attended run cannot do is originate one. Every requirement there was
+either read from the confirmed PRD or got by asking, so a plan claiming an
+assumption is describing a conversation that did not happen, and the claim is
+dropped.
+
+Starting a plan and changing one are the same lifecycle, and a revision is
+where the Architect first meets a requirement the original plan did not need.
+Both are run the same way, or a Borg planned without a terminal can only be
+revised with one.
 
 **Success Criteria**:
-- Started unattended, a question round is answered by the Architect and
-  planning continues to a plan.
-- Each answer records that the Architect assumed it, and what it assumed, in
-  the stored round beside its question.
-- The resulting plan carries those assumptions where a reader meets them,
-  rather than only in the store.
+- Run unattended, the Architect is instructed to decide rather than ask, and
+  planning reaches a plan without a prompt being issued.
+- A question asked regardless is answered by the Architect, against the plan
+  that raised it where a plan raised it, and the stored round records what it
+  assumed beside the question that prompted it.
+- The plan a reader receives names every requirement the run settled itself,
+  from all three sources, and a revision that does not mention an assumption
+  does not lose it.
 - Without the unattended option the existing behaviour is unchanged, including
-  stopping when a prompt returns nothing.
+  stopping when a prompt returns nothing and refusing an assumption a plan
+  claims for itself.
 - The bounded round cap that governs question rounds still governs them, so an
   Architect that keeps asking still ends the run rather than looping.
+- Changing a plan runs unattended on the same terms as starting one.
 
 **Tests**:
-- A question round started unattended yields a plan, with no prompt issued.
-- The stored round carries the Architect's answer and marks it assumed.
-- The plan a reader receives names the assumptions it rests on.
-- Interactive planning still prompts, and still stops on a cancelled prompt.
+- An unattended run's Architect turns carry the instruction to decide, and an
+  attended run's carry neither half of it.
+- A plan run unattended names the requirements it settled for itself.
+- A recorded round survives a plan that leaves it out, in the wording it was
+  asked in, and so does an assumption the revision does not mention.
+- A question round run unattended yields a plan with no prompt issued, its
+  stored round marks the answer assumed, and a round raised by a plan is
+  decided with that plan in the workspace.
+- An answer that repeats a question, skips one, or says nothing is refused,
+  and an abandoned answers turn is not recovered for a later round.
+- Interactive planning still prompts, still stops on a cancelled prompt, and
+  still drops an assumption its plan claims.
 - An Architect that asks past the round cap still ends the run.
+- A plan changed unattended assumes the questions its revision raises.
 
 **Status**: Not Started

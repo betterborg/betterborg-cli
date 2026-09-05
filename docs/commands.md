@@ -149,6 +149,33 @@ be brainstormed is not one that can be adopted. The Borg it creates is the one
 an interview would have confirmed, so continue with `betterborg plan start
 NAME` as usual.
 
+## Plan without a terminal
+
+The Architect asks when the requirements do not settle something it needs, and
+with a terminal the operator answers. `--unattended` supplies the missing
+party: the Architect is told nobody can be asked, so it settles each
+uncertainty itself, on the reading the evidence it already read best supports.
+
+```console
+betterborg plan start my-feature --yes --unattended
+```
+
+The plan `betterborg plan show` renders lists every requirement settled that
+way under `## Assumptions`, so the gaps a run closed on its own stay in front
+of whoever reads it. An Architect that asks anyway is answered the same way
+instead of ending the run, and that answer is stored beside its question,
+marked as assumed rather than answered.
+
+`betterborg plan change NAME --note ... --unattended` revises the same way, so
+a Borg planned without a terminal can be changed without one.
+
+Without `--unattended` planning still prompts, a prompt that returns nothing
+still stops the run for a person to resume, and a plan that claims an
+assumption is not believed, because there every requirement was given. An
+unattended run's questions are bounded: an Architect that keeps asking past
+the round budget ends the run with its unanswered round preserved, so
+`betterborg plan start NAME` resumes it with a person answering.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

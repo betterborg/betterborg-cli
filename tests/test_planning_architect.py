@@ -17,9 +17,11 @@ from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     ARCHITECT_PLAN_CONTRACT_ROUND_CAP,
+    ARCHITECT_QUESTION_ROUND_CAP,
     ArchitectCancelled,
     ArchitectError,
     ArchitectLoop,
+    render_plan_markdown,
 )
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
@@ -123,6 +125,662 @@ def test_answers_product_questions_inline_and_persists_plan(
             attempt.status is PlanningAttemptStatus.COMPLETED for attempt in attempts
         )
         assert attempts[-1].result == _plan()
+
+
+def test_unattended_planning_assumes_its_own_answers_and_carries_them(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    prompts: list[str] = []
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required at launch?",
+                        "why": "This determines the packaging test matrix.",
+                        "hint": "Name the required operating systems.",
+                    }
+                ],
+            }
+        )
+    )
+
+    def assume_the_answer(spec):
+        assert "q1: Which platforms are required at launch?" in spec.user_prompt
+        assert (
+            "Why this matters: This determines the packaging test matrix."
+            in spec.user_prompt
+        )
+        assert (
+            "Answer guidance: Name the required operating systems."
+            in spec.user_prompt
+        )
+        return {
+            "answers": [
+                {
+                    "q_id": "q1",
+                    "answer": "Linux and macOS in the first release.",
+                }
+            ]
+        }
+
+    adapter.queue(MockResponse(dynamic=assume_the_answer))
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+
+    def plan_after_assumption(spec):
+        questions = json.loads(
+            (
+                spec.cwd / ".betterborg/state/planning/context/questions.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert questions[0]["answers"] == [
+            {
+                "q_id": "q1",
+                "answer": "Linux and macOS in the first release.",
+                "assumed": True,
+            }
+        ]
+        return _plan()
+
+    adapter.queue(MockResponse(dynamic=plan_after_assumption))
+
+    database = committed_git_repo.parent / "architect-unattended.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "unattended"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda message: prompts.append(message) or "Never asked.",
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+            unattended=True,
+        ).run()
+
+        assert prompts == []
+        assert result.borg.state is BorgState.TECH_REVIEW_WORKING
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required at launch?",
+                "assumption": "Linux and macOS in the first release.",
+            }
+        ]
+        assert "## Assumptions" in render_plan_markdown(result.plan)
+        assert [attempt.phase for attempt in store.list_planning_attempts(borg.id)] == [
+            "architect_questions",
+            "architect_answers",
+            "architect_questions",
+            "architect_plan",
+        ]
+        assert all(
+            attempt.status is PlanningAttemptStatus.COMPLETED
+            for attempt in store.list_planning_attempts(borg.id)
+        )
+        questions = store.list_planning_questions(borg.id)
+        assert questions[0].answers == [
+            {
+                "q_id": "q1",
+                "answer": "Linux and macOS in the first release.",
+                "assumed": True,
+            }
+        ]
+
+
+def test_an_attended_plan_cannot_claim_an_assumption_nobody_assumed(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """With a person present, an assumption is a claim nobody made.
+
+    Every requirement an attended run did not read from the PRD it got by
+    asking, so a plan that mints an assumption is describing a conversation
+    that did not happen, and sends the reader to audit settled ground.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    forged = dict(_plan())
+    forged["assumptions"] = [
+        {"question": "Invented?", "assumption": "Nobody was ever asked this."}
+    ]
+    adapter.queue(MockResponse(payload=forged))
+
+    database = committed_git_repo.parent / "architect-forged.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "forged"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda _message: None,
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+        ).run()
+
+        assert "assumptions" not in result.plan
+        assert "## Assumptions" not in render_plan_markdown(result.plan)
+
+
+def test_unattended_planning_is_told_to_decide_rather_than_ask(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Answering a question it never had to ask is the cheaper path.
+
+    A question round costs a turn to ask and another to answer, and ends the
+    run outright once the round cap is reached, so the instruction that stops
+    it being asked is worth more than the machinery that recovers from it.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-directive.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "directive"
+        )
+        io = InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        )
+        ArchitectLoop(
+            repository, borg, store, adapter, io=io, unattended=True
+        ).run()
+
+        questions_prompt = " ".join(adapter.calls[0].system_prompt.split())
+        assert "Nobody is available to answer questions on this run." in (
+            questions_prompt
+        )
+        assert "return ready_to_plan" in questions_prompt
+        plan_prompt = " ".join(adapter.calls[1].system_prompt.split())
+        assert "List each one under assumptions" in plan_prompt
+
+
+def test_attended_planning_is_not_told_to_answer_its_own_questions(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A run with somebody to ask keeps the instruction to ask them."""
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-attended.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "attended"
+        )
+        ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda _message: None,
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+        ).run()
+
+        assert "Nobody is available" not in adapter.calls[0].system_prompt
+        assert "under assumptions" not in adapter.calls[1].system_prompt
+
+
+def test_an_unattended_plan_carries_the_requirements_it_settled_itself(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A decision taken instead of a question is the one nobody else knows."""
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    decided = dict(_plan())
+    decided["assumptions"] = [
+        {
+            "question": "Which platforms are required at launch?",
+            "assumption": "Linux and macOS, because CI builds only those.",
+        }
+    ]
+    adapter.queue(MockResponse(payload=decided))
+
+    database = committed_git_repo.parent / "architect-decided.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "decided"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda _message: None,
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required at launch?",
+                "assumption": "Linux and macOS, because CI builds only those.",
+            }
+        ]
+        rendered = render_plan_markdown(result.plan)
+        assert "## Assumptions" in rendered
+        assert "Linux and macOS, because CI builds only those." in rendered
+
+
+def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Betterborg recorded the round, so the plan cannot decide to forget it.
+
+    The plan below names one new decision and restates the recorded one in
+    its own words. Dropping the recorded wording would let a plan quietly
+    soften the question it was actually asked.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required at launch?",
+                        "why": "This determines the packaging test matrix.",
+                    }
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [
+                    {"q_id": "q1", "answer": "Linux and macOS in the first release."}
+                ]
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    partial = dict(_plan())
+    partial["assumptions"] = [
+        {
+            "question": "which platforms are required at launch?",
+            "assumption": "Every platform the team uses.",
+        },
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        },
+    ]
+    adapter.queue(MockResponse(payload=partial))
+
+    database = committed_git_repo.parent / "architect-merged.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "merged"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda _message: None,
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required at launch?",
+                "assumption": "Linux and macOS in the first release.",
+            },
+            {
+                "question": "Where does the changelog live?",
+                "assumption": "At the repository root, beside the README.",
+            },
+        ]
+
+
+def test_an_answered_question_is_not_an_assumption(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A person's answer is a requirement, and must not read as a guess.
+
+    The marking has to separate the two in both directions: labelling a given
+    requirement an assumption sends the reader to audit settled ground.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required at launch?",
+                        "why": "This determines the packaging test matrix.",
+                        "hint": "Name the required operating systems.",
+                    }
+                ],
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-answered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "answered"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=InteractiveIO(
+                prompt=lambda _message: "Linux only.",
+                confirm=lambda _message, _default: False,
+                write=lambda _message: None,
+            ),
+        ).run()
+
+        answers = store.list_planning_questions(borg.id)[0].answers or []
+        assert answers == [{"q_id": "q1", "answer": "Linux only."}]
+        assert "assumptions" not in result.plan
+        assert "## Assumptions" not in render_plan_markdown(result.plan)
+
+
+def test_unattended_planning_ends_when_questions_pass_the_round_cap(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    adapter = MockAdapter(name="openai")
+    for index in range(ARCHITECT_QUESTION_ROUND_CAP):
+        adapter.queue(
+            MockResponse(
+                payload={
+                    "decision": "ask_more",
+                    "questions": [
+                        {"id": "q1", "question": f"Question {index + 1}?"}
+                    ],
+                }
+            )
+        )
+        adapter.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": f"Assumption {index + 1}."}
+                    ]
+                }
+            )
+        )
+    adapter.queue(
+        MockResponse(
+            payload={
+                **_plan(),
+                "open_questions": ["Which release channel is the default?"],
+            }
+        )
+    )
+
+    database = committed_git_repo.parent / "architect-unattended-cap.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "unattended-cap"
+        )
+        with pytest.raises(ArchitectError, match="asked past question round"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                unattended=True,
+            ).run()
+
+        assert len(adapter.calls) == 2 * ARCHITECT_QUESTION_ROUND_CAP + 1
+        questions = store.list_planning_questions(borg.id)
+        assert len(questions) == ARCHITECT_QUESTION_ROUND_CAP + 1
+        assert questions[-1].answers is None
+        current = store.get_borg(borg.id)
+        assert current is not None
+        assert current.state is BorgState.ARCHITECT_AWAITING_ANSWERS
+
+
+def test_assumed_answers_must_cover_every_question_in_their_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"},
+                    {"id": "q2", "question": "Which release channel is default?"},
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={"answers": [{"q_id": "q1", "answer": "Linux and macOS."}]}
+        )
+    )
+
+    database = committed_git_repo.parent / "architect-partial-answers.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "partial-answers"
+        )
+        with pytest.raises(ArchitectError, match="one answer for each question"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                unattended=True,
+            ).run()
+
+        attempts = store.list_planning_attempts(borg.id)
+        assert [attempt.phase for attempt in attempts] == [
+            "architect_questions",
+            "architect_answers",
+        ]
+        assert attempts[-1].status is PlanningAttemptStatus.FAILED
+        assert store.list_planning_questions(borg.id)[0].answers is None
+
+
+def test_assumed_answers_must_answer_each_question_once(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Two answers to one question leave the round with no single decision.
+
+    The set of ids answered still matches the set asked, so only counting
+    them separates this from a complete round.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [
+                    {"q_id": "q1", "answer": "Linux and macOS."},
+                    {"q_id": "q1", "answer": "Windows only."},
+                ]
+            }
+        )
+    )
+
+    database = committed_git_repo.parent / "architect-duplicate-answers.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "duplicate-answers"
+        )
+        with pytest.raises(ArchitectError, match="answer IDs must be unique"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                unattended=True,
+            ).run()
+
+        assert store.list_planning_questions(borg.id)[0].answers is None
+
+
+def test_an_assumed_answer_of_whitespace_is_not_a_decision(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Blank is what the schema's minimum length cannot catch.
+
+    A single space satisfies it, strips to nothing, and would be stored as an
+    assumption saying the Architect decided the question and decided nothing.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload={"answers": [{"q_id": "q1", "answer": "   "}]}))
+
+    database = committed_git_repo.parent / "architect-blank-answer.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "blank-answer"
+        )
+        with pytest.raises(ArchitectError, match="answers must not be empty"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                unattended=True,
+            ).run()
+
+        assert store.list_planning_questions(borg.id)[0].answers is None
+
+
+def test_an_abandoned_answers_turn_is_not_recovered_for_a_later_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """One round's answer must never be recovered as another round's.
+
+    Question ids restart at q1 every round, so an abandoned attempt from an
+    earlier round validates perfectly against a later one and would be stored
+    as its assumption, silently and with the wrong text. The request context
+    is the only thing keeping the two apart.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which release channel is default?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "The stable one."}]})
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-stale-answers.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "stale-answers"
+        )
+        # An answers turn killed before it could record its result: the row
+        # stays RUNNING with a recoverable payload beside it, and it belongs
+        # to a question this run will never ask.
+        store.append_planning_attempt(
+            PlanningAttempt(
+                borg_id=borg.id,
+                phase="architect_answers",
+                round=1,
+                adapter="mock",
+                model="test-model",
+                status=PlanningAttemptStatus.RUNNING,
+                request={"question_id": "an-earlier-round"},
+                result={
+                    "answers": [{"q_id": "q1", "answer": "Whatever was asked."}]
+                },
+            )
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        stale = next(
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.request.get("question_id") == "an-earlier-round"
+        )
+        assert stale.status is PlanningAttemptStatus.FAILED
+        assert "stale request context" in (stale.summary or "")
+        assert store.list_planning_questions(borg.id)[0].answers == [
+            {"q_id": "q1", "answer": "The stable one.", "assumed": True}
+        ]
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which release channel is default?",
+                "assumption": "The stable one.",
+            }
+        ]
 
 
 def test_planning_survives_an_architect_result_that_misses_the_schema(

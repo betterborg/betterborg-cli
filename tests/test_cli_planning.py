@@ -105,6 +105,89 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
         ]
 
 
+def test_plan_start_unattended_assumes_answers_and_shows_them_in_the_plan(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = MockAdapter(name="openai")
+    tech_lead_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required?",
+                        "why": "This controls the test matrix.",
+                    }
+                ],
+            }
+        )
+    )
+    architect_adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [{"q_id": "q1", "answer": "Linux and macOS."}]
+            }
+        )
+    )
+    architect_adapter.queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter.queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    prompts: list[str] = []
+
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-plan"
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-plan", "--yes", "--unattended"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert prompts == []
+    assert "Plan approval pending" in result.output
+    assert len(architect_adapter.calls) == 4
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-plan")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert store.list_planning_questions(borg.id)[0].answers == [
+            {"q_id": "q1", "answer": "Linux and macOS.", "assumed": True}
+        ]
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "unattended-plan"])
+
+    assert shown.exit_code == 0, shown.output
+    assert "## Assumptions" in shown.output
+    assert "**Which platforms are required?** Linux and macOS." in shown.output
+
+
 def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -568,6 +651,93 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         assert store.list_planning_attempts(borg.id) == attempts
         assert store.list_planning_findings(borg.id) == findings
         assert store.list_plan_change_requests(borg.id) == requests
+
+
+def test_plan_change_unattended_assumes_the_questions_the_revision_raises(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+) -> None:
+    """A Borg planned without a terminal must be revisable without one.
+
+    `plan start` and `plan change` are the same lifecycle, and a revision is
+    where the Architect meets the requirement it did not need for the first
+    plan. Stopping there costs the review that has already been paid for.
+    """
+    original_plan = planning_plan_response(summary="Original plan.")
+    ambiguous_plan = planning_plan_response(summary="Stage the rollout.")
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = planning_plan_response(summary="Retry, then roll back.")
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        original_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    prompts: list[str] = []
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-change"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+
+    started = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-change", "--yes", "--unattended"]
+    )
+    assert started.exit_code == 0, started.output
+
+    for payload in (
+        ambiguous_plan,
+        {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
+        revised_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+
+    changed = cli_runner.invoke(
+        cli,
+        [
+            "plan",
+            "change",
+            "unattended-change",
+            "--note",
+            "Stage the rollout.",
+            "--yes",
+            "--unattended",
+        ],
+    )
+
+    assert changed.exit_code == 0, changed.output
+    assert prompts == []
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-change")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        questions = store.list_planning_questions(borg.id)
+        assert questions[-1].answers == [
+            {
+                "q_id": "q1",
+                "answer": "Retry twice, then roll back.",
+                "assumed": True,
+            }
+        ]
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "unattended-change"])
+    assert shown.exit_code == 0, shown.output
+    assert "## Assumptions" in shown.output
+    assert "Retry twice, then roll back." in shown.output
 
 
 def test_plan_change_rejects_empty_note_without_mutating_gate(

@@ -37,6 +37,34 @@ def test_rejects_invalid_phase_names(repository: Path, name: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("assumption", "message"),
+    [
+        (
+            {"question": "   ", "assumption": "Linux only."},
+            r"assumptions\[0\].question",
+        ),
+        (
+            {"question": "Which platforms?", "assumption": " "},
+            r"assumptions\[0\].assumption",
+        ),
+    ],
+)
+def test_rejects_an_assumption_with_nothing_in_it(
+    repository: Path, assumption: dict[str, str], message: str
+) -> None:
+    """An assumption that says nothing warns the reader about nothing.
+
+    Whitespace clears the schema's minimum length, so only the completeness
+    pass separates a disclosed decision from an empty one.
+    """
+    plan = _two_phase_plan()
+    plan["assumptions"] = [assumption]
+
+    with pytest.raises(PlanValidationError, match=message):
+        validate_plan(plan, repository)
+
+
+@pytest.mark.parametrize(
     ("names", "message"),
     [
         (["01-foundation", "03-finish"], "expected number 02"),

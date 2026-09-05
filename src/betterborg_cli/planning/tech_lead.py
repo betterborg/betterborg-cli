@@ -113,6 +113,7 @@ class TechLeadLoop:
         *,
         architect_agent: AgentAdapter | SelectedAgent | None = None,
         io: InteractiveIO,
+        unattended: bool = False,
         artifact_dir: Path | None = None,
         model: str | None = None,
         architect_model: str | None = None,
@@ -147,6 +148,7 @@ class TechLeadLoop:
         self.agent = agent
         self.architect_agent = architect
         self.io = io
+        self.unattended = unattended
         self.artifact_dir = Path(
             artifact_dir or paths.artifacts_dir / "planning" / str(borg.id)
         ).resolve()
@@ -229,6 +231,7 @@ class TechLeadLoop:
                     self.store,
                     self.architect_agent,
                     io=self.io,
+                    unattended=self.unattended,
                     artifact_dir=self.artifact_dir,
                     model=self.architect_model,
                     cancel=self.cancel,

@@ -1664,6 +1664,30 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     ]
 
 
+def test_plan_show_carries_an_assumption_the_architect_made(
+    planning_plan_response,
+) -> None:
+    """An unattended plan must survive the surface a person approves it on.
+
+    The plan document is closed to unknown fields, so an assumption that the
+    Architect schema allows but this model does not know is not merely dropped
+    here: it makes the plan unreadable, and unapprovable, over MCP.
+    """
+    plan = planning_plan_response()
+    plan["assumptions"] = [
+        {"question": "Which platforms are required?", "assumption": "Linux only."}
+    ]
+
+    document = mcp_server.PlanDocument.model_validate(plan)
+
+    assert document.assumptions[0].question == "Which platforms are required?"
+    assert document.assumptions[0].assumption == "Linux only."
+    shown = mcp_server.PlanShowData(borg="unattended", plan=document).model_dump()
+    assert shown["plan"]["assumptions"] == (
+        {"question": "Which platforms are required?", "assumption": "Linux only."},
+    )
+
+
 def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     committed_git_repo: Path,
     planning_cli_repository,

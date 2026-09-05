@@ -436,6 +436,228 @@ def test_recovers_completed_provider_review_without_duplicate_turn(
         assert len(reviewer.calls) == 1
 
 
+def test_unattended_revision_assumes_the_questions_it_raises(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A revision the Tech Lead asked for must not stop on its own question.
+
+    Later question rounds arise here rather than in the first Architect pass,
+    and this loop builds the Architect that answers them, so an unattended run
+    that does not reach this one dies after the review it already paid for.
+    """
+    initial_plan = planning_plan_response()
+    ambiguous_plan = planning_plan_response(
+        summary="Choose a concrete rollback strategy."
+    )
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = planning_plan_response(
+        summary="Use retries before rolling back the release."
+    )
+    database = committed_git_repo.parent / "tech-lead-unattended.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-unattended"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=ambiguous_plan))
+        architect.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": "Retry twice, then roll back."}
+                    ]
+                }
+            )
+        )
+        architect.queue(MockResponse(payload=revised_plan))
+
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+
+
+def test_an_assumption_survives_the_revision_that_does_not_revisit_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A revision addresses a finding; it does not re-argue settled ground.
+
+    The Architect names an assumption once, in the plan that made it. Nothing
+    obliges the revision that answers an unrelated finding to restate it, and
+    a plan that quietly stops carrying one leaves a decision nobody took
+    reading like a requirement somebody gave.
+    """
+    initial_plan = planning_plan_response()
+    initial_plan["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+    # The revision addresses the finding and says nothing about assumptions,
+    # which is what a schema making the field optional invites.
+    revised_plan = planning_plan_response(
+        summary="Define the rollback behavior the review asked for."
+    )
+    assert "assumptions" not in revised_plan
+
+    database = committed_git_repo.parent / "tech-lead-carried.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-carried"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+        assert handoff.plan["assumptions"] == initial_plan["assumptions"]
+
+        architect.queue(MockResponse(payload=revised_plan))
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+
+
+def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The turn deciding a plan's open question needs the plan that raised it.
+
+    It is a fresh agent holding none of the reasoning that produced the
+    question. Given a workspace whose manifest says no plan exists, it answers
+    from the PRD alone, and that answer is recorded as a decision the plan
+    rests on.
+    """
+    initial_plan = planning_plan_response()
+    ambiguous_plan = planning_plan_response(
+        summary="Choose a concrete rollback strategy."
+    )
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = planning_plan_response(
+        summary="Use retries before rolling back the release."
+    )
+    seen: dict[str, object] = {}
+
+    def answer_against_the_plan(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        seen["current_plan"] = manifest.get("current_plan")
+        seen["plan_text"] = (spec.cwd / str(manifest["current_plan"])).read_text(
+            encoding="utf-8"
+        )
+        seen["user_prompt"] = spec.user_prompt
+        return {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]}
+
+    database = committed_git_repo.parent / "tech-lead-plan-context.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-plan-context"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=ambiguous_plan))
+        architect.queue(MockResponse(dynamic=answer_against_the_plan))
+        architect.queue(MockResponse(payload=revised_plan))
+
+        TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert seen["current_plan"] is not None
+    assert "Choose a concrete rollback strategy." in str(seen["plan_text"])
+    assert "a question raised by a plan is a question about that plan" in str(
+        seen["user_prompt"]
+    )
+
+
 def test_resumes_committed_change_request_through_architect_pause(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -604,6 +604,12 @@ def plan() -> None:
 @plan.command(name="start")
 @click.argument("name")
 @click.option(
+    "--unattended",
+    "unattended",
+    is_flag=True,
+    help="Plan with nobody to ask: the Architect settles its own questions.",
+)
+@click.option(
     "--yes",
     "explicit_trust",
     is_flag=True,
@@ -614,9 +620,10 @@ def start_plan(
     paths: RepoPaths,
     cancel: CancellationToken | None,
     name: str,
+    unattended: bool,
 ) -> None:
     """Start or resume planning for the named Borg."""
-    borg = _continue_planning(paths, name, cancel=cancel)
+    borg = _continue_planning(paths, name, cancel=cancel, unattended=unattended)
     _write_planning_gate(name, borg, changed=False)
 
 
@@ -1826,6 +1833,12 @@ def approve_plan(
     help="Plain-language changes for the Architect to apply.",
 )
 @click.option(
+    "--unattended",
+    "unattended",
+    is_flag=True,
+    help="Revise with nobody to ask: the Architect settles its own questions.",
+)
+@click.option(
     "--yes",
     "explicit_trust",
     is_flag=True,
@@ -1837,6 +1850,7 @@ def change_plan(
     cancel: CancellationToken | None,
     name: str,
     note: str | None,
+    unattended: bool,
 ) -> None:
     """Request changes to a plan awaiting human approval."""
     if note is None:
@@ -1845,7 +1859,9 @@ def change_plan(
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
-    borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
+    borg = _continue_planning(
+        paths, name, change_note=note, cancel=cancel, unattended=unattended
+    )
     _write_planning_gate(name, borg, changed=True)
 
 
@@ -1856,6 +1872,7 @@ def _continue_planning(
     change_note: str | None = None,
     io: InteractiveIO | None = None,
     cancel: CancellationToken | None = None,
+    unattended: bool = False,
 ) -> Borg:
     """Load and drain one initial or change-request planning lifecycle."""
     change_requested = change_note is not None
@@ -1933,6 +1950,7 @@ def _continue_planning(
                         store,
                         architect_agent,
                         io=planning_io,
+                        unattended=unattended,
                         cancel=cancel,
                         progress=progress,
                     ).run().borg
@@ -1943,6 +1961,7 @@ def _continue_planning(
                     tech_lead_agent,
                     architect_agent=architect_agent,
                     io=planning_io,
+                    unattended=unattended,
                     cancel=cancel,
                     progress=progress,
                 ).run().borg

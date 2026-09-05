@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +45,7 @@ ARCHITECT_QUESTION_ROUND_CAP = 3
 #: the same budget as the schema retry it sits one layer above.
 ARCHITECT_PLAN_CONTRACT_ROUND_CAP = 3
 _QUESTIONS_PHASE = "architect_questions"
+_ANSWERS_PHASE = "architect_answers"
 _PLAN_PHASE = "architect_plan"
 
 ARCHITECT_QUESTIONS_SCHEMA: dict[str, Any] = {
@@ -66,6 +67,28 @@ ARCHITECT_QUESTIONS_SCHEMA: dict[str, Any] = {
                     "question": {"type": "string", "minLength": 1},
                     "why": {"type": "string"},
                     "hint": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+ARCHITECT_ANSWERS_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["answers"],
+    "properties": {
+        "answers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["q_id", "answer"],
+                "properties": {
+                    "q_id": {"type": "string", "minLength": 1},
+                    "answer": {"type": "string", "minLength": 1},
                 },
             },
         },
@@ -186,6 +209,20 @@ ARCHITECT_PLAN_SCHEMA: dict[str, Any] = {
         },
         "risks": _NONEMPTY_STRINGS,
         "open_questions": _NONEMPTY_STRINGS,
+        # Derived from the durable question rounds the Architect answered
+        # itself, so a reader of the plan meets every assumption it rests on.
+        "assumptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["question", "assumption"],
+                "properties": {
+                    "question": {"type": "string", "minLength": 1},
+                    "assumption": {"type": "string", "minLength": 1},
+                },
+            },
+        },
     },
 }
 
@@ -194,6 +231,36 @@ materialized repository and planning context before deciding. Ask only genuine
 product questions that the PRD and code cannot answer. Return ask_more with at
 most eight concise questions, or ready_to_plan when no material uncertainty
 remains. Do not modify files. Return only the required JSON object.
+"""
+
+_ANSWERS_SYSTEM_PROMPT = """You are the Architect for this project, and nobody
+is available to answer the questions you asked. Decide each one yourself:
+inspect the materialized repository and planning context, and pick the reading
+that evidence best supports. Answer every question exactly once, concretely
+enough to plan against, and state the decision rather than the uncertainty.
+Every answer is recorded as an assumption the plan rests on. Do not modify
+files. Return only the required JSON object.
+"""
+
+#: Appended to the questions prompt when nobody can be asked. A question put to
+#: an empty room stops the run, so the same judgement has to be spent deciding
+#: instead of asking.
+_UNATTENDED_QUESTIONS_DIRECTIVE = """
+Nobody is available to answer questions on this run. Asking one ends the run
+without a plan, so it buys nothing. Decide every uncertainty yourself: read the
+evidence, take the reading it best supports, and return ready_to_plan. Prefer a
+defensible assumption to a question. Ask only where the repository, the PRD and
+the analysis together leave you guessing rather than inferring, and the plan
+would be built on the guess.
+"""
+
+#: Appended to the plan prompt on the same runs. Deciding a requirement is
+#: sound; presenting the decision as a given is what costs the reader.
+_UNATTENDED_PLAN_DIRECTIVE = """
+Nobody confirmed the requirements you settled yourself on this run. List each
+one under assumptions, paired with the question it answers, so a reader meets
+every decision the plan rests on. A requirement the PRD, the analysis or the
+answered Q&A already settles is not an assumption.
 """
 
 _PLAN_SYSTEM_PROMPT = """You are the Architect for this project. Inspect the
@@ -247,6 +314,7 @@ class ArchitectLoop:
         agent: AgentAdapter | SelectedAgent,
         *,
         io: InteractiveIO,
+        unattended: bool = False,
         artifact_dir: Path | None = None,
         model: str | None = None,
         cancel: CancellationToken | None = None,
@@ -274,6 +342,7 @@ class ArchitectLoop:
         self.store = store
         self.agent = agent
         self.io = io
+        self.unattended = unattended
         self.artifact_dir = Path(
             artifact_dir or paths.artifacts_dir / "planning" / str(borg.id)
         ).resolve()
@@ -384,7 +453,7 @@ class ArchitectLoop:
                 phase=_QUESTIONS_PHASE,
                 round_number=self._turns.next_round(_QUESTIONS_PHASE),
                 schema=ARCHITECT_QUESTIONS_SCHEMA,
-                system_prompt=_QUESTIONS_SYSTEM_PROMPT,
+                system_prompt=self._questions_system_prompt(),
                 user_prompt=(
                     "Inspect .betterborg/state/planning/context/manifest.json and its "
                     "referenced evidence. This is Architect question round "
@@ -460,7 +529,7 @@ class ArchitectLoop:
                 phase=_PLAN_PHASE,
                 round_number=self._turns.next_round(_PLAN_PHASE),
                 schema=ARCHITECT_PLAN_SCHEMA,
-                system_prompt=_PLAN_SYSTEM_PROMPT,
+                system_prompt=self._plan_system_prompt(),
                 user_prompt=user_prompt,
                 current_plan=(
                     json.dumps(plan_to_revise, indent=2, sort_keys=True)
@@ -475,6 +544,7 @@ class ArchitectLoop:
             # a missing repository rather than as the cancellation it is.
             if self.cancel is not None and self.cancel.is_set():
                 raise ArchitectCancelled("Architect run cancelled")
+            payload = self._with_assumptions(payload, plan_to_revise)
             open_questions = self._plan_open_questions(payload)
             borg = self._turns.current_borg()
             if open_questions:
@@ -579,6 +649,19 @@ class ArchitectLoop:
             )
 
     def _answer_question_round(self, borg: Borg, question: PlanningQuestion) -> Borg:
+        answers = (
+            self._assume_question_round(question)
+            if self.unattended
+            else self._prompt_question_round(question)
+        )
+        with self.store.transaction():
+            self.store.answer_planning_question(question.id, answers)
+            return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
+
+    def _prompt_question_round(
+        self, question: PlanningQuestion
+    ) -> list[dict[str, object]]:
+        """Ask the operator at the terminal for one round of answers."""
         answers: list[dict[str, object]] = []
         for item in question.questions:
             suspension = self.progress.suspend() if self.progress else nullcontext()
@@ -596,10 +679,51 @@ class ArchitectLoop:
             if not answer:
                 raise ArchitectError("Architect question answers must not be empty")
             answers.append({"q_id": item["id"], "answer": answer})
+        return answers
 
-        with self.store.transaction():
-            self.store.answer_planning_question(question.id, answers)
-            return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
+    def _assume_question_round(
+        self, question: PlanningQuestion
+    ) -> list[dict[str, object]]:
+        """Decide one round from the evidence, because nobody else can."""
+        if question.round > ARCHITECT_QUESTION_ROUND_CAP:
+            raise ArchitectError(
+                "Architect asked past question round "
+                f"{ARCHITECT_QUESTION_ROUND_CAP}; an unattended run cannot "
+                "assume further answers"
+            )
+        # A round raised by a plan is a question about that plan, and the turn
+        # answering it is a fresh agent with none of the reasoning that raised
+        # it. Without the plan in its workspace the manifest tells it no plan
+        # exists, and it decides the question from the PRD alone.
+        plan = self._latest_plan()
+        attempt, payload = self._turns.run(
+            phase=_ANSWERS_PHASE,
+            round_number=self._turns.next_round(_ANSWERS_PHASE),
+            schema=ARCHITECT_ANSWERS_SCHEMA,
+            system_prompt=_ANSWERS_SYSTEM_PROMPT,
+            user_prompt=self._assumed_answers_prompt(question, plan is not None),
+            current_plan=(
+                json.dumps(plan.result, indent=2, sort_keys=True)
+                if plan is not None
+                else None
+            ),
+            turn_name="assumed answers",
+            request_context={"question_id": str(question.id)},
+        )
+        try:
+            answers = self._assumed_answers(question, payload)
+        except ArchitectError as error:
+            self.store.complete_planning_attempt(
+                attempt.id,
+                status=PlanningAttemptStatus.FAILED,
+                result=payload,
+                summary=str(error),
+            )
+            raise
+        self._complete_attempt(
+            attempt, payload, f"assumed {len(answers)} answer(s)"
+        )
+        return answers
 
     def _start_progress(self) -> None:
         if self.progress is None:
@@ -755,6 +879,142 @@ class ArchitectLoop:
         questions = self.store.list_planning_questions(self.borg_id)
         return max((question.round for question in questions), default=0) + 1
 
+    def _questions_system_prompt(self) -> str:
+        """Instruct the Architect for the room it is actually speaking to."""
+        if not self.unattended:
+            return _QUESTIONS_SYSTEM_PROMPT
+        return _QUESTIONS_SYSTEM_PROMPT + _UNATTENDED_QUESTIONS_DIRECTIVE
+
+    def _plan_system_prompt(self) -> str:
+        if not self.unattended:
+            return _PLAN_SYSTEM_PROMPT
+        return _PLAN_SYSTEM_PROMPT + _UNATTENDED_PLAN_DIRECTIVE
+
+    def _with_assumptions(
+        self, plan: dict[str, Any], superseded: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Settle which assumptions the plan carries, rather than the plan.
+
+        Three sources reach here. Betterborg contributes the rounds the
+        Architect asked and then answered itself, which are recorded and so
+        cannot be dropped by leaving them out of a plan. The Architect
+        declares the requirements it decided in place of asking, which only it
+        knows it decided. And the plan this one supersedes contributes what it
+        already carried, because a revision that rewrites a plan to address a
+        finding has no reason to restate an assumption it is not revisiting,
+        and losing one there costs the reader the same warning as never making
+        it.
+
+        Carrying forward is unconditional, so an assumption outlives the mode
+        of the run that revises it. A stale one sends a reader to look at
+        settled ground; a dropped one leaves a decision nobody took reading
+        like a requirement somebody gave. The first is the cheaper mistake.
+
+        What an attended run cannot do is originate one. A question there was
+        answered by a person, so a plan claiming an assumption is describing a
+        conversation that did not happen.
+        """
+        declared = self._declared_assumptions(plan) if self.unattended else []
+        carried = self._declared_assumptions(superseded or {})
+        stored = self._stored_assumptions()
+        assumptions: list[dict[str, str]] = []
+        seen: set[str] = set()
+        # Stored first: an assumption Betterborg recorded is the one whose
+        # wording came from the question as asked.
+        for assumption in [*stored, *carried, *declared]:
+            key = assumption["question"].casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            assumptions.append(assumption)
+        plan = {key: value for key, value in plan.items() if key != "assumptions"}
+        return {**plan, "assumptions": assumptions} if assumptions else plan
+
+    @staticmethod
+    def _declared_assumptions(plan: Mapping[str, Any]) -> list[dict[str, str]]:
+        """Read the assumptions the Architect named in its own plan."""
+        declared = plan.get("assumptions")
+        if not isinstance(declared, list):
+            return []
+        assumptions: list[dict[str, str]] = []
+        for assumption in declared:
+            if not isinstance(assumption, Mapping):
+                continue
+            question = str(assumption.get("question") or "").strip()
+            decision = str(assumption.get("assumption") or "").strip()
+            if question and decision:
+                assumptions.append({"question": question, "assumption": decision})
+        return assumptions
+
+    def _stored_assumptions(self) -> list[dict[str, str]]:
+        """Pair every assumed answer with the question that prompted it."""
+        assumptions: list[dict[str, str]] = []
+        for stored in self.store.list_planning_questions(self.borg_id):
+            asked = {
+                str(item.get("id")): str(item.get("question") or "").strip()
+                for item in stored.questions
+            }
+            for answer in stored.answers or []:
+                if not answer.get("assumed"):
+                    continue
+                question = asked.get(str(answer.get("q_id")), "")
+                assumption = str(answer.get("answer") or "").strip()
+                if question and assumption:
+                    assumptions.append(
+                        {"question": question, "assumption": assumption}
+                    )
+        return assumptions
+
+    @staticmethod
+    def _assumed_answers_prompt(
+        question: PlanningQuestion, has_plan: bool = False
+    ) -> str:
+        lines = [
+            "Nobody is available to answer these Architect questions, so "
+            "decide them yourself. Read "
+            ".betterborg/state/planning/context/manifest.json and its "
+            "referenced evidence, then answer every question below exactly "
+            "once, by id.",
+            "",
+        ]
+        if has_plan:
+            lines[0] += (
+                " The plan these questions were raised against is supplied "
+                "with this turn; read it first, because a question raised by "
+                "a plan is a question about that plan."
+            )
+        for item in question.questions:
+            lines.append(f"- {item['id']}: {str(item['question']).strip()}")
+            why = str(item.get("why") or "").strip()
+            hint = str(item.get("hint") or "").strip()
+            if why:
+                lines.append(f"  Why this matters: {why}")
+            if hint:
+                lines.append(f"  Answer guidance: {hint}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _assumed_answers(
+        question: PlanningQuestion, payload: dict[str, Any]
+    ) -> list[dict[str, object]]:
+        answered = {
+            str(item["q_id"]): str(item["answer"]).strip()
+            for item in payload["answers"]
+        }
+        if len(answered) != len(payload["answers"]):
+            raise ArchitectError("Architect assumed answer IDs must be unique")
+        asked = [str(item["id"]) for item in question.questions]
+        if set(answered) != set(asked):
+            raise ArchitectError(
+                "Architect must assume exactly one answer for each question"
+            )
+        if not all(answered.values()):
+            raise ArchitectError("Architect assumed answers must not be empty")
+        return [
+            {"q_id": q_id, "answer": answered[q_id], "assumed": True}
+            for q_id in asked
+        ]
+
     @staticmethod
     def _plan_open_questions(result: dict[str, Any] | None) -> list[str]:
         return [
@@ -779,6 +1039,7 @@ class ArchitectLoop:
 
 
 __all__ = [
+    "ARCHITECT_ANSWERS_SCHEMA",
     "ARCHITECT_PLAN_CONTRACT_ROUND_CAP",
     "ARCHITECT_PLAN_SCHEMA",
     "ARCHITECT_QUESTION_ROUND_CAP",

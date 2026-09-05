@@ -183,6 +183,11 @@ def _validate_completeness(plan: Mapping[str, Any]) -> None:
     _require_nonblank_items(plan.get("risks", []), "risks")
     _require_nonblank_items(plan.get("open_questions", []), "open_questions")
 
+    for index, assumption in enumerate(plan.get("assumptions", [])):
+        prefix = f"assumptions[{index}]"
+        _require_nonblank(assumption["question"], f"{prefix}.question")
+        _require_nonblank(assumption["assumption"], f"{prefix}.assumption")
+
     for index, repository in enumerate(plan.get("repositories", [])):
         _require_nonblank(repository["id"], f"repositories[{index}].id")
 
@@ -391,6 +396,24 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
     if approach:
         add("## Overall approach")
         add(markdown_text(approach))
+
+    assumption_lines: list[str] = []
+    assumptions = plan.get("assumptions")
+    if isinstance(assumptions, list):
+        for assumption in assumptions:
+            if not isinstance(assumption, Mapping):
+                continue
+            question = _string(assumption.get("question"))
+            decision = _string(assumption.get("assumption"))
+            if not question or not decision:
+                continue
+            assumption_lines.append(
+                f"- **{markdown_text(question)}** {markdown_text(decision)}"
+            )
+    if assumption_lines:
+        add("## Assumptions")
+        add("The Architect decided these itself; nobody confirmed them.")
+        add("\n".join(assumption_lines))
 
     repository_lines: list[str] = []
     repositories = plan.get("repositories")

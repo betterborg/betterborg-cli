@@ -200,6 +200,11 @@ class PlanCodePointer(ProtocolModel):
     why: str
 
 
+class PlanAssumption(ProtocolModel):
+    question: str
+    assumption: str
+
+
 class PlanDocument(ProtocolModel):
     title: str
     repositories: tuple[PlanRepository, ...] = ()
@@ -207,6 +212,7 @@ class PlanDocument(ProtocolModel):
     overall_approach: str
     phases: tuple[PlanPhase, ...]
     code_pointers: tuple[PlanCodePointer, ...] = ()
+    assumptions: tuple[PlanAssumption, ...] = ()
     risks: tuple[str, ...] = ()
     open_questions: tuple[str, ...] = ()
 
