@@ -348,6 +348,40 @@ def _suspend_progress(
     return progress.suspend() if progress is not None else nullcontext()
 
 
+def _write_after_progress(
+    progress: RunProgress | None,
+    writer: Callable[[], None],
+) -> None:
+    """Quiesce progress before writing one already-owed command report."""
+
+    progress_error: BaseException | None = None
+    if progress is not None:
+        try:
+            if _progress_has_observed_work(progress):
+                progress.close()
+                progress.raise_if_render_failed()
+            else:
+                progress.stop_display()
+        except BaseException as error:
+            progress_error = error
+            try:
+                progress.stop_display()
+            except BaseException as disposal_error:
+                if disposal_error is not error:
+                    error.add_note(
+                        f"progress display disposal also failed: {disposal_error}"
+                    )
+
+    try:
+        writer()
+    except BaseException as error:
+        if progress_error is not None and progress_error is not error:
+            error.add_note(f"progress finalization also failed: {progress_error}")
+        raise
+    if progress_error is not None:
+        raise progress_error
+
+
 def _trusted_workspace_callback(function):
     """Gate a callback before it can load repository-controlled context."""
 
@@ -435,67 +469,88 @@ def initialize_repository(
             result = service.initialize()
 
             if result.initialized and interactive:
-                if cancel is not None and cancel.is_set():
-                    return
-                with _suspend_progress(progress):
+                onboarding_error: BaseException | None = None
+                try:
+                    if cancel is None or not cancel.is_set():
+                        config = load_repository_config(paths)
+                        if cancel is None or not cancel.is_set():
+                            io = _interactive_io()
+                            creator = CreateService(
+                                result.repository,
+                                store,
+                                select_agent(
+                                    config,
+                                    AgentStage.REQUIREMENTS,
+                                    paths,
+                                    interactive=True,
+                                ),
+                                io=io,
+                                editor=_edit_markdown,
+                                cancel=cancel,
+                                progress=progress,
+                            )
+                            OnboardingDispatcher(
+                                result.repository,
+                                store,
+                                io,
+                                creator,
+                                result.improvement_prds,
+                                cancel=cancel,
+                                progress=progress,
+                            ).run()
+                except BaseException as error:
+                    onboarding_error = error
+
+                try:
+                    _write_after_progress(
+                        progress,
+                        lambda: _write_initialized(result),
+                    )
+                except BaseException as error:
+                    if onboarding_error is None:
+                        raise
+                    if error is not onboarding_error:
+                        onboarding_error.add_note(
+                            f"initialization progress finalization also failed: {error}"
+                        )
+                if onboarding_error is not None:
+                    raise onboarding_error
+                return
+
+            if cancel is not None and cancel.is_set():
+                return
+            commands = create_commands(paths.root, result.improvement_prds)
+
+            def write_result() -> None:
+                if json_output:
+                    click.echo(
+                        json.dumps(
+                            {
+                                "repository_id": str(result.repository.id),
+                                "initialized": result.initialized,
+                                "score": result.analysis.overall_score,
+                                "create_commands": [
+                                    shlex.join(command) for command in commands
+                                ],
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                elif not result.initialized:
+                    click.echo(
+                        f"Repository already initialized: {result.repository.id}"
+                    )
+                else:
                     _write_initialized(result)
-                config = load_repository_config(paths)
-                if cancel is not None and cancel.is_set():
-                    return
-                io = _interactive_io()
-                creator = CreateService(
-                    result.repository,
-                    store,
-                    select_agent(
-                        config,
-                        AgentStage.REQUIREMENTS,
-                        paths,
-                        interactive=True,
-                    ),
-                    io=io,
-                    editor=_edit_markdown,
-                    cancel=cancel,
-                    progress=progress,
-                )
-                OnboardingDispatcher(
-                    result.repository,
-                    store,
-                    io,
-                    creator,
-                    result.improvement_prds,
-                    cancel=cancel,
-                    progress=progress,
-                ).run()
+                    for command in commands:
+                        click.echo(shlex.join(command))
+
+            _write_after_progress(progress, write_result)
     except click.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
-
-    if cancel is not None and cancel.is_set():
-        return
-    commands = create_commands(paths.root, result.improvement_prds)
-    with _suspend_progress(progress):
-        if json_output:
-            click.echo(
-                json.dumps(
-                    {
-                        "repository_id": str(result.repository.id),
-                        "initialized": result.initialized,
-                        "score": result.analysis.overall_score,
-                        "create_commands": [
-                            shlex.join(command) for command in commands
-                        ],
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-        elif not result.initialized:
-            click.echo(f"Repository already initialized: {result.repository.id}")
-        elif not interactive:
-            _write_initialized(result)
-            for command in commands:
-                click.echo(shlex.join(command))
 
 
 @cli.command(name="analyze")
@@ -543,7 +598,8 @@ def analyze_repository(
     analysis = result.analysis
     previous_score = result.previous_analysis.overall_score
     score_delta = analysis.overall_score - previous_score
-    with _suspend_progress(progress):
+
+    def write_result() -> None:
         if json_output:
             click.echo(
                 json.dumps(
@@ -565,6 +621,8 @@ def analyze_repository(
                 f"(previous {previous_score:.2f}/5, "
                 f"delta {score_delta:+.2f})."
             )
+
+    _write_after_progress(progress, write_result)
 
 
 @cli.command(name="create")
@@ -626,7 +684,8 @@ def create_borg(
 
     if cancel is not None and cancel.is_set():
         return
-    with _suspend_progress(progress):
+
+    def write_result() -> None:
         if result.confirmed:
             click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
             click.echo(f"betterborg plan start {result.borg.name}")
@@ -634,6 +693,8 @@ def create_borg(
             click.echo("Borg PRD needs more input before it can be created.")
         else:
             click.echo("Borg draft saved without a confirmed PRD.")
+
+    _write_after_progress(progress, write_result)
 
 
 @cli.group()
@@ -657,7 +718,10 @@ def start_plan(
 ) -> None:
     """Start or resume planning for the named Borg."""
     borg = _continue_planning(paths, name, cancel=cancel)
-    _write_planning_gate(name, borg, changed=False)
+    _write_after_progress(
+        _repository_progress(False),
+        lambda: _write_planning_gate(name, borg, changed=False),
+    )
 
 
 @plan.command(name="show")
@@ -1061,17 +1125,20 @@ def execute_borg(
         except BaseException as error:
             follow_up_error = error
 
-    close_error: BaseException | None = None
-    if progress is not None:
-        try:
-            progress.close()
-        except BaseException as error:
-            close_error = error
-    _write_host_execution_result(result)
+    try:
+        _write_after_progress(
+            progress,
+            lambda: _write_host_execution_result(result),
+        )
+    except BaseException as error:
+        if follow_up_error is None:
+            raise
+        if error is not follow_up_error:
+            follow_up_error.add_note(
+                f"execution progress finalization also failed: {error}"
+            )
     if follow_up_error is not None:
         raise follow_up_error
-    if close_error is not None:
-        raise close_error
 
 
 def _reconcile_execution_estimate(
@@ -1821,6 +1888,7 @@ def approve_plan(
 ) -> None:
     """Approve the current plan and prepare its executable task generation."""
     resumable = False
+    progress = _repository_progress(False)
 
     def mark_resumable() -> None:
         nonlocal resumable
@@ -1828,7 +1896,6 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
-        progress = _repository_progress(False)
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -1866,18 +1933,21 @@ def approve_plan(
             ) from error
         raise click.ClickException(str(error)) from error
 
-    relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
-    click.echo(
-        f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
-    )
-    if workflow.borg.state is BorgState.READY_TO_EXECUTE:
-        click.echo(f"Borg {name!r} is ready to execute.")
-        click.echo("Current tasks:")
-        assert workflow.publication is not None
-        for item in workflow.publication.files:
-            click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
-    else:
-        click.echo(f"Task decomposition blocked for Borg {name!r}.")
+    def write_result() -> None:
+        relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
+        click.echo(
+            f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
+        )
+        if workflow.borg.state is BorgState.READY_TO_EXECUTE:
+            click.echo(f"Borg {name!r} is ready to execute.")
+            click.echo("Current tasks:")
+            assert workflow.publication is not None
+            for item in workflow.publication.files:
+                click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
+        else:
+            click.echo(f"Task decomposition blocked for Borg {name!r}.")
+
+    _write_after_progress(progress, write_result)
 
 @plan.command(name="change")
 @click.argument("name")
@@ -1906,7 +1976,10 @@ def change_plan(
     note = note.strip()
 
     borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
-    _write_planning_gate(name, borg, changed=True)
+    _write_after_progress(
+        _repository_progress(False),
+        lambda: _write_planning_gate(name, borg, changed=True),
+    )
 
 
 def _continue_planning(

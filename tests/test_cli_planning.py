@@ -85,6 +85,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert outputs == ["Why this matters: This controls the test matrix."]
     assert "Plan approval pending" in result.output
     assert "betterborg plan show inline-plan" in result.output
+    assert result.output.count("none failed or stopped.") == 1
+    assert result.output.index("none failed or stopped.") < result.output.index(
+        "Plan approval pending"
+    )
     assert architect_adapter is not tech_lead_adapter
     assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
     assert len(architect_adapter.calls) == 3
@@ -527,6 +531,10 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     assert changed.exit_code == 0, changed.output
     assert "Plan approval pending" in changed.output
     assert "betterborg plan show change-plan" in changed.output
+    assert changed.output.count("none failed or stopped.") == 1
+    assert changed.output.index("none failed or stopped.") < changed.output.index(
+        "Plan approval pending"
+    )
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "change-plan")
         assert borg is not None

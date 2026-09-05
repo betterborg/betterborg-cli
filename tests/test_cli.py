@@ -212,6 +212,61 @@ def test_progress_observed_work_requires_a_nonpending_stage() -> None:
     assert progress.stages["waiting"].state is StageState.PENDING
 
 
+def test_write_after_progress_closes_before_the_owed_report() -> None:
+    stream = io.StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    progress.declare(StageSpec("done", "Done"))
+    progress.start("done")
+    progress.complete("done", "complete")
+    progress.declare(StageSpec("waiting", "Waiting"))
+
+    cli_module._write_after_progress(progress, lambda: stream.write("report\n"))
+
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue().endswith(
+        "1 of 1 stage finished in 0:00; none failed or stopped.\nreport\n"
+    )
+
+
+def test_write_after_progress_writes_owed_report_before_close_failure() -> None:
+    events: list[str] = []
+
+    class CloseFailingProgress(RunProgress):
+        def close(self) -> None:
+            events.append("close")
+            raise RuntimeError("progress close failed")
+
+        def stop_display(self) -> None:
+            events.append("dispose")
+            super().stop_display()
+
+    progress = CloseFailingProgress(enabled=False)
+    progress.declare(StageSpec("done", "Done"))
+    progress.start("done")
+    progress.complete("done")
+
+    with pytest.raises(RuntimeError, match="progress close failed"):
+        cli_module._write_after_progress(progress, lambda: events.append("report"))
+
+    assert events == ["close", "dispose", "report"]
+    assert progress._cadence_worker is None
+
+
+def test_write_after_progress_disposes_unobserved_work_without_summary() -> None:
+    stream = io.StringIO()
+    progress = RunProgress(stream=stream)
+    progress.declare(StageSpec("waiting", "Waiting"))
+
+    cli_module._write_after_progress(progress, lambda: stream.write("report\n"))
+
+    assert not progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["waiting"].state is StageState.PENDING
+    assert stream.getvalue() == "report\n"
+
+
 @pytest.mark.parametrize(
     ("failure", "expected_error", "expected_stage_keys"),
     [
@@ -710,6 +765,7 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
         ),
     )
     snapshots: list[tuple[str, str, str]] = []
+    report_closed: list[bool] = []
 
     def cross_heartbeat(boundary: str) -> None:
         before = stream.getvalue()
@@ -747,6 +803,7 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
             assert self.progress is not None
             self.progress.declare(StageSpec("active", "Active work"))
             self.progress.start("active")
+            self.progress.complete("active", "done")
             return SimpleNamespace(
                 repository=repository,
                 analysis=SimpleNamespace(overall_score=3.0),
@@ -759,6 +816,11 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     original_confirm = click.confirm
 
     def echo(message=None, *args, **kwargs):
+        if isinstance(message, str) and message.startswith(
+            "Initialized repository"
+        ):
+            report_closed.append(progress.closed)
+            return original_echo(message, *args, **kwargs)
         cross_heartbeat(f"output:{message}")
         return original_echo(message, *args, **kwargs)
 
@@ -796,10 +858,7 @@ def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     )
 
     assert result.exit_code == 0, result.output
-    assert any(
-        boundary.startswith("output:Initialized repository")
-        for boundary, *_ in snapshots
-    )
+    assert report_closed == [True]
     assert any(boundary == "prompt" for boundary, *_ in snapshots)
     assert any(boundary == "confirmation" for boundary, *_ in snapshots)
     assert any(boundary == "editor" for boundary, *_ in snapshots)

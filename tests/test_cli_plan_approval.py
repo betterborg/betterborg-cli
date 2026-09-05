@@ -408,6 +408,10 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     assert "Borg 'approved-plan' is ready to execute." in result.output
     assert ".betterborg/plans/approved-plan.md" in result.output
     assert ".betterborg/tasks/approved-plan/" in result.output
+    assert result.output.count("none failed or stopped.") == 1
+    assert result.output.index("none failed or stopped.") < result.output.index(
+        "Approved plan:"
+    )
     project_manager_line = result.output.index("✔ Project Manager")
     supervisor_line = result.output.index("✔ Supervisor")
     assert project_manager_line < supervisor_line

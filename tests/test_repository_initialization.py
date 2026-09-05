@@ -607,6 +607,63 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
     assert len(adapter.calls) == 5
 
 
+def test_interactive_init_dismissal_closes_four_stages_before_one_report(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    _adapter_instance, selected = _adapter(committed_git_repo)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    run = cli_module.CliRunContext(CancellationToken(), progress)
+    report_closed: list[bool] = []
+    write_initialized = cli_module._write_initialized
+
+    def observed_write_initialized(result: object) -> None:
+        report_closed.append(progress.closed)
+        write_initialized(result)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: selected
+    )
+    monkeypatch.setattr(cli_module, "_write_initialized", observed_write_initialized)
+
+    result = cli_runner.invoke(
+        cli,
+        ["init", "--yes"],
+        input="q\n",
+        obj=run,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert report_closed == [True]
+    assert result.output.count("Initialized repository") == 1
+    assert tuple(progress.stages) == (
+        "discover",
+        "analyze",
+        "prompts",
+        "improvement-prds",
+        "requirements",
+    )
+    assert all(
+        progress.stages[key].state is StageState.COMPLETED
+        for key in ("discover", "analyze", "prompts", "improvement-prds")
+    )
+    assert progress.stages["requirements"].state is StageState.PENDING
+    assert stream.getvalue().endswith(
+        "4 of 4 stages finished in 0:00; none failed or stopped.\n"
+    )
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert paths.tracked_dir.joinpath("config.toml").is_file()
+
+
 def test_analyze_appends_history_and_refreshes_generated_outputs(
     cli_runner: CliRunner,
     committed_git_repo: Path,

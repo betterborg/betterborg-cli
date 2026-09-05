@@ -363,6 +363,7 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
     assert "✔ Estimate and decision" in approved.output
     assert "approved" in approved.output
     assert "Recorded execution estimate approved" in approved.output
+    assert approved.output.count("none failed or stopped.") == 1
     assert approved.output.index(" finished in ") < approved.output.index(
         "Execution operation"
     )
