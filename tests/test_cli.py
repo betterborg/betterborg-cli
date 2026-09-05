@@ -268,6 +268,205 @@ def test_write_after_progress_disposes_unobserved_work_without_summary() -> None
 
 
 @pytest.mark.parametrize(
+    "command_name",
+    (
+        "analyze",
+        "create",
+        "plan-start",
+        "plan-change",
+        "plan-approve",
+        "init",
+        "execute",
+    ),
+)
+def test_successful_agent_commands_finalize_once_before_unchanged_report(
+    cli_runner: CliRunner,
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    command_name: str,
+) -> None:
+    repository, paths = initialized_cli_repository
+    stream = io.StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    progress.declare(StageSpec("matrix-stage", "Matrix stage"))
+    progress.start("matrix-stage")
+    progress.complete("matrix-stage", "ready")
+    run = cli_module.CliRunContext(cli_module.CancellationToken(), progress)
+    operation_id = repository.id
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+
+    def echo(message=None, *_args, nl: bool = True, **_kwargs) -> None:
+        if message is not None:
+            stream.write(str(message))
+        if nl:
+            stream.write("\n")
+
+    monkeypatch.setattr(cli_module.click, "echo", echo)
+
+    if command_name == "analyze":
+        analysis = SimpleNamespace(id=operation_id, overall_score=4.0)
+        previous_analysis = SimpleNamespace(overall_score=3.0)
+
+        class StubRepositoryService:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def analyze(self) -> object:
+                return SimpleNamespace(
+                    repository=repository,
+                    analysis=analysis,
+                    previous_analysis=previous_analysis,
+                )
+
+        monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+        arguments = ["analyze", "--yes"]
+        expected_report = (
+            f"Analyzed repository {repository.id}: score 4.00/5 "
+            "(previous 3.00/5, delta +1.00).\n"
+        )
+        report_marker = "Analyzed repository"
+    elif command_name == "create":
+
+        class StubCreateService:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def create(self, name: str, _source: Path | None) -> object:
+                return SimpleNamespace(
+                    confirmed=True,
+                    borg=SimpleNamespace(name=name),
+                    prd_path=Path(".betterborg/prds/matrix.md"),
+                    questions=(),
+                )
+
+        monkeypatch.setattr(cli_module, "CreateService", StubCreateService)
+        arguments = ["create", "matrix", "--yes"]
+        expected_report = (
+            "Created Borg 'matrix': .betterborg/prds/matrix.md\n"
+            "betterborg plan start matrix\n"
+        )
+        report_marker = "Created Borg"
+    elif command_name in {"plan-start", "plan-change"}:
+        monkeypatch.setattr(
+            cli_module,
+            "_continue_planning",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                state=cli_module.BorgState.PLAN_APPROVAL_PENDING
+            ),
+        )
+        changed = command_name == "plan-change"
+        arguments = (
+            ["plan", "change", "matrix", "--note", "Refine it", "--yes"]
+            if changed
+            else ["plan", "start", "matrix", "--yes"]
+        )
+        suffix = " after applying the change" if changed else ""
+        expected_report = (
+            f"Plan approval pending for Borg 'matrix'{suffix}.\n"
+            "Review it with: betterborg plan show matrix\n"
+        )
+        report_marker = "Plan approval pending"
+    elif command_name == "plan-approve":
+        monkeypatch.setattr(
+            cli_module,
+            "approve_plan_workflow",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                plan_path=paths.tracked_dir / "plans" / "matrix.md",
+                approval=SimpleNamespace(plan_digest="matrix-digest"),
+                borg=SimpleNamespace(state=cli_module.BorgState.BLOCKED),
+            ),
+        )
+        arguments = ["plan", "approve", "matrix", "--yes"]
+        expected_report = (
+            "Approved plan: .betterborg/plans/matrix.md (matrix-digest)\n"
+            "Task decomposition blocked for Borg 'matrix'.\n"
+        )
+        report_marker = "Approved plan"
+    elif command_name == "init":
+
+        class StubRepositoryService:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def initialize(self) -> object:
+                return SimpleNamespace(
+                    repository=repository,
+                    analysis=SimpleNamespace(overall_score=4.0),
+                    initialized=True,
+                    improvement_prds=(),
+                )
+
+        monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+        monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+        arguments = ["init", "--yes"]
+        expected_report = (
+            f"Initialized repository {repository.id} with score 4.00/5.\n"
+        )
+        report_marker = "Initialized repository"
+    else:
+
+        def execute_workflow(
+            *_args, progress: RunProgress, **_kwargs
+        ) -> object:
+            progress.complete("estimate-decision", "approved")
+            return SimpleNamespace(
+                publication=SimpleNamespace(
+                    generation=SimpleNamespace(id=operation_id)
+                ),
+                decision_event=None,
+                host_result=SimpleNamespace(
+                    preflight=object(),
+                    active_operation_id=None,
+                    operation_id=operation_id,
+                    status=cli_module.ExecutionRunStatus.COMPLETED,
+                ),
+            )
+
+        monkeypatch.setattr(cli_module, "execute_workflow", execute_workflow)
+        arguments = ["execute", "matrix", "--auto-execute"]
+        expected_report = f"Execution operation {operation_id}: completed\n"
+        report_marker = "Execution operation"
+
+    result = cli_runner.invoke(cli, arguments, obj=run)
+
+    output = stream.getvalue()
+    summary_matches = re.findall(
+        r"\d+ of \d+ stages? finished in \d+:\d{2}; none failed or stopped\.",
+        output,
+    )
+    report_bytes = "".join(
+        line
+        for line in output.splitlines(keepends=True)
+        if "Matrix stage" not in line
+        and "Estimate and decision" not in line
+        and "stages finished in" not in line
+        and "stage finished in" not in line
+    )
+
+    assert result.exit_code == 0, result.exception
+    participating = 2 if command_name == "execute" else 1
+    expected_summary = (
+        f"{participating} of {participating} "
+        f"{'stage' if participating == 1 else 'stages'} finished in 0:00; "
+        "none failed or stopped."
+    )
+    assert summary_matches == [expected_summary]
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert output.index(summary_matches[0]) < output.index(report_marker)
+    assert report_bytes == expected_report
+
+
+@pytest.mark.parametrize(
     ("failure", "expected_error", "expected_stage_keys"),
     [
         ("trust", "workspace was not trusted", ()),

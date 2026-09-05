@@ -12,8 +12,10 @@ import threading
 import time
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner
 from progress_test_support import FakeClock, WaitableStringIO
@@ -31,6 +33,7 @@ from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
     RunProgress,
+    StageSpec,
     StageState,
 )
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
@@ -662,6 +665,144 @@ def test_interactive_init_dismissal_closes_four_stages_before_one_report(
     assert progress.closed
     assert progress._cadence_worker is None
     assert paths.tracked_dir.joinpath("config.toml").is_file()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_exit_code", "expected_summary", "requirements_state"),
+    (
+        (
+            "completion",
+            0,
+            "5 of 5 stages finished in 0:00; none failed or stopped.",
+            StageState.COMPLETED,
+        ),
+        (
+            "dismissal",
+            0,
+            "4 of 4 stages finished in 0:00; none failed or stopped.",
+            StageState.PENDING,
+        ),
+        (
+            "token-cancellation",
+            0,
+            "4 of 5 stages finished in 0:00; 0 failed and 1 stopped.",
+            StageState.STOPPED,
+        ),
+        (
+            "abort",
+            1,
+            "4 of 5 stages finished in 0:00; 0 failed and 1 stopped.",
+            StageState.STOPPED,
+        ),
+        (
+            "failure",
+            1,
+            "4 of 5 stages finished in 0:00; 1 failed and 0 stopped.",
+            StageState.FAILED,
+        ),
+    ),
+)
+def test_interactive_init_outcomes_preserve_one_report_after_quiescence(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    outcome: str,
+    expected_exit_code: int,
+    expected_summary: str,
+    requirements_state: StageState,
+) -> None:
+    repository = Repository(root=committed_git_repo)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    run = cli_module.CliRunContext(CancellationToken(), progress)
+    report_closed: list[bool] = []
+    write_initialized = cli_module._write_initialized
+
+    class StubRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+            for key, label in (
+                ("discover", "Discover evidence"),
+                ("analyze", "Analyze repository"),
+                ("prompts", "Generate role prompts"),
+                ("improvement-prds", "Draft improvement PRDs"),
+            ):
+                progress.declare(StageSpec(key, label))
+
+        def initialize(self) -> object:
+            for key in ("discover", "analyze", "prompts", "improvement-prds"):
+                self.progress.start(key)
+                self.progress.complete(key, "done")
+            return SimpleNamespace(
+                repository=repository,
+                analysis=SimpleNamespace(overall_score=4.0),
+                initialized=True,
+                improvement_prds=(),
+            )
+
+    class StubCreateService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            progress.declare(StageSpec("requirements", "Gather requirements"))
+
+    class StubOnboardingDispatcher:
+        def __init__(
+            self,
+            *_args,
+            cancel: CancellationToken,
+            progress: RunProgress,
+            **_kwargs,
+        ) -> None:
+            self.cancel = cancel
+            self.progress = progress
+
+        def run(self) -> None:
+            if outcome == "dismissal":
+                return
+            self.progress.start("requirements")
+            if outcome == "completion":
+                self.progress.complete("requirements", "created")
+            elif outcome == "token-cancellation":
+                self.cancel.cancel()
+                self.progress.stop("requirements", "cancelled")
+            elif outcome == "abort":
+                self.progress.stop("requirements", "aborted")
+                raise click.Abort()
+            else:
+                self.progress.fail("requirements", "onboarding failed")
+                raise RuntimeError("onboarding failed")
+
+    def observed_write_initialized(result: object) -> None:
+        report_closed.append(progress.closed)
+        write_initialized(result)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+    monkeypatch.setattr(cli_module, "CreateService", StubCreateService)
+    monkeypatch.setattr(
+        cli_module, "OnboardingDispatcher", StubOnboardingDispatcher
+    )
+    monkeypatch.setattr(cli_module, "load_repository_config", lambda _paths: object())
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli_module, "_write_initialized", observed_write_initialized)
+
+    result = cli_runner.invoke(cli, ["init", "--yes"], obj=run)
+
+    assert result.exit_code == expected_exit_code, result.output
+    assert result.output.count("Initialized repository") == 1
+    assert report_closed == [True]
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["requirements"].state is requirements_state
+    assert stream.getvalue().endswith(expected_summary + "\n")
+    assert run.cancellation.is_set() is (outcome == "token-cancellation")
+    if outcome == "abort":
+        assert result.output.endswith("Aborted!\n")
+    elif outcome == "failure":
+        assert result.output.endswith("Error: onboarding failed\n")
 
 
 def test_analyze_appends_history_and_refreshes_generated_outputs(
