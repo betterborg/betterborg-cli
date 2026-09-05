@@ -947,6 +947,7 @@ def test_init_shows_animated_startup_account_before_bootstrap_selection(
     selection_entered = threading.Event()
     release_selection = threading.Event()
     observed: list[str] = []
+    declared_frames: list[list[str]] = []
     observer_errors: list[BaseException] = []
     launched_at = 0.0
 
@@ -956,6 +957,10 @@ def test_init_shows_animated_startup_account_before_bootstrap_selection(
         return progress
 
     def select_after_preview(*_args: object, **_kwargs: object) -> SelectedAgent:
+        assert reporters
+        declared_frames.append(
+            [line.plain for line in reporters[0]._live_lines()]
+        )
         selection_entered.set()
         if not release_selection.wait(timeout=3):
             raise TimeoutError("bootstrap selection was not released")
@@ -1018,6 +1023,11 @@ def test_init_shows_animated_startup_account_before_bootstrap_selection(
     assert not observer.is_alive()
     assert observer_errors == []
     assert observed
+    assert len(declared_frames) == 1
+    assert all(
+        sum(label in line for line in declared_frames[0]) == 1
+        for label in expected_labels
+    )
     assert outcome == 0
 
 

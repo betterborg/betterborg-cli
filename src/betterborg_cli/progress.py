@@ -349,11 +349,21 @@ class RunProgress:
                 }
             )
             self._stages[spec.key] = record
+            adopted_preview_keys = {
+                preview.key
+                for preview in self._preview_specs
+                if preview.key == spec.key
+                or preview.key == preview.label == spec.label
+            }
             self._preview_specs = tuple(
                 preview
                 for preview in self._preview_specs
-                if preview.key != spec.key
+                if preview.key not in adopted_preview_keys
             )
+            if adopted_preview_keys.intersection(self._cohort_keys):
+                self._cohort_keys = frozenset(
+                    (*self._cohort_keys.difference(adopted_preview_keys), spec.key)
+                )
             if not self._initializing:
                 self._refresh_safely()
             return record

@@ -22,6 +22,7 @@ from pytest import MonkeyPatch
 
 from betterborg_cli import __version__
 from betterborg_cli import cli as cli_module
+from betterborg_cli import repository_service as repository_service_module
 from betterborg_cli import run_control as run_control_module
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import cli
@@ -209,6 +210,111 @@ def test_progress_observed_work_requires_a_nonpending_stage() -> None:
     progress.start("active")
     assert cli_module._progress_has_observed_work(progress) is True
     assert progress.stages["waiting"].state is StageState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error", "expected_stage_keys"),
+    [
+        ("trust", "workspace was not trusted", ()),
+        ("path-discovery", "repository path unavailable", ()),
+        (
+            "configuration",
+            "invalid repository configuration",
+            ("discover", "analyze", "prompts", "improvement-prds"),
+        ),
+        (
+            "default-branch",
+            "default branch unavailable",
+            ("discover", "analyze", "prompts", "improvement-prds"),
+        ),
+        (
+            "agent-selection",
+            "bootstrap agent unavailable",
+            ("discover", "analyze", "prompts", "improvement-prds"),
+        ),
+    ],
+)
+def test_init_prework_failures_leave_root_progress_unobserved(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    failure: str,
+    expected_error: str,
+    expected_stage_keys: tuple[str, ...],
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    stream = io.StringIO()
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    arguments = ["init", "--yes"]
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+
+    if failure == "trust":
+        arguments = ["init"]
+        monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+        monkeypatch.setattr(
+            cli_module.click, "confirm", lambda *_args, **_kwargs: False
+        )
+    elif failure == "path-discovery":
+        monkeypatch.setattr(
+            RepoPaths,
+            "discover",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                ValueError("repository path unavailable")
+            ),
+        )
+    elif failure == "configuration":
+        paths.tracked_dir.mkdir()
+        paths.tracked_dir.joinpath("config.toml").write_text(
+            "version = [\n", encoding="utf-8"
+        )
+    elif failure == "default-branch":
+        monkeypatch.setattr(
+            repository_service_module,
+            "_default_branch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("default branch unavailable")
+            ),
+        )
+    elif failure == "agent-selection":
+        monkeypatch.setattr(
+            cli_module,
+            "select_agent",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("bootstrap agent unavailable")
+            ),
+        )
+    else:  # pragma: no cover - the parameter table is exhaustive
+        raise AssertionError(f"unknown failure fixture: {failure}")
+
+    try:
+        exit_code = cli_module.main(arguments, prog_name="betterborg")
+    finally:
+        for reporter in reporters:
+            reporter.stop_display()
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert expected_error in captured.err
+    assert len(reporters) == 1
+    assert tuple(reporters[0].records) == expected_stage_keys
+    assert all(
+        record.state is StageState.PENDING
+        for record in reporters[0].records.values()
+    )
+    assert cli_module._progress_has_observed_work(reporters[0]) is False
+    assert stream.getvalue() == ""
 
 
 def test_main_enables_multiprocessing_before_click_dispatch(

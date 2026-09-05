@@ -1446,10 +1446,8 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
     assert "Draft improvement PRDs" in _terminal_text(stream.getvalue())
     assert progress.stages == {}
 
-    progress.declare(
-        StageSpec("Draft improvement PRDs", "Draft improvement PRDs")
-    )
-    progress.start("Draft improvement PRDs")
+    progress.declare(StageSpec("improvement-prds", "Draft improvement PRDs"))
+    progress.start("improvement-prds")
 
     adopted = [line.plain for line in progress._live_lines()]
     assert adopted == [
@@ -1457,6 +1455,9 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
         "",
         "ctrl-c to stop",
     ]
+    assert progress._projection_snapshot().cohort_keys == frozenset(
+        {"improvement-prds"}
+    )
 
     plain = StringIO()
     RunProgress(
