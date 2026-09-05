@@ -8,7 +8,6 @@ import shlex
 import signal
 import subprocess
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1015,7 +1014,11 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
                     progress_clock.now = 72.0
                     progress.stages[task_keys[3]].started_at = 31.0
                     progress.stages[task_keys[4]].started_at = 0.0
-                    progress._spinner_started_at = time.monotonic()
+                    monkeypatch.setattr(
+                        progress,
+                        "_current_spinner_frame",
+                        lambda _record=None: "⠋",
+                    )
                 progress.refresh()
             snapshot = progress._projection_snapshot()
             task_stages = {

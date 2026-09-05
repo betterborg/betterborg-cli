@@ -1389,7 +1389,7 @@ class RunProgress:
             prefer_detail=prefer_detail,
             label_column_width=14 if compact else _LABEL_COLUMN_WIDTH,
         )
-        spinner = _DOTS_FRAME if compact else self._current_spinner_frame(record)
+        spinner = self._current_spinner_frame(record)
         return Text.assemble(
             "  ",
             (spinner, "cyan"),

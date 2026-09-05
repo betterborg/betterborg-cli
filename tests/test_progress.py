@@ -23,6 +23,7 @@ from progress_test_support import (
 from rich.cells import cell_len
 from rich.text import Text
 
+import betterborg_cli.progress as progress_module
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
@@ -1663,6 +1664,28 @@ def test_focused_counts_are_independent_from_visible_previews_and_adoption() -> 
     assert adopted.count("  ◦ Preflight") == 1
     assert adopted[0] == "  3 done · 2 running · 9 pending"
     assert adopted[-1] == "  ctrl-c to stop"
+
+
+def test_focused_running_rows_advance_spinner_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    task_specs = tuple(
+        StageSpec(f"task-{number}", f"Task {number}") for number in range(9)
+    )
+    progress.preview_pending(task_specs)
+    progress.declare(task_specs[0])
+    progress.start(task_specs[0].key)
+    progress._spinner_started_at = 0.0
+    spinner_now = 0.0
+    monkeypatch.setattr(progress_module.time, "monotonic", lambda: spinner_now)
+
+    first_frame = progress._live_lines()[1].plain
+    spinner_now = 0.08
+    second_frame = progress._live_lines()[1].plain
+
+    assert first_frame.startswith("  ⠙ Task 0")
+    assert second_frame.startswith("  ⠹ Task 0")
 
 
 def test_outside_record_keeps_live_permanent_and_summary_participation() -> None:
