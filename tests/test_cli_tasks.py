@@ -140,6 +140,7 @@ def test_task_list_json_describes_only_verified_current_records(
     planning_cli_repository,
     approved_task_generation,
     monkeypatch,
+    json_progress_probe,
 ) -> None:
     _database, _superseded, current, _preparing = _multiple_generations(
         committed_git_repo, planning_cli_repository, approved_task_generation
@@ -152,7 +153,7 @@ def test_task_list_json_describes_only_verified_current_records(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload == {
+    expected = {
         "approved_plan_digest": "sha256:approved-plan",
         "borg": "inspect-tasks",
         "generation_digest": current.generation.digest,
@@ -190,6 +191,11 @@ def test_task_list_json_describes_only_verified_current_records(
             "duration_seconds": None,
         },
     }
+    assert payload == expected
+    assert result.output == json.dumps(
+        expected, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    json_progress_probe.assert_silent(expected_count=0)
 
 
 def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
@@ -198,6 +204,7 @@ def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
     planning_cli_repository,
     approved_task_generation,
     monkeypatch,
+    json_progress_probe,
 ) -> None:
     _database, _superseded, current, _preparing = _multiple_generations(
         committed_git_repo, planning_cli_repository, approved_task_generation
@@ -228,6 +235,10 @@ def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
     assert estimate["sample_size"] == 0
     assert estimate["billing"]["api"]["estimate"] is None
     assert estimate["billing"]["api"]["unknown"] is True
+    assert machine.output == json.dumps(
+        estimate, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    json_progress_probe.assert_silent(expected_count=0)
     assert estimate["billing"]["subscription"]["usd"] is None
     assert estimate["provenance"]["prior_label"].startswith("DUMMY DATA")
 
@@ -346,6 +357,7 @@ def test_task_show_renders_current_markdown_and_json_and_rejects_noncurrent_refs
     planning_cli_repository,
     approved_task_generation,
     monkeypatch,
+    json_progress_probe,
 ) -> None:
     _database, superseded, current, preparing = _multiple_generations(
         committed_git_repo, planning_cli_repository, approved_task_generation
@@ -370,7 +382,7 @@ def test_task_show_renders_current_markdown_and_json_and_rejects_noncurrent_refs
         ],
     )
     assert shown_json.exit_code == 0, shown_json.output
-    assert json.loads(shown_json.output) == {
+    expected_json = {
         "complexity": "small",
         "dependencies": [],
         "digest": current.task.digest,
@@ -382,6 +394,11 @@ def test_task_show_renders_current_markdown_and_json_and_rejects_noncurrent_refs
         "task_ref": current.task.task_ref,
         "title": "Current task",
     }
+    assert json.loads(shown_json.output) == expected_json
+    assert shown_json.output == json.dumps(
+        expected_json, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    json_progress_probe.assert_silent(expected_count=0)
 
     for hidden in (superseded, preparing):
         result = cli_runner.invoke(

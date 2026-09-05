@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from rich.filesize import decimal
+
 from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
@@ -455,18 +457,19 @@ def _run_in_workspace(
     if progress is not None:
         progress.complete(
             discovery_stage_key,
-            f"{len(manifest.files)} evidence files",
+            f"{len(manifest.files)} files · {decimal(manifest.total_copied_bytes)}",
         )
         progress.start("analyze")
     try:
         require_read_only_agent(agent, role="analyzer", error_factory=AnalyzerError)
+        analysis_model = resolve_analysis_model(agent, config.model)
         run_id = uuid4()
         spec = AgentRunSpec(
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=_USER_PROMPT,
             schema=ANALYZER_OUTPUT_SCHEMA,
             cwd=workspace_dir.resolve(),
-            model=resolve_analysis_model(agent, config.model),
+            model=analysis_model,
             effort=config.effort,
             allowed_tools=READ_ONLY_API_TOOLS,
             log_path=artifact_dir / f"{run_id}.log",
@@ -511,7 +514,7 @@ def _run_in_workspace(
                 progress.fail("analyze", str(error))
         raise
     if progress is not None:
-        progress.complete("analyze", f"score {analysis.overall_score:.2f}/5")
+        progress.complete("analyze", f"{agent.name} · {analysis_model}")
     return analysis
 
 

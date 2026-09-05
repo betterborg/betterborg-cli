@@ -17,7 +17,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import RLock
 from uuid import UUID
 
 import click
@@ -107,6 +107,7 @@ from betterborg_cli.store import (
     TaskRuntimeRow,
 )
 from betterborg_cli.workflow_service import (
+    EXECUTION_PREFLIGHT_STAGE,
     ExecutionDecisionRequest,
     approve_plan_workflow,
     execute_workflow,
@@ -118,6 +119,21 @@ from betterborg_cli.workspace_trust import (
 )
 
 _EXECUTION_ESTIMATE_STAGE_KEY = "estimate-decision"
+_INIT_STARTUP_LABEL = "Starting betterborg init"
+_INIT_STARTUP_PENDING = (
+    "Discover evidence",
+    "Analyze repository",
+    "Generate role prompts",
+    "Draft improvement PRDs",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RootInvocation:
+    """Top-level command selection and Click eager-exit classification."""
+
+    command_name: str | None
+    eager_exit: bool
 
 
 @dataclass(slots=True)
@@ -125,8 +141,81 @@ class CliRunContext:
     """Cancellation and reporting state shared by one root command invocation."""
 
     cancellation: CancellationToken
-    progress: RunProgress
+    progress: RunProgress | None
     progress_configured: bool = True
+
+
+def _root_invocation(requested_arguments: Sequence[str]) -> RootInvocation:
+    """Classify the root command and direct Click help without business parsing."""
+
+    arguments = tuple(requested_arguments)
+    command_index: int | None = None
+    root_options = True
+    for index, argument in enumerate(arguments):
+        if root_options and argument in {"-h", "--help"}:
+            return RootInvocation(command_name=None, eager_exit=True)
+        if root_options and argument == "--":
+            root_options = False
+            continue
+        command_index = index
+        break
+
+    if command_index is None:
+        return RootInvocation(command_name=None, eager_exit=False)
+
+    command_name = arguments[command_index]
+    for argument in arguments[command_index + 1 :]:
+        if argument == "--":
+            break
+        if argument in {"-h", "--help"}:
+            return RootInvocation(command_name=command_name, eager_exit=True)
+    return RootInvocation(command_name=command_name, eager_exit=False)
+
+
+def _progress_has_observed_work(progress: RunProgress) -> bool:
+    """Return whether any declared stage has participated in the run."""
+
+    return any(
+        record.state is not StageState.PENDING
+        for record in progress.records.values()
+    )
+
+
+def _dispose_unobserved_progress_after_return(
+    progress: RunProgress | None,
+) -> None:
+    """Dispose a no-work reporter without closing or summarizing it."""
+
+    if (
+        progress is not None
+        and not progress.closed
+        and not _progress_has_observed_work(progress)
+    ):
+        progress.stop_display()
+
+
+def _progress_for_invocation(
+    invocation: RootInvocation,
+    *,
+    machine_readable: bool,
+) -> RunProgress | None:
+    """Construct a human or display-disabled JSON reporter, but none for MCP."""
+
+    if invocation.command_name == "mcp":
+        return None
+    progress_kwargs: dict[str, object] = {
+        "machine_readable": machine_readable
+    }
+    if (
+        invocation.command_name == "init"
+        and not invocation.eager_exit
+        and not machine_readable
+    ):
+        progress_kwargs.update(
+            startup_label=_INIT_STARTUP_LABEL,
+            startup_pending=_INIT_STARTUP_PENDING,
+        )
+    return RunProgress(**progress_kwargs)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -135,10 +224,15 @@ def cli(context: click.Context) -> None:
     """Work with Betterborg from the command line."""
 
     if context.obj is None:
+        invocation = _root_invocation(
+            (context.invoked_subcommand,)
+            if context.invoked_subcommand is not None
+            else ()
+        )
         context.obj = CliRunContext(
             CancellationToken(),
-            RunProgress(enabled=False),
-            progress_configured=False,
+            None,
+            progress_configured=invocation.command_name == "mcp",
         )
 
 
@@ -151,12 +245,19 @@ def main(
     multiprocessing.freeze_support()
     arguments = list(args) if args is not None else None
     requested_arguments = arguments if arguments is not None else sys.argv[1:]
+    invocation = _root_invocation(requested_arguments)
     machine_readable = "--json" in requested_arguments
+    progress = _progress_for_invocation(
+        invocation,
+        machine_readable=machine_readable,
+    )
     run = CliRunContext(
         CancellationToken(),
-        RunProgress(machine_readable=machine_readable),
+        progress,
+        progress_configured=True,
     )
     control = RunControl(run.cancellation, progress=run.progress).install()
+    progress_finalized_before_error = False
     try:
         try:
             result = cli.main(
@@ -166,13 +267,20 @@ def main(
                 obj=run,
             )
         except click.ClickException as error:
-            if _caused_by_interruption(error):
+            if _caused_by_interruption(
+                error,
+                interruption_requested=control.interruption_requested,
+            ):
                 return _interrupted_exit_code(control, run.progress)
+            _finalize_progress_before_error(run.progress, error)
+            progress_finalized_before_error = True
             error.show()
             return error.exit_code
         except click.Abort as error:
             if control.interruption_requested or _caused_by_interruption(error):
                 return _interrupted_exit_code(control, run.progress)
+            _finalize_progress_before_error(run.progress, error)
+            progress_finalized_before_error = True
             click.echo("Aborted!", err=True)
             return 1
         except OSError as error:
@@ -181,21 +289,67 @@ def main(
             return 1
         if control.interruption_requested:
             return _interrupted_exit_code(control, run.progress)
-        return result if isinstance(result, int) else 0
+        exit_code = result if isinstance(result, int) else 0
+        _dispose_unobserved_progress_after_return(run.progress)
+        return exit_code
     finally:
-        control.close()
+        try:
+            if not progress_finalized_before_error:
+                _dispose_unobserved_progress_after_return(run.progress)
+        finally:
+            control.close()
 
 
-def _caused_by_interruption(error: BaseException) -> bool:
-    """Return whether Click directly wrapped an unsuppressed interrupt."""
+def _finalize_progress_before_error(
+    progress: RunProgress | None,
+    error: BaseException,
+) -> None:
+    """Quiesce progress without displacing an authoritative command error."""
+
+    if progress is None:
+        return
+    try:
+        if _progress_has_observed_work(progress):
+            progress.close()
+            progress.raise_if_render_failed()
+        else:
+            progress.stop_display()
+    except BaseException as progress_error:
+        try:
+            progress.stop_display()
+        except BaseException as disposal_error:
+            if disposal_error is not progress_error:
+                progress_error.add_note(
+                    f"progress display disposal also failed: {disposal_error}"
+                )
+        if progress_error is not error:
+            error.add_note(f"progress finalization also failed: {progress_error}")
+
+
+def _caused_by_interruption(
+    error: BaseException,
+    *,
+    interruption_requested: bool = False,
+) -> bool:
+    """Return whether Click wrapped an interrupt or reconciled cancellation."""
 
     cause = error.__cause__
     if cause is None and not error.__suppress_context__:
         cause = error.__context__
-    return isinstance(cause, KeyboardInterrupt)
+    if isinstance(cause, KeyboardInterrupt):
+        return True
+    if not isinstance(
+        cause,
+        ArchitectCancelled | SupervisorCancelled | TechLeadCancelled,
+    ):
+        return False
+    return interruption_requested or _caused_by_interruption(cause)
 
 
-def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
+def _interrupted_exit_code(
+    control: RunControl,
+    progress: RunProgress | None,
+) -> int:
     """Map interruption only after strict progress reconciliation succeeds."""
 
     if control.interruption_requested:
@@ -205,8 +359,13 @@ def _interrupted_exit_code(control: RunControl, progress: RunProgress) -> int:
                 f"cancellation dispatch failed: {dispatch_error}"
             ).show()
             return 1
+    if progress is None:
+        return INTERRUPTED_EXIT_CODE
     try:
-        progress.close()
+        if _progress_has_observed_work(progress):
+            progress.close()
+        else:
+            progress.stop_display()
     except ProgressError as error:
         click.ClickException(str(error)).show()
         return 1
@@ -270,11 +429,22 @@ def _repository_progress(machine_readable: bool) -> RunProgress | None:
     context = click.get_current_context(silent=True)
     if context is None:
         return None
-    run = context.find_root().obj
+    root = context.find_root()
+    run = root.obj
     if not isinstance(run, CliRunContext):
         return None
+    invocation = _root_invocation(
+        (root.invoked_subcommand,)
+        if root.invoked_subcommand is not None
+        else ()
+    )
+    if invocation.command_name == "mcp":
+        return None
     if not run.progress_configured:
-        run.progress = RunProgress(machine_readable=machine_readable)
+        run.progress = _progress_for_invocation(
+            invocation,
+            machine_readable=machine_readable,
+        )
         run.progress_configured = True
     return run.progress
 
@@ -283,6 +453,41 @@ def _suspend_progress(
     progress: RunProgress | None,
 ) -> AbstractContextManager[object]:
     return progress.suspend() if progress is not None else nullcontext()
+
+
+def _write_after_progress(
+    progress: RunProgress | None,
+    writer: Callable[[], None],
+) -> None:
+    """Quiesce progress before writing one already-owed command report."""
+
+    progress_error: BaseException | None = None
+    if progress is not None:
+        try:
+            if _progress_has_observed_work(progress):
+                progress.close()
+                progress.raise_if_render_failed()
+            else:
+                progress.stop_display()
+        except BaseException as error:
+            progress_error = error
+            try:
+                progress.stop_display()
+            except BaseException as disposal_error:
+                if disposal_error is not error:
+                    error.add_note(
+                        f"progress display disposal also failed: {disposal_error}"
+                    )
+
+    try:
+        writer()
+    except BaseException as error:
+        if progress_error is not None and progress_error is not error:
+            progress_error.add_note(f"owed report writing also failed: {error}")
+            raise progress_error from error
+        raise
+    if progress_error is not None:
+        raise progress_error
 
 
 def _trusted_workspace_callback(function):
@@ -298,13 +503,19 @@ def _trusted_workspace_callback(function):
             interactive = _stdin_is_interactive() and not kwargs.get(
                 "json_output", False
             )
-            require_workspace_trust(
-                paths,
-                explicit=explicit_trust,
-                interactive=interactive,
-                confirm=lambda prompt: click.confirm(prompt, default=False),
-                cancel=cancel,
+            progress = (
+                _repository_progress(bool(kwargs.get("json_output", False)))
+                if isinstance(run, CliRunContext)
+                else None
             )
+            with _suspend_progress(progress):
+                require_workspace_trust(
+                    paths,
+                    explicit=explicit_trust,
+                    interactive=interactive,
+                    confirm=lambda prompt: click.confirm(prompt, default=False),
+                    cancel=cancel,
+                )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             raise click.ClickException(str(error)) from error
         return function(*args, paths=paths, cancel=cancel, **kwargs)
@@ -370,67 +581,88 @@ def initialize_repository(
             result = service.initialize()
 
             if result.initialized and interactive:
-                if cancel is not None and cancel.is_set():
-                    return
-                with _suspend_progress(progress):
+                onboarding_error: BaseException | None = None
+                try:
+                    if cancel is None or not cancel.is_set():
+                        config = load_repository_config(paths)
+                        if cancel is None or not cancel.is_set():
+                            io = _interactive_io()
+                            creator = CreateService(
+                                result.repository,
+                                store,
+                                select_agent(
+                                    config,
+                                    AgentStage.REQUIREMENTS,
+                                    paths,
+                                    interactive=True,
+                                ),
+                                io=io,
+                                editor=_edit_markdown,
+                                cancel=cancel,
+                                progress=progress,
+                            )
+                            OnboardingDispatcher(
+                                result.repository,
+                                store,
+                                io,
+                                creator,
+                                result.improvement_prds,
+                                cancel=cancel,
+                                progress=progress,
+                            ).run()
+                except BaseException as error:
+                    onboarding_error = error
+
+                try:
+                    _write_after_progress(
+                        progress,
+                        lambda: _write_initialized(result),
+                    )
+                except BaseException as error:
+                    if onboarding_error is None:
+                        raise
+                    if error is not onboarding_error:
+                        onboarding_error.add_note(
+                            f"initialization progress finalization also failed: {error}"
+                        )
+                if onboarding_error is not None:
+                    raise onboarding_error
+                return
+
+            if cancel is not None and cancel.is_set():
+                return
+            commands = create_commands(paths.root, result.improvement_prds)
+
+            def write_result() -> None:
+                if json_output:
+                    click.echo(
+                        json.dumps(
+                            {
+                                "repository_id": str(result.repository.id),
+                                "initialized": result.initialized,
+                                "score": result.analysis.overall_score,
+                                "create_commands": [
+                                    shlex.join(command) for command in commands
+                                ],
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                elif not result.initialized:
+                    click.echo(
+                        f"Repository already initialized: {result.repository.id}"
+                    )
+                else:
                     _write_initialized(result)
-                config = load_repository_config(paths)
-                if cancel is not None and cancel.is_set():
-                    return
-                io = _interactive_io()
-                creator = CreateService(
-                    result.repository,
-                    store,
-                    select_agent(
-                        config,
-                        AgentStage.REQUIREMENTS,
-                        paths,
-                        interactive=True,
-                    ),
-                    io=io,
-                    editor=_edit_markdown,
-                    cancel=cancel,
-                    progress=progress,
-                )
-                OnboardingDispatcher(
-                    result.repository,
-                    store,
-                    io,
-                    creator,
-                    result.improvement_prds,
-                    cancel=cancel,
-                    progress=progress,
-                ).run()
+                    for command in commands:
+                        click.echo(shlex.join(command))
+
+            _write_after_progress(progress, write_result)
     except click.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
-
-    if cancel is not None and cancel.is_set():
-        return
-    commands = create_commands(paths.root, result.improvement_prds)
-    with _suspend_progress(progress):
-        if json_output:
-            click.echo(
-                json.dumps(
-                    {
-                        "repository_id": str(result.repository.id),
-                        "initialized": result.initialized,
-                        "score": result.analysis.overall_score,
-                        "create_commands": [
-                            shlex.join(command) for command in commands
-                        ],
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-        elif not result.initialized:
-            click.echo(f"Repository already initialized: {result.repository.id}")
-        elif not interactive:
-            _write_initialized(result)
-            for command in commands:
-                click.echo(shlex.join(command))
 
 
 @cli.command(name="analyze")
@@ -478,7 +710,8 @@ def analyze_repository(
     analysis = result.analysis
     previous_score = result.previous_analysis.overall_score
     score_delta = analysis.overall_score - previous_score
-    with _suspend_progress(progress):
+
+    def write_result() -> None:
         if json_output:
             click.echo(
                 json.dumps(
@@ -500,6 +733,8 @@ def analyze_repository(
                 f"(previous {previous_score:.2f}/5, "
                 f"delta {score_delta:+.2f})."
             )
+
+    _write_after_progress(progress, write_result)
 
 
 @cli.command(name="create")
@@ -561,7 +796,8 @@ def create_borg(
 
     if cancel is not None and cancel.is_set():
         return
-    with _suspend_progress(progress):
+
+    def write_result() -> None:
         if result.confirmed:
             click.echo(f"Created Borg {result.borg.name!r}: {result.prd_path}")
             click.echo(f"betterborg plan start {result.borg.name}")
@@ -569,6 +805,8 @@ def create_borg(
             click.echo("Borg PRD needs more input before it can be created.")
         else:
             click.echo("Borg draft saved without a confirmed PRD.")
+
+    _write_after_progress(progress, write_result)
 
 
 @cli.group()
@@ -592,7 +830,10 @@ def start_plan(
 ) -> None:
     """Start or resume planning for the named Borg."""
     borg = _continue_planning(paths, name, cancel=cancel)
-    _write_planning_gate(name, borg, changed=False)
+    _write_after_progress(
+        _repository_progress(False),
+        lambda: _write_planning_gate(name, borg, changed=False),
+    )
 
 
 @plan.command(name="show")
@@ -626,9 +867,8 @@ def show_plan(name: str, json_output: bool) -> None:
         raise click.ClickException(str(error)) from error
 
     run = click.get_current_context().find_root().obj
-    suspension = (
-        run.progress.suspend() if isinstance(run, CliRunContext) else nullcontext()
-    )
+    progress = run.progress if isinstance(run, CliRunContext) else None
+    suspension = _suspend_progress(progress)
     with suspension:
         if json_output:
             click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
@@ -832,12 +1072,28 @@ def execute_borg(
     open_pull_request: bool,
 ) -> None:
     """Run the current, digest-verified task generation for a Borg."""
+    requested_follow_ups = tuple(
+        spec
+        for requested, spec in (
+            (push_project, StageSpec("push-project", "Push project branch")),
+            (
+                open_pull_request,
+                StageSpec("rollup-pr", "Open rollup pull request"),
+            ),
+        )
+        if requested
+    )
     progress = _repository_progress(False)
     if progress is not None:
-        progress.declare(
-            StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
-        )
-        progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
+        with progress.suspend():
+            progress.preview_pending(
+                (EXECUTION_PREFLIGHT_STAGE, *requested_follow_ups),
+                cohort_keys=tuple(spec.key for spec in requested_follow_ups),
+            )
+            progress.declare(
+                StageSpec(_EXECUTION_ESTIMATE_STAGE_KEY, "Estimate and decision")
+            )
+            progress.start(_EXECUTION_ESTIMATE_STAGE_KEY)
 
     def decide(estimate):
         suspension = progress.suspend() if progress is not None else nullcontext()
@@ -890,6 +1146,7 @@ def execute_borg(
             name,
             decide=decide,
             invoke_host=invoke_host,
+            requested_follow_ups=requested_follow_ups,
             cancel=cancel,
             progress=progress,
         )
@@ -912,18 +1169,12 @@ def execute_borg(
         result = workflow.host_result
     except (OSError, RuntimeError, ValueError, sqlite3.IntegrityError) as error:
         _reconcile_execution_estimate(progress, cancel, error)
-        if progress is not None:
-            progress.close()
         raise click.ClickException(str(error)) from error
     except (KeyboardInterrupt, click.Abort) as error:
         _reconcile_execution_estimate(progress, cancel, error)
-        if isinstance(error, click.Abort) and progress is not None:
-            progress.close()
         raise
 
     if result is None:
-        if progress is not None:
-            progress.close()
         raise click.Abort()
 
     follow_up_error: BaseException | None = None
@@ -932,7 +1183,9 @@ def execute_borg(
         and result.status is ExecutionRunStatus.COMPLETED
     ):
         try:
+            follow_up_specs = iter(requested_follow_ups)
             if push_project:
+                push_spec = next(follow_up_specs)
                 push_git = SafeGit(
                     paths.root,
                     cancel=cancel,
@@ -944,12 +1197,12 @@ def execute_borg(
                 )
                 _run_execution_follow_up(
                     progress,
-                    "push-project",
-                    "Push project branch",
+                    push_spec,
                     lambda: _push_project_base(push_git, name),
                     cancel=cancel,
                 )
             if open_pull_request:
+                pull_request_spec = next(follow_up_specs)
                 approval = workflow.approval
                 plan = approval.manifest.get("plan") if approval is not None else None
                 if not isinstance(plan, dict):
@@ -958,8 +1211,7 @@ def execute_borg(
                 prd_path = prd_session.prd_path if prd_session is not None else None
                 _run_execution_follow_up(
                     progress,
-                    "rollup-pr",
-                    "Open rollup pull request",
+                    pull_request_spec,
                     lambda: _open_rollup_pull_request(
                         paths.root,
                         name,
@@ -978,17 +1230,20 @@ def execute_borg(
         except BaseException as error:
             follow_up_error = error
 
-    close_error: BaseException | None = None
-    if progress is not None:
-        try:
-            progress.close()
-        except BaseException as error:
-            close_error = error
-    _write_host_execution_result(result)
+    try:
+        _write_after_progress(
+            progress,
+            lambda: _write_host_execution_result(result),
+        )
+    except BaseException as error:
+        if follow_up_error is None:
+            raise
+        if error is not follow_up_error:
+            follow_up_error.add_note(
+                f"execution progress finalization also failed: {error}"
+            )
     if follow_up_error is not None:
         raise follow_up_error
-    if close_error is not None:
-        raise close_error
 
 
 def _reconcile_execution_estimate(
@@ -1012,19 +1267,15 @@ def _reconcile_execution_estimate(
 
 def _run_execution_follow_up(
     progress: RunProgress | None,
-    stage_key: str,
-    label: str,
+    spec: StageSpec,
     action: Callable[[], str],
     *,
     cancel: CancellationToken | None = None,
 ) -> None:
     """Run one optional delivery action under the shared stage lifecycle."""
     if progress is not None:
-        progress.declare(StageSpec(stage_key, label))
-        progress.start(stage_key)
-    heartbeat_stop = Event()
-    heartbeat_thread: Thread | None = None
-    heartbeat_errors: list[BaseException] = []
+        progress.declare(spec)
+        progress.start(spec.key)
     force_registration = None
     try:
         if cancel is not None:
@@ -1032,57 +1283,77 @@ def _run_execution_follow_up(
             # command immediately so the first interrupt can still reconcile
             # the stage and emit the already-completed core report.
             force_registration = cancel.register(cancel.force)
-        if progress is not None:
-            heartbeat_thread = Thread(
-                target=_refresh_execution_follow_up,
-                args=(progress, heartbeat_stop, heartbeat_errors),
-                name=f"betterborg-{stage_key}-progress",
-                daemon=True,
-            )
-            heartbeat_thread.start()
         try:
             result = action()
-        finally:
-            heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join()
-        if heartbeat_errors:
-            raise heartbeat_errors[0]
-    except BaseException as error:
-        if progress is not None:
-            detail = str(error).strip() or type(error).__name__
-            if isinstance(error, KeyboardInterrupt | click.Abort) or (
-                cancel is not None and cancel.is_set()
-            ):
-                progress.stop(stage_key, detail)
-            else:
-                progress.fail(stage_key, detail)
-        raise
+        except BaseException as error:
+            if progress is not None:
+                _reconcile_execution_follow_up(
+                    progress,
+                    spec.key,
+                    error,
+                    stopped=(
+                        isinstance(error, KeyboardInterrupt | click.Abort)
+                        or (cancel is not None and cancel.is_set())
+                    ),
+                )
+            raise
+
+        if progress is None:
+            click.echo(result)
+            return
+
+        try:
+            progress.raise_if_render_failed()
+            progress.complete(spec.key, result)
+        except BaseException as error:
+            _reconcile_execution_follow_up(
+                progress,
+                spec.key,
+                error,
+                stopped=False,
+            )
+            raise
     finally:
-        heartbeat_stop.set()
-        if heartbeat_thread is not None and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         if force_registration is not None:
             force_registration.unregister()
-    if progress is not None:
-        progress.complete(stage_key, result)
-    else:
-        click.echo(result)
 
 
-def _refresh_execution_follow_up(
+def _reconcile_execution_follow_up(
     progress: RunProgress,
-    stopped: Event,
-    errors: list[BaseException],
+    stage_key: str,
+    primary_error: BaseException,
+    *,
+    stopped: bool,
 ) -> None:
-    """Keep plain and interactive follow-up activity visibly current."""
-    while not stopped.wait(0.1):
+    """Settle one running follow-up without masking its primary exception."""
+    detail = str(primary_error).strip() or type(primary_error).__name__
+    transition = progress.stop if stopped else progress.fail
+    diagnostics: list[tuple[str, BaseException]] = []
+
+    if progress.stages[stage_key].state is StageState.RUNNING:
         try:
-            progress.refresh()
+            transition(stage_key, detail)
         except BaseException as error:
-            errors.append(error)
-            stopped.set()
-            return
+            diagnostics.append(("reconciliation", error))
+            if progress.stages[stage_key].state is StageState.RUNNING:
+                try:
+                    transition(stage_key, detail)
+                except BaseException as retry_error:
+                    diagnostics.append(("reconciliation", retry_error))
+
+    try:
+        progress.raise_if_render_failed()
+    except BaseException as error:
+        diagnostics.append(("rendering", error))
+
+    attached: set[int] = set()
+    for boundary, error in diagnostics:
+        if error is primary_error or id(error) in attached:
+            continue
+        primary_error.add_note(
+            f"execution follow-up progress {boundary} also failed: {error}"
+        )
+        attached.add(id(error))
 
 
 def _push_project_base(git: SafeGit, name: str) -> str:
@@ -1433,7 +1704,10 @@ def _invoke_host_execution(
         runtime,
         worktree_manager=worktrees,
         compose_manager=compose,
-        scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
+        scheduler_config=HostSchedulerConfig(
+            jobs=config.execution.jobs,
+            review_passes=config.execution.review_passes,
+        ),
         progress=progress,
     )
     secrets = {
@@ -1719,6 +1993,7 @@ def approve_plan(
 ) -> None:
     """Approve the current plan and prepare its executable task generation."""
     resumable = False
+    progress = _repository_progress(False)
 
     def mark_resumable() -> None:
         nonlocal resumable
@@ -1726,7 +2001,6 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
-        progress = _repository_progress(False)
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -1764,18 +2038,21 @@ def approve_plan(
             ) from error
         raise click.ClickException(str(error)) from error
 
-    relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
-    click.echo(
-        f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
-    )
-    if workflow.borg.state is BorgState.READY_TO_EXECUTE:
-        click.echo(f"Borg {name!r} is ready to execute.")
-        click.echo("Current tasks:")
-        assert workflow.publication is not None
-        for item in workflow.publication.files:
-            click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
-    else:
-        click.echo(f"Task decomposition blocked for Borg {name!r}.")
+    def write_result() -> None:
+        relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
+        click.echo(
+            f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
+        )
+        if workflow.borg.state is BorgState.READY_TO_EXECUTE:
+            click.echo(f"Borg {name!r} is ready to execute.")
+            click.echo("Current tasks:")
+            assert workflow.publication is not None
+            for item in workflow.publication.files:
+                click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
+        else:
+            click.echo(f"Task decomposition blocked for Borg {name!r}.")
+
+    _write_after_progress(progress, write_result)
 
 @plan.command(name="change")
 @click.argument("name")
@@ -1804,7 +2081,10 @@ def change_plan(
     note = note.strip()
 
     borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
-    _write_planning_gate(name, borg, changed=True)
+    _write_after_progress(
+        _repository_progress(False),
+        lambda: _write_planning_gate(name, borg, changed=True),
+    )
 
 
 def _continue_planning(

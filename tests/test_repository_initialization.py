@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
 import threading
+import time
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner
+from progress_test_support import FakeClock, WaitableStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
@@ -24,7 +29,13 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
-from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
@@ -50,6 +61,77 @@ from betterborg_cli.store import (
     RepositoryPackage,
     SqliteStore,
 )
+
+
+def test_init_primary_error_survives_root_progress_close_failure(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    primary_error = RuntimeError("initialization bootstrap failed")
+    close_error = RuntimeError("progress close failed")
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        stop_calls = 0
+
+        def close(self) -> None:
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class FailingRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def initialize(self) -> None:
+            self.progress.declare(StageSpec("discover", "Discover evidence"))
+            self.progress.start("discover")
+            self.progress.fail("discover", str(primary_error))
+            self.progress.declare(StageSpec("analyze", "Analyze repository"))
+            raise primary_error
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "RepositoryService", FailingRepositoryService)
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(["init", "--yes"], prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Error: initialization bootstrap failed\n"
+    assert shown_errors[0].__cause__ is primary_error
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["discover"].state is StageState.FAILED
+    assert progress.stages["analyze"].state is StageState.PENDING
 
 
 def _analysis_payload(
@@ -244,9 +326,9 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
         "betterborg create theme-ci --prd "
         ".betterborg/prds/improvements/theme-ci.md\n"
     ) in first.output
-    prompts_complete = "completed Generate role prompts — 3 prompts"
-    drafts_started = "running Draft improvement PRDs"
-    drafts_complete = "completed Draft improvement PRDs — 1 PRD"
+    prompts_complete = "✔ Generate role prompts"
+    drafts_started = "⠋ Draft improvement PRDs"
+    drafts_complete = "✔ Draft improvement PRDs"
     assert first.output.count(drafts_complete) == 1
     assert first.output.index(prompts_complete) < first.output.index(drafts_started)
     assert first.output.index(drafts_started) < first.output.index(drafts_complete)
@@ -254,8 +336,8 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
     second = cli_runner.invoke(cli, ["init", "--yes"])
 
     assert second.exit_code == 0, second.output
-    assert "completed Discover evidence" in second.output
-    assert "completed Analyze repository" in second.output
+    assert "✔ Discover evidence" in second.output
+    assert "✔ Analyze repository" in second.output
     assert second.output.endswith(
         f"Repository already initialized: {config.repository_id}\n"
     )
@@ -279,6 +361,74 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
         assert repository_count == 1
+
+
+def test_first_run_progress_account_matches_the_product_layout(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(stream=stream, clock=clock, width=100)
+    monkeypatch.setattr(
+        progress,
+        "_current_spinner_frame",
+        lambda record: "⠋" if record.is_child else "⠙",
+    )
+
+    with SqliteStore.open(paths.state_dir / "account.sqlite3") as store:
+        RepositoryService(
+            paths,
+            store,
+            lambda _config: MockAdapter(),
+            progress=progress,
+        )
+
+        progress.start("discover")
+        clock.advance(2)
+        progress.complete("discover", "142 files · 1.8 MB")
+        progress.start("analyze")
+        clock.advance(134)
+        progress.complete("analyze", "claude · opus-4-8")
+        progress.start("prompts")
+        progress.update("prompts", "3 agents")
+        for role in PROMPT_ROLES:
+            progress.start_child("prompts", role)
+        clock.advance(38)
+        progress.complete_child("prompts", "coding", "prompt v1")
+        clock.advance(3)
+        progress.child_activity(
+            "prompts",
+            "review",
+            AgentActivity(AgentActivityKind.SEARCHING, "docker-compose"),
+        )
+        progress.child_activity(
+            "prompts",
+            "merge",
+            AgentActivity(AgentActivityKind.THINKING),
+        )
+
+    completed_lines = [
+        line
+        for line in stream.getvalue().splitlines()
+        if line.startswith("✔ Discover") or line.startswith("✔ Analyze")
+    ]
+    live_lines = [line.plain for line in progress._live_lines()]
+    account = "\n".join((*completed_lines, "", *live_lines)) + "\n"
+
+    assert account == (
+        "✔ Discover evidence      0:02  142 files · 1.8 MB\n"
+        "✔ Analyze repository     2:14  claude · opus-4-8\n"
+        "\n"
+        "  ⠙ Generate role prompts  0:41  3 agents\n"
+        "      ├ coding   ✔ 0:38\n"
+        '      ├ review   ⠋ 0:41  searching "docker-compose"\n'
+        "      └ merge    ⠋ 0:41  thinking\n"
+        "  ◦ Draft improvement PRDs\n"
+        "\n"
+        "  ctrl-c to stop\n"
+    )
 
 
 @pytest.mark.parametrize("interrupt_after_claim", [False, True])
@@ -435,6 +585,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     monkeypatch: MonkeyPatch,
+    json_progress_probe,
 ) -> None:
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
@@ -466,6 +617,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     assert result.output == json.dumps(
         expected, sort_keys=True, separators=(",", ":")
     ) + "\n"
+    json_progress_probe.assert_silent(expected_count=1)
     assert selected_interactivity == [False]
     assert paths.improvement_prds_dir.joinpath("theme-ci.md").is_file()
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -531,6 +683,201 @@ def test_first_interactive_init_presents_doors_and_creates_selected_theme(
     assert len(adapter.calls) == 5
 
 
+def test_interactive_init_dismissal_closes_four_stages_before_one_report(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    _adapter_instance, selected = _adapter(committed_git_repo)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    run = cli_module.CliRunContext(CancellationToken(), progress)
+    report_closed: list[bool] = []
+    write_initialized = cli_module._write_initialized
+
+    def observed_write_initialized(result: object) -> None:
+        report_closed.append(progress.closed)
+        write_initialized(result)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: selected
+    )
+    monkeypatch.setattr(cli_module, "_write_initialized", observed_write_initialized)
+
+    result = cli_runner.invoke(
+        cli,
+        ["init", "--yes"],
+        input="q\n",
+        obj=run,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert report_closed == [True]
+    assert result.output.count("Initialized repository") == 1
+    assert tuple(progress.stages) == (
+        "discover",
+        "analyze",
+        "prompts",
+        "improvement-prds",
+        "requirements",
+    )
+    assert all(
+        progress.stages[key].state is StageState.COMPLETED
+        for key in ("discover", "analyze", "prompts", "improvement-prds")
+    )
+    assert progress.stages["requirements"].state is StageState.PENDING
+    assert stream.getvalue().endswith(
+        "4 of 4 stages finished in 0:00; none failed or stopped.\n"
+    )
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert paths.tracked_dir.joinpath("config.toml").is_file()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_exit_code", "expected_summary", "requirements_state"),
+    (
+        (
+            "completion",
+            0,
+            "5 of 5 stages finished in 0:00; none failed or stopped.",
+            StageState.COMPLETED,
+        ),
+        (
+            "dismissal",
+            0,
+            "4 of 4 stages finished in 0:00; none failed or stopped.",
+            StageState.PENDING,
+        ),
+        (
+            "token-cancellation",
+            0,
+            "4 of 5 stages finished in 0:00; 0 failed and 1 stopped.",
+            StageState.STOPPED,
+        ),
+        (
+            "abort",
+            1,
+            "4 of 5 stages finished in 0:00; 0 failed and 1 stopped.",
+            StageState.STOPPED,
+        ),
+        (
+            "failure",
+            1,
+            "4 of 5 stages finished in 0:00; 1 failed and 0 stopped.",
+            StageState.FAILED,
+        ),
+    ),
+)
+def test_interactive_init_outcomes_preserve_one_report_after_quiescence(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    outcome: str,
+    expected_exit_code: int,
+    expected_summary: str,
+    requirements_state: StageState,
+) -> None:
+    repository = Repository(root=committed_git_repo)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, clock=FakeClock())
+    run = cli_module.CliRunContext(CancellationToken(), progress)
+    report_closed: list[bool] = []
+    write_initialized = cli_module._write_initialized
+
+    class StubRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+            for key, label in (
+                ("discover", "Discover evidence"),
+                ("analyze", "Analyze repository"),
+                ("prompts", "Generate role prompts"),
+                ("improvement-prds", "Draft improvement PRDs"),
+            ):
+                progress.declare(StageSpec(key, label))
+
+        def initialize(self) -> object:
+            for key in ("discover", "analyze", "prompts", "improvement-prds"):
+                self.progress.start(key)
+                self.progress.complete(key, "done")
+            return SimpleNamespace(
+                repository=repository,
+                analysis=SimpleNamespace(overall_score=4.0),
+                initialized=True,
+                improvement_prds=(),
+            )
+
+    class StubCreateService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            progress.declare(StageSpec("requirements", "Gather requirements"))
+
+    class StubOnboardingDispatcher:
+        def __init__(
+            self,
+            *_args,
+            cancel: CancellationToken,
+            progress: RunProgress,
+            **_kwargs,
+        ) -> None:
+            self.cancel = cancel
+            self.progress = progress
+
+        def run(self) -> None:
+            if outcome == "dismissal":
+                return
+            self.progress.start("requirements")
+            if outcome == "completion":
+                self.progress.complete("requirements", "created")
+            elif outcome == "token-cancellation":
+                self.cancel.cancel()
+                self.progress.stop("requirements", "cancelled")
+            elif outcome == "abort":
+                self.progress.stop("requirements", "aborted")
+                raise click.Abort()
+            else:
+                self.progress.fail("requirements", "onboarding failed")
+                raise RuntimeError("onboarding failed")
+
+    def observed_write_initialized(result: object) -> None:
+        report_closed.append(progress.closed)
+        write_initialized(result)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "RepositoryService", StubRepositoryService)
+    monkeypatch.setattr(cli_module, "CreateService", StubCreateService)
+    monkeypatch.setattr(
+        cli_module, "OnboardingDispatcher", StubOnboardingDispatcher
+    )
+    monkeypatch.setattr(cli_module, "load_repository_config", lambda _paths: object())
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli_module, "_write_initialized", observed_write_initialized)
+
+    result = cli_runner.invoke(cli, ["init", "--yes"], obj=run)
+
+    assert result.exit_code == expected_exit_code, result.output
+    assert result.output.count("Initialized repository") == 1
+    assert report_closed == [True]
+    assert progress.closed
+    assert progress._cadence_worker is None
+    assert progress.stages["requirements"].state is requirements_state
+    assert stream.getvalue().endswith(expected_summary + "\n")
+    assert run.cancellation.is_set() is (outcome == "token-cancellation")
+    if outcome == "abort":
+        assert result.output.endswith("Aborted!\n")
+    elif outcome == "failure":
+        assert result.output.endswith("Error: onboarding failed\n")
+
+
 def test_analyze_appends_history_and_refreshes_generated_outputs(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -583,8 +930,10 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         f"Analyzed repository {config.repository_id}: score 4.00/5 "
         "(previous 3.00/5, delta +1.00).\n"
     )
-    assert "completed Discover evidence — 1 evidence files" in result.output
-    assert "completed Analyze repository — score 4.00/5" in result.output
+    assert "✔ Discover evidence" in result.output
+    assert "1 files · 40 bytes" in result.output
+    assert "✔ Analyze repository" in result.output
+    assert "score 4.00/5" in result.output
     assert load_repository_config(paths).repository_id == config.repository_id
     assert confirmed_path.read_text(encoding="utf-8") == confirmed_body
     assert not paths.improvement_prds_dir.joinpath("theme-ci.md").exists()
@@ -629,6 +978,7 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     monkeypatch: MonkeyPatch,
+    json_progress_probe,
 ) -> None:
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
@@ -663,6 +1013,7 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
     assert result.output == json.dumps(
         expected, sort_keys=True, separators=(",", ":")
     ) + "\n"
+    json_progress_probe.assert_silent(expected_count=2)
     assert selected_interactivity == [False, False]
 
 
@@ -911,11 +1262,13 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     assert progress.stages["analyze"].state is StageState.PENDING
     assert progress.closed
     output = progress_stream.getvalue()
-    assert "stopping..." in output
-    assert "stopped Discover evidence — interrupted" in output
-    assert "failed Discover evidence" not in output
-    assert output.endswith(
-        "summary: 0 completed, 0 failed, 1 stopped — 0 retained\n"
+    assert "stopping…" in output
+    assert "■ Discover evidence" in output
+    assert "interrupted" in output
+    assert "✖ Discover evidence" not in output
+    assert re.fullmatch(
+        r"0 of 1 stage finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output.splitlines()[-1],
     )
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -927,6 +1280,136 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_analyses(config.repository_id) == []
         assert store.list_operations(config.repository_id) == []
+
+
+def test_init_shows_animated_startup_account_before_bootstrap_selection(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    _adapter_instance, selected = _adapter(committed_git_repo)
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+    selection_entered = threading.Event()
+    release_selection = threading.Event()
+    observed: list[str] = []
+    declared_frames: list[list[str]] = []
+    observer_errors: list[BaseException] = []
+    launched_at = 0.0
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def select_after_preview(*_args: object, **_kwargs: object) -> SelectedAgent:
+        assert reporters
+        declared_frames.append(
+            [line.plain for line in reporters[0]._live_lines()]
+        )
+        selection_entered.set()
+        if not release_selection.wait(timeout=3):
+            raise TimeoutError("bootstrap selection was not released")
+        return selected
+
+    def observe_startup() -> None:
+        try:
+            assert selection_entered.wait(timeout=1)
+            remaining = max(0.01, 2 - (time.monotonic() - launched_at))
+            rendered = stream.wait_for(full_startup_account, timeout=remaining)
+            assert time.monotonic() - launched_at < 2
+            assert all(label in rendered for label in expected_labels)
+            assert not paths.score_report.exists()
+            observed.append(rendered)
+        except BaseException as error:
+            observer_errors.append(error)
+        finally:
+            release_selection.set()
+
+    expected_labels = (
+        "Discover evidence",
+        "Analyze repository",
+        "Generate role prompts",
+        "Draft improvement PRDs",
+    )
+    spinner_frames = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+    def full_startup_account(value: str) -> bool:
+        return (
+            "Starting betterborg init" in value
+            and "thinking" in value
+            and all(label in value for label in expected_labels)
+            and len(spinner_frames.intersection(value)) >= 2
+            and "0:00" in value
+            and "0:01" in value
+        )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli_module, "select_agent", select_after_preview)
+
+    observer = threading.Thread(target=observe_startup)
+    observer.start()
+    launched_at = time.monotonic()
+    try:
+        outcome = cli_module.main(["init", "--yes"], prog_name="betterborg")
+    finally:
+        release_selection.set()
+        observer.join(timeout=5)
+        for reporter in reporters:
+            reporter.stop_display()
+
+    assert not observer.is_alive()
+    assert observer_errors == []
+    assert observed
+    assert len(declared_frames) == 1
+    assert all(
+        sum(label in line for line in declared_frames[0]) == 1
+        for label in expected_labels
+    )
+    assert outcome == 0
+
+
+@pytest.mark.parametrize("help_option", ["-h", "--help"])
+def test_main_init_help_disposes_reporter_without_progress_output(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    cli_runner: CliRunner,
+    help_option: str,
+) -> None:
+    arguments = ["init", help_option]
+    expected = cli_runner.invoke(cli, arguments, prog_name="betterborg")
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    assert expected.exit_code == 0
+    assert exit_code == 0
+    assert captured.out == expected.output
+    assert captured.err == ""
+    assert len(reporters) == 1
+    progress = reporters[0]
+    assert not progress.records
+    assert not progress.closed
+    assert progress._display_stopped
+    assert progress._cadence_worker is None
+    assert stream.getvalue() == ""
 
 
 def test_default_branch_keeps_detached_head_classification(
@@ -1041,13 +1524,22 @@ def test_init_cancellation_after_atomic_improvement_publication_stops_stage(
     assert progress.stages["improvement-prds"].state is StageState.STOPPED
     assert progress.stages["improvement-prds"].result == "interrupted"
     assert progress.closed
+    assert progress._cadence_worker is None
     output = progress_stream.getvalue()
-    assert output.index("completed Generate role prompts — 3 prompts") < output.index(
-        "running Draft improvement PRDs"
+    assert output.index("✔ Generate role prompts") < output.index(
+        "⠋ Draft improvement PRDs"
     )
-    assert "stopped Draft improvement PRDs — interrupted" in output
-    assert "failed Draft improvement PRDs" not in output
-    assert "completed Draft improvement PRDs" not in output
+    assert "■ Draft improvement PRDs" in output
+    assert "interrupted" in output
+    assert "✖ Draft improvement PRDs" not in output
+    assert "✔ Draft improvement PRDs" not in output
+    assert len(
+        re.findall(
+            r"3 of 4 stages finished in \d+:\d{2}; "
+            r"0 failed and 1 stopped\.",
+            output,
+        )
+    ) == 1
     assert len(adapter.calls) == 4
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -1112,7 +1604,8 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
                 }
             )
         )
-        progress = RunProgress(stream=StringIO())
+        retry_progress_stream = StringIO()
+        progress = RunProgress(stream=retry_progress_stream)
         result = RepositoryService(
             paths,
             store,
@@ -1149,8 +1642,16 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
     assert review.state is StageState.COMPLETED
     assert review.retained is False
     assert review.started_at is not None
+    retry_progress_output = retry_progress_stream.getvalue()
+    assert "[retained]" not in retry_progress_output
+    assert retry_progress_output.count("reused from earlier run") == 4
+    assert all(
+        label in retry_progress_output
+        for label in ("Discover evidence", "Analyze repository", "coding", "merge")
+    )
 
-    all_retained_progress = RunProgress(stream=StringIO())
+    all_retained_stream = StringIO()
+    all_retained_progress = RunProgress(stream=all_retained_stream)
 
     def fail_factory(_config):
         pytest.fail("an all-retained initialization must not select an agent")
@@ -1176,3 +1677,6 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
         and child.started_at is None
         for child in retained_parent.children.values()
     )
+    all_retained_output = all_retained_stream.getvalue()
+    assert "[retained]" not in all_retained_output
+    assert all_retained_output.count("reused from earlier run") == 6

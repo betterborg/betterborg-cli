@@ -121,19 +121,24 @@ For example, an analysis can display a live row like this while the agent is
 working:
 
 ```text
-running Analyze repository (12.4s) — reading: src/betterborg_cli/cli.py
+⠋ Analyze repository     0:12  reading src/betterborg_cli/cli.py
 ```
 
 When the stage finishes, the transient row is replaced by canonical permanent
 output such as:
 
 ```text
-completed Analyze repository — score 4.20/5 (18.7s)
+✔ Analyze repository     0:18  score 4.20/5
 ```
 
-Durations and results naturally vary by repository. Long labels and activity
-details are truncated to the terminal width, and at most eight live rows are
-shown; permanent outcome lines still record every stage.
+The leading mark communicates the state: `✔` completed, `✖` failed, and
+`■` stopped. Running rows use an animated dots spinner, while pending child rows
+use `◦`. Durations use `M:SS` below one hour and `H:MM:SS` from one hour
+onward. Current work uses product language such as `thinking`, `reading PATH`,
+`searching "TERM"`, `running COMMAND`, or `writing PATH`. Durations, results,
+and spinner frames naturally vary by repository and refresh. Long labels and
+activity details are truncated to the terminal width, and at most eight live
+rows are shown; permanent outcome lines still record every stage.
 
 When stderr is redirected or is otherwise noninteractive, the same progress is
 plain, newline-delimited text with no cursor control or color. A line is written
@@ -144,9 +149,9 @@ stages also refresh periodically while their commands run. A periodic push
 heartbeat can look like this:
 
 ```text
-running Push project branch (0.0s)
-running Push project branch (30.0s)
-completed Push project branch — Pushed project/example to origin. (35.2s)
+⠋ Push project branch    0:00  thinking
+⠋ Push project branch    0:30  thinking
+✔ Push project branch    0:35  Pushed project/example to origin.
 ```
 
 Heartbeats are refresh-driven rather than a timer guarantee for every stage. A
@@ -173,15 +178,15 @@ progress renderer.
 ## Interrupting work
 
 Press Ctrl+C once to request cooperative cancellation. Betterborg prints
-`stopping...`, stops starting new work, cancels active agent, provider, and
+`stopping…`, stops starting new work, cancels active agent, provider, and
 local-command processes, and waits for their cleanup and durable state to be
 reconciled. A normally reconciled interruption exits with status 130 and can
 end with output like:
 
 ```text
-stopping...
-stopped Analyze repository — interrupted (12.4s)
-summary: 1 completed, 0 failed, 1 stopped — 0 retained
+stopping…
+■ Analyze repository     0:12  interrupted
+1 of 2 stages finished in 0:12; 0 failed and 1 stopped.
 ```
 
 If cooperative cleanup has not finished after one second, Betterborg requests
@@ -191,12 +196,12 @@ immediately instead of waiting for the deadline. A forced exit may occur before
 the normal closing summary, but its process exit status is still 130.
 
 Cancellation does not roll back durable work that already completed. When a
-later invocation can reuse a stage outcome, that outcome is marked
-`[retained]`; this is reuse of a safe persisted checkpoint, not continuation of
-an in-flight process:
+later invocation can reuse a stage outcome, its result says
+`reused from earlier run`; this is reuse of a safe persisted checkpoint, not
+continuation of an in-flight process:
 
 ```text
-completed Analyze repository — score 4.20/5 (—) [retained]
+✔ Analyze repository     —  score 4.20/5 · reused from earlier run
 ```
 
 What is retained depends on the command:

@@ -149,6 +149,8 @@ def generate_role_prompts(
     _raise_if_cancelled(cancel)
     if progress is not None:
         progress.start(stage_key)
+        agent_word = "agent" if len(selected_roles) == 1 else "agents"
+        progress.update(stage_key, f"{len(selected_roles)} {agent_word}")
 
     def generate(role: str) -> PromptGeneration:
         prompt_path = paths.prompts_dir / f"{role}.system.md"

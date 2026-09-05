@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
@@ -42,12 +42,15 @@ from betterborg_cli.host_execution.scheduler import (
     TaskActivitySink,
 )
 from betterborg_cli.host_execution.worktrees import HostWorktreeManager, WorktreeError
-from betterborg_cli.progress import AgentActivity, RunProgress, StageState
+from betterborg_cli.progress import AgentActivity, RunProgress
 from betterborg_cli.store import ExecutionRunStatus, SqliteStore, TaskRuntimeStatus
 
 
 class HostExecutionError(RuntimeError):
     """Raised when run-scoped host setup cannot be completed safely."""
+
+
+TaskActivityHandoff = Callable[[UUID, AgentActivity], AgentActivity]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,10 +59,9 @@ class _ExecutionActivityBinding:
 
     mask_values: tuple[str, ...] = field(repr=False)
     reporter: TaskActivitySink | None = field(repr=False)
-    progress: RunProgress | None = field(default=None, repr=False)
 
-    def emit(self, task_id: UUID, activity: AgentActivity) -> None:
-        """Publish a freshly redacted activity without affecting execution."""
+    def emit(self, task_id: UUID, activity: AgentActivity) -> AgentActivity:
+        """Return freshly redacted activity after notifying the observer."""
         detail = activity.detail
         if detail is not None:
             detail = redact_secrets(detail, self.mask_values)
@@ -70,14 +72,7 @@ class _ExecutionActivityBinding:
         except Exception:
             # Activity reporters are observational and cannot change execution.
             pass
-        try:
-            if self.progress is not None:
-                stage = self.progress.stages.get(str(task_id))
-                if stage is not None and stage.state is StageState.RUNNING:
-                    self.progress.activity(stage.key, redacted)
-        except Exception:
-            # The generic progress reporter is observational too.
-            pass
+        return redacted
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,8 +479,8 @@ class HostExecutionService:
         activity = _ExecutionActivityBinding(
             declared_secret_mask_values(validated, secrets),
             self._activity,
-            self._progress,
         )
+        activity_handoff: TaskActivityHandoff = activity.emit
         cleanup = list(
             self._cleanup_stale(cancel=cancel, activity=activity.emit)
         )
@@ -592,11 +587,7 @@ class HostExecutionService:
             self._store,
             behavior,
             config=self._scheduler_config,
-            activity=(
-                activity.emit
-                if self._activity is not None or self._progress is not None
-                else None
-            ),
+            activity_handoff=activity_handoff,
             progress=self._progress,
             interruption_cleanup=lambda: cleanup.extend(
                 self._cleanup_stale(cancel=cancel, activity=activity.emit)

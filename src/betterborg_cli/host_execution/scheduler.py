@@ -7,6 +7,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
@@ -50,6 +51,7 @@ class HostSchedulerConfig:
     """Timing and concurrency limits for one execution scheduler."""
 
     jobs: int = 1
+    review_passes: int = 3
     lease_duration: timedelta = timedelta(minutes=2)
     heartbeat_interval: timedelta = timedelta(seconds=30)
     poll_interval_seconds: float = 0.02
@@ -57,6 +59,8 @@ class HostSchedulerConfig:
     def __post_init__(self) -> None:
         if self.jobs < 1:
             raise ValueError("scheduler jobs must be positive")
+        if self.review_passes < 1:
+            raise ValueError("scheduler review passes must be positive")
         if self.lease_duration <= timedelta(0):
             raise ValueError("scheduler lease duration must be positive")
         if not timedelta(0) < self.heartbeat_interval < self.lease_duration:
@@ -182,7 +186,9 @@ class HostTaskScheduler:
         *,
         config: HostSchedulerConfig | None = None,
         clock: Callable[[], datetime] = _utcnow,
-        activity: TaskActivitySink | None = None,
+        activity_handoff: (
+            Callable[[UUID, AgentActivity], AgentActivity] | None
+        ) = None,
         progress: RunProgress | None = None,
         interruption_cleanup: Callable[[], None] | None = None,
     ) -> None:
@@ -190,9 +196,11 @@ class HostTaskScheduler:
         self._behavior = behavior
         self._config = config or HostSchedulerConfig()
         self._clock = clock
-        self._activity = activity
+        self._activity_handoff = activity_handoff
         self._progress = progress
         self._interruption_cleanup = interruption_cleanup
+        self._progress_projection_lock = Lock()
+        self._render_error: BaseException | None = None
 
     def run(
         self,
@@ -225,6 +233,22 @@ class HostTaskScheduler:
                 generation_id,
                 acquired=False,
             )
+        try:
+            result = self._run_acquired(generation_id, acquisition, cancel=cancel)
+        except BaseException as error:
+            self._finalize_progress_projection(generation_id, error)
+            raise
+        self._finalize_progress_projection(generation_id)
+        return result
+
+    def _run_acquired(
+        self,
+        generation_id: UUID,
+        acquisition: ExecutionRunAcquisition,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> HostSchedulerResult:
+        """Run an acquired operation before final presentation reconciliation."""
         token = cancel or CancellationToken()
         started_at = self._clock()
         owner_token = acquisition.owner_token
@@ -315,7 +339,8 @@ class HostTaskScheduler:
                             clock=self._clock,
                             activity=(
                                 partial(self._report_activity, claim.task_id)
-                                if self._activity is not None
+                                if self._activity_handoff is not None
+                                or self._progress is not None
                                 else None
                             ),
                             _transitioned=self._transition_progress,
@@ -399,7 +424,8 @@ class HostTaskScheduler:
         for record in records:
             stage_key = str(record.id)
             if stage_key not in self._progress.stages:
-                self._progress.declare(StageSpec(stage_key, record.title))
+                spec = StageSpec(stage_key, record.title)
+                self._project_progress(self._progress.declare, spec)
             stage = self._progress.stages[stage_key]
             if stage.state is not StageState.PENDING:
                 continue
@@ -408,12 +434,16 @@ class HostTaskScheduler:
             duration = row.duration_seconds if row is not None else None
             result = self._progress_result(runtime)
             if runtime.status is TaskRuntimeStatus.DONE:
-                self._progress.seed_completed(stage_key, result, duration)
+                self._project_progress(
+                    self._progress.seed_completed, stage_key, result, duration
+                )
             elif runtime.status in {
                 TaskRuntimeStatus.FAILED,
                 TaskRuntimeStatus.BLOCKED,
             }:
-                self._progress.seed_failed(stage_key, result, duration)
+                self._project_progress(
+                    self._progress.seed_failed, stage_key, result, duration
+                )
 
     def _start_progress(self, claim: TaskClaim) -> None:
         """Start a task timer only after its durable claim was accepted."""
@@ -421,8 +451,12 @@ class HostTaskScheduler:
             return
         stage = self._progress.stages.get(str(claim.task_id))
         if stage is not None and stage.state is StageState.PENDING:
-            self._progress.start(stage.key)
-            self._progress.update(stage.key, claim.resume_phase)
+            self._project_progress(self._progress.start, stage.key)
+            runtime = self._store.get_task_runtime(claim.task_id)
+            if runtime is None:
+                raise KeyError(f"task runtime {claim.task_id} not found")
+            detail = self._progress_detail(runtime, phase=claim.resume_phase)
+            self._project_progress(self._progress.update, stage.key, detail)
 
     def _transition_progress(self, runtime: TaskRuntime) -> None:
         """Reflect one already-accepted durable task transition."""
@@ -433,16 +467,23 @@ class HostTaskScheduler:
             return
         result = self._progress_result(runtime)
         if runtime.status is TaskRuntimeStatus.DONE:
-            self._progress.complete(stage.key, result)
+            self._project_progress(self._progress.complete, stage.key, result)
         elif runtime.status in {TaskRuntimeStatus.FAILED, TaskRuntimeStatus.BLOCKED}:
-            self._progress.fail(stage.key, result)
+            self._project_progress(self._progress.fail, stage.key, result)
         else:
-            self._progress.update(stage.key, runtime.status.value)
+            detail = self._progress_detail(runtime)
+            self._project_progress(self._progress.update, stage.key, detail)
 
     def _report_activity(self, task_id: UUID, activity: AgentActivity) -> None:
-        """Forward already-redacted activity to configured task observers."""
-        if self._activity is not None:
-            self._activity(task_id, activity)
+        """Hand off activity before forwarding only its returned projection."""
+        reported = activity
+        if self._activity_handoff is not None:
+            reported = self._activity_handoff(task_id, activity)
+        if self._progress is None:
+            return
+        stage = self._progress.stages.get(str(task_id))
+        if stage is not None and stage.state is StageState.RUNNING:
+            self._project_progress(self._progress.activity, stage.key, reported)
 
     def _reconcile_interrupted_progress(
         self, run_id: UUID, generation_id: UUID
@@ -469,14 +510,125 @@ class HostTaskScheduler:
                     result = self._progress_result(runtime)
                     duration = durations.get(runtime.task_id)
                     if runtime.status is TaskRuntimeStatus.DONE:
-                        self._progress.seed_completed(stage.key, result, duration)
+                        self._project_progress(
+                            self._progress.seed_completed,
+                            stage.key,
+                            result,
+                            duration,
+                        )
                     else:
-                        self._progress.seed_failed(stage.key, result, duration)
+                        self._project_progress(
+                            self._progress.seed_failed,
+                            stage.key,
+                            result,
+                            duration,
+                        )
             elif stage.state is StageState.RUNNING:
-                self._progress.stop(stage.key, "execution cancelled")
+                self._project_progress(
+                    self._progress.stop, stage.key, "execution cancelled"
+                )
+
+    def _project_progress(
+        self, projection: Callable[..., object], *args: object
+    ) -> None:
+        """Apply one lifecycle projection while retaining renderer failures."""
+        progress = self._progress
+        if progress is None:
+            return
+        with self._progress_projection_lock:
+            self._capture_autonomous_render_error(progress)
+            try:
+                projection(*args)
+            except ProgressError:
+                raise
+            except Exception as error:
+                self._remember_render_error(error)
+            self._capture_autonomous_render_error(progress)
+
+    def _capture_progress_render_error(self) -> None:
+        progress = self._progress
+        if progress is None:
+            return
+        with self._progress_projection_lock:
+            self._capture_autonomous_render_error(progress)
+
+    def _capture_autonomous_render_error(self, progress: RunProgress) -> None:
+        try:
+            progress.raise_if_render_failed()
+        except ProgressError:
+            raise
+        except BaseException as error:
+            self._remember_render_error(error)
+
+    def _remember_render_error(self, error: BaseException) -> None:
+        if self._render_error is None:
+            self._render_error = error
+
+    def _finalize_progress_projection(
+        self,
+        generation_id: UUID,
+        authoritative_error: BaseException | None = None,
+    ) -> None:
+        """Reconcile terminal rows, then surface or annotate rendering failure."""
+        reconciliation_error: BaseException | None = None
+        try:
+            if self._progress is not None:
+                self._capture_progress_render_error()
+                for runtime in self._store.list_task_runtimes(generation_id):
+                    if runtime.status in _TERMINAL_TASK_STATUSES:
+                        self._transition_progress(runtime)
+                self._capture_progress_render_error()
+        except BaseException as error:
+            reconciliation_error = error
+
+        with self._progress_projection_lock:
+            render_error = self._render_error
+            self._render_error = None
+
+        final_error = authoritative_error or reconciliation_error
+        if authoritative_error is not None and reconciliation_error is not None:
+            authoritative_error.add_note(
+                "execution progress reconciliation also failed: "
+                f"{reconciliation_error}"
+            )
+        if render_error is not None:
+            if final_error is None:
+                raise render_error
+            if render_error is not final_error:
+                final_error.add_note(
+                    f"execution progress rendering also failed: {render_error}"
+                )
+        if authoritative_error is None and reconciliation_error is not None:
+            raise reconciliation_error
+
+    def _progress_detail(
+        self,
+        runtime: TaskRuntime,
+        *,
+        phase: str | None = None,
+    ) -> str:
+        """Project one durable active phase without changing its lifecycle."""
+        phase_label = runtime.status.value if phase is None else phase
+        if phase_label == TaskRuntimeStatus.REVIEW.value:
+            pass_number = runtime.review_round + 1
+            if 1 <= pass_number <= self._config.review_passes:
+                return (
+                    f"review (pass {pass_number}/{self._config.review_passes})"
+                )
+        elif phase_label == TaskRuntimeStatus.FIX.value:
+            pass_number = runtime.review_round
+            if 1 <= pass_number < self._config.review_passes:
+                return f"fix (pass {pass_number}/{self._config.review_passes})"
+
+        detail = phase_label
+        if runtime.state_reason:
+            detail += f": {runtime.state_reason}"
+        return detail
 
     @staticmethod
     def _progress_result(runtime: TaskRuntime) -> str:
+        if runtime.status is TaskRuntimeStatus.DONE:
+            return "merged"
         result = runtime.status.value
         if runtime.state_reason:
             result += f": {runtime.state_reason}"
@@ -577,14 +729,8 @@ class HostTaskScheduler:
     ) -> None:
         """Fence active work before durably interrupting and reconciling a run."""
         token.cancel()
-        progress_error: BaseException | None = None
         if self._progress is not None:
-            try:
-                self._progress.begin_cancellation()
-            except BaseException as error:
-                # Output is advisory: preserve its failure without letting it
-                # bypass durable cancellation and owned-resource cleanup.
-                progress_error = error
+            self._project_progress(self._progress.begin_cancellation)
         try:
             self._drain_cancelled(active, run_id, owner_token, next_heartbeat)
             self._store.interrupt_execution_run(
@@ -596,16 +742,7 @@ class HostTaskScheduler:
             if self._interruption_cleanup is not None:
                 self._interruption_cleanup()
         finally:
-            try:
-                self._reconcile_interrupted_progress(run_id, generation_id)
-            except BaseException as error:
-                if progress_error is None:
-                    raise
-                progress_error.add_note(
-                    f"execution progress reconciliation also failed: {error}"
-                )
-        if progress_error is not None:
-            raise progress_error
+            self._reconcile_interrupted_progress(run_id, generation_id)
 
     def _interrupt_after_keyboard_interrupt(
         self,

@@ -18,8 +18,8 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
+from progress_test_support import FailingStringIO, TTYStringIO
 from progress_test_support import FakeClock as ProgressClock
-from progress_test_support import TTYStringIO
 from test_execution_preflight import FakeComposeRunner
 from test_host_scheduler import FakeClock
 
@@ -59,6 +59,7 @@ from betterborg_cli.host_execution import (
     MergeTip,
     SafeGit,
 )
+from betterborg_cli.host_execution.service import _ExecutionActivityBinding
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
@@ -966,7 +967,7 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             ("environment", "claimed"),
             ("environment", "environment"),
             ("coding", "coding"),
-            ("review", "review"),
+            ("review (pass 1/3)", "review"),
             ("merging", "merging"),
         ]
         assert displayed_completions == ["done"]
@@ -1150,6 +1151,145 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             "merge: agent [REDACTED] [REDACTED] [REDACTED]",
         ]
     finally:
+        store.close()
+
+
+def test_activity_binding_returns_masked_event_when_observer_fails() -> None:
+    task_id = uuid4()
+    observed: list[AgentActivity] = []
+
+    def failing_observer(
+        observed_task_id: UUID, activity: AgentActivity
+    ) -> None:
+        assert observed_task_id == task_id
+        observed.append(activity)
+        raise RuntimeError("observer unavailable")
+
+    binding = _ExecutionActivityBinding(
+        ("local-secret", "agent-secret"), failing_observer
+    )
+    raw = AgentActivity(
+        AgentActivityKind.READING,
+        "local local-secret and agent agent-secret",
+    )
+
+    masked = binding.emit(task_id, raw)
+
+    assert masked == AgentActivity(
+        AgentActivityKind.READING,
+        "local [REDACTED] and agent [REDACTED]",
+    )
+    assert masked is observed[0]
+    assert masked is not raw
+
+
+def test_service_settles_durable_task_before_render_failure_escapes(
+    tmp_path: Path,
+) -> None:
+    store, borg, generation, records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    token = "service-secret"
+    plan = replace(
+        _plan(tmp_path),
+        required_secret_names=("EXECUTION_TOKEN",),
+        secret_requirements=(
+            HostSecret(
+                name="EXECUTION_TOKEN",
+                scope="agent",
+                used_by=("coding",),
+                evidence="render failure fixture",
+            ),
+        ),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    observed: list[AgentActivity] = []
+
+    class BlockingActivityCoding(_Coding):
+        def run(self, context, *, environment=None) -> TaskRuntimeStatus:
+            started.set()
+            assert release.wait(timeout=2)
+            activity = context.activity_sink("coding")
+            assert activity is not None
+            activity(
+                AgentActivity(
+                    AgentActivityKind.COMMAND,
+                    f"running tool --token {token}",
+                )
+            )
+            return super().run(context, environment=environment)
+
+    def failing_observer(task_id: UUID, activity: AgentActivity) -> None:
+        assert task_id == records[0].id
+        observed.append(activity)
+        raise RuntimeError("observer unavailable")
+
+    compose = _Compose(calls)
+    runtime = HostTaskRuntime(
+        plan,
+        environment_manager=_Environment(calls),
+        compose_manager=compose,
+        coding=BlockingActivityCoding(
+            calls,
+            {
+                "CACHE": "prepared",
+                "SERVICE_URL": "http://127.0.0.1",
+                "EXECUTION_TOKEN": token,
+            },
+        ),
+        review_fix=_Review(calls),
+        merge=_Merge(calls),
+        sanity=_Sanity(calls),
+    )
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    try:
+        service = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            runtime,
+            worktree_manager=_Worktrees(calls),
+            compose_manager=compose,
+            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
+            activity=failing_observer,
+            progress=progress,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                service.run,
+                borg.id,
+                generation.id,
+                {},
+                secret_values={"EXECUTION_TOKEN": token},
+            )
+            assert started.wait(timeout=2)
+            worker = progress._cadence_worker
+            assert worker is not None
+            stream.fail_next_write()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            release.set()
+            with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+                running.result(timeout=2)
+
+        run = store.list_execution_runs(borg.id)[0]
+        runtime_row = store.get_task_runtime(records[0].id)
+        assert run.status is ExecutionRunStatus.COMPLETED
+        assert runtime_row is not None
+        assert runtime_row.status is TaskRuntimeStatus.DONE
+        assert runtime_row.state_reason is None
+        assert progress.stages[str(records[0].id)].state is StageState.COMPLETED
+        assert observed == [
+            AgentActivity(
+                AgentActivityKind.COMMAND,
+                "coding: running tool --token [REDACTED]",
+            )
+        ]
+        assert token not in repr(progress.records)
+        assert token not in stream.getvalue()
+        progress.raise_if_render_failed()
+    finally:
+        release.set()
         store.close()
 
 

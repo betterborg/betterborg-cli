@@ -5,6 +5,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import click
+import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
 
@@ -14,6 +16,7 @@ from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
@@ -85,6 +88,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert outputs == ["Why this matters: This controls the test matrix."]
     assert "Plan approval pending" in result.output
     assert "betterborg plan show inline-plan" in result.output
+    assert result.output.count("none failed or stopped.") == 1
+    assert result.output.index("none failed or stopped.") < result.output.index(
+        "Plan approval pending"
+    )
     assert architect_adapter is not tech_lead_adapter
     assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
     assert len(architect_adapter.calls) == 3
@@ -421,6 +428,9 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
 
     assert json_result.exit_code == 0, json_result.output
     assert json.loads(json_result.output) == plan
+    assert json_result.output == json.dumps(
+        plan, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     assert json_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
@@ -527,6 +537,10 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
     assert changed.exit_code == 0, changed.output
     assert "Plan approval pending" in changed.output
     assert "betterborg plan show change-plan" in changed.output
+    assert changed.output.count("none failed or stopped.") == 1
+    assert changed.output.index("none failed or stopped.") < changed.output.index(
+        "Plan approval pending"
+    )
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "change-plan")
         assert borg is not None
@@ -557,6 +571,9 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
 
     assert shown.exit_code == 0, shown.output
     assert json.loads(shown.output) == final_plan
+    assert shown.output == json.dumps(
+        final_plan, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_planning_attempts(borg.id) == attempts
         assert store.list_planning_findings(borg.id) == findings
@@ -616,6 +633,8 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
     planning_plan_response,
     tech_lead_approval_response,
     configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     adapter = MockAdapter(name="openai")
     for payload in (
@@ -638,11 +657,36 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
     started = cli_runner.invoke(cli, ["plan", "start", "resume-change", "--yes"])
     assert started.exit_code == 0, started.output
 
-    adapter.queue(
-        MockResponse(raise_error=RuntimeError("planning provider unavailable"))
-    )
-    failed = cli_runner.invoke(
-        cli,
+    primary_error = RuntimeError("planning provider unavailable")
+    adapter.queue(MockResponse(raise_error=primary_error))
+    close_error = RuntimeError("progress close failed")
+    shown_errors: list[click.ClickException] = []
+    reporters: list[RunProgress] = []
+    original_progress = cli_module.RunProgress
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        stop_calls = 0
+
+        def close(self) -> None:
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+    failed_exit_code = cli_module.main(
         [
             "plan",
             "change",
@@ -651,12 +695,27 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
             "Add rollback verification.",
             "--yes",
         ],
+        prog_name="betterborg",
     )
 
-    assert failed.exit_code == 1
-    assert "could not continue" in failed.output
-    assert "planning provider unavailable" in failed.output
-    assert "betterborg plan start resume-change" in failed.output
+    captured = capsys.readouterr()
+    expected_error = (
+        "Error: Plan change for Borg 'resume-change' could not continue "
+        "(Architect architect_plan turn crashed: planning provider unavailable). "
+        "Run 'betterborg plan start "
+        "resume-change' to resume.\n"
+    )
+    assert failed_exit_code == 1
+    assert captured.out == ""
+    assert captured.err == expected_error
+    assert "progress close failed" not in captured.err
+    assert shown_errors[0].__cause__ is not None
+    assert shown_errors[0].__cause__.__cause__ is primary_error
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert reporters[0].stop_calls == 1
+    assert reporters[0]._cadence_worker is None
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "resume-change")
         assert borg is not None
@@ -665,6 +724,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
             request.note for request in store.list_plan_change_requests(borg.id)
         ] == ["Add rollback verification."]
 
+    monkeypatch.setattr(cli_module, "RunProgress", original_progress)
     adapter.queue(
         MockResponse(payload=planning_plan_response(summary="Revised plan."))
     )
@@ -682,6 +742,85 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
         assert [
             request.note for request in store.list_plan_change_requests(borg.id)
         ] == ["Add rollback verification."]
+
+
+def test_plan_start_primary_error_survives_root_progress_close_failure(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    repository, _paths = planning_cli_repository(
+        committed_git_repo, "start-close-failure"
+    )
+    primary_error = RuntimeError("planning provider unavailable")
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=primary_error)
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".start-close-state",
+    )
+    close_error = RuntimeError("progress close failed")
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        stop_calls = 0
+
+        def close(self) -> None:
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(
+        ["plan", "start", "start-close-failure", "--yes"],
+        prog_name="betterborg",
+    )
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    expected_error = (
+        "Error: Planning for Borg 'start-close-failure' could not continue "
+        "(Architect architect_questions turn crashed: planning provider "
+        "unavailable). "
+        "Run 'betterborg plan start start-close-failure' to resume.\n"
+    )
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == expected_error
+    assert "progress close failed" not in captured.err
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert shown_errors[0].__cause__ is not None
+    assert shown_errors[0].__cause__.__cause__ is primary_error
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["architect"].state is StageState.FAILED
 
 
 def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:

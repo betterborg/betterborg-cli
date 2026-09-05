@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
 import click
 import pytest
 from click.testing import CliRunner
+from progress_test_support import (
+    FailingStringIO,
+    FakeClock,
+    WaitableStringIO,
+    terminal_screen,
+    terminal_text,
+)
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
@@ -28,15 +38,29 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.cli import CliRunContext, cli
-from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
+from betterborg_cli.host_execution import (
+    HostCommand,
+    HostExecutionResult,
+    HostPreflightPlan,
+    HostSchedulerConfig,
+    ScheduledTaskContext,
+)
 from betterborg_cli.planning import TaskPublisher
-from betterborg_cli.progress import RunProgress, StageSpec, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    ChildSpec,
+    RunProgress,
+    StageSpec,
+    StageState,
+)
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
     PlanApproval,
     SqliteStore,
+    TaskRuntimeStatus,
 )
 
 
@@ -64,6 +88,8 @@ def _seed_executable_generation(
     *,
     name: str = "execute-gate",
     round_number: int = 1,
+    task_count: int = 1,
+    task_titles: tuple[str, ...] | None = None,
     approval: PlanApproval | None = None,
 ):
     if approval is None:
@@ -104,11 +130,23 @@ def _seed_executable_generation(
                 },
             )
             store.append_plan_approval(approval)
+        bodies = []
+        if task_titles is not None and len(task_titles) != task_count:
+            raise ValueError("task titles must match the requested task count")
+        for position in range(1, task_count + 1):
+            body = _task_body(round_number)
+            body["stem"] = f"{round_number:02d}-execute-gate-{position:02d}"
+            body["title"] = (
+                task_titles[position - 1]
+                if task_titles is not None
+                else f"Execute task {position}"
+            )
+            bodies.append(body)
         fixture = approved_task_generation(
             store,
             borg,
             approval,
-            body=_task_body(round_number),
+            body=bodies,
             round_number=round_number,
             task_ref=f"T-{round_number}",
         )
@@ -322,11 +360,13 @@ def test_execute_requires_trust_then_approves_resumes_and_regates_generation(
         input="y\n",
     )
     assert approved.exit_code == 0, approved.output
-    assert approved.output.startswith("running Estimate and decision")
+    assert approved.output.startswith("⠋ Estimate and decision")
     assert "DUMMY DATA" in approved.output
-    assert "completed Estimate and decision — approved" in approved.output
+    assert "✔ Estimate and decision" in approved.output
+    assert "approved" in approved.output
     assert "Recorded execution estimate approved" in approved.output
-    assert approved.output.index("summary:") < approved.output.index(
+    assert approved.output.count("none failed or stopped.") == 1
+    assert approved.output.index(" finished in ") < approved.output.index(
         "Execution operation"
     )
     assert len(calls) == 1
@@ -410,6 +450,7 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
     planning_cli_repository,
     approved_task_generation,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     _repository, paths, borg, _approval, _fixture, _publication = (
         _seed_executable_generation(
@@ -427,27 +468,34 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
             "declined execution must not invoke the host"
         ),
     )
+    monkeypatch.setattr(sys, "stdin", StringIO("n\n"))
 
-    result = cli_runner.invoke(
-        cli,
+    def progress_factory(**kwargs: object) -> RunProgress:
+        return RunProgress(stream=sys.stdout, clock=FakeClock(), **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+
+    exit_code = cli_module.main(
         ["execute", "declined-execution"],
-        input="n\n",
+        prog_name="betterborg",
     )
 
-    assert result.exit_code == 1
-    assert "completed Estimate and decision — declined" in result.output
-    assert result.output.index("[y/N]: n") < result.output.index(
-        "completed Estimate and decision — declined"
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "✔ Estimate and decision" in captured.out
+    assert "declined" in captured.out
+    assert captured.out.index("[y/N]:") < captured.out.index(
+        "✔ Estimate and decision"
     )
-    assert result.output.index("completed Estimate and decision — declined") < (
-        result.output.index("summary:")
+    assert captured.out.index("✔ Estimate and decision") < (
+        captured.out.index(" finished in ")
     )
-    assert "Aborted!" in result.output
+    assert captured.err == "Aborted!\n"
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_current_execution_decision(borg.id) is None
 
 
-def test_execute_threads_one_control_context_and_suspends_confirmation(
+def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
@@ -478,7 +526,8 @@ def test_execute_threads_one_control_context_and_suspends_confirmation(
                 self.suspended = False
 
     token = CancellationToken()
-    progress = TrackingProgress(stream=StringIO())
+    stream = StringIO()
+    progress = TrackingProgress(stream=stream, clock=FakeClock())
     run = CliRunContext(token, progress)
     discovered_tokens: list[CancellationToken | None] = []
     host_contexts: list[tuple[CancellationToken | None, RunProgress | None]] = []
@@ -506,14 +555,907 @@ def test_execute_threads_one_control_context_and_suspends_confirmation(
     assert discovered_tokens
     assert all(observed is token for observed in discovered_tokens)
     assert host_contexts == [(token, progress)]
-    assert progress.suspension_count == 1
+    assert progress.suspension_count == 3
     assert progress.closed
+    assert stream.getvalue().splitlines()[0] == (
+        "⠋ Estimate and decision  0:00  thinking"
+    )
     estimate = progress.stages["estimate-decision"]
     assert estimate.state is StageState.COMPLETED
     assert estimate.result == "approved"
     preflight = progress.stages["preflight"]
     assert preflight.state is StageState.COMPLETED
     assert preflight.result == "ready"
+
+
+@pytest.mark.parametrize("blocked_seam", ["configuration", "publication"])
+def test_execute_projects_the_first_live_frame_before_repository_setup_returns(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_seam: str,
+) -> None:
+    name = f"execution-preview-{blocked_seam}"
+    _repository, _paths, _borg, _approval, fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+        )
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+    frames: list[tuple[RunProgress, tuple[str, ...]]] = []
+    real_progress = RunProgress
+    real_refresh = RunProgress._refresh_transient
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(stream=stream, width=100, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def observed_refresh(progress, *, started=None, parent_label=None) -> None:
+        frame = tuple(line.plain for line in progress._live_lines())
+        if frame and not progress._suspension_depth:
+            frames.append((progress, frame))
+        real_refresh(progress, started=started, parent_label=parent_label)
+
+    entered = threading.Event()
+    release = threading.Event()
+    actual_load_config = cli_module.load_repository_config
+
+    def blocked_load_config(paths):
+        entered.set()
+        assert release.wait(timeout=2)
+        return actual_load_config(paths)
+
+    actual_inspect = TaskPublisher.inspect_current_task_files
+
+    def blocked_inspect(publisher, borg_id):
+        entered.set()
+        assert release.wait(timeout=2)
+        return actual_inspect(publisher, borg_id)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(RunProgress, "_refresh_transient", observed_refresh)
+    if blocked_seam == "configuration":
+        monkeypatch.setattr(cli_module, "load_repository_config", blocked_load_config)
+    else:
+        monkeypatch.setattr(
+            TaskPublisher, "inspect_current_task_files", blocked_inspect
+        )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_push_project_base",
+        lambda _git, _name: "pushed",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_open_rollup_pull_request",
+        lambda *_args, **_kwargs: "opened",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", "--push", "--pr"],
+        )
+        assert entered.wait(timeout=2)
+        try:
+            progress = next(
+                reporter for reporter in reporters if reporter._enabled
+            )
+            rendered = stream.wait_for(
+                lambda value: all(
+                    label in terminal_text(value)
+                    for label in (
+                        "Estimate and decision",
+                        "Preflight",
+                        "Push project branch",
+                        "Open rollup pull request",
+                    )
+                )
+            )
+            assert "  ◦ Preflight" in terminal_text(rendered)
+            assert "  ◦ Push project branch" in terminal_text(rendered)
+            assert "  ◦ Open rollup pull request" in terminal_text(rendered)
+            assert tuple(progress.stages) == ("estimate-decision",)
+            assert tuple(
+                spec.label for spec in progress._projection_snapshot().previews
+            ) == (
+                "Preflight",
+                "Push project branch",
+                "Open rollup pull request",
+            )
+        finally:
+            release.set()
+        result = invocation.result(timeout=5)
+
+    assert result.exit_code == 0, result.output
+    first_frame = next(frame for reporter, frame in frames if reporter is progress)
+    estimate_line = next(
+        line for line in first_frame if "Estimate and decision" in line
+    )
+    assert estimate_line[:3] in {
+        f"  {frame}" for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    }
+    assert "  ◦ Preflight" in first_frame
+    assert "  ◦ Push project branch" in first_frame
+    assert "  ◦ Open rollup pull request" in first_frame
+    task_key = str(fixture.task.id)
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["push-project"].state is StageState.COMPLETED
+    assert progress.stages["rollup-pr"].state is StageState.COMPLETED
+    assert task_key not in progress.stages
+
+
+def test_execute_adopts_requested_follow_up_previews_in_action_order(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "follow-up-preview-adoption"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    stream = WaitableStringIO(interactive=True)
+    progress = RunProgress(stream=stream, width=100, heartbeat_interval=0.01)
+    push_entered = threading.Event()
+    release_push = threading.Event()
+    pr_entered = threading.Event()
+    release_pr = threading.Event()
+    actions: list[str] = []
+
+    def blocked_push(_git, _name) -> str:
+        actions.append("push")
+        push_entered.set()
+        assert release_push.wait(timeout=2)
+        return "pushed"
+
+    def blocked_pr(*_args, **_kwargs) -> str:
+        actions.append("pr")
+        pr_entered.set()
+        assert release_pr.wait(timeout=2)
+        return "opened"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", blocked_push)
+    monkeypatch.setattr(cli_module, "_open_rollup_pull_request", blocked_pr)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", "--push", "--pr"],
+            obj=CliRunContext(CancellationToken(), progress),
+        )
+        assert push_entered.wait(timeout=2)
+        try:
+            push_frame = stream.wait_for(
+                lambda value: "  ◦ Open rollup pull request"
+                in terminal_screen(value)
+            )
+            assert "  ◦ Open rollup pull request" in terminal_screen(push_frame)
+            assert progress.stages["push-project"].state is StageState.RUNNING
+            assert "rollup-pr" not in progress.stages
+            preview_keys = tuple(
+                preview.key
+                for preview in progress._projection_snapshot().previews
+            )
+            assert preview_keys.count("rollup-pr") == 1
+            assert "push-project" not in preview_keys
+
+            release_push.set()
+            assert pr_entered.wait(timeout=2)
+            pr_frame = stream.wait_for(
+                lambda value: any(
+                    "Open rollup pull request" in line
+                    for line in terminal_screen(value).splitlines()
+                )
+            )
+            assert progress.stages["push-project"].state is StageState.COMPLETED
+            assert progress.stages["rollup-pr"].state is StageState.RUNNING
+            assert all(
+                preview.key != "rollup-pr"
+                for preview in progress._projection_snapshot().previews
+            )
+            assert sum(
+                "Open rollup pull request" in line
+                for line in terminal_screen(pr_frame).splitlines()
+            ) == 1
+        finally:
+            release_push.set()
+            release_pr.set()
+        result = invocation.result(timeout=5)
+
+    assert result.exit_code == 0, result.output
+    assert actions == ["push", "pr"]
+    assert progress.stages["push-project"].result == "pushed"
+    assert progress.stages["rollup-pr"].result == "opened"
+
+
+def test_failed_push_discards_undeclared_pr_preview(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "failed-push-skips-pr"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    stream = StringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    pr_called = False
+
+    def rejected_push(_git, _name) -> str:
+        raise click.ClickException("push rejected")
+
+    def unexpected_pr(*_args, **_kwargs) -> str:
+        nonlocal pr_called
+        pr_called = True
+        return "opened"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(),
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", rejected_push)
+    monkeypatch.setattr(cli_module, "_open_rollup_pull_request", unexpected_pr)
+
+    result = cli_runner.invoke(
+        cli,
+        ["execute", name, "--auto-execute", "--push", "--pr"],
+        obj=CliRunContext(CancellationToken(), progress),
+    )
+
+    assert result.exit_code == 1
+    assert result.output.encode().endswith(b"Error: push rejected\n")
+    assert not pr_called
+    assert "rollup-pr" not in progress.stages
+    assert progress._projection_snapshot().previews == ()
+    assert not any(
+        token in stream.getvalue()
+        for token in (
+            "✔ Open rollup pull request",
+            "✖ Open rollup pull request",
+            "■ Open rollup pull request",
+        )
+    )
+    assert (
+        "2 of 3 stages finished in 0:00; 1 failed and 0 stopped."
+        in stream.getvalue()
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "task_count",
+        "completed_count",
+        "follow_up_arguments",
+        "expected_live_account",
+        "expected_summary_count",
+    ),
+    [
+        (1, 0, ("--push", "--pr"), None, 5),
+        (14, 3, (), "3 done · 2 running · 9 pending", 16),
+    ],
+)
+def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    task_count: int,
+    completed_count: int,
+    follow_up_arguments: tuple[str, ...],
+    expected_live_account: str | None,
+    expected_summary_count: int,
+) -> None:
+    name = f"execution-projection-{task_count}"
+    long_execution_titles = (
+        "auth-refactor",
+        "rate-limiter",
+        "config-loader",
+        "webhook-retry",
+        "db-migration",
+        *(f"pending-task-{number}" for number in range(6, 15)),
+    )
+    _repository, paths, borg, _approval, _fixture, publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+            task_count=task_count,
+            task_titles=long_execution_titles if task_count == 14 else None,
+        )
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n[execution]\njobs = 2\nreview_passes = 3\n",
+        encoding="utf-8",
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+
+    task_records = tuple(item.task for item in publication.files)
+    task_keys = tuple(str(task.id) for task in task_records)
+    task_labels = tuple(task.title for task in task_records)
+    stream = WaitableStringIO(interactive=True)
+    progress_clock = FakeClock()
+    progress_ref: dict[str, RunProgress] = {}
+    real_progress = RunProgress
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(
+            stream=stream if kwargs.get("enabled", True) else StringIO(),
+            clock=progress_clock,
+            width=100,
+            **kwargs,
+        )
+        if kwargs.get("enabled", True):
+            progress_ref["progress"] = progress
+        return progress
+
+    follow_up_labels = (
+        ("Push project branch", "Open rollup pull request")
+        if follow_up_arguments
+        else ()
+    )
+    setup_checkpoints: list[str] = []
+
+    def assert_setup_projection(checkpoint: str) -> None:
+        progress = progress_ref["progress"]
+        snapshot = progress._projection_snapshot()
+        stages = {stage.record.key: stage.record for stage in snapshot.stages}
+        assert stages["estimate-decision"].state is StageState.COMPLETED
+        assert stages["preflight"].state is StageState.COMPLETED
+        assert not set(task_keys).intersection(stages)
+        assert tuple(spec.label for spec in snapshot.previews) == (
+            *task_labels,
+            *follow_up_labels,
+        )
+        assert snapshot.cohort_keys == frozenset(
+            (*task_keys, *(spec.key for spec in snapshot.previews[-2:]))
+            if follow_up_arguments
+            else task_keys
+        )
+        setup_checkpoints.append(checkpoint)
+
+    actual_write_estimate = cli_module._write_execution_estimate
+    projected_follow_ups: tuple[StageSpec, ...] = ()
+
+    def observed_write_estimate(project_name, estimate) -> None:
+        nonlocal projected_follow_ups
+        progress = progress_ref["progress"]
+        snapshot = progress._projection_snapshot()
+        assert tuple(spec.label for spec in snapshot.previews) == (
+            "Preflight",
+            *task_labels,
+            *follow_up_labels,
+        )
+        assert tuple(progress.stages) == ("estimate-decision",)
+        projected_follow_ups = tuple(
+            spec for spec in snapshot.previews if spec.label in follow_up_labels
+        )
+        setup_checkpoints.append("decision")
+        actual_write_estimate(project_name, estimate)
+
+    plan = HostPreflightPlan(
+        repository_root=committed_git_repo,
+        commands=(),
+        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
+        materialize_commands=(),
+        environment_files=(),
+        executables=(),
+        required_secret_names=(),
+        compose_files=(),
+        services=(),
+    )
+
+    class ObservedPreflight:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.validated_result = None
+
+        def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
+            progress = progress_ref["progress"]
+            snapshot = progress._projection_snapshot()
+            assert snapshot.stages[-1].record.key == "preflight"
+            assert snapshot.stages[-1].record.state is StageState.RUNNING
+            assert tuple(spec.label for spec in snapshot.previews) == (
+                *task_labels,
+                *follow_up_labels,
+            )
+            setup_checkpoints.append("preflight-validation")
+            self.validated_result = plan
+            return plan
+
+    selected_stages: list[AgentStage] = []
+
+    def select_observed_agent(_config, stage, *_args, **_kwargs):
+        assert_setup_projection(f"agent-{stage.value}")
+        selected_stages.append(stage)
+        return SimpleNamespace(name="mock", model="test-model", effort=None)
+
+    class ObservedWorktrees:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def prepare_current_task_worktrees(self, *_args, **_kwargs):
+            assert_setup_projection("worktree-preparation")
+            return [
+                SimpleNamespace(task_id=task.id, path=committed_git_repo)
+                for task in task_records
+            ]
+
+        def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class ObservedCompose:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
+            return ()
+
+    active_lock = threading.Lock()
+    active_started = 0
+    target_active = min(2, task_count - completed_count)
+    scheduler_blocked = threading.Event()
+    release_scheduler = threading.Event()
+
+    class BlockingRuntime:
+        def __init__(self, runtime_plan, **_kwargs) -> None:
+            self.plan = runtime_plan
+
+        def with_secret_values(self, _secret_values):
+            return self
+
+        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
+            assert_setup_projection("cache-preparation")
+            return ("prepared",)
+
+        def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            nonlocal active_started
+            task_index = next(
+                index
+                for index, task in enumerate(task_records)
+                if task.id == context.claim.task_id
+            )
+            if task_index < completed_count:
+                durations = (134.0, 182.0, 108.0)
+                progress = progress_ref["progress"]
+                with active_lock:
+                    progress_clock.now = durations[task_index]
+                    progress.stages[context.stage_key].started_at = 0.0
+                    context.transition(
+                        TaskRuntimeStatus.CLAIMED,
+                        TaskRuntimeStatus.DONE,
+                    )
+                return TaskRuntimeStatus.DONE
+
+            if task_count == 14 and task_index == 3:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.REVIEW,
+                    resume_phase="review",
+                    review_round=1,
+                )
+                activity_sink = context.activity_sink("review")
+                assert activity_sink is not None
+                activity_sink(
+                    AgentActivity(
+                        AgentActivityKind.READING,
+                        "src/webhook/retry.go",
+                    )
+                )
+            elif task_count == 14 and task_index == 4:
+                context.transition(
+                    TaskRuntimeStatus.CLAIMED,
+                    TaskRuntimeStatus.CODING,
+                    resume_phase="coding",
+                )
+                activity_sink = context.activity_sink("coding")
+                assert activity_sink is not None
+                activity_sink(AgentActivity(AgentActivityKind.THINKING))
+            with active_lock:
+                active_started += 1
+                if active_started == target_active:
+                    scheduler_blocked.set()
+            assert release_scheduler.wait(timeout=3)
+            context.transition(
+                context.runtime.status,
+                TaskRuntimeStatus.DONE,
+            )
+            return TaskRuntimeStatus.DONE
+
+    actual_reconcile = SqliteStore.reconcile_expired_execution_runs
+    stale_checks = 0
+
+    def observed_reconcile(store, *args, **kwargs):
+        nonlocal stale_checks
+        progress = progress_ref.get("progress")
+        if progress is not None and not set(task_keys).intersection(progress.stages):
+            stale_checks += 1
+            assert_setup_projection(f"stale-cleanup-{stale_checks}")
+        return actual_reconcile(store, *args, **kwargs)
+
+    actual_acquire = SqliteStore.acquire_execution_run
+
+    def observed_acquire(store, *args, **kwargs):
+        acquisition = actual_acquire(store, *args, **kwargs)
+        assert acquisition.acquired
+        assert_setup_projection("run-acquisition")
+        return acquisition
+
+    actual_follow_up = cli_module._run_execution_follow_up
+    adopted_follow_ups: list[StageSpec] = []
+
+    def observed_follow_up(progress, spec, action, **kwargs) -> None:
+        adopted_follow_ups.append(spec)
+        actual_follow_up(progress, spec, action, **kwargs)
+
+    actual_scheduler_config = HostSchedulerConfig
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(
+        cli_module, "_write_execution_estimate", observed_write_estimate
+    )
+    monkeypatch.setattr(cli_module, "HostPreflight", ObservedPreflight)
+    monkeypatch.setattr(cli_module, "select_agent", select_observed_agent)
+    monkeypatch.setattr(
+        cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(cli_module, "HostComposeManager", ObservedCompose)
+    monkeypatch.setattr(cli_module, "HostWorktreeManager", ObservedWorktrees)
+    monkeypatch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostReviewFixPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostMergePhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostSanityPhase", lambda *_a, **_k: object())
+    monkeypatch.setattr(cli_module, "HostTaskRuntime", BlockingRuntime)
+    monkeypatch.setattr(
+        cli_module,
+        "HostSchedulerConfig",
+        lambda *, jobs, review_passes: actual_scheduler_config(
+            jobs=jobs,
+            review_passes=review_passes,
+            poll_interval_seconds=0.005,
+        ),
+    )
+    monkeypatch.setattr(
+        SqliteStore, "reconcile_expired_execution_runs", observed_reconcile
+    )
+    monkeypatch.setattr(SqliteStore, "acquire_execution_run", observed_acquire)
+    monkeypatch.setattr(
+        cli_module, "_run_execution_follow_up", observed_follow_up
+    )
+    monkeypatch.setattr(cli_module, "_push_project_base", lambda *_args: "pushed")
+    monkeypatch.setattr(
+        cli_module,
+        "_open_rollup_pull_request",
+        lambda *_args, **_kwargs: "opened",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        invocation = executor.submit(
+            cli_runner.invoke,
+            cli,
+            ["execute", name, "--auto-execute", *follow_up_arguments],
+        )
+        assert scheduler_blocked.wait(timeout=3)
+        try:
+            progress = progress_ref["progress"]
+            if task_count == 14:
+                with progress._lock:
+                    progress_clock.now = 72.0
+                    progress.stages[task_keys[3]].started_at = 31.0
+                    progress.stages[task_keys[4]].started_at = 0.0
+                    monkeypatch.setattr(
+                        progress,
+                        "_current_spinner_frame",
+                        lambda _record=None: "⠋",
+                    )
+                progress.refresh()
+            snapshot = progress._projection_snapshot()
+            task_stages = {
+                stage.record.key: stage.record
+                for stage in snapshot.stages
+                if stage.record.key in task_keys
+            }
+            assert len(task_stages) == task_count
+            assert sum(
+                stage.state is StageState.COMPLETED
+                for stage in task_stages.values()
+            ) == completed_count
+            assert sum(
+                stage.state is StageState.RUNNING
+                for stage in task_stages.values()
+            ) == target_active
+            retained = tuple(
+                progress.stages[key]
+                for key, stage in task_stages.items()
+                if stage.state is StageState.COMPLETED
+            )
+            pending = tuple(
+                progress.stages[key]
+                for key, stage in task_stages.items()
+                if stage.state is StageState.PENDING
+            )
+            assert all(
+                not stage.retained
+                and stage.started_at is not None
+                and stage.finished_at is not None
+                for stage in retained
+            )
+            assert all(
+                not stage.retained
+                and stage.started_at is None
+                and stage.finished_at is None
+                for stage in pending
+            )
+            assert tuple(spec.label for spec in snapshot.previews) == follow_up_labels
+            assert len(snapshot.stages) == task_count + 2
+            if expected_live_account is not None:
+                expected_literal_account = (
+                    "✔ auth-refactor    2:14  merged\n"
+                    "✔ rate-limiter     3:02  merged\n"
+                    "✔ config-loader    1:48  merged\n"
+                    "\n"
+                    "  3 done · 2 running · 9 pending\n"
+                    "  ⠋ webhook-retry   0:41  review (pass 2/3)\n"
+                    "      └ reading src/webhook/retry.go\n"
+                    "  ⠋ db-migration    1:12  coding\n"
+                    "      └ thinking\n"
+                    "\n"
+                    "  ctrl-c to stop"
+                )
+                output = stream.wait_for(
+                    lambda value: expected_literal_account
+                    in terminal_screen(value)
+                )
+                rendered = terminal_text(output)
+                visible = terminal_screen(output)
+                assert expected_literal_account in visible
+                assert "✔ Estimate and decision" in visible
+                assert "✔ Preflight" in visible
+                assert expected_live_account in visible
+                assert "5 done · 2 running · 9 pending" not in rendered
+        finally:
+            release_scheduler.set()
+        result = invocation.result(timeout=10)
+
+    assert result.exit_code == 0, result.output
+    assert selected_stages == [AgentStage.CODING, AgentStage.REVIEW, AgentStage.MERGE]
+    assert setup_checkpoints == [
+        "decision",
+        "preflight-validation",
+        "agent-coding",
+        "agent-review",
+        "agent-merge",
+        "stale-cleanup-1",
+        "run-acquisition",
+        "stale-cleanup-2",
+        "worktree-preparation",
+        "cache-preparation",
+    ]
+    assert stale_checks == 2
+    assert len(progress.stages) == expected_summary_count
+    assert all(
+        stage.state is StageState.COMPLETED
+        for stage in progress.stages.values()
+    )
+    assert (
+        f"{expected_summary_count} of {expected_summary_count} stages finished "
+        f"in {'1:12' if task_count == 14 else '0:00'}; "
+        "none failed or stopped."
+    ) in terminal_text(stream.getvalue())
+    assert len(adopted_follow_ups) == len(projected_follow_ups)
+    assert all(
+        adopted is projected
+        for adopted, projected in zip(
+            adopted_follow_ups, projected_follow_ups, strict=True
+        )
+    )
+
+
+@pytest.mark.parametrize("interactive", [False, True], ids=["plain", "interactive"])
+def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive: bool,
+) -> None:
+    real_progress = RunProgress
+    actual_scheduler_config = HostSchedulerConfig
+    name = "reporter-parity-run"
+    _repository, paths, _borg, _approval, _fixture, publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+            task_titles=("reporter-parity",),
+        )
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n[execution]\njobs = 1\nreview_passes = 3\n",
+        encoding="utf-8",
+    )
+    stream = WaitableStringIO(interactive=interactive)
+    progress_clock = FakeClock()
+    progress_ref: dict[str, RunProgress] = {}
+    task = publication.files[0].task
+    plan = HostPreflightPlan(
+        repository_root=committed_git_repo,
+        commands=(),
+        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
+        materialize_commands=(),
+        environment_files=(),
+        executables=(),
+        required_secret_names=(),
+        compose_files=(),
+        services=(),
+    )
+
+    def progress_factory(**kwargs) -> RunProgress:
+        progress = real_progress(
+            stream=stream if kwargs.get("enabled", True) else StringIO(),
+            clock=progress_clock,
+            width=100,
+            **kwargs,
+        )
+        if kwargs.get("enabled", True):
+            progress_ref["progress"] = progress
+        return progress
+
+    class ReadyPreflight:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.validated_result = None
+
+        def validate(self, *_args, **_kwargs) -> HostPreflightPlan:
+            self.validated_result = plan
+            return plan
+
+    class PreparedWorktrees:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def prepare_current_task_worktrees(self, *_args, **_kwargs):
+            return [SimpleNamespace(task_id=task.id, path=committed_git_repo)]
+
+        def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
+            return False
+
+    class CleanCompose:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
+            return ()
+
+    class DeterministicRuntime:
+        def __init__(self, runtime_plan, **_kwargs) -> None:
+            self.plan = runtime_plan
+
+        def with_secret_values(self, _secret_values):
+            return self
+
+        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
+            return ("prepared",)
+
+        def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            progress = progress_ref["progress"]
+            progress.declare_child(
+                context.stage_key,
+                ChildSpec("checks", "Checks"),
+            )
+            progress.start_child(context.stage_key, "checks")
+            progress_clock.now = 4.0
+            progress.complete_child(
+                context.stage_key,
+                "checks",
+                "142 files",
+            )
+            progress_clock.now = 65.0
+            progress.stages[context.stage_key].started_at = 0.0
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.DONE,
+            )
+            return TaskRuntimeStatus.DONE
+
+    with monkeypatch.context() as run_patch:
+        run_patch.delenv("CI", raising=False)
+        run_patch.delenv("NO_COLOR", raising=False)
+        run_patch.delenv("TERM", raising=False)
+        run_patch.setattr(cli_module, "RunProgress", progress_factory)
+        run_patch.setattr(cli_module, "HostPreflight", ReadyPreflight)
+        run_patch.setattr(
+            cli_module,
+            "select_agent",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                name="mock", model="test-model", effort=None
+            ),
+        )
+        run_patch.setattr(
+            cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
+        )
+        run_patch.setattr(cli_module, "HostComposeManager", CleanCompose)
+        run_patch.setattr(cli_module, "HostWorktreeManager", PreparedWorktrees)
+        run_patch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
+        run_patch.setattr(
+            cli_module, "HostReviewFixPhase", lambda *_a, **_k: object()
+        )
+        run_patch.setattr(cli_module, "HostMergePhase", lambda *_a, **_k: object())
+        run_patch.setattr(cli_module, "HostSanityPhase", lambda *_a, **_k: object())
+        run_patch.setattr(cli_module, "HostTaskRuntime", DeterministicRuntime)
+        run_patch.setattr(
+            cli_module,
+            "HostSchedulerConfig",
+            lambda *, jobs, review_passes: actual_scheduler_config(
+                jobs=jobs,
+                review_passes=review_passes,
+                poll_interval_seconds=0.005,
+            ),
+        )
+        _trust(cli_runner, committed_git_repo, run_patch)
+        result = cli_runner.invoke(
+            cli,
+            ["execute", name, "--auto-execute"],
+        )
+
+    assert result.exit_code == 0, result.output
+    finished_rows = tuple(
+        line
+        for line in terminal_screen(stream.getvalue()).splitlines()
+        if line.startswith(("✔ ", "├ ✔ ", "└ ✔ "))
+    )
+    assert finished_rows == (
+        "✔ Estimate and decision  0:00  bypassed",
+        "✔ Preflight              0:00  ready",
+        "✔ reporter-parity        1:05  merged",
+        "└ ✔ Checks                 0:04  142 files",
+    )
 
 
 def test_execute_without_push_succeeds_without_a_remote(
@@ -584,6 +1526,85 @@ def test_failure_after_preflight_does_not_reclassify_preflight(
     assert progress.stages["preflight"].result == "ready"
 
 
+def test_execute_primary_error_survives_root_progress_close_failure(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    name = "close-failure-precedence"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    primary_error = RuntimeError("task setup failed")
+    close_error = RuntimeError("progress close failed")
+    progress_stream = StringIO()
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        close_calls = 0
+        stop_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(
+            stream=progress_stream,
+            clock=FakeClock(),
+            **kwargs,
+        )
+        reporters.append(progress)
+        return progress
+
+    def fail_after_preflight(*_args, progress=None, **_kwargs):
+        assert progress is reporters[0]
+        progress.complete("preflight", "ready")
+        raise primary_error
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", fail_after_preflight)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(
+        ["execute", name, "--auto-execute"],
+        prog_name="betterborg",
+    )
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    assert exit_code == 1
+    assert captured.err == "Error: task setup failed\n"
+    assert "progress close failed" not in captured.out + captured.err
+    assert shown_errors[0].__cause__ is primary_error
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert progress.close_calls == 1
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["estimate-decision"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+
+
 def test_push_option_publishes_completed_project_branch_non_force(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -611,11 +1632,10 @@ def test_push_option_publishes_completed_project_branch_non_force(
 
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
-    assert "completed Push project branch — Pushed project/push-success" in (
-        result.output
-    )
+    assert "✔ Push project branch" in result.output
+    assert "Pushed project/push-success" in result.output
     assert f"Pushed project/{name} to origin." in result.output
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert _remote_project_sha(remote, name) == local_sha
@@ -649,10 +1669,10 @@ def test_push_missing_remote_reports_delivery_failure_and_preserves_local_branch
 
     assert result.exit_code == 1
     assert ": completed" in result.output
-    assert "failed Push project branch" in result.output
+    assert "✖ Push project branch" in result.output
     assert "Local execution completed, but push" in result.output
     assert "origin" in result.output
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert result.output.index("Execution operation") < result.output.rindex(
@@ -687,31 +1707,111 @@ def test_push_timeout_keeps_existing_error_and_local_branch(
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
-def test_follow_up_heartbeat_failure_fails_stage_and_propagates() -> None:
-    refresh_attempted = Event()
-
-    class FailingProgress(RunProgress):
-        def refresh(self) -> None:
-            refresh_attempted.set()
-            raise RuntimeError("progress heartbeat failed")
-
-    progress = FailingProgress(stream=StringIO())
+def test_follow_up_autonomous_render_failure_fails_successful_action_stage() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(
+        stream=stream,
+        heartbeat_interval=0.01,
+    )
+    action_entered = threading.Event()
+    release_action = threading.Event()
 
     def action() -> str:
-        assert refresh_attempted.wait(1)
+        action_entered.set()
+        assert release_action.wait(timeout=2)
+        return "published"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(
+            cli_module._run_execution_follow_up,
+            progress,
+            StageSpec("push-project", "Push project branch"),
+            action,
+        )
+        assert action_entered.wait(timeout=2)
+        worker = progress._cadence_worker
+        assert worker is not None
+        stream.fail_next_write()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        release_action.set()
+        with pytest.raises(
+            RuntimeError, match="progress heartbeat failed"
+        ) as caught:
+            running.result(timeout=2)
+
+    stage = progress.stages["push-project"]
+    assert str(caught.value) == "progress heartbeat failed"
+    assert stage.state is StageState.FAILED
+    assert stage.result == "progress heartbeat failed"
+    assert progress._cadence_worker is None
+    progress.raise_if_render_failed()
+
+
+def test_follow_up_action_failure_wins_autonomous_render_failure_race() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    action_entered = threading.Event()
+    release_action = threading.Event()
+    action_error = click.ClickException("push rejected")
+
+    def action() -> str:
+        action_entered.set()
+        assert release_action.wait(timeout=2)
+        raise action_error
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(
+            cli_module._run_execution_follow_up,
+            progress,
+            StageSpec("push-project", "Push project branch"),
+            action,
+        )
+        assert action_entered.wait(timeout=2)
+        worker = progress._cadence_worker
+        assert worker is not None
+        stream.fail_next_write()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        release_action.set()
+        with pytest.raises(click.ClickException) as caught:
+            running.result(timeout=2)
+
+    stage = progress.stages["push-project"]
+    assert caught.value is action_error
+    assert stage.state is StageState.FAILED
+    assert stage.result == "push rejected"
+    assert caught.value.__notes__ == [
+        "execution follow-up progress rendering also failed: "
+        "progress heartbeat failed"
+    ]
+    expected = StringIO()
+    click.ClickException("push rejected").show(file=expected)
+    actual = StringIO()
+    caught.value.show(file=actual)
+    assert actual.getvalue().encode() == expected.getvalue().encode()
+    assert progress._cadence_worker is None
+    progress.raise_if_render_failed()
+
+
+def test_follow_up_completion_output_failure_preserves_completed_stage() -> None:
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream)
+
+    def action() -> str:
+        stream.fail_next_write()
         return "published"
 
     with pytest.raises(RuntimeError, match="progress heartbeat failed"):
         cli_module._run_execution_follow_up(
             progress,
-            "push-project",
-            "Push project branch",
+            StageSpec("push-project", "Push project branch"),
             action,
         )
 
     stage = progress.stages["push-project"]
-    assert stage.state is StageState.FAILED
-    assert stage.result == "progress heartbeat failed"
+    assert stage.state is StageState.COMPLETED
+    assert stage.result == "published"
 
 
 def test_push_interrupt_reaps_tree_stops_stage_and_preserves_core_report(
@@ -758,10 +1858,12 @@ actual_safe_git = cli_module.SafeGit
 
 class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+        super().__init__(
+            *args, stream=sys.stdout, heartbeat_interval=0.01, **kwargs
+        )
 
-    def refresh(self):
-        super().refresh()
+    def _render_cadence_frame(self, stopped):
+        keep_running = super()._render_cadence_frame(stopped)
         stage = self.stages.get("push-project")
         if (
             stage is not None
@@ -771,6 +1873,7 @@ class FastProgress(RunProgress):
             (marker_root / "push-heartbeat").write_text(
                 "refreshed", encoding="utf-8"
             )
+        return keep_running
 
 
 def runner(command, **kwargs):
@@ -833,13 +1936,18 @@ raise SystemExit(
     real_process_harness.assert_tree_absent("execute-push")
     assert real_process_harness.wait_for_marker("push-token") == "bound"
     assert real_process_harness.wait_for_marker("push-activity") == "bound"
-    assert output.count("running Push project branch") >= 2
-    assert "command: git push origin refs/heads/project/push-interrupt" in output
-    assert "stopped Push project branch" in output
-    assert "failed Push project branch" not in output
-    assert "summary:" in output
+    assert output.count("⠋ Push project branch") >= 2
+    assert "running git push origin refs/heads/project/push-interrupt" in output
+    assert "■ Push project branch" in output
+    assert "✖ Push project branch" not in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
+    summaries = re.findall(
+        r"2 of 3 stages finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output,
+    )
+    assert len(summaries) == 1, output
+    assert output.index(summaries[0]) < output.index(report)
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
@@ -1041,9 +2149,8 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert result.exit_code == 0, result.output
     assert ": completed" in result.output
     assert "Pushed" not in result.output
-    assert "completed Open rollup pull request — Opened rollup pull request" in (
-        result.output
-    )
+    assert "✔ Open rollup pull request" in result.output
+    assert "Opened rollup pull request" in result.output
     assert "Opened rollup pull request" in result.output
     assert args_path.read_text(encoding="utf-8").splitlines() == [
         "pr",
@@ -1182,12 +2289,12 @@ def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
     )
 
     assert result.exit_code == 0, result.output
-    assert "completed Push project branch" in result.output
-    assert "completed Open rollup pull request" in result.output
+    assert "✔ Push project branch" in result.output
+    assert "✔ Open rollup pull request" in result.output
     assert result.output.index("Pushed project/") < result.output.index(
         "Opened rollup pull request"
     )
-    assert result.output.index("summary:") < result.output.index(
+    assert result.output.index(" finished in ") < result.output.index(
         "Execution operation"
     )
     assert args_path.exists()
@@ -1257,10 +2364,12 @@ actual_run_captured = cli_module.run_captured
 
 class FastProgress(RunProgress):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, heartbeat_interval=0.01, **kwargs)
+        super().__init__(
+            *args, stream=sys.stdout, heartbeat_interval=0.01, **kwargs
+        )
 
-    def refresh(self):
-        super().refresh()
+    def _render_cadence_frame(self, stopped):
+        keep_running = super()._render_cadence_frame(stopped)
         stage = self.stages.get("rollup-pr")
         if (
             stage is not None
@@ -1270,6 +2379,7 @@ class FastProgress(RunProgress):
             (marker_root / "pr-heartbeat").write_text(
                 "refreshed", encoding="utf-8"
             )
+        return keep_running
 
 
 def command_kind(command):
@@ -1341,13 +2451,18 @@ raise SystemExit(
     assert real_process_harness.wait_for_marker("pr-token") == "bound"
     observed_command = real_process_harness.wait_for_marker("pr-command")
     assert command_text in observed_command
-    assert output.count("running Open rollup pull request") >= 2
-    assert f"command: {observed_command}" in output
-    assert "stopped Open rollup pull request" in output
-    assert "failed Open rollup pull request" not in output
-    assert "summary:" in output
+    assert output.count("⠋ Open rollup pull request") >= 2
+    assert f"running {observed_command}" in output
+    assert "■ Open rollup pull request" in output
+    assert "✖ Open rollup pull request" not in output
     report = f"Execution operation {operation_id}: completed"
     assert report in output
+    summaries = re.findall(
+        r"2 of 3 stages finished in \d+:\d{2}; 0 failed and 1 stopped\.",
+        output,
+    )
+    assert len(summaries) == 1, output
+    assert output.index(summaries[0]) < output.index(report)
     assert _project_branch_sha(committed_git_repo, name) == local_sha
 
 
@@ -1756,6 +2871,9 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         assert review_config.review_effort == "review-effort"
         assert review_config.fix_effort == "review-effort"
         assert review_config.review_passes == config.execution.review_passes
+        assert service._scheduler_config.review_passes == (
+            config.execution.review_passes
+        )
         merge_config = service._runtime._merge._config
         assert merge_config.model == "selected-merge-model"
         assert merge_config.effort == "merge-effort"
