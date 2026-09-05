@@ -9,12 +9,14 @@ import signal
 import sqlite3
 import subprocess
 import threading
+import time
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from progress_test_support import WaitableStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
@@ -932,6 +934,91 @@ def test_init_ctrl_c_during_git_head_reports_stopped_and_exits_interrupted(
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_analyses(config.repository_id) == []
         assert store.list_operations(config.repository_id) == []
+
+
+def test_init_shows_animated_startup_account_before_bootstrap_selection(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    _adapter_instance, selected = _adapter(committed_git_repo)
+    stream = WaitableStringIO(interactive=True)
+    reporters: list[RunProgress] = []
+    selection_entered = threading.Event()
+    release_selection = threading.Event()
+    observed: list[str] = []
+    observer_errors: list[BaseException] = []
+    launched_at = 0.0
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(stream=stream, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def select_after_preview(*_args: object, **_kwargs: object) -> SelectedAgent:
+        selection_entered.set()
+        if not release_selection.wait(timeout=3):
+            raise TimeoutError("bootstrap selection was not released")
+        return selected
+
+    def observe_startup() -> None:
+        try:
+            assert selection_entered.wait(timeout=1)
+            remaining = max(0.01, 2 - (time.monotonic() - launched_at))
+            rendered = stream.wait_for(full_startup_account, timeout=remaining)
+            assert time.monotonic() - launched_at < 2
+            assert all(label in rendered for label in expected_labels)
+            assert not paths.score_report.exists()
+            observed.append(rendered)
+        except BaseException as error:
+            observer_errors.append(error)
+        finally:
+            release_selection.set()
+
+    expected_labels = (
+        "Discover evidence",
+        "Analyze repository",
+        "Generate role prompts",
+        "Draft improvement PRDs",
+    )
+    spinner_frames = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+    def full_startup_account(value: str) -> bool:
+        return (
+            "Starting betterborg init" in value
+            and "thinking" in value
+            and all(label in value for label in expected_labels)
+            and len(spinner_frames.intersection(value)) >= 2
+            and "0:00" in value
+            and "0:01" in value
+        )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli_module, "select_agent", select_after_preview)
+
+    observer = threading.Thread(target=observe_startup)
+    observer.start()
+    launched_at = time.monotonic()
+    try:
+        outcome = cli_module.main(["init", "--yes"], prog_name="betterborg")
+    finally:
+        release_selection.set()
+        observer.join(timeout=5)
+        for reporter in reporters:
+            reporter.stop_display()
+
+    assert not observer.is_alive()
+    assert observer_errors == []
+    assert observed
+    assert outcome == 0
 
 
 def test_default_branch_keeps_detached_head_classification(

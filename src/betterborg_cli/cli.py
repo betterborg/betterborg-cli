@@ -118,6 +118,21 @@ from betterborg_cli.workspace_trust import (
 )
 
 _EXECUTION_ESTIMATE_STAGE_KEY = "estimate-decision"
+_INIT_STARTUP_LABEL = "Starting betterborg init"
+_INIT_STARTUP_PENDING = (
+    "Discover evidence",
+    "Analyze repository",
+    "Generate role prompts",
+    "Draft improvement PRDs",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RootInvocation:
+    """Top-level command selection and Click eager-exit classification."""
+
+    command_name: str | None
+    eager_exit: bool
 
 
 @dataclass(slots=True)
@@ -127,6 +142,42 @@ class CliRunContext:
     cancellation: CancellationToken
     progress: RunProgress
     progress_configured: bool = True
+
+
+def _root_invocation(requested_arguments: Sequence[str]) -> RootInvocation:
+    """Classify the root command and direct Click help without business parsing."""
+
+    arguments = tuple(requested_arguments)
+    command_index: int | None = None
+    root_options = True
+    for index, argument in enumerate(arguments):
+        if root_options and argument in {"-h", "--help"}:
+            return RootInvocation(command_name=None, eager_exit=True)
+        if root_options and argument == "--":
+            root_options = False
+            continue
+        command_index = index
+        break
+
+    if command_index is None:
+        return RootInvocation(command_name=None, eager_exit=False)
+
+    command_name = arguments[command_index]
+    for argument in arguments[command_index + 1 :]:
+        if argument == "--":
+            break
+        if argument in {"-h", "--help"}:
+            return RootInvocation(command_name=command_name, eager_exit=True)
+    return RootInvocation(command_name=command_name, eager_exit=False)
+
+
+def _progress_has_observed_work(progress: RunProgress) -> bool:
+    """Return whether any declared stage has participated in the run."""
+
+    return any(
+        record.state is not StageState.PENDING
+        for record in progress.records.values()
+    )
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -151,10 +202,21 @@ def main(
     multiprocessing.freeze_support()
     arguments = list(args) if args is not None else None
     requested_arguments = arguments if arguments is not None else sys.argv[1:]
+    invocation = _root_invocation(requested_arguments)
     machine_readable = "--json" in requested_arguments
+    progress_kwargs: dict[str, object] = {"machine_readable": machine_readable}
+    if (
+        invocation.command_name == "init"
+        and not invocation.eager_exit
+        and not machine_readable
+    ):
+        progress_kwargs.update(
+            startup_label=_INIT_STARTUP_LABEL,
+            startup_pending=_INIT_STARTUP_PENDING,
+        )
     run = CliRunContext(
         CancellationToken(),
-        RunProgress(machine_readable=machine_readable),
+        RunProgress(**progress_kwargs),
     )
     control = RunControl(run.cancellation, progress=run.progress).install()
     try:
@@ -298,13 +360,15 @@ def _trusted_workspace_callback(function):
             interactive = _stdin_is_interactive() and not kwargs.get(
                 "json_output", False
             )
-            require_workspace_trust(
-                paths,
-                explicit=explicit_trust,
-                interactive=interactive,
-                confirm=lambda prompt: click.confirm(prompt, default=False),
-                cancel=cancel,
-            )
+            progress = run.progress if isinstance(run, CliRunContext) else None
+            with _suspend_progress(progress):
+                require_workspace_trust(
+                    paths,
+                    explicit=explicit_trust,
+                    interactive=interactive,
+                    confirm=lambda prompt: click.confirm(prompt, default=False),
+                    cancel=cancel,
+                )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
             raise click.ClickException(str(error)) from error
         return function(*args, paths=paths, cancel=cancel, **kwargs)

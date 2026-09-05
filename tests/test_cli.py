@@ -89,6 +89,128 @@ def test_help_lists_bootstrap_commands(cli_runner: CliRunner) -> None:
     assert "version" in result.output
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ([], cli_module.RootInvocation(None, False)),
+        (["-h"], cli_module.RootInvocation(None, True)),
+        (["--help"], cli_module.RootInvocation(None, True)),
+        (["init", "--yes"], cli_module.RootInvocation("init", False)),
+        (["init", "-h"], cli_module.RootInvocation("init", True)),
+        (["init", "--help"], cli_module.RootInvocation("init", True)),
+        (["--", "init", "--help"], cli_module.RootInvocation("init", True)),
+        (["init", "--", "--help"], cli_module.RootInvocation("init", False)),
+        (["init", "--", "-h"], cli_module.RootInvocation("init", False)),
+        (["version", "--help"], cli_module.RootInvocation("version", True)),
+    ],
+)
+def test_root_invocation_classifies_click_help_without_business_parsing(
+    arguments: list[str],
+    expected: cli_module.RootInvocation,
+) -> None:
+    assert cli_module._root_invocation(arguments) == expected
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["-h"], ["--help"], ["init", "-h"], ["init", "--help"]],
+)
+def test_main_root_and_init_help_have_no_startup_projection(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    arguments: list[str],
+) -> None:
+    expected = CliRunner().invoke(
+        cli,
+        arguments,
+        prog_name="betterborg",
+    )
+    stream = TTYStringIO()
+    construction: list[dict[str, object]] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        construction.append(kwargs)
+        return RunProgress(stream=stream, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+
+    exit_code = cli_module.main(
+        arguments,
+        prog_name="betterborg",
+    )
+
+    captured = capsys.readouterr()
+    assert expected.exit_code == 0
+    assert exit_code == 0
+    assert captured.out == expected.output
+    assert captured.err == ""
+    assert construction == [{"machine_readable": False}]
+    assert stream.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("arguments", "startup_expected"),
+    [
+        (["init", "--yes"], True),
+        (["init", "--", "--help"], True),
+        (["init", "--yes", "--json"], False),
+        (["version"], False),
+        ([], False),
+    ],
+)
+def test_main_selects_startup_projection_only_for_direct_human_init(
+    monkeypatch: MonkeyPatch,
+    arguments: list[str],
+    startup_expected: bool,
+) -> None:
+    stream = TTYStringIO()
+    construction: list[dict[str, object]] = []
+
+    def progress_factory(**kwargs) -> RunProgress:
+        construction.append(kwargs)
+        return RunProgress(stream=stream, **kwargs)
+
+    class StubRoot:
+        def main(self, **kwargs) -> int:
+            kwargs["obj"].progress.stop_display()
+            return 0
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "cli", StubRoot())
+
+    assert cli_module.main(arguments, prog_name="betterborg") == 0
+    assert len(construction) == 1
+    if startup_expected:
+        assert construction[0] == {
+            "machine_readable": False,
+            "startup_label": "Starting betterborg init",
+            "startup_pending": (
+                "Discover evidence",
+                "Analyze repository",
+                "Generate role prompts",
+                "Draft improvement PRDs",
+            ),
+        }
+    else:
+        assert "startup_label" not in construction[0]
+        assert "startup_pending" not in construction[0]
+
+
+def test_progress_observed_work_requires_a_nonpending_stage() -> None:
+    progress = RunProgress(enabled=False)
+
+    assert cli_module._progress_has_observed_work(progress) is False
+
+    progress.declare(StageSpec("waiting", "Waiting"))
+    assert cli_module._progress_has_observed_work(progress) is False
+    assert progress.stages["waiting"].state is StageState.PENDING
+
+    progress.declare(StageSpec("active", "Active"))
+    progress.start("active")
+    assert cli_module._progress_has_observed_work(progress) is True
+    assert progress.stages["waiting"].state is StageState.PENDING
+
+
 def test_main_enables_multiprocessing_before_click_dispatch(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -1002,6 +1124,50 @@ def test_trust_command_forwards_root_cancellation_token(
 
     assert result.exit_code == 0, result.output
     assert observed == [("paths", cancel), ("trust", cancel)]
+
+
+def test_trusted_callback_suspends_progress_while_trust_is_required(
+    cli_runner: CliRunner,
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    run = cli_module.CliRunContext(
+        cli_module.CancellationToken(),
+        RunProgress(enabled=False),
+    )
+    paths = RepoPaths.discover(git_repo)
+    events: list[str] = []
+
+    class Suspension:
+        def __enter__(self) -> None:
+            events.append("suspend")
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("resume")
+
+    @click.command()
+    @cli_module._trusted_workspace_callback
+    def command(paths: RepoPaths, cancel: object) -> None:
+        events.append("callback")
+
+    def require_trust(_paths: RepoPaths, **_kwargs: object) -> None:
+        assert _paths is paths
+        events.append("trust")
+
+    monkeypatch.setattr(RepoPaths, "discover", lambda **_kwargs: paths)
+    monkeypatch.setattr(
+        cli_module,
+        "_suspend_progress",
+        lambda progress: Suspension()
+        if progress is run.progress
+        else pytest.fail("root progress was not suspended"),
+    )
+    monkeypatch.setattr(cli_module, "require_workspace_trust", require_trust)
+
+    result = cli_runner.invoke(command, obj=run)
+
+    assert result.exit_code == 0, result.output
+    assert events == ["suspend", "trust", "resume", "callback"]
 
 
 def test_trusted_callback_reuses_discovered_paths_and_root_token(

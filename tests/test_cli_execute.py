@@ -449,7 +449,7 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
         assert store.get_current_execution_decision(borg.id) is None
 
 
-def test_execute_threads_one_control_context_and_suspends_confirmation(
+def test_execute_threads_one_control_context_and_suspends_trust_and_confirmation(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     planning_cli_repository,
@@ -508,7 +508,7 @@ def test_execute_threads_one_control_context_and_suspends_confirmation(
     assert discovered_tokens
     assert all(observed is token for observed in discovered_tokens)
     assert host_contexts == [(token, progress)]
-    assert progress.suspension_count == 1
+    assert progress.suspension_count == 2
     assert progress.closed
     estimate = progress.stages["estimate-decision"]
     assert estimate.state is StageState.COMPLETED
