@@ -544,21 +544,29 @@ the Architect's own account of what it decided without asking.
 
 What the plan carries is the standing set, never a history of it. Planning is
 iterative: a review sends a plan back, the Architect reopens its own question,
-and the same ground is settled more than once. One rule covers the record: the
-last round to answer a question is the one the plan was built on, so it is the
-one that surfaces. Where that round is a person's answer the question is
-settled and carries no assumption, and neither a plan carrying its list forward
-nor a plan declaring one may put the assumption back. Where the Architect has
-since reopened the question and decided it, the plan follows its reading and
-says so, because hiding a live assumption behind a superseded answer is the
-failure this section exists to prevent.
+and the same ground is settled more than once. Three accounts of what the run
+assumed exist, and the plan takes the most current one that says anything
+rather than merging them. The plan being written speaks first, because it was
+composed with every answered round in front of it and asked to name what it
+settled. The record follows, holding the rounds as they were answered, so an
+Architect that names nothing cannot thereby leave a run looking certain. The
+plan being superseded speaks last, for the assumptions taken without asking
+that no round recorded.
 
-The plan's own account is bounded by the same principle. A plan that names its
-assumptions has stated the whole set, so the plan it supersedes is not merged
-on top; that list stands in only where the new one is silent, which is the
-revision that addresses a finding without revisiting what it assumed. Without
-this an assumption reworded between rounds survives in both wordings, and a
-section that is mostly restatement buries the decisions it exists to surface.
+Choosing rather than merging is what keeps the section from growing, and the
+reason is that a question has no identity beyond its text. The Architect
+rewords freely between rounds, so merging publishes every phrasing of a
+decision it has revisited, and the reader cannot tell which one the plan
+follows. The price is that a plan naming some of its assumptions is trusted to
+have named them all. That is the narrower failure: an incomplete list is still
+a list of real decisions, while a merged one is a history in which the standing
+decision cannot be picked out.
+
+Within the record the last round to answer a question is the one that stands.
+Where that round is a person's answer the question is settled and carries no
+assumption at all, and no account may reopen it, because listing a requirement
+somebody gave under decisions nobody confirmed sends them to audit the one
+piece of ground they settled themselves.
 
 What an attended run cannot do is originate one. Every requirement there was
 either read from the confirmed PRD or got by asking, so a plan claiming an
@@ -578,9 +586,9 @@ command never built itself, and it decides on the same terms as the rest.
   that raised it where a plan raised it, and the stored round records what it
   assumed beside the question that prompted it.
 - The plan a reader receives names the requirements the run settled itself and
-  no more: the standing decision for each question, nothing a person has since
-  answered, and no restatement of what a revision reworded.
-- A revision that does not mention an assumption does not lose it.
+  no more: one account of them rather than several merged, nothing a person
+  has since answered, and no restatement of what a revision reworded.
+- A plan that names none of its assumptions does not thereby lose them.
 - Without the unattended option the existing behaviour is unchanged, including
   stopping when a prompt returns nothing and refusing an assumption a plan
   claims for itself.
@@ -597,16 +605,17 @@ command never built itself, and it decides on the same terms as the rest.
 - A plan run unattended names the requirements it settled for itself.
 - A question answered twice yields the later decision, not the one it
   replaced, whether the later answer is a person's or the Architect's; and a
-  revision that names its assumptions replaces the superseded list rather than
-  adding to it.
-- A recorded round survives a plan that leaves it out, in the wording it was
-  asked in, and so does an assumption a silent revision does not mention.
+  plan that names its assumptions owns the list, while one that names none
+  falls back to the record.
+- A recorded round survives a plan that says nothing about assumptions, and so
+  does one the superseded plan took without asking.
 - A question round run unattended yields a plan with no prompt issued, its
   stored round marks the answer assumed, and a round raised by a plan is
   decided with that plan in the workspace while one raised by the questions
   phase is not attributed to it.
-- An answer that repeats a question, skips one, or says nothing is refused,
-  and an abandoned answers turn is not recovered for a later round.
+- An answer that repeats a question, skips one, or says nothing is refused, an
+  abandoned answers turn is not recovered for a later round, and a decision
+  interrupted before its round is answered leaves neither half behind.
 - Interactive planning still prompts, still stops on a cancelled prompt, and
   still drops an assumption its plan claims.
 - An Architect that asks past the round cap still ends the run, and a new

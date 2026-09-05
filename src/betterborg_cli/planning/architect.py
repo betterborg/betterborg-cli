@@ -651,12 +651,23 @@ class ArchitectLoop:
             )
 
     def _answer_question_round(self, borg: Borg, question: PlanningQuestion) -> Borg:
-        answers = (
-            self._assume_question_round(question)
-            if self.unattended
-            else self._prompt_question_round(question)
-        )
+        decided: tuple[PlanningAttempt, dict[str, Any]] | None = None
+        if self.unattended:
+            decided, answers = self._assume_question_round(question)
+        else:
+            answers = self._prompt_question_round(question)
+        # The turn that decided and the round it decided are recorded
+        # together. Split across two writes, a run killed between them leaves
+        # a completed turn whose answer nothing reads: the resume finds the
+        # round still unanswered, pays for the decision again, reaches a
+        # different one, and spends another slot of a budget that counts
+        # completed turns.
         with self.store.transaction():
+            if decided is not None:
+                attempt, payload = decided
+                self._complete_attempt(
+                    attempt, payload, f"assumed {len(answers)} answer(s)"
+                )
             self.store.answer_planning_question(question.id, answers)
             return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
 
@@ -685,8 +696,12 @@ class ArchitectLoop:
 
     def _assume_question_round(
         self, question: PlanningQuestion
-    ) -> list[dict[str, object]]:
-        """Decide one round from the evidence, because nobody else can."""
+    ) -> tuple[tuple[PlanningAttempt, dict[str, Any]], list[dict[str, object]]]:
+        """Decide one round from the evidence, because nobody else can.
+
+        The turn is returned unfinished, so its caller can record completing
+        it and answering the round in one write.
+        """
         # Rounds spent by this planning cycle, not the round number, which
         # counts every question the Borg has ever been asked. A Borg that
         # spent its budget planning would otherwise be unrevisable for the
@@ -732,10 +747,7 @@ class ArchitectLoop:
                 summary=str(error),
             )
             raise
-        self._complete_attempt(
-            attempt, payload, f"assumed {len(answers)} answer(s)"
-        )
-        return answers
+        return (attempt, payload), answers
 
     def _start_progress(self) -> None:
         if self.progress is None:
@@ -907,41 +919,37 @@ class ArchitectLoop:
     ) -> dict[str, Any]:
         """Settle which assumptions the plan carries, rather than the plan.
 
-        Three sources reach here. Betterborg contributes the rounds the
-        Architect asked and then answered itself, which are recorded and so
-        cannot be dropped by leaving them out of a plan. The Architect
-        declares the requirements it decided in place of asking, which only it
-        knows it decided. And the plan this one supersedes stands in when the
-        new one names none, because a revision rewriting a plan to address a
-        finding may not restate an assumption it is not revisiting, and losing
-        one there costs the reader the same warning as never making it.
+        Three accounts of the same thing reach here, and the most current one
+        that says anything is the one to publish. The plan being written is
+        first: it was composed with every answered round in front of it and
+        asked to name what it settled, so its list is one coherent statement
+        of the set in force. The record follows, because it holds the rounds
+        as they were answered and an Architect that names nothing cannot
+        thereby leave a run looking certain. The plan being superseded speaks
+        last, and only for the assumptions it took without asking, which are
+        the ones no round recorded.
 
-        What survives is the standing set, never a history of it. A revision
-        that names its assumptions has stated the whole set, so the superseded
-        list is not merged on top of it; an assumption reworded between rounds
-        would otherwise appear in both wordings, and a section that is mostly
-        restatement buries the decisions it exists to surface.
+        Choosing one account rather than merging them is what keeps the
+        section from growing. The accounts identify a question only by its
+        text, and the Architect rewords freely between rounds, so merging
+        publishes every wording of a decision it has restated. The cost is
+        that a plan naming some of its assumptions is trusted to have named
+        them all, and the record no longer backstops what such a plan leaves
+        out. That is the narrower failure: an incomplete list is still a list
+        of real decisions, while a merged one is a history in which the
+        standing decision cannot be picked out.
 
-        What an attended run cannot do is originate one. A question there was
-        answered by a person, so a plan claiming an assumption is describing a
-        conversation that did not happen.
+        What no account may do is reopen a question a person closed. Their
+        answer is a requirement, and listing it under decisions nobody
+        confirmed sends them to audit the one piece of ground they settled
+        themselves.
         """
         declared = self._declared_assumptions(plan) if self.unattended else []
-        # A plan that names its assumptions is stating the whole set it rests
-        # on, so the superseded list stands in only where the new one is
-        # silent. Merging both instead accumulates a history: a revision that
-        # rewords its own assumption keeps the old wording alongside the new,
-        # and after a few review rounds the section is mostly restatement.
-        carried = [] if declared else self._declared_assumptions(superseded or {})
-        stored, answered = self._stored_assumptions()
-        # The record leads, and it holds at most one standing assumption per
-        # question already. Every question it has answered is spoken for,
-        # whether it answers or retires: without that, a plan carrying an
-        # assumption forward would reinstate one a person has since settled,
-        # and the carrying would outlive the answer.
-        assumptions: list[dict[str, str]] = list(stored)
-        seen: set[str] = set(answered)
-        for assumption in [*carried, *declared]:
+        carried = self._declared_assumptions(superseded or {})
+        stored, settled = self._stored_assumptions()
+        assumptions: list[dict[str, str]] = []
+        seen: set[str] = set(settled)
+        for assumption in declared or stored or carried:
             key = assumption["question"].casefold()
             if key in seen:
                 continue
@@ -978,12 +986,11 @@ class ArchitectLoop:
         requirement, and listing it under decisions nobody confirmed sends
         them to audit ground they themselves settled.
 
-        Returned beside the standing assumptions is every question the record
-        has answered at all, which is what lets the merge tell "no assumption
-        here" apart from "nothing known here".
+        Returned beside the standing assumptions are the questions a person
+        closed, which no other account may reopen as an assumption.
         """
         standing: dict[str, dict[str, str]] = {}
-        answered: set[str] = set()
+        settled: set[str] = set()
         for stored in self.store.list_planning_questions(self.borg_id):
             asked = {
                 str(item.get("id")): str(item.get("question") or "").strip()
@@ -994,17 +1001,18 @@ class ArchitectLoop:
                 if not question:
                     continue
                 key = question.casefold()
-                answered.add(key)
                 if not answer.get("assumed"):
                     standing.pop(key, None)
+                    settled.add(key)
                     continue
+                settled.discard(key)
                 assumption = str(answer.get("answer") or "").strip()
                 if assumption:
                     standing[key] = {
                         "question": question,
                         "assumption": assumption,
                     }
-        return list(standing.values()), answered
+        return list(standing.values()), settled
 
     def _raised_by_a_plan(self, question: PlanningQuestion) -> bool:
         """Say whether a plan turn is what put this round on the table.

@@ -36,6 +36,27 @@ def test_rejects_invalid_phase_names(repository: Path, name: str) -> None:
         validate_plan(plan, repository)
 
 
+def test_the_assumptions_section_says_who_decided_them(repository: Path) -> None:
+    """The heading alone reads as a list of requirements.
+
+    What separates it from one is the sentence underneath, so that sentence
+    is the feature: without it the section quietly becomes the opposite of
+    what it is for.
+    """
+    plan = _two_phase_plan()
+    plan["assumptions"] = [
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux and macOS.",
+        }
+    ]
+
+    rendered = render_plan_markdown(plan)
+
+    assert "## Assumptions" in rendered
+    assert "The Architect decided these itself; nobody confirmed them." in rendered
+
+
 @pytest.mark.parametrize(
     ("assumption", "message"),
     [

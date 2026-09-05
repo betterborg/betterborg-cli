@@ -150,6 +150,12 @@ def test_unattended_planning_assumes_its_own_answers_and_carries_them(
     )
 
     def assume_the_answer(spec):
+        # The instruction that makes this turn a decision rather than a
+        # question, and that tells it every answer becomes an assumption.
+        system = " ".join(spec.system_prompt.split())
+        assert "nobody is available to answer the questions you asked" in system
+        assert "Answer every question exactly once" in system
+        assert "recorded as an assumption the plan rests on" in system
         assert "q1: Which platforms are required at launch?" in spec.user_prompt
         assert (
             "Why this matters: This determines the packaging test matrix."
@@ -663,15 +669,16 @@ def test_reopening_a_question_a_person_settled_makes_it_an_assumption_again(
         ]
 
 
-def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
+def test_a_recorded_assumption_survives_a_plan_that_names_none(
     committed_git_repo: Path,
     persist_planning_context,
 ) -> None:
-    """Betterborg recorded the round, so the plan cannot decide to forget it.
+    """A plan saying nothing about assumptions must not read as having none.
 
-    The plan below names one new decision and restates the recorded one in
-    its own words. Dropping the recorded wording would let a plan quietly
-    soften the question it was actually asked.
+    The Architect answered its own question and then wrote a plan that never
+    mentions it. Silence is the shape the record exists to cover: without it
+    a run that guessed at a requirement publishes a plan indistinguishable
+    from one that was told.
     """
     adapter = MockAdapter(name="openai").queue(
         MockResponse(
@@ -697,18 +704,9 @@ def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
         )
     )
     adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
-    partial = dict(_plan())
-    partial["assumptions"] = [
-        {
-            "question": "which platforms are required at launch?",
-            "assumption": "Every platform the team uses.",
-        },
-        {
-            "question": "Where does the changelog live?",
-            "assumption": "At the repository root, beside the README.",
-        },
-    ]
-    adapter.queue(MockResponse(payload=partial))
+    silent = _plan()
+    assert "assumptions" not in silent
+    adapter.queue(MockResponse(payload=silent))
 
     database = committed_git_repo.parent / "architect-merged.sqlite3"
     with SqliteStore.open(database) as store:
@@ -720,11 +718,7 @@ def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
             borg,
             store,
             adapter,
-            io=InteractiveIO(
-                prompt=lambda _message: None,
-                confirm=lambda _message, _default: False,
-                write=lambda _message: None,
-            ),
+            io=_io(iter(()), []),
             unattended=True,
         ).run()
 
@@ -732,12 +726,61 @@ def test_a_recorded_assumption_survives_a_plan_that_leaves_it_out(
             {
                 "question": "Which platforms are required at launch?",
                 "assumption": "Linux and macOS in the first release.",
-            },
-            {
-                "question": "Where does the changelog live?",
-                "assumption": "At the repository root, beside the README.",
-            },
+            }
         ]
+        assert "## Assumptions" in render_plan_markdown(result.plan)
+
+
+def test_a_plan_that_names_its_assumptions_owns_the_list(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Naming any of them is a statement about all of them.
+
+    Nothing links a restated question to the round it restates: the wording
+    is regenerated each time, so merging the record underneath would publish
+    every phrasing of a decision the Architect has revisited. The plan's own
+    account is taken whole, and the record covers the plan that gives none.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Linux only."}]})
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    restating = dict(_plan())
+    restating["assumptions"] = [
+        {
+            "question": "Which platforms must the release support?",
+            "assumption": "Linux only, matching the CI matrix.",
+        }
+    ]
+    adapter.queue(MockResponse(payload=restating))
+
+    database = committed_git_repo.parent / "architect-owned.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "owned"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == restating["assumptions"]
+        assert "Linux only." not in render_plan_markdown(result.plan)
 
 
 def test_an_answered_question_is_not_an_assumption(
@@ -964,6 +1007,67 @@ def test_assumed_answers_must_cover_every_question_in_their_round(
             "architect_answers",
         ]
         assert attempts[-1].status is PlanningAttemptStatus.FAILED
+        assert store.list_planning_questions(borg.id)[0].answers is None
+
+
+def test_a_decided_round_and_its_answer_are_recorded_together(
+    committed_git_repo: Path,
+    persist_planning_context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn recorded as done whose answer is not is worse than no turn.
+
+    The resume reads the round as unanswered, pays for the decision again,
+    and may reach a different one; meanwhile the abandoned turn has already
+    spent a slot of a budget counted in completed turns.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Linux only."}]})
+    )
+
+    database = committed_git_repo.parent / "architect-torn-answer.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "torn-answer"
+        )
+        original = SqliteStore.answer_planning_question
+
+        def die_before_recording(self, question_id, answers):
+            raise RuntimeError("killed between the two writes")
+
+        monkeypatch.setattr(
+            SqliteStore, "answer_planning_question", die_before_recording
+        )
+        with pytest.raises(RuntimeError, match="killed between the two writes"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter(()), []),
+                unattended=True,
+            ).run()
+        monkeypatch.setattr(SqliteStore, "answer_planning_question", original)
+
+        # The decision is not half-recorded: the turn that made it did not
+        # survive the write that failed, so nothing claims it was spent.
+        answers_attempts = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "architect_answers"
+            and attempt.status is PlanningAttemptStatus.COMPLETED
+        ]
+        assert answers_attempts == []
         assert store.list_planning_questions(borg.id)[0].answers is None
 
 
