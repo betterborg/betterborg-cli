@@ -376,7 +376,8 @@ def _write_after_progress(
         writer()
     except BaseException as error:
         if progress_error is not None and progress_error is not error:
-            error.add_note(f"progress finalization also failed: {progress_error}")
+            progress_error.add_note(f"owed report writing also failed: {error}")
+            raise progress_error from error
         raise
     if progress_error is not None:
         raise progress_error

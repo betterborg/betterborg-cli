@@ -254,6 +254,41 @@ def test_write_after_progress_writes_owed_report_before_close_failure() -> None:
     assert progress._cadence_worker is None
 
 
+def test_write_after_progress_preserves_close_failure_when_writer_fails() -> None:
+    events: list[str] = []
+    close_error = RuntimeError("progress close failed")
+    writer_error = OSError("report write failed")
+
+    class CloseFailingProgress(RunProgress):
+        def close(self) -> None:
+            events.append("close")
+            raise close_error
+
+        def stop_display(self) -> None:
+            events.append("dispose")
+            super().stop_display()
+
+    def failing_writer() -> None:
+        events.append("report")
+        raise writer_error
+
+    progress = CloseFailingProgress(enabled=False)
+    progress.declare(StageSpec("done", "Done"))
+    progress.start("done")
+    progress.complete("done")
+
+    with pytest.raises(RuntimeError, match="progress close failed") as exc_info:
+        cli_module._write_after_progress(progress, failing_writer)
+
+    assert exc_info.value is close_error
+    assert exc_info.value.__cause__ is writer_error
+    assert exc_info.value.__notes__ == [
+        "owed report writing also failed: report write failed"
+    ]
+    assert events == ["close", "dispose", "report"]
+    assert progress._cadence_worker is None
+
+
 def test_write_after_progress_disposes_unobserved_work_without_summary() -> None:
     stream = io.StringIO()
     progress = RunProgress(stream=stream)
