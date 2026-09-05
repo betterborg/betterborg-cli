@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from progress_test_support import WaitableStringIO
+from progress_test_support import FakeClock, WaitableStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
@@ -27,7 +27,12 @@ from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.selection import SelectedAgent
 from betterborg_cli.cli import cli
-from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageState,
+)
 from betterborg_cli.repo_analysis import DIMENSIONS, PROMPT_ROLES
 from betterborg_cli.repo_analysis import analyzer as analyzer_module
 from betterborg_cli.repo_analysis import improvement_prds as improvement_prds_module
@@ -282,6 +287,74 @@ def test_init_creates_outputs_once_and_preserves_repository_identity(
             "SELECT COUNT(*) FROM repositories"
         ).fetchone()[0]
         assert repository_count == 1
+
+
+def test_first_run_progress_account_matches_the_product_layout(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    stream = StringIO()
+    clock = FakeClock()
+    progress = RunProgress(stream=stream, clock=clock, width=100)
+    monkeypatch.setattr(
+        progress,
+        "_current_spinner_frame",
+        lambda record: "⠋" if record.is_child else "⠙",
+    )
+
+    with SqliteStore.open(paths.state_dir / "account.sqlite3") as store:
+        RepositoryService(
+            paths,
+            store,
+            lambda _config: MockAdapter(),
+            progress=progress,
+        )
+
+        progress.start("discover")
+        clock.advance(2)
+        progress.complete("discover", "142 files · 1.8 MB")
+        progress.start("analyze")
+        clock.advance(134)
+        progress.complete("analyze", "claude · opus-4-8")
+        progress.start("prompts")
+        progress.update("prompts", "3 agents")
+        for role in PROMPT_ROLES:
+            progress.start_child("prompts", role)
+        clock.advance(38)
+        progress.complete_child("prompts", "coding", "prompt v1")
+        clock.advance(3)
+        progress.child_activity(
+            "prompts",
+            "review",
+            AgentActivity(AgentActivityKind.SEARCHING, "docker-compose"),
+        )
+        progress.child_activity(
+            "prompts",
+            "merge",
+            AgentActivity(AgentActivityKind.THINKING),
+        )
+
+    completed_lines = [
+        line
+        for line in stream.getvalue().splitlines()
+        if line.startswith("✔ Discover") or line.startswith("✔ Analyze")
+    ]
+    live_lines = [line.plain for line in progress._live_lines()]
+    account = "\n".join((*completed_lines, "", *live_lines)) + "\n"
+
+    assert account == (
+        "✔ Discover evidence      0:02  142 files · 1.8 MB\n"
+        "✔ Analyze repository     2:14  claude · opus-4-8\n"
+        "\n"
+        "  ⠙ Generate role prompts  0:41  3 agents\n"
+        "      ├ coding   ✔ 0:38\n"
+        '      ├ review   ⠋ 0:41  searching "docker-compose"\n'
+        "      └ merge    ⠋ 0:41  thinking\n"
+        "  ◦ Draft improvement PRDs\n"
+        "\n"
+        "  ctrl-c to stop\n"
+    )
 
 
 @pytest.mark.parametrize("interrupt_after_claim", [False, True])
@@ -587,7 +660,7 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         "(previous 3.00/5, delta +1.00).\n"
     )
     assert "✔ Discover evidence" in result.output
-    assert "1 evidence files" in result.output
+    assert "1 files · 40 bytes" in result.output
     assert "✔ Analyze repository" in result.output
     assert "score 4.00/5" in result.output
     assert load_repository_config(paths).repository_id == config.repository_id
@@ -1215,7 +1288,8 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
                 }
             )
         )
-        progress = RunProgress(stream=StringIO())
+        retry_progress_stream = StringIO()
+        progress = RunProgress(stream=retry_progress_stream)
         result = RepositoryService(
             paths,
             store,
@@ -1252,8 +1326,16 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
     assert review.state is StageState.COMPLETED
     assert review.retained is False
     assert review.started_at is not None
+    retry_progress_output = retry_progress_stream.getvalue()
+    assert "[retained]" not in retry_progress_output
+    assert retry_progress_output.count("reused from earlier run") == 4
+    assert all(
+        label in retry_progress_output
+        for label in ("Discover evidence", "Analyze repository", "coding", "merge")
+    )
 
-    all_retained_progress = RunProgress(stream=StringIO())
+    all_retained_stream = StringIO()
+    all_retained_progress = RunProgress(stream=all_retained_stream)
 
     def fail_factory(_config):
         pytest.fail("an all-retained initialization must not select an agent")
@@ -1279,3 +1361,6 @@ def test_incomplete_initialization_seeds_retained_analysis_without_restart(
         and child.started_at is None
         for child in retained_parent.children.values()
     )
+    all_retained_output = all_retained_stream.getvalue()
+    assert "[retained]" not in all_retained_output
+    assert all_retained_output.count("reused from earlier run") == 6

@@ -96,10 +96,7 @@ class RepositoryService:
                 StageSpec(
                     _PROMPTS_STAGE_KEY,
                     "Generate role prompts",
-                    tuple(
-                        ChildSpec(role, f"{role.title()} prompt")
-                        for role in PROMPT_ROLES
-                    ),
+                    tuple(ChildSpec(role, role) for role in PROMPT_ROLES),
                 )
             )
             progress.declare(

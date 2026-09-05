@@ -161,6 +161,7 @@ class _RecordSnapshot:
     retained: bool
     _activity_is_latest: bool
     dynamic: bool = False
+    is_child: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +207,7 @@ Clock = Callable[[], float]
 
 _MAX_LIVE_ROWS = 8
 _LABEL_COLUMN_WIDTH = 21
+_CHILD_LABEL_COLUMN_WIDTH = 7
 _DOTS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _DOTS_FRAME = _DOTS_FRAMES[0]
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
@@ -1063,6 +1065,7 @@ class RunProgress:
             retained=record.retained,
             _activity_is_latest=record._activity_is_latest,
             dynamic=isinstance(record, ChildRecord) and record.dynamic,
+            is_child=isinstance(record, ChildRecord),
         )
 
     def _project_live_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
@@ -1085,7 +1088,7 @@ class RunProgress:
             if record.state is StageState.RUNNING:
                 projected_lines.append(
                     (
-                        self._format_running_line(
+                        self._format_live_running_line(
                             record, cancelling=snapshot.cancelling
                         ),
                         StageState.RUNNING,
@@ -1098,12 +1101,18 @@ class RunProgress:
                     (
                         self._format_child_live_line(
                             child,
-                            parent_label=record.label,
+                            branch=(
+                                "└" if index == len(children) - 1 else "├"
+                            ),
                             cancelling=snapshot.cancelling,
                         ),
-                        child.state,
+                        (
+                            StageState.RUNNING
+                            if child.state in TERMINAL_STATES
+                            else child.state
+                        ),
                     )
-                    for child in children
+                    for index, child in enumerate(children)
                 )
                 if earlier_attempt_count:
                     noun = "attempt" if earlier_attempt_count == 1 else "attempts"
@@ -1138,7 +1147,7 @@ class RunProgress:
             footer = self._format_cohort_counts(snapshot, stages_by_key)
             footer.append("  ·  ctrl-c to stop")
         else:
-            footer = Text("ctrl-c to stop", style="dim")
+            footer = Text("  ctrl-c to stop", style="dim")
         return [*work_lines, Text(""), footer]
 
     def _format_cohort_counts(
@@ -1218,18 +1227,49 @@ class RunProgress:
         self,
         child: ChildRecord | _RecordSnapshot,
         *,
-        parent_label: str,
+        branch: str,
         cancelling: bool | None = None,
     ) -> Text:
+        label = _normalize_cell(child.label)
+        line = Text("      ")
+        line.append(branch, style="dim")
+        line.append(" ")
+        line.append(label)
+        line.append(" " * _child_column_gap(label))
         if child.state is StageState.RUNNING:
-            return self._format_running_line(
-                child,
-                parent_label=parent_label,
-                cancelling=cancelling,
-            )
+            line.append(self._current_spinner_frame(child), style="cyan")
+            line.append(" ")
+            line.append(_format_duration(self._elapsed(child)), style="dim")
+            line.append("  ")
+            work = _format_current_work(child)
+            if self._cancelling if cancelling is None else cancelling:
+                work = "stopping…"
+            line.append(work)
+            return line
+        glyph = _STATE_GLYPHS[child.state]
+        line.append(glyph, style=_STATE_STYLES[child.state])
         if child.state is StageState.PENDING:
-            return _format_pending_line(child, parent_label=parent_label)
-        return _format_terminal_line(child, parent_label=parent_label)
+            return line
+        line.append(" ")
+        line.append(_format_duration(child.duration_seconds), style="dim")
+        if child.retained:
+            result = _terminal_result(child)
+            if result:
+                line.append("  ")
+                line.append(result)
+        return line
+
+    def _current_spinner_frame(
+        self, record: ChildRecord | _RecordSnapshot | None = None
+    ) -> str:
+        elapsed = max(0.0, time.monotonic() - self._spinner_started_at)
+        index = int(elapsed / 0.08)
+        is_child = isinstance(record, ChildRecord) or (
+            isinstance(record, _RecordSnapshot) and record.is_child
+        )
+        if record is not None and not is_child:
+            index += 1
+        return _DOTS_FRAMES[index % len(_DOTS_FRAMES)]
 
     def _format_running_line(
         self,
@@ -1251,6 +1291,19 @@ class RunProgress:
         line.append("  ")
         line.append(work)
         return line
+
+    def _format_live_running_line(
+        self,
+        record: StageRecord | _RecordSnapshot,
+        *,
+        cancelling: bool,
+    ) -> Text:
+        line = self._format_running_line(record, cancelling=cancelling)
+        return Text.assemble(
+            "  ",
+            (self._current_spinner_frame(record), "cyan"),
+            line[1:],
+        )
 
     def _live_renderable(self, line: Text) -> Text | Spinner:
         line = self._truncate(line)
@@ -1506,29 +1559,39 @@ def _format_terminal_line(
     line.append(label)
     line.append(" " * _column_gap(label))
     line.append(_format_duration(record.duration_seconds), style="dim")
-    result_parts = []
-    if record.result is not None:
-        result_parts.append(_normalize_cell(str(record.result)))
-    if record.retained:
-        result_parts.append("reused from earlier run")
-    if result_parts:
+    result = _terminal_result(record)
+    if result:
         line.append("  ")
-        line.append(" · ".join(result_parts))
+        line.append(result)
     return line
 
 
 def _format_child_terminal_line(child: ChildRecord, *, branch: str) -> Text:
-    return Text.assemble((branch, "dim"), " ", _format_terminal_line(child))
+    label = _normalize_cell(child.label)
+    line = Text("    ")
+    line.append(branch, style="dim")
+    line.append(" ")
+    line.append(label)
+    line.append(" " * _child_column_gap(label))
+    line.append(_STATE_GLYPHS[child.state], style=_STATE_STYLES[child.state])
+    line.append(" ")
+    line.append(_format_duration(child.duration_seconds), style="dim")
+    result = _terminal_result(child)
+    if result:
+        line.append("  ")
+        line.append(result)
+    return line
 
 
-def _format_pending_line(
-    record: ChildRecord | _RecordSnapshot, *, parent_label: str | None = None
-) -> Text:
-    label = _format_label(record, parent_label=parent_label)
-    return Text(
-        f"{_STATE_GLYPHS[StageState.PENDING]} {label}",
-        style=_STATE_STYLES[StageState.PENDING],
-    )
+def _terminal_result(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
+    parts = []
+    if record.result is not None:
+        parts.append(_normalize_cell(str(record.result)))
+    if record.retained:
+        parts.append("reused from earlier run")
+    return " · ".join(parts)
 
 
 def _format_pending_stage_line(label: str) -> Text:
@@ -1551,6 +1614,10 @@ def _format_label(
 
 def _column_gap(label: str) -> int:
     return max(2, _LABEL_COLUMN_WIDTH - cell_len(label) + 2)
+
+
+def _child_column_gap(label: str) -> int:
+    return max(2, _CHILD_LABEL_COLUMN_WIDTH - cell_len(label) + 2)
 
 
 def _format_duration(seconds: float | None) -> str:

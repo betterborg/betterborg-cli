@@ -166,7 +166,8 @@ def test_terminal_state_glyphs_and_rich_styles_remain_distinct_without_colour(
         stream=pending_stream,
     )
     pending.start("stage")
-    assert "\x1b[2m◦ Stage: Child" in pending_stream.getvalue()
+    assert "Child" in pending_stream.getvalue()
+    assert "\x1b[2m◦" in pending_stream.getvalue()
 
     stripped = {
         resolution: _terminal_text(output)
@@ -304,7 +305,7 @@ def test_control_normalization_cannot_expand_the_live_region() -> None:
     live_lines = progress._live_lines()
     assert len(live_lines) == 10
     assert live_lines[-2].plain == ""
-    assert live_lines[-1].plain == "ctrl-c to stop"
+    assert live_lines[-1].plain == "  ctrl-c to stop"
     assert all(
         len(line.plain.splitlines()) == 1 for line in live_lines if line.plain
     )
@@ -1225,10 +1226,8 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
     progress.complete_child("stage", "first", "first result")
 
     live_lines = [line.plain for line in progress._live_lines()]
-    assert any(line.startswith("✔ Parent: First") for line in live_lines)
+    assert "      ├ First    ✔ 0:01" in live_lines
     child_output = _terminal_text(stream.getvalue())
-    assert "├ " not in child_output
-    assert "└ " not in child_output
     assert "✔ First                  0:01  first result" not in (
         child_output.splitlines()
     )
@@ -1244,8 +1243,8 @@ def test_terminal_children_remain_live_until_parent_emits_ordered_tree(
 
     expected = [
         "✔ Parent                 0:03  parent result",
-        "├ ✔ First                  0:01  first result",
-        "└ ✖ Second                 0:02  second result",
+        "    ├ First    ✔ 0:01  first result",
+        "    └ Second   ✖ 0:02  second result",
     ]
     rendered = _terminal_text(stream.getvalue())
     assert all(rendered.count(line) == 1 for line in expected)
@@ -1416,8 +1415,10 @@ def test_rich_live_output_uses_bounded_dynamic_child_projection(
 
     assert "✔ Plan: Attempt 1" not in output
     assert "✔ Plan: Attempt 2" not in output
-    assert "✔ Plan: Attempt 3        —  retry · reused from earlier run" in output
-    assert "◦ Plan: Attempt 4" in output
+    assert (
+        "├ Attempt 3  ✔ —  retry · reused from earlier run" in output
+    )
+    assert "└ Attempt 4  ◦" in output
     assert "… 2 earlier attempts" in output
 
 
@@ -1441,7 +1442,7 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
         "⠋ Preparing run          0:00  thinking",
         "  ◦ Draft improvement PRDs",
         "",
-        "ctrl-c to stop",
+        "  ctrl-c to stop",
     ]
     assert "Draft improvement PRDs" in _terminal_text(stream.getvalue())
     assert progress.stages == {}
@@ -1451,9 +1452,9 @@ def test_tty_startup_projection_shows_named_pending_and_retires_on_start(
 
     adopted = [line.plain for line in progress._live_lines()]
     assert adopted == [
-        "⠋ Draft improvement PRDs  0:00  thinking",
+        "  ⠙ Draft improvement PRDs  0:00  thinking",
         "",
-        "ctrl-c to stop",
+        "  ctrl-c to stop",
     ]
     assert progress._projection_snapshot().cohort_keys == frozenset(
         {"improvement-prds"}
@@ -1549,14 +1550,14 @@ def test_projection_snapshot_is_frozen_and_stable_after_record_updates() -> None
     ]
     current_frame = [line.plain for line in progress._live_lines()]
     assert frozen_frame == [
-        "⠋ Stage                  0:00  thinking",
+        "  ⠙ Stage                  0:00  thinking",
         "",
-        "ctrl-c to stop",
+        "  ctrl-c to stop",
     ]
     assert current_frame == [
-        "⠋ Stage                  0:05  new work",
+        "  ⠙ Stage                  0:05  new work",
         "",
-        "ctrl-c to stop",
+        "  ctrl-c to stop",
     ]
     with pytest.raises(FrozenInstanceError):
         snapshot.cancelling = True
@@ -1606,7 +1607,7 @@ def test_outside_record_keeps_live_permanent_and_summary_participation() -> None
 
     progress.start("outside")
     assert [line.plain for line in progress._live_lines()][0].startswith(
-        "⠋ Outside"
+        "  ⠙ Outside"
     )
     progress.complete("outside", "kept")
     progress.close()
@@ -1631,16 +1632,16 @@ def test_projection_prioritizes_active_rows_and_bounds_work_plus_footer() -> Non
     pending_only_frame = [line.plain for line in progress._live_lines()]
     assert len(pending_only_frame) == 10
     assert pending_only_frame[-3] == "… 5 more pending"
-    assert pending_only_frame[-2:] == ["", "ctrl-c to stop"]
+    assert pending_only_frame[-2:] == ["", "  ctrl-c to stop"]
 
     progress.declare(StageSpec("active", "Active"))
     progress.start("active")
 
     named_frame = [line.plain for line in progress._live_lines()]
     assert len(named_frame) == 10
-    assert named_frame[0].startswith("⠋ Active")
+    assert named_frame[0].startswith("  ⠙ Active")
     assert named_frame[1] == "  ◦ Pending 0"
-    assert named_frame[-2:] == ["", "ctrl-c to stop"]
+    assert named_frame[-2:] == ["", "  ctrl-c to stop"]
 
     progress.preview_pending(previews[:9])
     for number in range(9):
@@ -1681,10 +1682,10 @@ def test_projection_prioritizes_later_active_stage_over_inactive_children() -> N
 
     frame = [line.plain for line in progress._live_lines()]
     assert len(frame) == 10
-    assert frame[0].startswith("⠋ First")
-    assert frame[1].startswith("⠋ Second")
+    assert frame[0].startswith("  ⠙ First")
+    assert frame[1].startswith("  ⠙ Second")
     assert frame[-3] == "… 2 more pending"
-    assert frame[-2:] == ["", "ctrl-c to stop"]
+    assert frame[-2:] == ["", "  ctrl-c to stop"]
 
 
 def test_four_dynamic_attempts_collapse_inside_ten_row_frame() -> None:
@@ -1857,9 +1858,9 @@ def test_ascii_stream_degrades_rows_dynamic_text_and_spacing() -> None:
     assert stream.getvalue().splitlines() == [
         "[OK] R\\xe9sum\\xe9                 0:03  na\\xefve \\u2615 "
         "- reused from earlier run",
-        "+- [OK] Caf\\xe9                   0:01  142 files - 1.8 MB "
+        "    +- Caf\\xe9     [OK] 0:01  142 files - 1.8 MB "
         "- reused from earlier run",
-        r"\- [OK] Jalape\xf1o               0:02  "
+        r"    \- Jalape\xf1o  [OK] 0:02  "
         "3 done - 2 running - 9 pending - reused from earlier run",
         "[X] Failed                 -  touch\\xe9 - reused from earlier run",
         "* Stopped                0:00  thinking",
