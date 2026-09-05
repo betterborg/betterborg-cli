@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -24,6 +25,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning import task_publication as publication_module
 from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repository_config import AgentStage, load_repository_config
 from betterborg_cli.repository_files import (
     RepositoryGitVisibilityError,
@@ -476,6 +478,95 @@ Extend the existing repository conventions and verify public behavior.
         assert tasks[0].manifest["approved_plan_digest"] == approval.plan_digest
         task_path = repository.root / generation.manifest["tasks"][0]["path"]
         assert task_path.is_file()
+
+
+def test_plan_approve_primary_error_survives_root_progress_close_failure(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    plan = planning_plan_response()
+    repository, _attempt, _paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "approval-close-failure",
+        plan,
+    )
+    primary_error = RuntimeError("decomposition provider unavailable")
+    project_manager = MockAdapter(name="openai").queue(
+        MockResponse(raise_error=primary_error)
+    )
+    supervisor = MockAdapter(name="openai")
+    configure_interactive_cli(
+        repository.root,
+        project_manager,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".approval-close-state",
+    )
+    _select_approval_agents(
+        monkeypatch,
+        project_manager=project_manager,
+        supervisor=supervisor,
+    )
+    close_error = RuntimeError("progress close failed")
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        stop_calls = 0
+
+        def close(self) -> None:
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(
+        ["plan", "approve", "approval-close-failure", "--yes"],
+        prog_name="betterborg",
+    )
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err.endswith(
+        "Run 'betterborg plan approve approval-close-failure' to resume.\n"
+    )
+    assert "decomposition provider unavailable" in captured.err
+    assert "progress close failed" not in captured.err
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert shown_errors[0].__cause__ is not None
+    assert shown_errors[0].__cause__.__cause__ is not None
+    assert shown_errors[0].__cause__.__cause__.__cause__ is primary_error
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["project-manager"].state is StageState.FAILED
+    assert progress.stages["supervisor"].state is StageState.PENDING
 
 
 def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(

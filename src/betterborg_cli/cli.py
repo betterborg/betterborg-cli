@@ -1087,18 +1087,12 @@ def execute_borg(
         result = workflow.host_result
     except (OSError, RuntimeError, ValueError, sqlite3.IntegrityError) as error:
         _reconcile_execution_estimate(progress, cancel, error)
-        if progress is not None:
-            progress.close()
         raise click.ClickException(str(error)) from error
     except (KeyboardInterrupt, click.Abort) as error:
         _reconcile_execution_estimate(progress, cancel, error)
-        if isinstance(error, click.Abort) and progress is not None:
-            progress.close()
         raise
 
     if result is None:
-        if progress is not None:
-            progress.close()
         raise click.Abort()
 
     follow_up_error: BaseException | None = None

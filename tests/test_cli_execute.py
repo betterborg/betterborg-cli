@@ -7,6 +7,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -448,6 +449,7 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
     planning_cli_repository,
     approved_task_generation,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     _repository, paths, borg, _approval, _fixture, _publication = (
         _seed_executable_generation(
@@ -465,23 +467,29 @@ def test_execute_declines_under_suspended_progress_without_invoking_host(
             "declined execution must not invoke the host"
         ),
     )
+    monkeypatch.setattr(sys, "stdin", StringIO("n\n"))
 
-    result = cli_runner.invoke(
-        cli,
+    def progress_factory(**kwargs: object) -> RunProgress:
+        return RunProgress(stream=sys.stdout, clock=FakeClock(), **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+
+    exit_code = cli_module.main(
         ["execute", "declined-execution"],
-        input="n\n",
+        prog_name="betterborg",
     )
 
-    assert result.exit_code == 1
-    assert "✔ Estimate and decision" in result.output
-    assert "declined" in result.output
-    assert result.output.index("[y/N]: n") < result.output.index(
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "✔ Estimate and decision" in captured.out
+    assert "declined" in captured.out
+    assert captured.out.index("[y/N]:") < captured.out.index(
         "✔ Estimate and decision"
     )
-    assert result.output.index("✔ Estimate and decision") < (
-        result.output.index(" finished in ")
+    assert captured.out.index("✔ Estimate and decision") < (
+        captured.out.index(" finished in ")
     )
-    assert "Aborted!" in result.output
+    assert captured.err == "Aborted!\n"
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.get_current_execution_decision(borg.id) is None
 
@@ -1515,6 +1523,85 @@ def test_failure_after_preflight_does_not_reclassify_preflight(
     assert "task setup failed" in result.output
     assert progress.stages["preflight"].state is StageState.COMPLETED
     assert progress.stages["preflight"].result == "ready"
+
+
+def test_execute_primary_error_survives_root_progress_close_failure(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    name = "close-failure-precedence"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    primary_error = RuntimeError("task setup failed")
+    close_error = RuntimeError("progress close failed")
+    progress_stream = StringIO()
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        close_calls = 0
+        stop_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(
+            stream=progress_stream,
+            clock=FakeClock(),
+            **kwargs,
+        )
+        reporters.append(progress)
+        return progress
+
+    def fail_after_preflight(*_args, progress=None, **_kwargs):
+        assert progress is reporters[0]
+        progress.complete("preflight", "ready")
+        raise primary_error
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "_invoke_host_execution", fail_after_preflight)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(
+        ["execute", name, "--auto-execute"],
+        prog_name="betterborg",
+    )
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    assert exit_code == 1
+    assert captured.err == "Error: task setup failed\n"
+    assert "progress close failed" not in captured.out + captured.err
+    assert shown_errors[0].__cause__ is primary_error
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert progress.close_calls == 1
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["estimate-decision"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].state is StageState.COMPLETED
 
 
 def test_push_option_publishes_completed_project_branch_non_force(

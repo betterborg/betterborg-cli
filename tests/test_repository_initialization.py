@@ -63,6 +63,77 @@ from betterborg_cli.store import (
 )
 
 
+def test_init_primary_error_survives_root_progress_close_failure(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    primary_error = RuntimeError("initialization bootstrap failed")
+    close_error = RuntimeError("progress close failed")
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    class CloseFailingProgress(RunProgress):
+        stop_calls = 0
+
+        def close(self) -> None:
+            raise close_error
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[CloseFailingProgress] = []
+
+    def progress_factory(**kwargs: object) -> CloseFailingProgress:
+        progress = CloseFailingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class FailingRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def initialize(self) -> None:
+            self.progress.declare(StageSpec("discover", "Discover evidence"))
+            self.progress.start("discover")
+            self.progress.fail("discover", str(primary_error))
+            self.progress.declare(StageSpec("analyze", "Analyze repository"))
+            raise primary_error
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(committed_git_repo.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module, "RepositoryService", FailingRepositoryService)
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+
+    exit_code = cli_module.main(["init", "--yes"], prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    progress = reporters[0]
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Error: initialization bootstrap failed\n"
+    assert shown_errors[0].__cause__ is primary_error
+    assert shown_errors[0].__notes__ == [
+        "progress finalization also failed: progress close failed"
+    ]
+    assert progress.stop_calls == 1
+    assert progress._cadence_worker is None
+    assert progress.stages["discover"].state is StageState.FAILED
+    assert progress.stages["analyze"].state is StageState.PENDING
+
+
 def _analysis_payload(
     *,
     score: int = 3,

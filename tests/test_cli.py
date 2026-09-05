@@ -1195,6 +1195,227 @@ def test_main_preserves_handled_error_when_progress_close_fails(
     assert reporters[0]._cadence_worker is None
 
 
+@pytest.mark.parametrize(
+    "command_name",
+    [
+        "analyze",
+        "create",
+        "init",
+        "plan-start",
+        "plan-change",
+        "plan-approve",
+        "execute",
+    ],
+)
+def test_real_agent_command_failure_is_finalized_by_main(
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    command_name: str,
+) -> None:
+    repository, _paths = initialized_cli_repository
+    primary_error = RuntimeError(f"{command_name} provider failed")
+    reporters: list[RunProgress] = []
+    shown_errors: list[click.ClickException] = []
+    original_show = click.ClickException.show
+
+    def progress_factory(**kwargs: object) -> RunProgress:
+        progress = RunProgress(clock=FakeClock(), **kwargs)
+        reporters.append(progress)
+        return progress
+
+    def fail_progress(progress: RunProgress) -> None:
+        progress.declare(StageSpec("failed", "Failed work"))
+        progress.start("failed")
+        progress.fail("failed", str(primary_error))
+        progress.declare(StageSpec("waiting", "Waiting"))
+        raise primary_error
+
+    class FailingService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def _fail(self) -> None:
+            fail_progress(self.progress)
+
+        def analyze(self) -> None:
+            self._fail()
+
+        def create(self, _name: str, _source: Path | None) -> None:
+            self._fail()
+
+        def initialize(self) -> None:
+            self._fail()
+
+    def capture_show(error: click.ClickException, *args, **kwargs) -> None:
+        shown_errors.append(error)
+        original_show(error, *args, **kwargs)
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(cli_module.click.ClickException, "show", capture_show)
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "select_agent", lambda *_args, **_kwargs: object())
+    arguments = ["analyze", "--yes"]
+    if command_name == "analyze":
+        monkeypatch.setattr(cli_module, "RepositoryService", FailingService)
+    else:
+        if command_name == "create":
+            monkeypatch.setattr(cli_module, "CreateService", FailingService)
+            arguments = ["create", "matrix", "--yes"]
+        elif command_name == "init":
+            monkeypatch.setattr(cli_module, "RepositoryService", FailingService)
+            arguments = ["init", "--yes"]
+        elif command_name in {"plan-start", "plan-change"}:
+
+            def fail_planning(*_args, **_kwargs) -> None:
+                try:
+                    fail_progress(reporters[0])
+                except RuntimeError as error:
+                    raise click.ClickException(str(error)) from error
+
+            monkeypatch.setattr(cli_module, "_continue_planning", fail_planning)
+            arguments = (
+                ["plan", "start", "matrix", "--yes"]
+                if command_name == "plan-start"
+                else [
+                    "plan",
+                    "change",
+                    "matrix",
+                    "--note",
+                    "Refine it",
+                    "--yes",
+                ]
+            )
+        elif command_name == "plan-approve":
+
+            def fail_approval(*_args, progress: RunProgress, **_kwargs) -> None:
+                fail_progress(progress)
+
+            monkeypatch.setattr(
+                cli_module, "approve_plan_workflow", fail_approval
+            )
+            arguments = ["plan", "approve", "matrix", "--yes"]
+        else:
+
+            def fail_execution(*_args, progress: RunProgress, **_kwargs) -> None:
+                progress.fail("estimate-decision", str(primary_error))
+                progress.declare(StageSpec("waiting", "Waiting"))
+                raise primary_error
+
+            monkeypatch.setattr(cli_module, "execute_workflow", fail_execution)
+            arguments = ["execute", "matrix", "--auto-execute"]
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    summary = "0 of 1 stage finished in 0:00; 1 failed and 0 stopped.\n"
+    error_bytes = f"Error: {command_name} provider failed\n"
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err.endswith(summary + error_bytes)
+    assert captured.err.count("stage finished in") == 1
+    assert shown_errors[0].__cause__ is primary_error
+    assert reporters[0].closed
+    assert reporters[0]._cadence_worker is None
+    assert reporters[0].stages["waiting"].state is StageState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("case", "arguments", "expected_error", "pending"),
+    [
+        (
+            "plan-show",
+            ["plan", "show", "missing"],
+            "Error: Borg 'missing' does not exist; run "
+            "'betterborg create missing' first\n",
+            False,
+        ),
+        (
+            "pre-service-create",
+            ["create", "Not-Kebab", "--yes"],
+            "Error: Borg name must use kebab-case lowercase letters and numbers\n",
+            False,
+        ),
+        (
+            "pending-analyze",
+            ["analyze", "--yes"],
+            "Error: analysis bootstrap failed\n",
+            True,
+        ),
+    ],
+)
+def test_real_no_work_errors_dispose_progress_without_summary(
+    initialized_cli_repository: tuple[Repository, RepoPaths],
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    case: str,
+    arguments: list[str],
+    expected_error: str,
+    pending: bool,
+) -> None:
+    repository, _paths = initialized_cli_repository
+
+    class RecordingProgress(RunProgress):
+        close_calls = 0
+        stop_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+        def stop_display(self) -> None:
+            self.stop_calls += 1
+            super().stop_display()
+
+    reporters: list[RecordingProgress] = []
+
+    def progress_factory(**kwargs: object) -> RecordingProgress:
+        progress = RecordingProgress(enabled=False, **kwargs)
+        reporters.append(progress)
+        return progress
+
+    class PendingFailingRepositoryService:
+        def __init__(self, *_args, progress: RunProgress, **_kwargs) -> None:
+            self.progress = progress
+
+        def analyze(self) -> None:
+            self.progress.declare(StageSpec("waiting", "Waiting"))
+            raise RuntimeError("analysis bootstrap failed")
+
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "machine-state")
+    )
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    monkeypatch.setattr(
+        cli_module, "require_workspace_trust", lambda *_args, **_kwargs: None
+    )
+    if case == "pending-analyze":
+        monkeypatch.setattr(
+            cli_module, "RepositoryService", PendingFailingRepositoryService
+        )
+
+    exit_code = cli_module.main(arguments, prog_name="betterborg")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == expected_error
+    assert reporters[0].close_calls == 0
+    assert reporters[0].stop_calls == 1
+    assert not reporters[0].closed
+    assert reporters[0]._cadence_worker is None
+    assert cli_module._progress_has_observed_work(reporters[0]) is False
+    assert bool(reporters[0].records) is pending
+
+
 @pytest.mark.parametrize("environment", [{}, {"NO_COLOR": "1"}, {"TERM": "dumb"}])
 def test_init_cli_suspends_root_progress_across_every_interactive_boundary(
     cli_runner: CliRunner,
