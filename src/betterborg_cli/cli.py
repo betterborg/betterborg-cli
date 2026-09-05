@@ -199,7 +199,7 @@ def _progress_for_invocation(
     *,
     machine_readable: bool,
 ) -> RunProgress | None:
-    """Construct the reporter selected for one classified root invocation."""
+    """Construct a human or display-disabled JSON reporter, but none for MCP."""
 
     if invocation.command_name == "mcp":
         return None

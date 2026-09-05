@@ -585,6 +585,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     monkeypatch: MonkeyPatch,
+    json_progress_probe,
 ) -> None:
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
@@ -616,6 +617,7 @@ def test_json_init_never_prompts_and_emits_exact_create_commands(
     assert result.output == json.dumps(
         expected, sort_keys=True, separators=(",", ":")
     ) + "\n"
+    json_progress_probe.assert_silent(expected_count=1)
     assert selected_interactivity == [False]
     assert paths.improvement_prds_dir.joinpath("theme-ci.md").is_file()
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -976,6 +978,7 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
     cli_runner: CliRunner,
     committed_git_repo: Path,
     monkeypatch: MonkeyPatch,
+    json_progress_probe,
 ) -> None:
     git_repo = committed_git_repo
     paths = RepoPaths.discover(git_repo)
@@ -1010,6 +1013,7 @@ def test_json_analyze_emits_current_previous_and_delta_without_prompting(
     assert result.output == json.dumps(
         expected, sort_keys=True, separators=(",", ":")
     ) + "\n"
+    json_progress_probe.assert_silent(expected_count=2)
     assert selected_interactivity == [False, False]
 
 

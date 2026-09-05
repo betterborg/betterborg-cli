@@ -403,6 +403,9 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     shown = cli_runner.invoke(cli, ["plan", "show", "approved-plan", "--json"])
     assert shown.exit_code == 0, shown.output
     assert json.loads(shown.output) == plan
+    assert shown.output == json.dumps(
+        plan, sort_keys=True, separators=(",", ":")
+    ) + "\n"
 
     result = cli_runner.invoke(cli, ["plan", "approve", "approved-plan", "--yes"])
 

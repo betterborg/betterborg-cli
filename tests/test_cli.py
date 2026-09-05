@@ -206,6 +206,52 @@ def test_main_selects_startup_projection_only_for_direct_human_init(
         assert "startup_pending" not in construction[0]
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["init", "--yes", "--json"],
+        ["analyze", "--yes", "--json"],
+        ["plan", "show", "example", "--json"],
+        ["task", "list", "example", "--json"],
+        ["task", "estimate", "example", "--json"],
+        ["task", "show", "example", "T-1", "--json"],
+    ),
+)
+def test_main_json_commands_never_allocate_a_display_or_change_report_bytes(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    json_progress_probe,
+    arguments: list[str],
+) -> None:
+    expected_report = '{"ok":true}\n'
+
+    class StubRoot:
+        def main(self, **kwargs: object) -> int:
+            run = kwargs["obj"]
+            assert isinstance(run, cli_module.CliRunContext)
+            assert run.progress is not None
+            run.progress.declare(StageSpec("json-work", "JSON work"))
+            run.progress.start("json-work")
+            assert run.progress._live is None
+            assert run.progress._cadence_worker is None
+            run.progress.complete("json-work", "ready")
+            cli_module._write_after_progress(
+                run.progress,
+                lambda: click.echo(expected_report, nl=False),
+            )
+            return 0
+
+    monkeypatch.setattr(cli_module, "cli", StubRoot())
+
+    assert cli_module.main(arguments, prog_name="betterborg") == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == expected_report
+    assert captured.err == ""
+    assert json_progress_probe.reporters[0].closed
+    json_progress_probe.assert_silent(expected_count=1)
+
+
 @pytest.mark.parametrize("root_dispatch", [False, True])
 def test_mcp_dispatch_never_constructs_progress(
     monkeypatch: MonkeyPatch,

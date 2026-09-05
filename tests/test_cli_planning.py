@@ -428,6 +428,9 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
 
     assert json_result.exit_code == 0, json_result.output
     assert json.loads(json_result.output) == plan
+    assert json_result.output == json.dumps(
+        plan, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     assert json_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
@@ -568,6 +571,9 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
 
     assert shown.exit_code == 0, shown.output
     assert json.loads(shown.output) == final_plan
+    assert shown.output == json.dumps(
+        final_plan, sort_keys=True, separators=(",", ":")
+    ) + "\n"
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert store.list_planning_attempts(borg.id) == attempts
         assert store.list_planning_findings(borg.id) == findings

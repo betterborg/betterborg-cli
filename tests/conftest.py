@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import pytest
 from click.testing import CliRunner
+from progress_test_support import TTYStringIO
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
@@ -34,7 +35,7 @@ from betterborg_cli.planning import (
     task_markdown_digest,
 )
 from betterborg_cli.prd_session import InteractiveIO
-from betterborg_cli.progress import AgentActivity
+from betterborg_cli.progress import AgentActivity, RunProgress
 from betterborg_cli.repo_analysis import DIMENSIONS
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -88,6 +89,42 @@ class RecordingProgress:
         self, stage_key: str, child_key: str, activity: AgentActivity
     ) -> None:
         self.child_activities.append((stage_key, child_key, activity))
+
+
+class ObservedJsonProgress(RunProgress):
+    """Record whether a machine-readable reporter ever allocated display state."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.live_region_created = False
+        self.cadence_worker_created = False
+        super().__init__(*args, **kwargs)
+
+    def _ensure_cadence_worker(self) -> None:
+        self.live_region_created |= self._live is not None
+        super()._ensure_cadence_worker()
+        self.cadence_worker_created |= self._cadence_worker is not None
+
+
+@dataclass
+class JsonProgressProbe:
+    """Collect machine-readable reporters and their diagnostic streams."""
+
+    reporters: list[ObservedJsonProgress] = field(default_factory=list)
+    streams: list[TTYStringIO] = field(default_factory=list)
+
+    def assert_silent(self, *, expected_count: int) -> None:
+        assert len(self.reporters) == expected_count
+        assert len(self.streams) == expected_count
+        assert all(not reporter.live_region_created for reporter in self.reporters)
+        assert all(
+            not reporter.cadence_worker_created for reporter in self.reporters
+        )
+        assert all(not reporter._enabled for reporter in self.reporters)
+        assert all(reporter._live is None for reporter in self.reporters)
+        assert all(
+            reporter._cadence_worker is None for reporter in self.reporters
+        )
+        assert all(stream.getvalue() == "" for stream in self.streams)
 
 
 def blocked_dns_url_request_worker(
@@ -557,6 +594,22 @@ def cli_runner() -> CliRunner:
 def recording_progress() -> RecordingProgress:
     """Return a progress recorder that understands only shared activity types."""
     return RecordingProgress()
+
+
+@pytest.fixture
+def json_progress_probe(monkeypatch: MonkeyPatch) -> JsonProgressProbe:
+    """Capture display allocation and diagnostic writes for JSON reporters."""
+    probe = JsonProgressProbe()
+
+    def progress_factory(**kwargs: Any) -> ObservedJsonProgress:
+        stream = TTYStringIO()
+        reporter = ObservedJsonProgress(stream=stream, **kwargs)
+        probe.streams.append(stream)
+        probe.reporters.append(reporter)
+        return reporter
+
+    monkeypatch.setattr(cli_module, "RunProgress", progress_factory)
+    return probe
 
 
 @pytest.fixture
