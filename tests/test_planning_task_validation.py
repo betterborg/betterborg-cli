@@ -272,6 +272,14 @@ def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
             *payload["tasks"][0]["plan_refs"],
             *payload["tasks"][1]["plan_refs"],
         }
+        # The same-stage ordering rule is enforced on the output, so the PM is
+        # told it before writing rather than discovering it by rejection: it
+        # constrains how stems are named, which is not recoverable by editing
+        # one dependency.
+        instruction = " ".join(spec.system_prompt.split())
+        assert "a task may depend only on a task whose stem sorts before" in (
+            instruction
+        )
         return payload
 
     adapter = MockAdapter(name="openai").queue(MockResponse(dynamic=complete_batch))

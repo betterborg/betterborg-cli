@@ -145,7 +145,9 @@ shippable coding tasks. Do not modify files. Every task must stand alone with a
 specific rationale, scope, notes, acceptance criteria, tests, dependencies,
 exclusions, plan references, and S/M/L complexity. Assign every required plan
 reference to exactly one task and use only dependency task identities present
-in this batch. Return only the required JSON object.
+in this batch. Within one stage, a task may depend only on a task whose stem
+sorts before its own, so number the stems of a stage in the order they must
+run. Return only the required JSON object.
 """
 
 
