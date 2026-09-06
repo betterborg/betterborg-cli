@@ -271,6 +271,19 @@ budget in `.betterborg/config.toml`:
 review_rounds = 5
 ```
 
+Decomposition has the same shape and the same knob. The Supervisor reviews the
+Project Manager's task batch, sends it back where it finds something wrong, and
+after its rounds a batch it still will not approve blocks with its findings
+kept. `decomposition_rounds` sets how many it gets:
+
+```toml
+[planning]
+decomposition_rounds = 5
+```
+
+Both are read when a run starts and govern that run. A plan or a batch that has
+already blocked stays blocked whatever the setting becomes afterwards.
+
 The value is a whole number of at least one, and anything else is refused when
 the configuration is read rather than part-way through a review. Each review
 is told the round it is on and the budget it has. Raising the budget buys

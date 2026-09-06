@@ -861,3 +861,55 @@ def test_plan_commands_remove_extra_gates_and_standalone_decomposition(
     assert "reject" not in result.output
     assert "decompose" not in result.output
     assert "task-approve" not in result.output
+
+
+def test_plan_approve_honors_the_repository_decomposition_budget(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+) -> None:
+    """Three rounds is what a project gets by default, not what it must take.
+
+    A repository that wants its Supervisor to give up sooner, or to keep
+    working a batch it is steadily converging on, sets the number itself.
+    """
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo, planning_cli_repository, "budgeted-tasks", plan
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\ndecomposition_rounds = 1\n",
+        encoding="utf-8",
+    )
+    adapter = MockAdapter(name="openai")
+    for response in (
+        _pm_tasks(plan),
+        _review("request_changes", "The only round is incomplete."),
+    ):
+        adapter.queue(MockResponse(payload=response))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".budgeted-tasks-state",
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "approve", "budgeted-tasks", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Task decomposition blocked" in result.output
+    # One review, not the three the default would have spent.
+    assert len(adapter.calls) == 2
+    assert "in round 1 of 1." in adapter.calls[-1].user_prompt
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "budgeted-tasks")
+        assert borg is not None
+        assert borg.state is BorgState.BLOCKED

@@ -292,6 +292,18 @@ default_branch = "main"
         ("review_rounds = 0", "planning.review_rounds must be at least 1"),
         ("review_rounds = -1", "planning.review_rounds must be at least 1"),
         ("review_rounds = 1.5", "planning.review_rounds must be an integer"),
+        (
+            "decomposition_rounds = 0",
+            "planning.decomposition_rounds must be at least 1",
+        ),
+        (
+            "decomposition_rounds = -1",
+            "planning.decomposition_rounds must be at least 1",
+        ),
+        (
+            "decomposition_rounds = 1.5",
+            "planning.decomposition_rounds must be an integer",
+        ),
     ],
 )
 def test_rejects_planning_budgets_that_are_not_whole_and_positive(
@@ -361,3 +373,30 @@ default_branch = "main"
 
     with pytest.raises(RepositoryConfigError, match=message):
         load_repository_config(paths)
+
+
+def test_loads_the_decomposition_round_budget(git_repo: Path) -> None:
+    """The Supervisor's revisions are a project's decision too."""
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[planning]
+decomposition_rounds = 6
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.planning == PlanningLimits(decomposition_rounds=6)
+
+
+def test_unconfigured_repository_keeps_the_default_decomposition_budget() -> None:
+    from betterborg_cli.planning import SUPERVISOR_ROUND_CAP
+
+    assert PlanningLimits().decomposition_rounds == SUPERVISOR_ROUND_CAP

@@ -105,6 +105,7 @@ class PlanningLimits:
     """Repository defaults that bound repeated planning review."""
 
     review_rounds: int = 3
+    decomposition_rounds: int = 3
 
 
 @dataclass(frozen=True)
@@ -271,12 +272,23 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
 
     planning_document = _optional_table(document, "planning")
-    _require_only_keys(planning_document, {"review_rounds"}, section="planning")
+    _require_only_keys(
+        planning_document,
+        {"review_rounds", "decomposition_rounds"},
+        section="planning",
+    )
     review_rounds = _optional_int(
         planning_document, "review_rounds", default=3, section="planning"
     )
     if review_rounds < 1:
         raise RepositoryConfigError("planning.review_rounds must be at least 1")
+    decomposition_rounds = _optional_int(
+        planning_document, "decomposition_rounds", default=3, section="planning"
+    )
+    if decomposition_rounds < 1:
+        raise RepositoryConfigError(
+            "planning.decomposition_rounds must be at least 1"
+        )
 
     return RepositoryConfig(
         version=version,
@@ -284,7 +296,10 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         default_branch=default_branch,
         agents=AgentChoices(**agent_choices),
         execution=ExecutionLimits(jobs=jobs, review_passes=review_passes),
-        planning=PlanningLimits(review_rounds=review_rounds),
+        planning=PlanningLimits(
+            review_rounds=review_rounds,
+            decomposition_rounds=decomposition_rounds,
+        ),
     )
 
 

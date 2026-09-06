@@ -963,3 +963,53 @@ another route is preflight's to catch, where the checkout is known.
 - A catalogued command naming a relative directory is accepted.
 
 **Status**: Complete
+
+
+## Stage 17: A project decides how many revisions its task batches get
+
+**Goal**: The number of times the Supervisor may send a task batch back is a
+project's decision, on the same terms the Tech Lead's reviews already are.
+
+Decomposition has the shape planning has. The Project Manager writes a batch,
+the Supervisor reviews it, and where it finds something wrong the batch is
+revised and reviewed again. After three rounds a batch it still will not
+approve blocks, which is right for the same reason it is right one stage
+earlier: publishing tasks the reviewer rejects is the erosion that having a
+reviewer prevents. Three being the only answer is wrong for the same reason
+too, and a project large enough to want more rounds of one wants more of the
+other.
+
+So it is the same knob, in the same table, read the same way: `[planning]
+decomposition_rounds`, defaulting to what decomposition does today. The budget
+is read when a run starts and governs that run; a batch that has already
+blocked stays blocked whatever the setting becomes.
+
+The three rules the review budget already settled hold here unchanged, because
+they are properties of reading a record rather than of what the record is
+about. Whether a rejection revised or blocked was settled when it completed, so
+the record is not re-judged against a budget raised since. A revision already
+under way outlives a budget lowered beneath it, and the round it leads to is
+the last one rather than a number its budget contradicts. And the rejection
+that blocked never revises, so it declares no revision to reconstruct.
+
+**Success Criteria**:
+- A repository can set the number of Supervisor review rounds its batches get.
+- With nothing set, decomposition behaves exactly as it does today.
+- A batch still unapproved when the budget runs out still blocks, with its
+  findings preserved.
+- A blocked batch re-entered later reports what the record holds, whatever the
+  budget has since become.
+- A round past its budget is named the final round.
+- A budget below one, or not a whole number, is refused when configuration is
+  loaded, and by the loop that is handed one directly.
+
+**Tests**:
+- An unset budget leaves the number of rounds exactly as it is today.
+- A lowered budget blocks on its only round, and the round says so.
+- The configured budget reaches decomposition through `plan approve`.
+- A blocked batch re-entered with a raised budget reports the same result and
+  reviews nothing further.
+- A budget of zero, a negative one, and a fractional one are each refused with
+  a message naming the setting.
+
+**Status**: Complete

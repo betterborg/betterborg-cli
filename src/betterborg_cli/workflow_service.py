@@ -141,6 +141,7 @@ def approve_plan_workflow(
                 plan_approval=approval,
                 cancel=cancel,
                 progress=progress,
+                review_rounds=config.planning.decomposition_rounds,
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication

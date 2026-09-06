@@ -2211,3 +2211,119 @@ def test_moving_duplicate_dependency_to_another_edge_is_not_progress() -> None:
     ]
     with pytest.raises(NonProgressingTaskRepairError):
         validate_task_repair_progress(previous, repaired)
+
+
+def test_a_lowered_decomposition_budget_blocks_on_its_only_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Three rounds is a default, not the only answer a project may give."""
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-lowered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-lowered"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm_result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+
+        result = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=1,
+        ).run()
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert len(supervisor.calls) == 1
+        assert "in round 1 of 1." in supervisor.calls[0].user_prompt
+        assert store.list_task_findings(borg.id)
+
+
+def test_a_blocked_decomposition_reports_its_record_under_any_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Whether a rejection revised or blocked was settled when it completed.
+
+    Counting the record against a number raised since would deny the plainly
+    terminal record and answer with an error naming a state.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-blocked-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-blocked-raised"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm_result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+        first = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=1,
+        ).run()
+        assert first.borg.state is BorgState.BLOCKED
+
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        again = SupervisorLoop(
+            repository,
+            blocked,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=5,
+            progress=RunProgress(stream=StringIO()),
+        ).run()
+
+        assert again.borg.state is BorgState.BLOCKED
+        assert len(supervisor.calls) == 1
+
+
+def test_a_decomposition_budget_below_one_is_refused_at_construction(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-zero-budget.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-zero-budget"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(SupervisorError, match="at least 1"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                review_rounds=0,
+            )
