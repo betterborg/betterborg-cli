@@ -2795,3 +2795,64 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
     assert result.status == payload_status
     assert result.data.reason is not None
     assert "missing-runtime" in result.data.reason
+
+
+def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    monkeypatch,
+) -> None:
+    """Blocked is where the findings matter, and MCP has no terminal to print to.
+
+    A caller told only that its plan is blocked, with nothing said and nothing
+    to call, is in exactly the state keeping the findings exists to prevent.
+    """
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-blocked")
+    architect = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(),
+        planning_plan_response(summary="Clarify rollback behavior."),
+        planning_plan_response(summary="Name the rollback checks."),
+    ):
+        architect.queue(MockResponse(payload=payload))
+    tech_lead = MockAdapter(name="openai")
+    for message in (
+        "Clarify rollback behavior.",
+        "Name the rollback checks.",
+        "Cover a partial rollback.",
+    ):
+        tech_lead.queue(MockResponse(payload=tech_lead_change_request_response(message)))
+
+    def select(_config, stage, _paths, **_kwargs):
+        return {AgentStage.ARCHITECT: architect, AgentStage.TECH_LEAD: tech_lead}[stage]
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None, cancel=None: paths
+    )
+    monkeypatch.setattr(cli_module, "select_agent", select)
+
+    started = _structured(
+        _call_tool("plan", {"name": "mcp-blocked", "action": "start"})
+    )
+    shown = _structured(
+        _call_tool("plan", {"name": "mcp-blocked", "action": "show"})
+    )
+
+    assert started["status"] == BorgState.BLOCKED.value
+    assert shown["status"] == BorgState.BLOCKED.value
+    assert [
+        finding["message"] for finding in shown["data"]["findings"]
+    ] == [
+        "Clarify rollback behavior.",
+        "Name the rollback checks.",
+        "Cover a partial rollback.",
+    ]
+    assert [finding["round"] for finding in shown["data"]["findings"]] == [1, 2, 3]
+    # And the caller is told which call reaches them.
+    assert [
+        action["arguments"]["action"] for action in started["next_actions"]
+    ] == ["show"]

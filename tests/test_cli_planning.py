@@ -421,6 +421,23 @@ def test_plan_start_reports_review_cap_as_blocked(
         assert borg.state is BorgState.BLOCKED
         assert len(store.list_planning_findings(borg.id)) == 3
 
+    # Keeping the findings is worth something only where the run said to read
+    # them, so the command it named shows every one of them.
+    shown = cli_runner.invoke(cli, ["plan", "show", "blocked-plan"])
+
+    assert shown.exit_code == 0, shown.output
+    assert "## Tech Lead findings" in shown.output
+    for round_number, message in enumerate(
+        (
+            "Clarify rollback behavior.",
+            "Name the rollback checks.",
+            "Cover a partial rollback.",
+        ),
+        start=1,
+    ):
+        assert f"- Round {round_number} " in shown.output
+        assert message in shown.output
+
 
 def test_plan_start_honors_the_repository_review_round_budget(
     cli_runner: CliRunner,

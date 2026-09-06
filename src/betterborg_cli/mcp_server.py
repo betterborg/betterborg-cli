@@ -33,6 +33,7 @@ from betterborg_cli.repository_config import (
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
+    Borg,
     BorgState,
     ExecutionEvent,
     ExecutionRunStatus,
@@ -226,9 +227,17 @@ class PlanProgressData(ProtocolModel):
     questions: tuple[PlanningQuestionData, ...]
 
 
+class PlanFindingData(ProtocolModel):
+    round: int
+    severity: str
+    message: str
+    suggestion: str | None = None
+
+
 class PlanShowData(ProtocolModel):
     borg: str
     plan: PlanDocument
+    findings: tuple[PlanFindingData, ...] = ()
 
 
 class PlanApprovalData(ProtocolModel):
@@ -1335,9 +1344,38 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
     return borg, questions
 
 
+def _plan_findings(
+    store: SqliteStore, borg: Borg
+) -> tuple[PlanFindingData, ...]:
+    """Return the Tech Lead findings standing against this Borg's plan.
+
+    A blocked plan keeps them, and a headless caller has no terminal to read
+    them in, so they travel in the payload the way the drop summary does.
+    """
+
+    return tuple(
+        PlanFindingData(
+            round=finding.round,
+            severity=finding.severity,
+            message=finding.message,
+            suggestion=finding.suggestion,
+        )
+        for finding in store.list_planning_findings(borg.id)
+    )
+
+
 def _plan_actions(
     name: str, state: BorgState
 ) -> tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]:
+    if state is BorgState.BLOCKED:
+        # Blocked is where the findings matter most, and the terminal names a
+        # command to read them with. The headless caller gets the same one.
+        return (
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="show"),
+            ),
+        )
     if state is BorgState.PLAN_APPROVAL_PENDING:
         return (
             PlanNextAction(
@@ -1412,6 +1450,7 @@ def _plan(
         borg, _questions = _planning_state(paths, name)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             attempt = validated_current_plan_attempt(paths, store, borg)
+            approval_findings = _plan_findings(store, borg)
         plan_document = PlanDocument.model_validate(attempt.result)
         io.write(json.dumps(attempt.result, indent=2, sort_keys=True))
         if not io.confirm(
@@ -1421,7 +1460,11 @@ def _plan(
             return PlanResult(
                 status=borg.state,
                 next_actions=_plan_actions(name, borg.state),
-                data=PlanShowData(borg=name, plan=plan_document),
+                data=PlanShowData(
+                    borg=name,
+                    plan=plan_document,
+                    findings=approval_findings,
+                ),
             )
         borg, approval, plan_path, publication = _approve_plan(
             paths,
@@ -1456,12 +1499,14 @@ def _plan(
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")
             attempt = validated_current_plan_attempt(paths, store, borg)
+            findings = _plan_findings(store, borg)
         return PlanResult(
             status=borg.state,
             next_actions=_plan_actions(name, borg.state),
             data=PlanShowData(
                 borg=name,
                 plan=PlanDocument.model_validate(attempt.result),
+                findings=findings,
             ),
         )
 

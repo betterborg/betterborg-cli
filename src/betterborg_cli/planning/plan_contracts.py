@@ -408,10 +408,11 @@ def render_planning_findings_markdown(findings: Sequence[Any]) -> str:
     lines = ["## Tech Lead findings", ""]
     for finding in findings:
         lines.append(
-            f"- Round {finding.round} ({finding.severity}): {finding.message}"
+            f"- Round {finding.round} ({markdown_text(finding.severity)}): "
+            f"{markdown_text(finding.message)}"
         )
         if finding.suggestion:
-            lines.append(f"  - Suggestion: {finding.suggestion}")
+            lines.append(f"  - Suggestion: {markdown_text(finding.suggestion)}")
     lines.append("")
     return "\n".join(lines)
 

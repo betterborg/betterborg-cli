@@ -12,6 +12,7 @@ from betterborg_cli.planning import (
     PlanValidationError,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     validate_plan,
     validate_plan_json,
 )
@@ -617,3 +618,35 @@ def _multi_repository_plan() -> dict:
         }
     )
     return plan
+
+
+def test_a_finding_is_agent_text_and_is_escaped_like_the_rest_of_the_plan() -> None:
+    """A finding is free-form model output rendered into a Markdown document.
+
+    Left unescaped it can open a heading, break the list it belongs to, or
+    close a code span, so the account a reader gets of why a plan blocked is
+    not the account the reviewer wrote.
+    """
+    from uuid import uuid4
+
+    from betterborg_cli.store import PlanningFinding
+
+    finding = PlanningFinding(
+        borg_id=uuid4(),
+        attempt_id=uuid4(),
+        round=1,
+        severity="major",
+        message="Phase 1 is underspecified:\n- name the rollback checks\n# heading",
+        suggestion="use `make test`",
+    )
+
+    rendered = render_planning_findings_markdown([finding])
+
+    body = rendered.splitlines()
+    assert body[0] == "## Tech Lead findings"
+    entries = [line for line in body if line.startswith("- Round ")]
+    assert len(entries) == 1
+    assert "\n" not in entries[0]
+    # Escaped, so neither opens a heading nor closes a code span.
+    assert "\\# heading" in rendered
+    assert "\\`make test\\`" in rendered

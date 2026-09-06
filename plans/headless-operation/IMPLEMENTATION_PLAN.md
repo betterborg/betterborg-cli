@@ -806,7 +806,10 @@ agreement, never agreement itself.
 
 Blocking keeps the findings, and keeping them is worth something only if a
 reader can reach them, so the command the run names for reading them shows
-them. A revision already under way outlives a budget lowered beneath it, and
+them, on the surface a person reads and on the one a program calls: a headless
+caller is handed the findings and the call that reaches them, having no
+terminal to be told in. They are the reviewer's own words rendered into a
+document, so they are escaped like everything else the plan carries. A revision already under way outlives a budget lowered beneath it, and
 the round it leads to is the last one: that is what the reviewer is told, since
 a round numbered past its own budget describes nothing it can use.
 
@@ -814,7 +817,9 @@ a round numbered past its own budget describes nothing it can use.
 - A repository can set the number of Tech Lead review rounds its plans get.
 - With nothing set, planning behaves exactly as it does today.
 - A plan still unapproved when the budget runs out still blocks, with its
-  findings preserved, readable, and the run resumable.
+  findings preserved, readable on every surface that reports the block, and
+  the run resumable.
+- A surface reporting a block names the call that reaches the findings.
 - A blocked plan re-entered later reports what the record holds, whatever the
   budget has since become, and reconstructs its progress rather than raising.
 - The budget is reported where a reader can see which round they are in, and a
@@ -829,7 +834,9 @@ a round numbered past its own budget describes nothing it can use.
   approval on the later round completes planning.
 - A lowered budget blocks sooner.
 - A plan unapproved at the budget blocks with its findings intact, and showing
-  the plan shows them.
+  the plan shows them; a headless caller is handed the same findings and a
+  call that reaches them.
+- A finding carrying Markdown of its own renders as text, not as structure.
 - A blocked plan re-entered with a raised budget reports the same result and
   reviews nothing further; one re-entered with progress attached reconstructs
   the revisions that ran.
