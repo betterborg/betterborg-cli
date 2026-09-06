@@ -604,7 +604,7 @@ class ArchitectLoop:
                 rejected_plan = payload
                 continue
 
-            unnamed = self._unnamed_assumptions(named_assumptions, current_plan)
+            unnamed = self._unnamed_assumptions(named_assumptions)
             if unnamed and not assumptions_asked:
                 # One ask, not a budget. A plan turn is the most expensive
                 # thing this loop does, and the fallback below is a fair
@@ -1074,9 +1074,7 @@ class ArchitectLoop:
             return {**plan, "assumptions": assumptions}
         return dict(plan)
 
-    def _unnamed_assumptions(
-        self, named: bool, superseded: PlanningAttempt | None
-    ) -> list[dict[str, str]]:
+    def _unnamed_assumptions(self, named: bool) -> list[dict[str, str]]:
         """Return the decisions on record that the plan failed to name.
 
         Silence is the one thing the record can still catch. It cannot say
@@ -1086,11 +1084,23 @@ class ArchitectLoop:
         """
         if not self.unattended or named:
             return []
-        # Only rounds the standing plan could not have accounted for. A plan
-        # that spoke settled everything decided before it, so asking again
-        # about those would replace its account with a poorer one.
+        # Bounded by the last plan that spoke, not the last that completed.
+        # Only a plan naming assumptions accounted for what came before it,
+        # and a plan turn that raised open questions completes without ever
+        # being asked to. Measuring from that one would carry the boundary
+        # past decisions no plan has named, and no later window would reach
+        # back for them.
+        spoke = next(
+            (
+                attempt
+                for attempt in reversed(self._turns.attempts(_PLAN_PHASE))
+                if attempt.status is PlanningAttemptStatus.COMPLETED
+                and self._names_assumptions(attempt.result or {})
+            ),
+            None,
+        )
         return self._recorded_assumptions(
-            since=superseded.finished_at if superseded is not None else None
+            since=spoke.finished_at if spoke is not None else None
         )
 
     def _recorded_assumptions(

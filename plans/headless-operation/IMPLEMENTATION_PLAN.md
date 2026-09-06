@@ -574,6 +574,11 @@ plan that already spoke has accounted for everything decided before it.
 Publishing the record over such a plan would delete the assumptions it named
 that no round produced, and reinstate ones a later plan retired.
 
+Spoke, not merely finished. A plan turn that raises open questions completes on
+its way to having them answered, without being asked to name anything, so it
+accounts for nothing. Measured from that one, the boundary would move past
+decisions no plan has named and no later window would reach back for them.
+
 Silence is what the plan itself said, not what it was handed. A plan naming
 none of its own inherits the list the plan it supersedes carried, and judging
 it after that arrives would find a list there and count it as having spoken, so
@@ -645,6 +650,8 @@ command never built itself, and it decides on the same terms as the rest.
   twice keeps what it stands on and gains the rounds answered since.
 - A plan that already spoke is not asked again, and a retirement it made is not
   reinstated by the plan after it.
+- A plan that only raised questions does not close the window over the
+  decisions answered before it.
 - The record retires a question a person answered before it is published, and
   an attended run is never asked to name assumptions at all.
 - A plan naming an empty list retires what it inherits, and one that says

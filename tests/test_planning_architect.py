@@ -1139,6 +1139,82 @@ def test_a_retirement_survives_the_revision_after_it(
         assert "## Assumptions" not in render_plan_markdown(result.plan)
 
 
+def test_a_plan_that_only_raised_questions_does_not_close_the_window(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A plan turn that raised open questions never got asked to speak.
+
+    It completes on its way to having its own question answered, without the
+    ask and without the fallback, so it accounts for nothing. Measuring the
+    record from it would carry the boundary past decisions no plan has named,
+    and no later window would reach back for them.
+    """
+    raising = dict(_plan())
+    raising["open_questions"] = ["Which rollback strategy should be used?"]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={"answers": [{"q_id": "q1", "answer": "Linux and macOS."}]}
+        )
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=raising))
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [
+                    {"q_id": "q1", "answer": "Retry twice, then roll back."}
+                ]
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-window.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "window"
+        )
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        # Both decisions this run made, neither stranded behind a plan that
+        # never spoke about either of them.
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Which platforms are required?",
+                "assumption": "Linux and macOS.",
+            },
+            {
+                "question": "Which rollback strategy should be used?",
+                "assumption": "Retry twice, then roll back.",
+            },
+        ]
+        correction = " ".join(adapter.calls[-1].user_prompt.split())
+        assert "Which platforms are required?" in correction
+
+
 def test_the_last_resort_adds_to_what_the_plan_already_stands_on(
     committed_git_repo: Path,
     persist_planning_context,
