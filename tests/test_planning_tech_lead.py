@@ -660,6 +660,91 @@ def test_a_revision_that_names_its_assumptions_replaces_them_rather_than_adding(
     ]
 
 
+def test_two_question_raising_revisions_strand_no_decision(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A stored plan's assumptions key does not say who wrote it.
+
+    Every payload passes through the merge before it is stored, so a plan that
+    named nothing still holds what it inherited. Reading that as having spoken
+    would let each question-raising revision close the window over the answer
+    the one before it produced, and those decisions would reach neither the
+    correction nor the published plan.
+    """
+    initial = planning_plan_response()
+    initial["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    first_questions = planning_plan_response(summary="Stage the rollout.")
+    first_questions["open_questions"] = ["Which rollback strategy should be used?"]
+    second_questions = planning_plan_response(summary="Stage it again.")
+    second_questions["open_questions"] = ["Which changelog format is required?"]
+    silent = planning_plan_response(summary="Address the finding.")
+    assert "assumptions" not in silent
+
+    database = committed_git_repo.parent / "tech-lead-two-question-plans.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "two-question-plans"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=first_questions))
+        architect.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": "Retry twice, then roll back."}
+                    ]
+                }
+            )
+        )
+        architect.queue(MockResponse(payload=second_questions))
+        architect.queue(
+            MockResponse(
+                payload={"answers": [{"q_id": "q1", "answer": "Keep a Changelog."}]}
+            )
+        )
+        architect.queue(MockResponse(payload=silent))
+        architect.queue(MockResponse(payload=silent))
+
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    published = {
+        item["assumption"] for item in resumed.plan.get("assumptions", [])
+    }
+    assert "Retry twice, then roll back." in published
+    assert "Keep a Changelog." in published
+
+
 def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
     committed_git_repo: Path,
     persist_planning_context,

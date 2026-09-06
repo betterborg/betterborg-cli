@@ -1090,11 +1090,18 @@ class ArchitectLoop:
         # being asked to. Measuring from that one would carry the boundary
         # past decisions no plan has named, and no later window would reach
         # back for them.
+        # A stored plan's assumptions key does not say who wrote it: every
+        # payload passes through the merge before it is stored, so one that
+        # named nothing of its own still holds what it inherited. What does
+        # distinguish them durably is the open questions: a plan turn that
+        # raised any completed on its way to having them answered and was
+        # never asked to name anything, so it accounts for nothing.
         spoke = next(
             (
                 attempt
                 for attempt in reversed(self._turns.attempts(_PLAN_PHASE))
                 if attempt.status is PlanningAttemptStatus.COMPLETED
+                and not self._plan_open_questions(attempt.result)
                 and self._names_assumptions(attempt.result or {})
             ),
             None,
