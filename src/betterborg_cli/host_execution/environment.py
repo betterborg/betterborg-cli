@@ -993,8 +993,16 @@ class HostEnvironmentManager:
     def _materialization_marker(self, worktree: Path) -> Path:
         marker = materialization_marker(self._paths, worktree)
         if not self._paths.tracked_in_repository:
-            # The marker is outside every checkout, so no ignore rule of the
-            # repository's has anything to say about it.
+            # No ignore rule of the repository's has anything to say about a
+            # marker outside every checkout, but it still has to be somewhere
+            # Betterborg owns: a symlinked marker directory pointing back into
+            # the repository would put the file in the working tree that the
+            # relocation exists to keep empty.
+            parent = marker.parent.resolve()
+            if not parent.is_relative_to(self._paths.tracked_dir.resolve()):
+                raise EnvironmentMaterializationError(
+                    "environment marker escapes the tracked directory"
+                )
             return marker
         parent = marker.parent.resolve()
         if not parent.is_relative_to(worktree.resolve()):

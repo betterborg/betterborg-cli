@@ -23,6 +23,7 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.host_execution import (
+    EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
     HostEnvironmentManager,
@@ -718,6 +719,34 @@ def test_missing_relocated_materialization_marker_blocks_before_invocation(
     assert status is TaskRuntimeStatus.BLOCKED
     assert blocked is not None and "marker is missing" in blocked.state_reason
     assert adapter.calls == []
+
+
+def test_a_marker_directory_outside_the_tracked_one_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The marker still has to sit somewhere Betterborg owns.
+
+    Outside every checkout, no ignore rule of the repository's governs it, so
+    the ignore guard no longer applies. What remains is that the directory
+    holding it must not lead somewhere else, which is how it would end up
+    back in the working tree the relocation exists to keep empty.
+    """
+    home = tmp_path / "betterborg-home"
+    (home / "state").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (home / "state/environment-markers").symlink_to(
+        elsewhere, target_is_directory=True
+    )
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+
+    with pytest.raises(
+        EnvironmentMaterializationError, match="escapes the tracked directory"
+    ):
+        _coding_fixture(tmp_path)
+
+    assert list(elsewhere.iterdir()) == []
 
 
 def test_a_fresh_worktree_does_not_inherit_the_marker_it_replaces(

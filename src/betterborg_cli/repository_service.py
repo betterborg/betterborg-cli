@@ -240,12 +240,15 @@ class RepositoryService:
     ) -> tuple[Repository, RepositoryConfig, AnalysisAgent | None]:
         config_path = self.paths.tracked_dir / CONFIG_FILENAME
         bootstrap_agent = None
+        # Claimed before anything is written. A home already bound to another
+        # repository refuses this one, and a refusal that had already replaced
+        # the configuration would take the first repository's home with it.
+        bind_tracked_directory(self.paths)
         if not config_path.exists():
             bootstrap_agent = self._write_initial_config(
                 Repository(root=self.paths.root)
             )
         config = load_repository_config(self.paths)
-        bind_tracked_directory(self.paths)
         repository = Repository(root=self.paths.root, id=config.repository_id)
 
         stored = self.store.get_repository(repository.id)

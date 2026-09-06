@@ -512,7 +512,7 @@ configuration is refused rather than quietly shared between them.
 - A relocated directory pointing inside the repository fails and says why.
 - A relocated directory belonging to another repository fails and says why.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 12: An unattended run decides rather than stopping
 
