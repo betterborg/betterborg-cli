@@ -35,9 +35,16 @@ which is the right instinct and the correct thing to do with a terminal in
 front of it. Unattended there is nobody to answer, so a run that read its
 repository carefully and reasoned well stops anyway, on its best work.
 
+Finally, a run that plans and decomposes without a terminal still cannot
+execute anywhere but the machine the repository was written on. Preflight reads
+the analyzer's description of the repository as a list of things this run must
+have: every command found anywhere in it, every toolchain any file implies,
+every secret any workflow names. A container built to run one task is refused
+over tools nothing in the run would ever invoke.
+
 Together these block every unattended use, and spoil the output of the runs
 that do finish: CI, cron, a queue worker, and a benchmark container. The work
-here is twelve independent changes, each closing one of them.
+here is thirteen independent changes, each closing one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -657,5 +664,72 @@ command never built itself, and it decides on the same terms as the rest.
   cycle begins with its budget restored.
 - A plan changed unattended, and a plan the review sends back, both assume the
   questions their revisions raise.
+
+**Status**: Not Started
+
+## Stage 13: Preflight requires what the run will use
+
+**Goal**: A run is refused for what it is about to do, not for everything the
+repository has ever been able to do.
+
+The analyzer describes a repository: the commands it found, the toolchains its
+files imply, the secrets its workflows name. Preflight reads that description
+as this run's requirements and refuses when the host cannot satisfy all of it.
+On the machine the repository was written on the two are nearly the same thing,
+and the refusal is a real service: a missing tool found at preflight is a run
+that would have failed later, further in, having spent more. Somewhere else
+they are not the same thing at all, and the refusal is over tools nothing in
+the run would invoke.
+
+Three different things are being required, and only one of them is used.
+
+The toolchains and package managers are an inventory, not a command list. They
+are resolved by looking for an executable of the same name, but nothing ever
+said the name was an executable: the analyzer writes them for a person to read,
+and "Go modules" and "Node.js" name no program. The inventory also adds no
+coverage, because every command that runs already requires the program it
+invokes. It stops being a source of requirements.
+
+The commands are used, and requiring what they invoke is right. What changes is
+the answer when the host cannot invoke one: the command is dropped from the run
+and recorded as dropped, rather than the run being refused. This is the trade
+the stage makes, and it is a real one. Sanity is how a task proves it did not
+break the repository, so a check that does not run is a check that cannot fail,
+and dropping the wrong one lets a bad change through. What makes it the better
+side of the trade is that the alternative is not a stricter run but no run at
+all, and that dropping is only tolerable while it is visible: every dropped
+command is named in the preflight result and in the sanity result of every task
+that would have run it, so a green run that skipped its tests cannot be
+mistaken for a green run that passed them.
+
+The secrets follow the commands. One a workflow names but no command that runs
+asks for is not this run's requirement. And a secret named twice is only
+ambiguous when the two records disagree; refusing a repetition that says the
+same thing twice refuses over nothing.
+
+**Success Criteria**:
+- A host missing a program that only the toolchain inventory named runs, and
+  is not refused.
+- A host missing a program a catalogued command invokes runs, that command is
+  dropped rather than the run refused, and the drop is named in the preflight
+  result and in each affected task's sanity result.
+- A secret no command that will run requires does not block the run.
+- A secret named more than once blocks only when the records disagree.
+- A host that can satisfy everything behaves exactly as it does today,
+  including running every catalogued command.
+- Nothing is dropped silently: a run that dropped a command can be told apart
+  from one that ran it, without reading a log.
+
+**Tests**:
+- A toolchain the analyzer named for a person, with no executable of that name,
+  does not block a run.
+- A command whose program is missing is dropped, named in the result, and
+  named in the sanity result of a task that would have run it.
+- The commands that can run still run, and still fail the task when they fail.
+- A secret required only by a dropped command does not block the run.
+- Identical repeated secret records are accepted; conflicting ones are refused
+  and say what disagrees.
+- With every program present and every secret configured, the plan preflight
+  produces is unchanged.
 
 **Status**: Not Started
