@@ -691,6 +691,8 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         ]
         return requested_plan
 
+    # A change opens a new planning cycle, and a cycle starts by asking.
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     adapter.queue(MockResponse(dynamic=requested_revision))
     for payload in (
         tech_lead_change_request_response("Add rollback verification."),
@@ -859,6 +861,7 @@ def test_plan_change_unattended_assumes_the_questions_the_revision_raises(
     assert started.exit_code == 0, started.output
 
     for payload in (
+        {"decision": "ready_to_plan"},
         ambiguous_plan,
         {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
         revised_plan,
@@ -1002,6 +1005,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
             request.note for request in store.list_plan_change_requests(borg.id)
         ] == ["Add rollback verification."]
 
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     adapter.queue(
         MockResponse(payload=planning_plan_response(summary="Revised plan."))
     )

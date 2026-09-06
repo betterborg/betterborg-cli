@@ -1871,6 +1871,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
     assert invalid.isError is True
     assert "plan change note must not be empty" in invalid.content[0].text
 
+    # A change opens a new planning cycle, and a cycle starts by asking.
+    architect.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     architect.queue(MockResponse(payload=revised))
     tech_lead.queue(MockResponse(payload=tech_lead_approval_response()))
     changed = _structured(
@@ -1898,7 +1900,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
     ]
-    assert len(architect.calls) == 3
+    # Two turns per cycle: the cycle asks, then plans.
+    assert len(architect.calls) == 4
     assert len(tech_lead.calls) == 2
     assert shown["data"]["plan"]["summary"] == "Revised MCP plan."
     assert shown["data"]["plan"]["code_pointers"] == revised["code_pointers"]

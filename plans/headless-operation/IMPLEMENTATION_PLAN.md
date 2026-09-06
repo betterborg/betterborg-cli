@@ -672,7 +672,9 @@ command never built itself, and it decides on the same terms as the rest.
 - A plan naming an empty list retires what it inherits, and one that says
   nothing keeps it.
 - Where the record and an inherited list cover one question, the plan publishes
-  the later reading and not the one the run moved on from.
+  the later reading and not the one the run moved on from, and the record keeps
+  the later of two readings it holds itself.
+- A plan asked to name its assumptions is shown the plan it is told to restate.
 - An attended revision carries the superseded plan's assumptions, except over
   a question the operator answered in that run.
 - A question round run unattended yields a plan with no prompt issued, its
@@ -685,7 +687,8 @@ command never built itself, and it decides on the same terms as the rest.
 - Interactive planning still prompts, still stops on a cancelled prompt, and
   still drops an assumption its plan claims.
 - An Architect that asks past the round cap still ends the run, and a new
-  cycle begins with its budget restored.
+  cycle begins with its budget restored on both halves of it: a cycle
+  following a spent one still asks its first question.
 - A plan changed unattended, and a plan the review sends back, both assume the
   questions their revisions raise.
 

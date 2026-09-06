@@ -451,12 +451,17 @@ class ArchitectLoop:
             if self.cancel is not None and self.cancel.is_set():
                 raise ArchitectCancelled("Architect run cancelled")
 
-            question_attempts = self._turns.attempts(_QUESTIONS_PHASE)
-            completed_questions = [
-                attempt
-                for attempt in question_attempts
-                if attempt.status is PlanningAttemptStatus.COMPLETED
-            ]
+            # Rounds this planning cycle has spent, not every round the Borg
+            # has ever been asked. Counted for its whole life, a Borg that
+            # spent its budget planning would enter its next cycle already
+            # over: the gate fires before a turn is issued, so a revision
+            # could never ask anything, and an attended one could never ask
+            # the operator. The half of this budget that bounds the answers
+            # already reads the cycle.
+            completed_questions = completed_planning_phase_attempts(
+                current_planning_cycle_attempts(self.store, self.borg_id),
+                _QUESTIONS_PHASE,
+            )
             latest = completed_questions[-1] if completed_questions else None
             ready = (
                 latest is not None
