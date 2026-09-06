@@ -1613,12 +1613,8 @@ def test_identically_repeated_secret_records_are_accepted(
             {"used_by": ["test"], "scope": "agent"},
             "disagree on scope 'build' and 'agent'",
         ),
-        (
-            {"used_by": ["release"], "scope": "build"},
-            "disagree on used_by ['test'] and ['release']",
-        ),
     ],
-    ids=["scope", "used_by"],
+    ids=["scope"],
 )
 def test_conflicting_repeated_secret_records_say_what_disagrees(
     committed_git_repo: Path,
@@ -1653,6 +1649,59 @@ def test_conflicting_repeated_secret_records_say_what_disagrees(
     assert ".github/workflows/ci.yml, .github/workflows/release.yml" in (
         result.reason
     )
+
+
+def test_repeated_secret_records_accumulate_the_purposes_they_name(
+    committed_git_repo: Path,
+) -> None:
+    """Two workflows needing one secret is not a disagreement about it.
+
+    Scope decides how a value is supplied and cannot be two things at once.
+    What each workflow wants the secret for accumulates, and refusing the run
+    over that stops it for a secret nothing disagrees about, while keeping
+    only the first record would leave it unrequired for the stage the second
+    is the sole evidence for.
+    """
+    binary_dir = committed_git_repo.parent / "merged-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "example-release", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"]},
+                {"stage": "release", "argv": ["example-release"]},
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            },
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["release"],
+                "scope": "build",
+                "source": ".github/workflows/release.yml",
+            },
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("PACKAGE_TOKEN",)
+    secret = next(
+        item
+        for item in result.secret_requirements
+        if item.name == "PACKAGE_TOKEN"
+    )
+    assert set(secret.used_by) == {"test", "release"}
 
 
 def test_host_that_satisfies_everything_produces_the_unchanged_plan(

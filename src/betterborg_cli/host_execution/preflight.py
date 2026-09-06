@@ -704,6 +704,14 @@ class HostPreflight:
                 )
             if declared is None:
                 by_name[name] = record
+            elif not disagreements:
+                # The purposes accumulate. Keeping only the first record's
+                # would leave the secret unrequired for a stage the second
+                # record is the sole evidence for.
+                by_name[name] = {
+                    **declared,
+                    "used_by": _merged_used_by(declared, record),
+                }
 
         catalog = plan.get("command_catalog")
         catalog_evidence = (
@@ -1389,6 +1397,21 @@ def _command_executable_key(command: HostCommand) -> tuple[str, str]:
     return (command.argv[0], command.cwd if "/" in command.argv[0] else ".")
 
 
+def _merged_used_by(
+    declared: Mapping[str, Any], repeated: Mapping[str, Any]
+) -> list[Any]:
+    """Return every purpose either record gives for one secret, once each."""
+    merged: list[Any] = []
+    for record in (declared, repeated):
+        used_by = record.get("used_by")
+        if not isinstance(used_by, Sequence) or isinstance(used_by, str | bytes):
+            continue
+        for value in used_by:
+            if value not in merged:
+                merged.append(value)
+    return merged
+
+
 def _secret_stages(record: Mapping[str, Any]) -> tuple[str, ...]:
     """Return one secret record's used_by stages, order-insensitively.
 
@@ -1406,18 +1429,17 @@ def _secret_disagreements(
 ) -> tuple[str, ...]:
     """Name what two records for one secret say differently.
 
-    Only what preflight acts on is compared. Where the evidence was found
-    differs whenever a secret is named twice, and is never a disagreement
-    about the requirement itself.
+    Only a contradiction counts. Scope decides how the value is supplied, so
+    two records cannot both be right about it. Everything else accumulates:
+    two workflows naming one secret for different purposes are two things it
+    is needed for, and where the evidence was found differs whenever a secret
+    is named twice. Reading either as a conflict refuses a run over a secret
+    nothing disagrees about.
     """
     disagreements: list[str] = []
     if declared.get("scope") != repeated.get("scope"):
         disagreements.append(
             f"scope {declared.get('scope')!r} and {repeated.get('scope')!r}"
-        )
-    if _secret_stages(declared) != _secret_stages(repeated):
-        disagreements.append(
-            f"used_by {declared.get('used_by')!r} and {repeated.get('used_by')!r}"
         )
     return tuple(disagreements)
 
