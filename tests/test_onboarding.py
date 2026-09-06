@@ -61,11 +61,10 @@ def _documents(root: Path) -> tuple[ImprovementPrd, ...]:
 @pytest.fixture
 def onboarding_context(committed_git_repo: Path):
     repository = Repository(root=committed_git_repo)
-    with SqliteStore.open(
-        committed_git_repo / ".betterborg/state/betterborg.sqlite3"
-    ) as store:
+    paths = RepoPaths.discover(committed_git_repo)
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         store.add_repository(repository)
-        yield repository, store
+        yield paths, repository, store
 
 
 @pytest.mark.parametrize(
@@ -82,10 +81,11 @@ def test_fix_door_lists_every_ranked_theme_and_dispatches_exact_source(
     expected_name: str,
     expected_filename: str,
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     output: list[str] = []
     creator = RecordingCreator()
     dispatcher = OnboardingDispatcher(
+        paths,
         repository,
         store,
         _io(iter(["1", theme_answer, ""]), output),
@@ -111,11 +111,12 @@ def test_fix_door_lists_every_ranked_theme_and_dispatches_exact_source(
 
 
 def test_fix_door_edits_a_colliding_suggested_name(onboarding_context) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     store.add_borg(Borg(repository_id=repository.id, name="sentinel"))
     output: list[str] = []
     creator = RecordingCreator()
     dispatcher = OnboardingDispatcher(
+        paths,
         repository,
         store,
         _io(iter(["1", "", "", "Guardian"]), output),
@@ -124,6 +125,34 @@ def test_fix_door_edits_a_colliding_suggested_name(onboarding_context) -> None:
     )
 
     dispatcher.run()
+
+    assert creator.calls[0][0] == "Guardian"
+    assert "already exists" in "\n".join(output)
+
+
+def test_fix_door_sees_a_stray_prd_in_a_declared_home(
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    paths = RepoPaths.discover(committed_git_repo)
+    (home / "prds").mkdir()
+    (home / "prds/sentinel.md").write_text("# Stray\n", encoding="utf-8")
+    repository = Repository(root=committed_git_repo)
+    output: list[str] = []
+    creator = RecordingCreator()
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        store.add_repository(repository)
+        OnboardingDispatcher(
+            paths,
+            repository,
+            store,
+            _io(iter(["1", "", "", "Guardian"]), output),
+            creator,
+            _documents(committed_git_repo),
+        ).run()
 
     assert creator.calls[0][0] == "Guardian"
     assert "already exists" in "\n".join(output)
@@ -142,11 +171,12 @@ def test_other_doors_use_the_same_creator(
     answers: tuple[str, ...],
     expected: tuple[str, str | None],
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     output: list[str] = []
     creator = RecordingCreator()
 
     OnboardingDispatcher(
+        paths,
         repository,
         store,
         _io(iter(answers), output),
@@ -167,11 +197,12 @@ def test_other_doors_use_the_same_creator(
 
 
 def test_cancellation_does_not_dispatch_or_mutate(onboarding_context) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     output: list[str] = []
     creator = RecordingCreator()
 
     result = OnboardingDispatcher(
+        paths,
         repository,
         store,
         _io(iter(["q"]), output),
@@ -192,7 +223,7 @@ def test_cancellation_does_not_dispatch_or_mutate(onboarding_context) -> None:
 def test_token_cancellation_during_menu_starts_no_selected_door(
     onboarding_context,
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     cancel = CancellationToken()
     creator = RecordingCreator()
 
@@ -201,6 +232,7 @@ def test_token_cancellation_during_menu_starts_no_selected_door(
         return "1"
 
     result = OnboardingDispatcher(
+        paths,
         repository,
         store,
         InteractiveIO(
@@ -226,7 +258,7 @@ def test_token_cancellation_during_name_prompt_starts_no_prd_session(
     onboarding_context,
     answers_before_name: tuple[str, ...],
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     cancel = CancellationToken()
     creator = RecordingCreator()
     answers = iter(answers_before_name)
@@ -238,6 +270,7 @@ def test_token_cancellation_during_name_prompt_starts_no_prd_session(
         return next(answers)
 
     result = OnboardingDispatcher(
+        paths,
         repository,
         store,
         InteractiveIO(
@@ -266,7 +299,7 @@ def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
     monkeypatch: pytest.MonkeyPatch,
     environment: dict[str, str],
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     for key, value in environment.items():
@@ -290,6 +323,7 @@ def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
         return "q"
 
     result = OnboardingDispatcher(
+        paths,
         repository,
         store,
         InteractiveIO(
@@ -309,11 +343,9 @@ def test_menu_suspension_crosses_heartbeat_without_overdrawing_prompts(
 def test_machine_handoff_commands_are_exact_and_mutation_free(
     onboarding_context,
 ) -> None:
-    repository, store = onboarding_context
+    paths, repository, store = onboarding_context
 
-    commands = create_commands(
-        RepoPaths.discover(repository.root), _documents(repository.root)
-    )
+    commands = create_commands(paths, _documents(repository.root))
 
     assert commands == (
         (

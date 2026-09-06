@@ -126,15 +126,22 @@ BETTERBORG_HOME=~/.betterborg/acme betterborg init --yes
 Configuration, prompts, PRDs, plans, tasks, score, state and artifacts all
 move there together, and the repository's working tree and `.gitignore` are
 left exactly as Betterborg found them: with nothing of Betterborg's inside the
-repository there is nothing to ignore, so no managed block is written.
+repository there is nothing to ignore, so no managed block is written. The
+task and environment worktrees Betterborg mints are unaffected; they are
+siblings of the repository under `.betterborg-worktrees` and
+`.betterborg-environments`, and are not the operator's to place.
 
 Unset is the default and an empty value is read the same way. A path that
 resolves inside the repository fails the run, because it would reintroduce
-exactly what the variable exists to keep out, and so does a relative path. One
-directory serves one repository: a directory already holding another
-repository's configuration is refused rather than serving both. Like the
-sandbox declaration it belongs to whoever starts Betterborg, so it is
-environment-only and not valid tracked Betterborg configuration.
+exactly what the variable exists to keep out; so does a path that contains the
+repository, which would put the whole working tree inside what Betterborg
+owns, and so does a relative path. One directory serves one repository: a
+directory already holding another repository's configuration is refused rather
+than serving both, and it goes on refusing after its state directory is
+deleted, because a relocated directory records the repository it serves beside
+that configuration. Like the sandbox declaration it belongs to whoever starts
+Betterborg, so it is environment-only and not valid tracked Betterborg
+configuration.
 
 ## Host integrations
 

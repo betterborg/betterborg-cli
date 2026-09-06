@@ -136,7 +136,10 @@ def _scheduler_fixture(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(record.task_ref, encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
     return database, borg, generation, records
 

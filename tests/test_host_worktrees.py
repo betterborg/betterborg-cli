@@ -456,7 +456,10 @@ def test_allocates_persists_reuses_and_cleans_task_worktree(
         task_path.parent.mkdir(parents=True)
         task_path.write_text(render_task_markdown(body), encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=committed_git_repo / ".betterborg/tasks",
+            owned_root=committed_git_repo,
         )
 
     _git(committed_git_repo, "add", ".betterborg")

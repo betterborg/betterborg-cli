@@ -31,6 +31,7 @@ from betterborg_cli.repository_config import (
     CONFIG_VERSION,
     AgentStage,
     RepositoryConfig,
+    bind_tracked_directory,
     load_repository_config,
     require_registered_repository,
 )
@@ -244,6 +245,7 @@ class RepositoryService:
                 Repository(root=self.paths.root)
             )
         config = load_repository_config(self.paths)
+        bind_tracked_directory(self.paths)
         repository = Repository(root=self.paths.root, id=config.repository_id)
 
         stored = self.store.get_repository(repository.id)

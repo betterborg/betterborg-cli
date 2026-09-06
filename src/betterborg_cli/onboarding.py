@@ -78,6 +78,7 @@ class OnboardingDispatcher:
 
     def __init__(
         self,
+        paths: RepoPaths,
         repository: Repository,
         store: SqliteStore,
         io: InteractiveIO,
@@ -87,6 +88,7 @@ class OnboardingDispatcher:
         cancel: CancellationToken | None = None,
         progress: RunProgress | None = None,
     ) -> None:
+        self.paths = paths
         self.repository = repository
         self.store = store
         self.io = io
@@ -187,7 +189,7 @@ class OnboardingDispatcher:
             except ValueError as error:
                 self.io.write(f"Invalid Borg name: {error}")
                 continue
-            destination = self.repository.root / ".betterborg" / "prds" / f"{name}.md"
+            destination = self.paths.prds_dir / f"{name}.md"
             if (
                 self.store.get_borg_by_name(self.repository.id, name) is not None
                 or destination.exists()

@@ -403,6 +403,7 @@ def initialize_repository(
                     progress=progress,
                 )
                 OnboardingDispatcher(
+                    paths,
                     result.repository,
                     store,
                     io,
@@ -990,7 +991,7 @@ def execute_borg(
                     "rollup-pr",
                     "Open rollup pull request",
                     lambda: _open_rollup_pull_request(
-                        paths.root,
+                        paths,
                         name,
                         plan,
                         prd_path,
@@ -1134,7 +1135,7 @@ def _push_project_base(git: SafeGit, name: str) -> str:
 
 
 def _open_rollup_pull_request(
-    repository_root: Path,
+    paths: RepoPaths,
     name: str,
     plan: dict[str, object] | None,
     prd_path: Path | None,
@@ -1144,11 +1145,16 @@ def _open_rollup_pull_request(
     activity: Callable[[AgentActivity], None] | None = None,
 ) -> str:
     """Open one authenticated GitHub PR after completed local execution."""
+    repository_root = paths.root
     branch = f"project/{name}"
     failure_prefix = "Local execution completed, but rollup PR creation failed"
     try:
+        # The session records the PRD by the name it carries inside a
+        # checkout; this repository's tracked directory is what holds it.
         prd_markdown = (
-            read_repository_text(prd_path, root=repository_root)
+            read_repository_text(
+                paths.prds_dir / prd_path.name, root=paths.tracked_root
+            )
             if prd_path is not None
             else None
         )

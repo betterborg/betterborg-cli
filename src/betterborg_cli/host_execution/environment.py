@@ -83,6 +83,33 @@ ActivitySink = Callable[[AgentActivity], None]
 Clock = Callable[[], datetime]
 
 
+def materialization_marker(paths: RepoPaths, worktree: Path) -> Path:
+    """Locate the marker recording what one checkout has materialized.
+
+    While Betterborg's own files live inside the repository the marker is a
+    checkout-local file the managed ignore block hides, alongside the ignored
+    dependencies it describes. Once they live outside it, nothing of
+    Betterborg's may be written into a checkout at all, so the marker joins
+    the rest of its state and is keyed by the checkout it speaks for.
+    """
+    if paths.tracked_in_repository:
+        return worktree / ".betterborg/state/environment-materialization"
+    key = hashlib.sha256(str(Path(worktree).resolve()).encode("utf-8")).hexdigest()
+    return paths.state_dir / "environment-markers" / key
+
+
+def discard_materialization_marker(paths: RepoPaths, worktree: Path) -> None:
+    """Forget what a checkout materialized before it is replaced.
+
+    A checkout-local marker leaves with the checkout that holds it. One kept
+    outside every checkout has to be discarded deliberately, or a freshly
+    minted worktree would inherit the claim of the one it replaced.
+    """
+    if paths.tracked_in_repository:
+        return
+    _invalidate_marker(materialization_marker(paths, worktree))
+
+
 def environment_fingerprint(plan: HostPreflightPlan, worktree: Path) -> str:
     """Fingerprint analyzer inputs using their bytes in one exact worktree."""
     descriptors = _environment_descriptors(plan, worktree)
@@ -964,7 +991,11 @@ class HostEnvironmentManager:
         return self.cache_root / fingerprint.removeprefix("sha256:")
 
     def _materialization_marker(self, worktree: Path) -> Path:
-        marker = worktree / ".betterborg/state/environment-materialization"
+        marker = materialization_marker(self._paths, worktree)
+        if not self._paths.tracked_in_repository:
+            # The marker is outside every checkout, so no ignore rule of the
+            # repository's has anything to say about it.
+            return marker
         parent = marker.parent.resolve()
         if not parent.is_relative_to(worktree.resolve()):
             raise EnvironmentMaterializationError(

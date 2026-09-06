@@ -89,6 +89,15 @@ class RepoPaths:
         """Return the tracked repository score report path."""
         return self.tracked_dir / "score.md"
 
+    def in_checkout(self, path: Path) -> Path:
+        """Name a tracked file by the path it takes inside a checkout.
+
+        A checkout Betterborg prepares always carries its context under
+        ``.betterborg``, whether or not this repository's own tracked
+        directory lives there.
+        """
+        return Path(TRACKED_DIR_NAME) / Path(path).relative_to(self.tracked_dir)
+
     def label(self, path: Path) -> str:
         """Return ``path`` as an operator reads it.
 
@@ -167,7 +176,9 @@ def _tracked_dir(root: Path) -> Path:
 
     A home inside the repository is refused rather than accepted quietly: it
     would reintroduce exactly the scaffolding in the working tree that the
-    declaration exists to keep out.
+    declaration exists to keep out. A home that contains the repository is
+    refused for the mirror reason: every containment check Betterborg makes
+    against what it owns would then admit the whole working tree.
     """
     declared = os.environ.get(HOME_VARIABLE, "")
     home = declared.strip()
@@ -184,6 +195,11 @@ def _tracked_dir(root: Path) -> Path:
         raise BetterborgHomeError(
             f"{HOME_VARIABLE}={declared!r} resolves inside the repository "
             f"{root}; it must name a directory outside it"
+        )
+    if root.is_relative_to(resolved):
+        raise BetterborgHomeError(
+            f"{HOME_VARIABLE}={declared!r} contains the repository {root}; it "
+            "must name a directory outside it"
         )
     return resolved
 

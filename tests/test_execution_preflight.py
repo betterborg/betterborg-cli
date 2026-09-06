@@ -190,7 +190,10 @@ def execution_preflight_fixture(tmp_path: Path):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(render_task_markdown(task.task), encoding="utf-8")
             store._promote_published_task_generation(
-                generation.id, durable_root=durable_root
+                generation.id,
+                durable_root=durable_root,
+                tasks_root=repository / ".betterborg/tasks",
+                owned_root=repository,
             )
 
         _git(repository, "add", ".")

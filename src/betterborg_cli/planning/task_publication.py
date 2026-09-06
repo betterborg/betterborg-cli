@@ -167,7 +167,10 @@ class TaskPublisher:
         self._raise_if_cancelled()
         try:
             generation = self.store._promote_published_task_generation(
-                generation.id, durable_root=destination
+                generation.id,
+                durable_root=destination,
+                tasks_root=self.paths.tasks_dir,
+                owned_root=self.paths.tracked_root,
             )
         except (KeyError, ValueError) as error:
             raise TaskPublicationError(str(error)) from error

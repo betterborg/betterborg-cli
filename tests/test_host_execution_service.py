@@ -151,7 +151,12 @@ def _store_fixture(
         path = durable_root / record.stage / f"{record.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(record.task_ref, encoding="utf-8")
-    store._promote_published_task_generation(generation.id, durable_root=durable_root)
+    store._promote_published_task_generation(
+        generation.id,
+        durable_root=durable_root,
+        tasks_root=repository.root / ".betterborg/tasks",
+        owned_root=repository.root,
+    )
     return store, borg, generation, records
 
 
@@ -539,7 +544,8 @@ def _concrete_host_fixture(
         "services:\n  healthy:\n    image: fixture\n",
         encoding="utf-8",
     )
-    ensure_managed_gitignore(RepoPaths.discover(repository_root))
+    paths = RepoPaths.discover(repository_root)
+    ensure_managed_gitignore(paths)
     _git(repository_root, "add", ".")
     _git(repository_root, "commit", "--quiet", "-m", "initial")
 
@@ -661,16 +667,20 @@ def _concrete_host_fixture(
     store.append_plan_approval(approval)
     store.append_task_batch(batch)
     store.add_task_generation(generation, tasks, dependencies)
-    durable_root = (
-        repository_root / ".betterborg/tasks" / borg.name / str(generation.id)
-    )
+    durable_root = paths.tasks_dir / borg.name / str(generation.id)
     for task in tasks:
         path = durable_root / task.stage / f"{task.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_task_markdown(task.task), encoding="utf-8")
-    store._promote_published_task_generation(generation.id, durable_root=durable_root)
-    _git(repository_root, "add", ".")
-    _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
+    store._promote_published_task_generation(
+        generation.id,
+        durable_root=durable_root,
+        tasks_root=paths.tasks_dir,
+        owned_root=paths.tracked_root,
+    )
+    if paths.tracked_in_repository:
+        _git(repository_root, "add", ".")
+        _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
 
     clock = FakeClock()
     plan = HostPreflightPlan(
@@ -1486,6 +1496,47 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
                 f"project/{fixture.borg.name}",
             )
             == project_tip
+        )
+    finally:
+        fixture.store.close()
+
+
+def test_a_completed_run_under_a_declared_home_leaves_the_repository_untouched(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "betterborg-home"
+    home.mkdir()
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    fixture = _concrete_host_fixture(tmp_path, task_count=2)
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+            for task in fixture.tasks
+        )
+        repository_root = fixture.store.get_repository(
+            fixture.borg.repository_id
+        ).root
+        paths = RepoPaths.discover(repository_root)
+
+        assert paths.tasks_dir.is_relative_to(home)
+        assert list((home / "state/environment-markers").iterdir())
+        assert not (repository_root / ".betterborg").exists()
+        assert not paths.gitignore.exists()
+        assert (
+            _git(
+                repository_root,
+                "status",
+                "--short",
+                "--untracked-files=all",
+            )
+            == ""
         )
     finally:
         fixture.store.close()

@@ -1091,7 +1091,7 @@ def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
     monkeypatch.setattr(cli_module.shutil, "which", lambda _name: gh)
 
     result = cli_module._open_rollup_pull_request(
-        committed_git_repo,
+        cli_module.RepoPaths.discover(committed_git_repo),
         "runner-contract",
         {"title": "Runner contract"},
         None,
@@ -1149,6 +1149,51 @@ def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
     assert [activity.detail for activity in activities] == [
         shlex.join(call[0]) for call in calls
     ]
+
+
+def test_rollup_pr_reads_the_prd_from_a_declared_home(
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    (home / "prds").mkdir()
+    (home / "prds/relocated.md").write_text(
+        "# Relocated PRD\n", encoding="utf-8"
+    )
+    bodies: list[str] = []
+
+    def runner(command, **kwargs):
+        argv = tuple(command)
+        if argv[0] == "git":
+            stdout = "https://github.com/acme/widgets.git\n"
+        elif argv[1:3] == ("repo", "view"):
+            stdout = "main\n"
+        elif argv[1:3] == ("pr", "create"):
+            bodies.append(kwargs["input"])
+            stdout = "https://github.com/acme/widgets/pull/7\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: "/test/bin/gh")
+
+    result = cli_module._open_rollup_pull_request(
+        cli_module.RepoPaths.discover(committed_git_repo),
+        "relocated",
+        {"title": "Relocated"},
+        # The session records the PRD by the name it carries inside a
+        # checkout, which is no file of this repository's.
+        Path(".betterborg/prds/relocated.md"),
+        cancel=None,
+        command_runner=runner,
+    )
+
+    assert result.endswith(": https://github.com/acme/widgets/pull/7")
+    assert len(bodies) == 1
+    assert "# Relocated PRD" in bodies[0]
+    assert not (committed_git_repo / ".betterborg").exists()
 
 
 def test_combined_push_and_pr_publishes_branch_before_opening_rollup(

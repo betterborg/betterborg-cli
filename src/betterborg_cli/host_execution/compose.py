@@ -20,6 +20,7 @@ from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.host_execution.preflight import HostPreflightPlan, HostService
 from betterborg_cli.host_execution.scheduler import TaskActivitySink
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     ComposeResource,
     ExecutionEvent,
@@ -103,6 +104,7 @@ class HostComposeManager:
         clock: Clock = utcnow,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
+        self._paths = RepoPaths.discover(self.repository_root)
         source_environment = os.environ if environment is None else environment
         self._environment = {
             name: source_environment[name]
@@ -512,9 +514,7 @@ class HostComposeManager:
             owned_volumes,
             owned_images,
         )
-        override_directory = (
-            self.repository_root / ".betterborg/state/compose" / project_name
-        )
+        override_directory = self._paths.state_dir / "compose" / project_name
         cleanup = override_directory / "compose.cleanup.json"
         override = override_directory / "compose.override.yml"
         cleanup_model = _cleanup_compose_model(

@@ -26,7 +26,7 @@ from betterborg_cli.planning import (
     validate_plan,
 )
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
-from betterborg_cli.repo_paths import TRACKED_DIR_NAME, RepoPaths
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
     RepositoryConfig,
     require_registered_repository,
@@ -333,8 +333,8 @@ def bind_plan_approval(
     digest = approved_plan_digest(current_plan)
     body = render_plan_markdown(current_plan)
     body_digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-    relative_path = Path(TRACKED_DIR_NAME) / "plans" / f"{borg.name}.md"
     plan_path = paths.plans_dir / f"{borg.name}.md"
+    relative_path = paths.in_checkout(plan_path)
 
     approvals = store.list_plan_approvals(borg.id)
     if approvals:

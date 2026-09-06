@@ -215,13 +215,13 @@ def _materialize_context(
     prompts = store.get_latest_generated_prompts(repository.id)
 
     plan_path = (
-        _in_checkout(paths, paths.plans_dir / f"{session.prd_path.stem}.md")
+        paths.in_checkout(paths.plans_dir / f"{session.prd_path.stem}.md")
         if current_plan is not None
         else None
     )
     reserved = {
         Path(TRACKED_DIR_NAME) / CONFIG_FILENAME,
-        _in_checkout(paths, paths.score_report),
+        paths.in_checkout(paths.score_report),
         session.prd_path,
         _MANIFEST_PATH,
         _REPOSITORY_PATH,
@@ -230,7 +230,7 @@ def _materialize_context(
         _CHANGE_REQUESTS_PATH,
         _FINDINGS_PATH,
         *(
-            _in_checkout(paths, paths.prompts_dir / f"{role}.system.md")
+            paths.in_checkout(paths.prompts_dir / f"{role}.system.md")
             for role in prompts
         ),
     }
@@ -254,11 +254,11 @@ def _materialize_context(
     )
     _publish(destination, session.prd_path, prd_body)
     report = render_markdown_report(build_machine_report(analysis, packages))
-    _publish(destination, _in_checkout(paths, paths.score_report), report)
+    _publish(destination, paths.in_checkout(paths.score_report), report)
 
     prompt_manifest: dict[str, dict[str, Any]] = {}
     for role, prompt in prompts.items():
-        prompt_path = _in_checkout(paths, paths.prompts_dir / f"{role}.system.md")
+        prompt_path = paths.in_checkout(paths.prompts_dir / f"{role}.system.md")
         _publish(destination, prompt_path, prompt.body_md)
         prompt_manifest[role] = {
             "analysis_id": str(prompt.analysis_id),
@@ -334,7 +334,7 @@ def _materialize_context(
             "questions": _QUESTIONS_PATH.as_posix(),
             "repository": _REPOSITORY_PATH.as_posix(),
             "schema_version": 1,
-            "score_report": _in_checkout(paths, paths.score_report).as_posix(),
+            "score_report": paths.in_checkout(paths.score_report).as_posix(),
         },
     )
 
@@ -398,16 +398,6 @@ def _borg_relative_path(path: Path, repository_root: Path) -> Path:
             f"dirty document must be a repository-relative .betterborg file: {path}"
         )
     return candidate
-
-
-def _in_checkout(paths: RepoPaths, path: Path) -> Path:
-    """Name a tracked file by the path it takes inside a checkout.
-
-    A planning worktree always carries Betterborg's context under
-    ``.betterborg``, whether or not this repository's own tracked
-    directory lives there.
-    """
-    return Path(TRACKED_DIR_NAME) / path.relative_to(paths.tracked_dir)
 
 
 def _read_owned_text(root: Path, path: Path, label: str) -> str:

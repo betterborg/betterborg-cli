@@ -80,7 +80,10 @@ def _execution_fixture(tmp_path: Path, approved_task_generation):
         task_path.parent.mkdir(parents=True)
         task_path.write_text(render_task_markdown(body), encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
 
     return database, borg, generation, task
@@ -152,7 +155,10 @@ def _dependency_execution_fixture(tmp_path: Path):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(record.task_ref, encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
 
     return database, borg, generation, foundation, consumer

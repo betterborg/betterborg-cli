@@ -10,8 +10,12 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.host_execution.environment import (
+    discard_materialization_marker,
+)
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import SqliteStore, TaskRuntime, TaskRuntimeStatus
 
 _TASK_BRANCH = re.compile(
@@ -55,6 +59,7 @@ class HostWorktreeManager:
             raise WorktreeError("worktree manager Git binding must match repository")
         self._git = git or SafeGit(self.repo_root, cancel=cancel)
         self._guard = PrimaryCheckoutGuard(self.repo_root, git=self._git)
+        self._paths = RepoPaths.discover(self.repo_root, cancel=cancel)
 
     def ensure_project_base(self, project_name: str) -> str:
         """Create or fast-forward ``project/<name>`` from the configured source."""
@@ -258,6 +263,8 @@ class HostWorktreeManager:
         if spec.path.exists():
             raise WorktreeError(f"path exists but is not {spec.branch!r}: {spec.path}")
         spec.path.parent.mkdir(parents=True, exist_ok=True)
+        # Nothing is materialized in a checkout that does not exist yet.
+        discard_materialization_marker(self._paths, spec.path)
         try:
             self._git.add_worktree(spec.path, spec.branch, base=base_branch)
         except (OSError, subprocess.CalledProcessError) as error:

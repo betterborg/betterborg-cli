@@ -1077,7 +1077,12 @@ class SqliteStore:
         return _row_to_execution_decision(row) if row is not None else None
 
     def _promote_published_task_generation(
-        self, generation_id: UUID, *, durable_root: Path
+        self,
+        generation_id: UUID,
+        *,
+        durable_root: Path,
+        tasks_root: Path,
+        owned_root: Path,
     ) -> TaskGeneration:
         """Commit publication after ``TaskPublisher`` crosses its durable seam.
 
@@ -1086,6 +1091,11 @@ class SqliteStore:
         fsyncs the final tree before opening the current-generation transaction;
         ``TaskPublisher`` remains the sole production caller and has already
         crossed the stricter stage-and-rename boundaries when it invokes this.
+
+        Where Betterborg's own files live is ``RepoPaths``' to decide, so the
+        caller names both the published-task root and the root Betterborg owns
+        them under. What the store verifies independently is what only SQLite
+        knows: the Borg, the generation, and every file digest beneath them.
         """
         generation = self.get_task_generation(generation_id)
         if generation is None:
@@ -1096,9 +1106,7 @@ class SqliteStore:
         repository = self.get_repository(borg.repository_id)
         if repository is None:
             raise ValueError("task generation repository not found")
-        expected_root = (
-            repository.root / ".betterborg" / "tasks" / borg.name / str(generation.id)
-        )
+        expected_root = tasks_root / borg.name / str(generation.id)
         if durable_root != expected_root:
             raise ValueError("durable task generation path does not match SQLite")
         records = self.list_task_records(generation.id)
@@ -1113,9 +1121,7 @@ class SqliteStore:
             for relative in expected_files
         ):
             raise ValueError("durable task generation contains an unsafe path")
-        _verify_and_fsync_task_tree(
-            repository.root, durable_root, expected_files
-        )
+        _verify_and_fsync_task_tree(owned_root, durable_root, expected_files)
 
         promoted_at = utcnow()
         with self.transaction() as connection:
@@ -3699,12 +3705,12 @@ def _row_to_task_finding(row: sqlite3.Row) -> TaskFinding:
 
 
 def _verify_and_fsync_task_tree(
-    repository_root: Path,
+    owned_root: Path,
     durable_root: Path,
     expected_files: dict[Path, str],
 ) -> None:
-    candidate = repository_root
-    for component in durable_root.relative_to(repository_root).parts:
+    candidate = owned_root
+    for component in durable_root.relative_to(owned_root).parts:
         candidate /= component
         if candidate.is_symlink():
             raise ValueError(f"durable task publication path is a symlink: {candidate}")

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import AgentStage
+from betterborg_cli.repository_config import AgentStage, RepositoryConfigError
 from betterborg_cli.run_control import DEFAULT_FORCE_GRACE_SECONDS
 from betterborg_cli.store import (
     AgentAttempt,
@@ -1662,6 +1663,32 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     assert created["next_actions"] == [
         {"tool": "plan", "arguments": {"name": "new-borg", "action": "start"}}
     ]
+
+
+def test_mcp_tools_refuse_a_directory_that_serves_another_repository(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch,
+) -> None:
+    _repository, paths = planning_cli_repository(committed_git_repo, "mcp-served")
+    second = tmp_path_factory.mktemp("second-repository")
+    subprocess.run(["git", "init", "--quiet", str(second)], check=True)
+    # The configuration belongs to the first repository whichever one the
+    # operator has the server standing in.
+    foreign = replace(paths, root=second)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: foreign,
+    )
+
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._create("new-borg", None, None)
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._planning_state(foreign, "mcp-served")
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._plan("mcp-served", "show", None, None)
 
 
 def test_plan_show_carries_an_assumption_the_architect_made(

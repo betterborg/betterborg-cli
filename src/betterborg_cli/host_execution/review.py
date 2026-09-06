@@ -172,7 +172,7 @@ class HostReviewFixPhase:
         while True:
             try:
                 runtime, worktree = require_ready_worktree(
-                    self.repository_root,
+                    self._paths,
                     self._primary_git,
                     context,
                     expected_statuses={
@@ -181,7 +181,7 @@ class HostReviewFixPhase:
                     },
                 )
                 inputs = verified_task_inputs(
-                    self.repository_root,
+                    self._paths,
                     context,
                     worktree,
                     prompt_role=(

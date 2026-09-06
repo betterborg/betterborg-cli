@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -267,6 +268,38 @@ def test_a_declared_home_refuses_a_second_repository(
 
     assert cli_runner.invoke(cli, ["init", "--yes"]).exit_code == 0
 
+    monkeypatch.chdir(second)
+    result = cli_runner.invoke(cli, ["init", "--yes"])
+
+    assert result.exit_code != 0
+    assert "one directory serves one repository" in result.output
+    assert str(first) in result.output
+    assert str(second) in result.output
+
+
+def test_a_declared_home_refuses_a_second_repository_after_state_is_deleted(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    first = committed_git_repo
+    second = tmp_path_factory.mktemp("second-repository")
+    subprocess.run(["git", "init", "--quiet", str(second)], check=True)
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(first.parent / "machine-state"))
+    _adapter_unused, selected = _adapter(first)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: selected
+    )
+    monkeypatch.chdir(first)
+
+    assert cli_runner.invoke(cli, ["init", "--yes"]).exit_code == 0
+
+    # Discarding state is ordinary recovery; the configuration it leaves
+    # behind still belongs to the first repository.
+    shutil.rmtree(home / "state")
     monkeypatch.chdir(second)
     result = cli_runner.invoke(cli, ["init", "--yes"])
 

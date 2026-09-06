@@ -23,7 +23,7 @@ from betterborg_cli.agent_runtime.selection import (
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
-from betterborg_cli.repo_paths import TRACKED_DIR_NAME, RepoPaths
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_files import (
     RepositoryPathError,
     is_windows_reserved_filename,
@@ -537,14 +537,14 @@ def _new_borg_records(
     repository's tracked directory actually holds it.
     """
     validate_borg_name(name)
-    relative_prd_path = Path(TRACKED_DIR_NAME) / "prds" / f"{name}.md"
+    prd_path = paths.prds_dir / f"{name}.md"
     borg = Borg(repository_id=repository.id, name=name)
     session = StoredPrdSession(
         repository_id=repository.id,
         borg_id=borg.id,
-        prd_path=relative_prd_path,
+        prd_path=paths.in_checkout(prd_path),
     )
-    return borg, session, paths.prds_dir / f"{name}.md"
+    return borg, session, prd_path
 
 
 def _require_unclaimed_borg(

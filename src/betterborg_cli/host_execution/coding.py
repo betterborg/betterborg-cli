@@ -325,7 +325,7 @@ class HostCodingPhase:
         self, context: ScheduledTaskContext
     ) -> tuple[TaskRuntime, Path]:
         return require_ready_worktree(
-            self.repository_root,
+            self._paths,
             self._primary_git,
             context,
             expected_statuses={TaskRuntimeStatus.CODING},
@@ -335,7 +335,7 @@ class HostCodingPhase:
         self, context: ScheduledTaskContext, worktree: Path
     ) -> VerifiedTaskInputs:
         return verified_task_inputs(
-            self.repository_root,
+            self._paths,
             context,
             worktree,
             prompt_role="coding",

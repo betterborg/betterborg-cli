@@ -237,6 +237,34 @@ def test_declared_home_reached_by_symlink_into_the_repository_is_refused(
         RepoPaths.discover(git_repo)
 
 
+def test_declared_home_containing_the_repository_is_refused(
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOME_VARIABLE, str(git_repo.parent))
+
+    with pytest.raises(BetterborgHomeError) as failure:
+        RepoPaths.discover(git_repo)
+
+    message = str(failure.value)
+    assert HOME_VARIABLE in message
+    assert "contains the repository" in message
+    assert str(git_repo) in message
+
+
+def test_declared_home_reached_by_symlink_around_the_repository_is_refused(
+    git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    link = tmp_path_factory.mktemp("outside") / "looks-beside"
+    link.symlink_to(git_repo.parent, target_is_directory=True)
+    monkeypatch.setenv(HOME_VARIABLE, str(link))
+
+    with pytest.raises(BetterborgHomeError, match="contains the repository"):
+        RepoPaths.discover(git_repo)
+
+
 def test_declared_home_must_be_absolute(
     git_repo: Path,
     monkeypatch: MonkeyPatch,
@@ -260,6 +288,28 @@ def test_declared_home_leaves_the_repository_ignore_file_alone(
     ensure_managed_gitignore(paths)
 
     assert paths.gitignore.read_text(encoding="utf-8") == prior
+
+
+def test_in_checkout_names_a_tracked_file_the_same_way_from_either_home(
+    git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(HOME_VARIABLE, raising=False)
+    inside = RepoPaths.discover(git_repo)
+    monkeypatch.setenv(HOME_VARIABLE, str(tmp_path_factory.mktemp("home")))
+    relocated = RepoPaths.discover(git_repo)
+
+    # Every checkout Betterborg prepares carries its context under
+    # ``.betterborg``, wherever this repository's own tracked directory sits.
+    for paths in (inside, relocated):
+        assert paths.in_checkout(paths.prds_dir / "sentinel.md") == Path(
+            ".betterborg/prds/sentinel.md"
+        )
+        assert paths.in_checkout(paths.plans_dir / "sentinel.md") == Path(
+            ".betterborg/plans/sentinel.md"
+        )
+        assert paths.in_checkout(paths.score_report) == Path(".betterborg/score.md")
 
 
 def test_worktrees_are_placed_in_sibling_repository_directory(git_repo: Path) -> None:

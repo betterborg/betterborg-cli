@@ -25,7 +25,11 @@ from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import AgentStage, load_repository_config
+from betterborg_cli.repository_config import (
+    AgentStage,
+    load_repository_config,
+    require_registered_repository,
+)
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
@@ -1141,6 +1145,7 @@ def _initialize(
                 cancel=cancel,
             )
             onboarding = OnboardingDispatcher(
+                paths,
                 result.repository,
                 store,
                 io,
@@ -1244,11 +1249,9 @@ def _create(
     if source_path is not None and not source_path.is_absolute():
         source_path = paths.root / source_path
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         result = CreateService(
             repository,
             store,
@@ -1314,11 +1317,9 @@ async def create(
 def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, Any]]]:
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(f"Borg {name!r} does not exist")
@@ -1448,11 +1449,9 @@ def _plan(
     if action == "show":
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")

@@ -15,9 +15,11 @@ from betterborg_cli.agent_runtime import (
     AgentStatus,
     CancellationToken,
 )
+from betterborg_cli.host_execution.environment import materialization_marker
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError, TaskPublisher
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     ExecutionAttemptStatus,
     TaskRecord,
@@ -62,7 +64,7 @@ def cancelled_agent_reason(
 
 
 def require_ready_worktree(
-    repository_root: Path,
+    paths: RepoPaths,
     primary_git: SafeGit,
     context: ScheduledTaskContext,
     *,
@@ -98,7 +100,7 @@ def require_ready_worktree(
     ]
     if not materializations:
         raise HostAgentPhaseError("claimed task environment is not materialized")
-    marker = worktree / ".betterborg/state/environment-materialization"
+    marker = materialization_marker(paths, worktree)
     try:
         fingerprint = marker.read_text(encoding="utf-8").strip()
     except OSError as error:
@@ -113,7 +115,7 @@ def require_ready_worktree(
 
 
 def verified_task_inputs(
-    repository_root: Path,
+    paths: RepoPaths,
     context: ScheduledTaskContext,
     worktree: Path,
     *,
@@ -127,7 +129,7 @@ def verified_task_inputs(
     if borg is None:
         raise HostAgentPhaseError("task Borg is missing")
     repository = context.store.get_repository(borg.repository_id)
-    if repository is None or repository.root != repository_root:
+    if repository is None or repository.root != paths.root:
         raise HostAgentPhaseError("task repository does not match agent checkout")
     publication = TaskPublisher(
         repository, context.store
@@ -137,8 +139,8 @@ def verified_task_inputs(
     if published is None:
         raise HostAgentPhaseError("claimed task is not in the current generation")
 
-    relative = published.path.relative_to(repository_root)
-    task_markdown = read_digest_valid(worktree / relative, published.task.digest)
+    task_path, task_source = _task_file(paths, worktree, published.path)
+    task_markdown = read_digest_valid(task_source, published.task.digest)
     dependency_ids = {
         edge.depends_on_task_id
         for edge in context.store.list_task_dependencies(generation.id)
@@ -151,14 +153,14 @@ def verified_task_inputs(
         dependency = by_id.get(dependency_id)
         if dependency is None:
             raise HostAgentPhaseError("task dependency is not in the generation")
-        dependency_relative = dependency.path.relative_to(repository_root)
+        dependency_path, dependency_source = _task_file(
+            paths, worktree, dependency.path
+        )
         dependencies.append(
             (
                 dependency.task,
-                dependency_relative,
-                read_digest_valid(
-                    worktree / dependency_relative, dependency.task.digest
-                ),
+                dependency_path,
+                read_digest_valid(dependency_source, dependency.task.digest),
             )
         )
 
@@ -171,11 +173,26 @@ def verified_task_inputs(
         )
     return VerifiedTaskInputs(
         task=published.task,
-        task_path=relative,
+        task_path=task_path,
         task_markdown=task_markdown,
         dependencies=tuple(dependencies),
         system_prompt=prompt.body_md,
     )
+
+
+def _task_file(paths: RepoPaths, worktree: Path, published: Path) -> tuple[Path, Path]:
+    """Name one published task for an agent, and locate the copy it reads.
+
+    Published tasks inside the repository are committed files, so the agent's
+    own checkout carries them and names them the way it names any other
+    repository file. Once they live outside the repository they are in no
+    checkout at all: the published file is the only copy there is, and only
+    its absolute path names it.
+    """
+    if not paths.tracked_in_repository:
+        return published, published
+    named = published.relative_to(paths.root)
+    return named, worktree / named
 
 
 class AgentAttemptArtifacts:
