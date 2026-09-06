@@ -15,6 +15,7 @@ from betterborg_cli.planning.plan_contracts import (
     PlanValidationError,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     validate_plan,
     validate_plan_json,
 )
@@ -117,6 +118,7 @@ __all__ = [
     "task_batch_semantic_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
+    "render_planning_findings_markdown",
     "render_task_markdown",
     "task_graph_findings",
     "task_markdown_digest",

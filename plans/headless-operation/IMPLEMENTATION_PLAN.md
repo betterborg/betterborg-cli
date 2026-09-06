@@ -755,26 +755,40 @@ The Tech Lead reviews a plan, and where it finds something wrong the Architect
 revises and it reviews again. After a fixed three rounds a plan it still will
 not approve blocks, which is right: executing a plan the reviewer rejects is
 the silent erosion of quality that having a reviewer prevents. What is not
-right is that three is the only answer. A hard problem the reviewer is steadily
-converging on ends the same way as one it has given up on, and an operator
-watching real progress across three rounds has no way to buy a fourth.
+right is that three is the only answer. A project whose plans are large enough
+that its reviewer is still converging at the third round ends every one of them
+the same way as a project whose reviewer has given up.
 
 Execution already treats this kind of bound as a project's to set:
 `[execution] review_passes` decides how many times a coding task may be sent
 back. Planning gets the same knob for the same reason, defaulting to what it
 does today so no repository changes behaviour by upgrading.
 
-The budget bounds revisions, and nothing else changes. A plan the Tech Lead
-has not approved still blocks when the budget runs out, with its findings
-preserved for whoever picks it up. Raising the budget buys more attempts at
+The budget bounds revisions, and nothing else changes. It is read when a run
+starts and governs that run: a plan the Tech Lead has not approved blocks when
+the budget runs out and stays blocked whatever the setting becomes afterwards,
+because whether a rejection revised or blocked was settled when it completed
+and is held in the Borg's state. Reading the record back through a number
+raised since would deny a plainly terminal plan and answer with an error naming
+a state. Raising the budget buys the plans that follow more attempts at
 agreement, never agreement itself.
+
+Blocking keeps the findings, and keeping them is worth something only if a
+reader can reach them, so the command the run names for reading them shows
+them. A revision already under way outlives a budget lowered beneath it, and
+the round it leads to is the last one: that is what the reviewer is told, since
+a round numbered past its own budget describes nothing it can use.
 
 **Success Criteria**:
 - A repository can set the number of Tech Lead review rounds its plans get.
 - With nothing set, planning behaves exactly as it does today.
 - A plan still unapproved when the budget runs out still blocks, with its
-  findings preserved and the run resumable.
-- The budget is reported where a reader can see which round they are in.
+  findings preserved, readable, and the run resumable.
+- A blocked plan re-entered later reports what the record holds, whatever the
+  budget has since become, and reconstructs its progress rather than raising.
+- The budget is reported where a reader can see which round they are in, and a
+  round past its budget is named the final one rather than given a number its
+  budget contradicts.
 - A budget below one, or not a whole number, is refused when configuration is
   loaded rather than part-way through a review.
 
@@ -783,11 +797,17 @@ agreement, never agreement itself.
 - A raised budget lets the Tech Lead send a plan back more times, and an
   approval on the later round completes planning.
 - A lowered budget blocks sooner.
-- A plan unapproved at the budget blocks with its findings intact.
+- A plan unapproved at the budget blocks with its findings intact, and showing
+  the plan shows them.
+- A blocked plan re-entered with a raised budget reports the same result and
+  reviews nothing further; one re-entered with progress attached reconstructs
+  the revisions that ran.
+- A revision under way when the budget is lowered still finishes, and the round
+  it leads to is named the final one.
 - A budget of zero, a negative one, and a fractional one are each refused with
   a message naming the setting.
 
-**Status**: Not Started
+**Status**: Complete
 
 
 ## Stage 15: The sanity gate runs the repository's checks, not its catalog

@@ -1111,6 +1111,14 @@ def test_lowering_the_budget_does_not_strand_a_revision_already_under_way(
         ).run()
 
         assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        # The round the stranded revision leads to is the last one, and saying
+        # so is the only description of it that is true. "Round 2 of 1" hands
+        # the reviewer a number it cannot use.
+        assert "review round 1 of 3." in reviewer.calls[0].user_prompt
+        assert (
+            "review round 2, the final round." in reviewer.calls[-1].user_prompt
+        )
+        assert "of 1" not in reviewer.calls[-1].user_prompt
 
 
 def test_lowered_review_budget_blocks_after_its_only_round(
@@ -1411,6 +1419,129 @@ def _findings(spec) -> list[dict]:
 
 def _assert_prior_finding_count(spec, expected: int) -> None:
     assert len(_findings(spec)) == expected
+
+
+def _blocked_by_three_rejections(
+    store,
+    repository,
+    borg,
+    planning_plan_response,
+    tech_lead_change_request_response,
+):
+    """Drive a Borg to BLOCKED on the default budget and return its adapters."""
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    for index in range(4):
+        architect.queue(
+            MockResponse(payload=planning_plan_response(summary=f"Revision {index}."))
+        )
+    reviewer = MockAdapter(name="openai")
+    for index in range(3):
+        reviewer.queue(
+            MockResponse(payload=tech_lead_change_request_response(f"Fix {index}."))
+        )
+    handoff = ArchitectLoop(repository, borg, store, architect, io=_io()).run()
+    result = TechLeadLoop(
+        repository,
+        handoff.borg,
+        store,
+        reviewer,
+        architect_agent=architect,
+        io=_io(),
+    ).run()
+    assert result.borg.state is BorgState.BLOCKED
+    return architect, reviewer, result
+
+
+def test_a_blocked_plan_reconstructs_its_progress_without_a_stranded_child(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The rejection that blocked never revises, so it declares no revision.
+
+    A child declared for it stays pending, and a pending child refuses to let
+    its parent be seeded, so re-entering the record raises instead of
+    reporting what it holds.
+    """
+    database = committed_git_repo.parent / "tech-lead-blocked-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-blocked-progress"
+        )
+        architect, reviewer, first = _blocked_by_three_rejections(
+            store,
+            repository,
+            borg,
+            planning_plan_response,
+            tech_lead_change_request_response,
+        )
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        progress = RunProgress(stream=StringIO())
+
+        again = TechLeadLoop(
+            repository,
+            blocked,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            progress=progress,
+        ).run()
+
+        assert again.borg.state is BorgState.BLOCKED
+        assert again == first
+        children = progress.stages["tech-lead"].children
+        assert [child.state for child in children.values()] == [
+            StageState.COMPLETED,
+            StageState.COMPLETED,
+        ]
+
+
+def test_a_blocked_plan_stays_blocked_when_the_budget_is_raised_afterwards(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    """Whether a rejection blocked was settled when it completed.
+
+    The budget bounds a run from its start. Counting the record against a
+    number raised since would deny the plainly terminal record, and the caller
+    would get an error naming a state rather than the result it asked for.
+    """
+    database = committed_git_repo.parent / "tech-lead-blocked-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-blocked-raised"
+        )
+        architect, reviewer, first = _blocked_by_three_rejections(
+            store,
+            repository,
+            borg,
+            planning_plan_response,
+            tech_lead_change_request_response,
+        )
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        reviews_before = len(reviewer.calls)
+
+        again = TechLeadLoop(
+            repository,
+            blocked,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=5,
+        ).run()
+
+        assert again == first
+        assert again.borg.state is BorgState.BLOCKED
+        assert len(reviewer.calls) == reviews_before
 
 
 def _io(answers: Iterator[str] | None = None) -> InteractiveIO:

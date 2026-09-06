@@ -396,6 +396,26 @@ def _validate_relative_path(raw_path: str, *, field: str) -> PurePosixPath:
     return path
 
 
+def render_planning_findings_markdown(findings: Sequence[Any]) -> str:
+    """Render the Tech Lead findings a blocked plan left behind.
+
+    A plan blocks with its findings kept, and keeping them is only worth
+    something if the reader can see them.
+    """
+
+    if not findings:
+        return ""
+    lines = ["## Tech Lead findings", ""]
+    for finding in findings:
+        lines.append(
+            f"- Round {finding.round} ({finding.severity}): {finding.message}"
+        )
+        if finding.suggestion:
+            lines.append(f"  - Suggestion: {finding.suggestion}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
     """Render a plan as portable GFM, tolerating partial legacy input."""
     if not plan or not isinstance(plan, Mapping):

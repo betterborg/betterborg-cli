@@ -66,6 +66,7 @@ from betterborg_cli.planning import (
     TechLeadLoop,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     render_task_markdown,
     task_markdown_digest,
 )
@@ -652,6 +653,7 @@ def show_plan(name: str, json_output: bool) -> None:
                 )
             attempt = validated_current_plan_attempt(paths, store, borg)
             stored_plan = attempt.result
+            findings = store.list_planning_findings(borg.id)
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
@@ -664,6 +666,10 @@ def show_plan(name: str, json_output: bool) -> None:
             click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
         else:
             click.echo(render_plan_markdown(stored_plan), nl=False)
+            rendered_findings = render_planning_findings_markdown(findings)
+            if rendered_findings:
+                click.echo()
+                click.echo(rendered_findings, nl=False)
 
 
 @cli.group()

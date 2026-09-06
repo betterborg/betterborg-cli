@@ -570,7 +570,14 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     )
 
     assert markdown_result.exit_code == 0, markdown_result.output
-    assert markdown_result.output == render_plan_markdown(plan)
+    assert markdown_result.output.startswith(render_plan_markdown(plan))
+    # A plan blocks with its findings kept, and the command the CLI names for
+    # reading them is this one.
+    assert "## Tech Lead findings" in markdown_result.output
+    assert (
+        "- Round 1 (minor): Name the supported platforms."
+        in markdown_result.output
+    )
     assert markdown_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
