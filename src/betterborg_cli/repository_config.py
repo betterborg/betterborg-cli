@@ -101,6 +101,13 @@ class ExecutionLimits:
 
 
 @dataclass(frozen=True)
+class PlanningLimits:
+    """Repository defaults that bound repeated planning review."""
+
+    review_rounds: int = 3
+
+
+@dataclass(frozen=True)
 class RepositoryConfig:
     """Validated contents of tracked ``.betterborg/config.toml``."""
 
@@ -109,6 +116,7 @@ class RepositoryConfig:
     default_branch: str
     agents: AgentChoices = field(default_factory=AgentChoices)
     execution: ExecutionLimits = field(default_factory=ExecutionLimits)
+    planning: PlanningLimits = field(default_factory=PlanningLimits)
 
 
 def require_registered_repository(
@@ -210,7 +218,9 @@ def load_repository_config(paths: RepoPaths) -> RepositoryConfig:
 
 
 def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
-    _require_only_keys(document, {"version", "repository", "agents", "execution"})
+    _require_only_keys(
+        document, {"version", "repository", "agents", "execution", "planning"}
+    )
 
     version = _require_int(document, "version")
     if version != CONFIG_VERSION:
@@ -260,12 +270,21 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
 
+    planning_document = _optional_table(document, "planning")
+    _require_only_keys(planning_document, {"review_rounds"}, section="planning")
+    review_rounds = _optional_int(
+        planning_document, "review_rounds", default=3, section="planning"
+    )
+    if review_rounds < 1:
+        raise RepositoryConfigError("planning.review_rounds must be at least 1")
+
     return RepositoryConfig(
         version=version,
         repository_id=repository_id,
         default_branch=default_branch,
         agents=AgentChoices(**agent_choices),
         execution=ExecutionLimits(jobs=jobs, review_passes=review_passes),
+        planning=PlanningLimits(review_rounds=review_rounds),
     )
 
 

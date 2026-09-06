@@ -44,7 +44,7 @@ over tools nothing in the run would ever invoke.
 
 Together these block every unattended use, and spoil the output of the runs
 that do finish: CI, cron, a queue worker, and a benchmark container. The work
-here is thirteen independent changes, each closing one of them.
+here is fourteen independent changes, each closing one of them.
 
 ## Stage 1: A read-only sandbox satisfies the PRD session
 
@@ -738,5 +738,48 @@ same thing twice refuses over nothing.
   and say what disagrees.
 - With every program present and every secret configured, the plan preflight
   produces is unchanged.
+
+**Status**: Not Started
+
+## Stage 14: A project decides how many revisions its plans get
+
+**Goal**: The number of times the Tech Lead may send a plan back is a
+project's decision, not a constant.
+
+The Tech Lead reviews a plan, and where it finds something wrong the Architect
+revises and it reviews again. After a fixed three rounds a plan it still will
+not approve blocks, which is right: executing a plan the reviewer rejects is
+the silent erosion of quality that having a reviewer prevents. What is not
+right is that three is the only answer. A hard problem the reviewer is steadily
+converging on ends the same way as one it has given up on, and an operator
+watching real progress across three rounds has no way to buy a fourth.
+
+Execution already treats this kind of bound as a project's to set:
+`[execution] review_passes` decides how many times a coding task may be sent
+back. Planning gets the same knob for the same reason, defaulting to what it
+does today so no repository changes behaviour by upgrading.
+
+The budget bounds revisions, and nothing else changes. A plan the Tech Lead
+has not approved still blocks when the budget runs out, with its findings
+preserved for whoever picks it up. Raising the budget buys more attempts at
+agreement, never agreement itself.
+
+**Success Criteria**:
+- A repository can set the number of Tech Lead review rounds its plans get.
+- With nothing set, planning behaves exactly as it does today.
+- A plan still unapproved when the budget runs out still blocks, with its
+  findings preserved and the run resumable.
+- The budget is reported where a reader can see which round they are in.
+- A budget below one, or not a whole number, is refused when configuration is
+  loaded rather than part-way through a review.
+
+**Tests**:
+- An unset budget leaves the number of rounds exactly as it is today.
+- A raised budget lets the Tech Lead send a plan back more times, and an
+  approval on the later round completes planning.
+- A lowered budget blocks sooner.
+- A plan unapproved at the budget blocks with its findings intact.
+- A budget of zero, a negative one, and a fractional one are each refused with
+  a message naming the setting.
 
 **Status**: Not Started

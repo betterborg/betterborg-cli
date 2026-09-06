@@ -246,6 +246,27 @@ spent its budget planning can still be revised. An Architect that keeps asking
 past that budget ends the run with its unanswered round preserved, so
 `betterborg plan start NAME` resumes it with a person answering.
 
+## Choose how many revisions a plan gets
+
+The Tech Lead reviews the Architect's plan, and where it finds something wrong
+the Architect revises and it reviews again. Three rounds is what a plan gets,
+and one the Tech Lead still will not approve then blocks with its findings
+kept, so `betterborg plan show NAME` says what stood in the way.
+
+A repository that wants more or fewer attempts at agreement sets its own
+budget in `.betterborg/config.toml`:
+
+```toml
+[planning]
+review_rounds = 5
+```
+
+The value is a whole number of at least one, and anything else is refused when
+the configuration is read rather than part-way through a review. Each review
+is told the round it is on and the budget it has. Raising the budget buys
+further rounds, never approval: a plan that spends the larger budget
+unapproved blocks exactly as one that spends the default does.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

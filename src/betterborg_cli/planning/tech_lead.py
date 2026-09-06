@@ -41,6 +41,7 @@ from betterborg_cli.store import (
     SqliteStore,
 )
 
+#: Review rounds a plan gets where its repository configures no budget.
 TECH_REVIEW_ROUND_CAP = 3
 _TECH_REVIEW_PHASE = "tech_review"
 _ARCHITECT_PLAN_PHASE = "architect_plan"
@@ -102,7 +103,7 @@ class TechLeadResult:
 
 
 class TechLeadLoop:
-    """Review a validated plan, revising it at most twice before blocking."""
+    """Review a validated plan, revising it within its round budget."""
 
     def __init__(
         self,
@@ -114,6 +115,7 @@ class TechLeadLoop:
         architect_agent: AgentAdapter | SelectedAgent | None = None,
         io: InteractiveIO,
         unattended: bool = False,
+        review_rounds: int = TECH_REVIEW_ROUND_CAP,
         artifact_dir: Path | None = None,
         model: str | None = None,
         architect_model: str | None = None,
@@ -149,6 +151,7 @@ class TechLeadLoop:
         self.architect_agent = architect
         self.io = io
         self.unattended = unattended
+        self.review_rounds = review_rounds
         self.artifact_dir = Path(
             artifact_dir or paths.artifacts_dir / "planning" / str(borg.id)
         ).resolve()
@@ -275,7 +278,7 @@ class TechLeadLoop:
             decision = payload["decision"]
             if decision == "approve":
                 next_state = BorgState.PLAN_APPROVAL_PENDING
-            elif review_round < TECH_REVIEW_ROUND_CAP:
+            elif review_round < self.review_rounds:
                 next_state = BorgState.ARCHITECT_WORKING
             else:
                 next_state = BorgState.BLOCKED
@@ -312,7 +315,7 @@ class TechLeadLoop:
                 "Read .betterborg/state/planning/context/manifest.json and all "
                 "referenced evidence. Review the complete current plan. "
                 f"This is Tech Lead review round {review_round} of "
-                f"{TECH_REVIEW_ROUND_CAP}."
+                f"{self.review_rounds}."
             ),
             current_plan=json.dumps(plan, indent=2, sort_keys=True),
             turn_name="review",
@@ -413,7 +416,7 @@ class TechLeadLoop:
             borg.state is BorgState.BLOCKED
             and (
                 decision != "request_changes"
-                or len(self._completed_reviews()) < TECH_REVIEW_ROUND_CAP
+                or len(self._completed_reviews()) < self.review_rounds
             )
         ):
             return None
@@ -462,7 +465,7 @@ class TechLeadLoop:
         return planning_request_change_attempts(
             self._cycle_attempts(),
             _TECH_REVIEW_PHASE,
-            round_cap=TECH_REVIEW_ROUND_CAP,
+            round_cap=self.review_rounds,
         )
 
     @staticmethod

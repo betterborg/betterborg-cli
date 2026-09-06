@@ -1972,6 +1972,7 @@ def _continue_planning(
                     architect_agent=architect_agent,
                     io=planning_io,
                     unattended=unattended,
+                    review_rounds=config.planning.review_rounds,
                     cancel=cancel,
                     progress=progress,
                 ).run().borg

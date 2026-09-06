@@ -12,6 +12,7 @@ from betterborg_cli.repository_config import (
     AgentChoices,
     AgentStage,
     ExecutionLimits,
+    PlanningLimits,
     RepositoryConfigError,
     load_repository_config,
 )
@@ -50,7 +51,28 @@ review_passes = 1
     assert config.repository_id == UUID(REPOSITORY_ID)
     assert config.default_branch == "main"
     assert config.execution == ExecutionLimits(jobs=10, review_passes=1)
+    assert config.planning == PlanningLimits()
     assert config.agents == AgentChoices()
+
+
+def test_loads_the_planning_review_round_budget(git_repo: Path) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[planning]
+review_rounds = 5
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.planning == PlanningLimits(review_rounds=5)
 
 
 @pytest.mark.parametrize("stage", list(AgentStage))
@@ -257,6 +279,33 @@ id = "{REPOSITORY_ID}"
 default_branch = "main"
 [execution]
 {execution}
+""",
+    )
+
+    with pytest.raises(RepositoryConfigError, match=message):
+        load_repository_config(paths)
+
+
+@pytest.mark.parametrize(
+    ("planning", "message"),
+    [
+        ("review_rounds = 0", "planning.review_rounds must be at least 1"),
+        ("review_rounds = -1", "planning.review_rounds must be at least 1"),
+        ("review_rounds = 1.5", "planning.review_rounds must be an integer"),
+    ],
+)
+def test_rejects_planning_budgets_that_are_not_whole_and_positive(
+    git_repo: Path, planning: str, message: str
+) -> None:
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+[planning]
+{planning}
 """,
     )
 

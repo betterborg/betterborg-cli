@@ -422,6 +422,60 @@ def test_plan_start_reports_review_cap_as_blocked(
         assert len(store.list_planning_findings(borg.id)) == 3
 
 
+def test_plan_start_honors_the_repository_review_round_budget(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = MockAdapter(name="openai")
+    for payload in ({"decision": "ready_to_plan"}, planning_plan_response()):
+        architect_adapter.queue(MockResponse(payload=payload))
+    tech_lead_adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Clarify rollback behavior.")
+        )
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "budgeted-plan")
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\nreview_rounds = 1\n",
+        encoding="utf-8",
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "budgeted-plan", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Planning blocked" in result.output
+    assert len(architect_adapter.calls) == 2
+    assert len(tech_lead_adapter.calls) == 1
+    assert "review round 1 of 1" in tech_lead_adapter.calls[0].user_prompt
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "budgeted-plan")
+        assert borg is not None
+        assert borg.state is BorgState.BLOCKED
+        assert len(store.list_planning_findings(borg.id)) == 1
+
+
 def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     cli_runner: CliRunner,
     committed_git_repo: Path,

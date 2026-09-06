@@ -48,6 +48,42 @@ def _rubric(score: float) -> dict[str, dict[str, object]]:
     }
 
 
+def _commit_cited_evidence(git_repo: Path) -> None:
+    """Commit the small evidence set the citation-shape tests analyze."""
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    (git_repo / "Makefile").write_text(
+        "test:\n\tpython -m pytest\n", encoding="utf-8"
+    )
+    (git_repo / "package.json").write_text(
+        '{"scripts":{"test":"python -m pytest"}}\n', encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(git_repo), "add", "--all"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+
+
+def _catalog_payload(catalog: dict[str, object]) -> dict[str, object]:
+    """Wrap one command catalog in the smallest valid analyzer payload."""
+    return {
+        "summary": "A small Python command-line application.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": catalog,
+    }
+
+
 @pytest.fixture
 def analysis() -> RepositoryAnalysis:
     return RepositoryAnalysis(
@@ -430,6 +466,106 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
             "port.missing.yml",
         )
     )
+
+
+def test_single_anchored_and_directory_relative_citations_stay_accepted(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["make", "test"],
+                    "source": "package.json#scripts",
+                },
+                {
+                    "stage": "lint",
+                    "argv": ["make", "lint"],
+                    "source": "package.json/scripts",
+                },
+            ],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+
+        assert len(store.list_analyses(repository.id)) == 1
+
+
+def test_a_citation_naming_several_manifest_files_is_accepted(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile; package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["make", "test"],
+                    "source": "package.json#scripts; Makefile",
+                }
+            ],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+
+        analyses = store.list_analyses(repository.id)
+        assert len(analyses) == 1
+        catalog = analyses[0].analysis_json["command_catalog"]
+        assert catalog["source"] == "Makefile; package.json"
+
+
+def test_a_citation_naming_several_files_reports_only_the_absent_one(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile; not-discovered.yml",
+            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+
+        with pytest.raises(AnalyzerError, match="absent from manifest") as error:
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+
+        assert store.list_analyses(repository.id) == []
+
+    assert "not-discovered.yml" in str(error.value)
+    assert "Makefile" not in str(error.value)
 
 
 def test_materialize_command_alone_is_a_valid_environment_input(

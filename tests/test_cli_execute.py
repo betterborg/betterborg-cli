@@ -125,6 +125,7 @@ def _seed_executable_generation(
 
 def _execution_result(
     status: ExecutionRunStatus = ExecutionRunStatus.COMPLETED,
+    dropped_commands: tuple[HostDroppedCommand, ...] = (),
 ):
     return SimpleNamespace(
         preflight=HostPreflightPlan(
@@ -137,6 +138,7 @@ def _execution_result(
             required_secret_names=(),
             compose_files=(),
             services=(),
+            dropped_commands=dropped_commands,
         ),
         active_operation_id=None,
         operation_id=uuid4(),
@@ -1069,6 +1071,70 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert "### 01-delivery — Deliver the project" in body
     assert _project_branch_sha(committed_git_repo, name) == local_sha
     assert _remote_project_sha(remote, name) == local_sha
+
+
+def test_the_rollup_pull_request_names_a_check_this_host_could_not_run(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drop has to travel from preflight into the artifact, not just be
+    formattable into it.
+
+    Testing the body builder proves the section can be written. What decides
+    whether a reviewer ever sees it is whether execute hands it the drop, and
+    that wire is the thing a green suite must not survive losing.
+    """
+    name = "pr-dropped"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "push",
+            str(remote),
+            f"refs/heads/project/{name}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    dropped = (
+        HostDroppedCommand(
+            command=HostCommand(
+                stage="test",
+                argv=("missing-runtime", "-m", "pytest"),
+                cwd=".",
+                evidence="pyproject.toml",
+            ),
+            reason="host executable is not available: missing-runtime",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(dropped_commands=dropped),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 0, result.output
+    body = body_path.read_text(encoding="utf-8")
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime" in body
+    assert local_sha == _project_branch_sha(committed_git_repo, name)
 
 
 def test_rollup_pr_commands_keep_runner_contract_and_report_activity(

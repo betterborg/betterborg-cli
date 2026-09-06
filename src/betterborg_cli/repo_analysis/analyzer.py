@@ -342,9 +342,11 @@ cite manifest paths, target one package and dimension, and state S/M/L effort.
 Group recommendations into themes with an explicit S/M/L theme effort and
 rationale. Every reported Harness command, environment input, Compose file,
 required secret, and service must cite a manifest path or inherit a source
-from its containing catalog/environment/service. Service env contains variable
-names only, never values. Omit an optional category when bounded evidence is
-insufficient. Return only the JSON object required by the supplied schema.
+from its containing catalog/environment/service. A source names one path; when
+several files support a claim, cite the one that establishes it. Service env
+contains variable names only, never values. Omit an optional category when
+bounded evidence is insufficient. Return only the JSON object required by the
+supplied schema.
 """
 _USER_PROMPT = (
     "Analyze the bounded discovery manifest and copied evidence. Treat omitted "
@@ -694,11 +696,9 @@ def _validate_harness_evidence(
         raise AnalyzerError(f"Harness input lacks bounded evidence for: {names}")
 
     known_paths = {file.path for file in manifest.files}
-    unknown_sources = {
-        source
-        for source in cited_paths
-        if not _source_is_in_manifest(source, known_paths)
-    }
+    unknown_sources: set[str] = set()
+    for source in cited_paths:
+        unknown_sources |= _unknown_citation_parts(source, known_paths)
     if unknown_sources:
         names = ", ".join(sorted(unknown_sources))
         raise AnalyzerError(
@@ -720,6 +720,27 @@ def _source(value: object) -> str | None:
         if source.partition("#")[0] != ANALYSIS_INPUT_FILENAME:
             return source
     return None
+
+
+def _unknown_citation_parts(source: str, known_paths: set[str]) -> set[str]:
+    """Name every part of one citation that the manifest does not account for.
+
+    A citation carries a single path, but the schema offers one string per
+    source, so analysis packs several semicolon-separated paths into it when
+    more than one file supports a claim. Reading such a list as a filename
+    fails a whole analysis over evidence that is entirely real, so a citation
+    the manifest cannot place is retried as a list. Splitting widens what
+    counts as well formed, never what counts as evidence: every part is held to
+    the same manifest check, and an unplaceable part is named on its own so the
+    complaint points at the one path that is missing.
+    """
+    if _source_is_in_manifest(source, known_paths):
+        return set()
+
+    parts = [part.strip() for part in source.split(";")]
+    if len(parts) < 2 or not all(parts):
+        return {source}
+    return {part for part in parts if not _source_is_in_manifest(part, known_paths)}
 
 
 def _source_is_in_manifest(source: str, known_paths: set[str]) -> bool:

@@ -13,6 +13,7 @@ from planning_progress_test_support import BoundaryInterruptProgress
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
+    TECH_REVIEW_ROUND_CAP,
     ArchitectCancelled,
     ArchitectError,
     ArchitectLoop,
@@ -26,6 +27,7 @@ from betterborg_cli.progress import (
     StageRecord,
     StageState,
 )
+from betterborg_cli.repository_config import PlanningLimits
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
@@ -894,6 +896,118 @@ def test_third_change_request_blocks_with_durable_resumable_history(
         ]
         assert loop.run() == result
         assert len(reviewer.calls) == 3
+
+
+def test_unconfigured_repository_keeps_the_default_review_round_budget() -> None:
+    assert PlanningLimits().review_rounds == TECH_REVIEW_ROUND_CAP
+
+
+def test_raised_review_budget_approves_on_a_round_the_default_denies(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    database = committed_git_repo.parent / "tech-lead-raised-budget.sqlite3"
+    plans = [
+        planning_plan_response(),
+        planning_plan_response(summary="Revision one."),
+        planning_plan_response(summary="Revision two."),
+        planning_plan_response(summary="Revision three."),
+    ]
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    for plan in plans:
+        architect.queue(MockResponse(payload=plan))
+    reviewer = MockAdapter(name="openai")
+    for round_number in range(1, 4):
+        reviewer.queue(
+            MockResponse(
+                payload=tech_lead_change_request_response(
+                    f"Finding round {round_number}."
+                )
+            )
+        )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-raised-budget"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=4,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert result.plan == plans[-1]
+        assert len(reviewer.calls) == 4
+        assert "review round 1 of 4" in reviewer.calls[0].user_prompt
+        assert "review round 4 of 4" in reviewer.calls[-1].user_prompt
+        assert [item.round for item in store.list_planning_findings(borg.id)] == [
+            1,
+            2,
+            3,
+        ]
+
+
+def test_lowered_review_budget_blocks_after_its_only_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    database = committed_git_repo.parent / "tech-lead-lowered-budget.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-lowered-budget"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        loop = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+        )
+
+        result = loop.run()
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert "review round 1 of 1" in reviewer.calls[0].user_prompt
+        assert len(reviewer.calls) == 1
+        assert len(architect.calls) == 2
+        assert [
+            (item.round, item.message)
+            for item in store.list_planning_findings(borg.id)
+        ] == [(1, "Define rollback behavior.")]
+        assert loop.run() == result
+        assert len(reviewer.calls) == 1
 
 
 def test_two_revision_children_reconstruct_once_from_durable_attempt_ids(
