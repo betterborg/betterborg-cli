@@ -104,7 +104,9 @@ def analysis() -> RepositoryAnalysis:
             ],
             "command_catalog": {
                 "source": "Makefile",
-                "commands": [{"stage": "test", "argv": ["make", "test"]}],
+                "commands": [
+                    {"stage": "test", "argv": ["make", "test"], "verifies": True}
+                ],
             },
             "required_secrets": [
                 {
@@ -259,6 +261,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "package.json#scripts",
                     "uses_services": ["postgres"],
@@ -411,6 +414,7 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "command.missing.yml#jobs",
                 }
@@ -478,11 +482,13 @@ def test_single_anchored_and_directory_relative_citations_stay_accepted(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "package.json#scripts",
                 },
                 {
                     "stage": "lint",
+                    "verifies": True,
                     "argv": ["make", "lint"],
                     "source": "package.json/scripts",
                 },
@@ -514,6 +520,7 @@ def test_a_citation_naming_several_manifest_files_is_accepted(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "package.json#scripts; Makefile",
                 }
@@ -545,7 +552,7 @@ def test_a_citation_naming_several_files_reports_only_the_absent_one(
     payload = _catalog_payload(
         {
             "source": "Makefile; not-discovered.yml",
-            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}],
         }
     )
     repository = Repository(root=git_repo)
@@ -705,7 +712,7 @@ def test_analyzer_rejects_uncited_harness_detections(git_repo: Path) -> None:
         "recommendations": [],
         "themes": [],
         "command_catalog": {
-            "commands": [{"stage": "test", "argv": ["make", "test"]}]
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}]
         },
         "environment": {
             "toolchains": [{"name": "python"}],
@@ -866,6 +873,7 @@ def test_human_reports_sanitize_control_characters_and_escape_markdown(
         "commands": [
             {
                 "stage": "test\n## Command\x1b[31m",
+                "verifies": True,
                 "argv": ["make", "bad\n## Arg"],
             }
         ]
@@ -976,7 +984,7 @@ def test_analyzer_treats_the_workspace_index_as_no_harness_evidence(
         "themes": [],
         "command_catalog": {
             "source": ANALYSIS_INPUT_FILENAME,
-            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}],
         },
     }
     repository = Repository(root=git_repo)
@@ -994,3 +1002,51 @@ def test_analyzer_treats_the_workspace_index_as_no_harness_evidence(
         assert store.list_analyses(repository.id) == []
 
     assert ANALYSIS_INPUT_FILENAME not in str(error.value)
+
+
+def test_a_catalogued_command_must_say_whether_it_verifies(
+    git_repo: Path,
+) -> None:
+    """The gate runs this list, so each entry answers what running it settles.
+
+    Left to infer it, a gate cannot: a docs watch server and a docs build are
+    one word apart in the same manifest.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small application whose catalogue declines the question.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="verifies"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []

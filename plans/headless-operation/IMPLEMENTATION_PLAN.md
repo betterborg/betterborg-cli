@@ -788,3 +788,48 @@ agreement, never agreement itself.
   a message naming the setting.
 
 **Status**: Not Started
+
+
+## Stage 15: The sanity gate runs the repository's checks, not its catalog
+
+**Goal**: A merged task is proved by the commands that verify the repository,
+and never by one that serves, watches, or publishes.
+
+The analyzer catalogs what a repository can do, and describes the list in its
+own words as the development commands: a Makefile's targets and a package's
+scripts, gathered for a person to choose among. The sanity gate has exactly one
+input and it is that list, so it runs all of it. Beside the test target it runs
+the docs watch server, the interactive shell, and the release pipeline. The
+first of those never exits, and the last publishes.
+
+Nothing ever told the analyzer the list would be used this way, so nothing in
+an entry says whether running it proves anything. The gate cannot infer it: a
+docs watch server and a docs build are one word apart in the same manifest, and
+the difference between them is what the command does, not what it is called. So
+the entry says it. Each catalogued command declares whether running it to
+completion verifies the repository, and the gate runs the ones that do.
+
+An entry written before the analyzer was asked declares nothing, and is run.
+Reading that silence as "not a check" would quietly stop running a repository's
+tests, and a run that checked nothing would be indistinguishable from one that
+passed. Too much in the gate is visible in the result; too little is not.
+
+A command the gate will not run states no requirement for the run, so the
+secrets rule already in place follows it: a secret only a non-verifying command
+names does not block.
+
+**Success Criteria**:
+- Each catalogued command declares whether running it verifies the repository,
+  and analysis is refused when one does not.
+- The sanity gate runs the commands that declare they do, and no others.
+- A catalog recorded before the declaration existed still runs in full.
+- A secret only a non-verifying command names does not block the run.
+- Prepare and materialize commands are unaffected; they build the run itself.
+
+**Tests**:
+- A catalog mixing verifying and non-verifying entries runs only the former.
+- A catalog that declares nothing runs every command.
+- A secret named only by a non-verifying command does not block.
+- The analyzer schema refuses a catalogued command that does not declare.
+
+**Status**: Complete

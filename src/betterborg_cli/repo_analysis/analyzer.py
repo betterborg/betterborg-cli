@@ -68,9 +68,10 @@ _RUBRIC_SCHEMA: dict[str, Any] = {
 _COMMAND_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["stage", "argv"],
+    "required": ["stage", "argv", "verifies"],
     "properties": {
         "stage": {"type": "string", "minLength": 1},
+        "verifies": {"type": "boolean"},
         "argv": {
             "type": "array",
             "minItems": 1,
@@ -343,7 +344,11 @@ Group recommendations into themes with an explicit S/M/L theme effort and
 rationale. Every reported Harness command, environment input, Compose file,
 required secret, and service must cite a manifest path or inherit a source
 from its containing catalog/environment/service. A source names one path; when
-several files support a claim, cite the one that establishes it. Service env
+several files support a claim, cite the one that establishes it. Every
+catalogued command says whether running it verifies the repository: verifies is
+true for one that builds, formats, lints, or tests and then exits on its own,
+and false for one that serves, watches, publishes, releases, or waits for
+input. Service env
 contains variable names only, never values. Omit an optional category when
 bounded evidence is insufficient. Return only the JSON object required by the
 supplied schema.

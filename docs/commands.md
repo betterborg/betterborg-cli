@@ -173,6 +173,13 @@ analysis lists are an inventory written for a person to read, so a host with no
 program by one of those names is not refused; every command that runs already
 requires the program it invokes.
 
+The catalog lists what a repository can do, and only part of it settles
+whether a change broke anything. Each catalogued command says whether running
+it to completion verifies the repository: a build, format, lint, or test does,
+while a command that serves, watches, publishes, or waits for input does not.
+The sanity gate runs the ones that do. An analysis recorded before the question
+was asked says nothing, and every command in it still runs.
+
 A catalog command whose program is missing is dropped from the run rather than
 refusing it, and never silently. The Preflight stage names each dropped
 command, and so does the result of every task that would have run it:

@@ -1210,6 +1210,7 @@ def test_preserves_ordered_compose_stack_and_active_profiles(
                 {
                     "stage": "test",
                     "argv": ["available-command"],
+                    "verifies": True,
                     "uses_services": ["database"],
                     "source": "README.md#test",
                 }
@@ -1775,3 +1776,124 @@ def test_host_that_satisfies_everything_produces_the_unchanged_plan(
             HostSecret("PACKAGE_TOKEN", "build", ("test",), "pyproject.toml"),
         ),
     )
+
+
+def test_the_gate_runs_only_the_commands_that_declare_they_verify(
+    committed_git_repo: Path,
+) -> None:
+    """The catalogue lists what a repository can do; the gate proves a change.
+
+    A docs watch server and a test target are one word apart in a package
+    manifest, so the entry says which of them settles whether a change broke
+    the repository, and only that one runs.
+    """
+    binary_dir = committed_git_repo.parent / "verifies-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "run", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "docs-development",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "run", "test")
+    ]
+    assert result.dropped_commands == ()
+
+
+def test_a_catalogue_that_declares_nothing_runs_every_command(
+    committed_git_repo: Path,
+) -> None:
+    """An analysis recorded before the question was asked answers it by silence.
+
+    Treating that silence as "not a check" would quietly stop running a
+    repository's tests, and the run would look exactly like one that passed
+    them.
+    """
+    binary_dir = committed_git_repo.parent / "silent-catalogue-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {"stage": "test", "argv": ["example-npm", "run", "test"]},
+                {"stage": "build", "argv": ["example-npm", "run", "build"]},
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "run", "test"),
+        ("example-npm", "run", "build"),
+    ]
+
+
+def test_a_secret_only_a_non_verifying_command_names_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    """A command the gate will not run states no requirement for the run."""
+    binary_dir = committed_git_repo.parent / "publish-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "run", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                    "required_secrets": ["NPM_PUBLISH_TOKEN"],
+                },
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "NPM_PUBLISH_TOKEN",
+                "used_by": ["release"],
+                "scope": "build",
+                "source": "package.json#release",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("NPM_PUBLISH_TOKEN",)

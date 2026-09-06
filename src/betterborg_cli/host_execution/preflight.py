@@ -441,12 +441,16 @@ class HostPreflight:
             validated_groups.append(commands)
             validated_records.append(accepted)
         catalog_commands, prepare_commands, materialize_commands = validated_groups
-        return (
-            catalog_commands,
-            prepare_commands,
-            materialize_commands,
-            validated_records[0],
-        )
+        checks: list[HostCommand] = []
+        check_records: list[Mapping[str, Any]] = []
+        for command, record in zip(
+            catalog_commands, validated_records[0], strict=True
+        ):
+            if not _verifies(record):
+                continue
+            checks.append(command)
+            check_records.append(record)
+        return (checks, prepare_commands, materialize_commands, check_records)
 
     def _environment_files(
         self,
@@ -1410,6 +1414,19 @@ def _merged_used_by(
             if value not in merged:
                 merged.append(value)
     return merged
+
+
+def _verifies(record: Mapping[str, Any]) -> bool:
+    """Return whether running this catalogued command proves the repository.
+
+    The catalogue lists what a repository can do; the gate runs what shows a
+    change did not break it. A record written before the analyzer was asked to
+    tell the two apart declares nothing, and is run: a gate that quietly
+    stopped running a repository's tests would be the worse failure, and it
+    would look exactly like a gate that passed them.
+    """
+
+    return record.get("verifies") is not False
 
 
 def _secret_stages(record: Mapping[str, Any]) -> tuple[str, ...]:
