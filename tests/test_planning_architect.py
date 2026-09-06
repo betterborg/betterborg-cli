@@ -541,7 +541,9 @@ def test_an_answer_a_person_gives_retires_the_assumption_it_replaces(
             unattended=True,
         ).run()
 
-        assert "assumptions" not in result.plan
+        # An empty list rather than an absent field: the plan said it rests
+        # on nothing assumed, and has to still be saying so to the next one.
+        assert result.plan["assumptions"] == []
         assert "## Assumptions" not in render_plan_markdown(result.plan)
 
 
@@ -815,7 +817,9 @@ def test_a_revision_can_say_it_rests_on_nothing_assumed(
             unattended=True,
         ).run()
 
-        assert "assumptions" not in result.plan
+        # An empty list rather than an absent field: the plan said it rests
+        # on nothing assumed, and has to still be saying so to the next one.
+        assert result.plan["assumptions"] == []
         assert "## Assumptions" not in render_plan_markdown(result.plan)
 
 
@@ -969,6 +973,336 @@ def test_an_inherited_list_does_not_answer_for_a_plan_that_said_nothing(
         assert result.plan["assumptions"] == spoken["assumptions"]
 
 
+def _seed_plan_and_review(store, borg, plan: dict[str, object]) -> None:
+    """Leave a Borg where a review has sent one completed plan back.
+
+    The plan finishes after every round already answered, because that is the
+    order a run produces and the order that decides whether a round is one the
+    plan could have accounted for.
+    """
+    answered = [
+        question.answered_at
+        for question in store.list_planning_questions(borg.id)
+        if question.answered_at is not None
+    ]
+    # Just after the rounds it saw, and no later, so a round answered after
+    # this call is genuinely one the plan could not have accounted for.
+    finished = (
+        max(answered) + timedelta(milliseconds=1) if answered else borg.created_at
+    )
+    for phase, result in (
+        ("architect_plan", plan),
+        ("tech_review", {"decision": "request_changes"}),
+    ):
+        store.append_planning_attempt(
+            PlanningAttempt(
+                borg_id=borg.id,
+                phase=phase,
+                round=1,
+                adapter="mock",
+                model="test-model",
+                status=PlanningAttemptStatus.COMPLETED,
+                finished_at=finished,
+                result=result,
+            )
+        )
+
+
+def _seed_answered_round(
+    store, borg, question: str, answer: str, *, assumed: bool
+) -> None:
+    """Put one answered question round on the record."""
+    asked = [{"id": "q1", "question": question}]
+    store.append_planning_attempt(
+        PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_questions",
+            round=1,
+            adapter="mock",
+            model="test-model",
+            status=PlanningAttemptStatus.COMPLETED,
+            finished_at=borg.created_at,
+            result={"decision": "ask_more", "questions": asked},
+        )
+    )
+    stored = PlanningQuestion(
+        borg_id=borg.id,
+        attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+        round=1,
+        questions=asked,
+    )
+    store.append_planning_question(stored)
+    recorded: dict[str, object] = {"q_id": "q1", "answer": answer}
+    if assumed:
+        recorded["assumed"] = True
+    store.answer_planning_question(stored.id, [recorded])
+
+
+def test_the_record_does_not_speak_over_a_plan_that_already_did(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A plan that spoke settled everything decided before it.
+
+    Asking again would replace its account with the record's, which knows
+    only the rounds: an assumption it took without asking has no round, so
+    publishing the record in place of its list deletes that assumption.
+    """
+    carried = dict(_plan())
+    carried["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        },
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux and macOS.",
+        },
+    ]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-spoke-before.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "spoke-before"
+        )
+        _seed_answered_round(
+            store, borg, "Which platforms are required?", "Linux and macOS.",
+            assumed=True,
+        )
+        _seed_plan_and_review(store, borg, carried)
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        # No correction turn: the questions turn and the plan turn only.
+        assert len(adapter.calls) == 2
+        assert result.plan["assumptions"] == carried["assumptions"]
+
+
+def test_a_retirement_survives_the_revision_after_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The record must not reinstate what a plan said it no longer rests on.
+
+    A revision the review settled retires everything with an empty list. The
+    revision after it is silent, and the record still holds the round that
+    produced the retired decision. Publishing it back would assert the plan
+    rests on something a plan in the same lifecycle said it does not.
+    """
+    retired = dict(_plan())
+    retired["assumptions"] = []
+    silent = dict(_plan())
+    silent["summary"] = "Address the second finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-retired-durable.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "retired-durable"
+        )
+        _seed_answered_round(
+            store, borg, "Which platforms are required?", "Linux and macOS.",
+            assumed=True,
+        )
+        _seed_plan_and_review(store, borg, retired)
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == []
+        assert "## Assumptions" not in render_plan_markdown(result.plan)
+
+
+def test_the_last_resort_adds_to_what_the_plan_already_stands_on(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The record knows the rounds and nothing else.
+
+    A decision the Architect took without asking leaves no round behind, so
+    publishing the record in place of the standing list deletes it. Here a
+    question is answered after the standing plan was written, and the plan
+    that follows says nothing twice: the new decision is added, and the one
+    that never had a round survives.
+    """
+    carried = dict(_plan())
+    carried["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-last-resort-adds.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "last-resort-adds"
+        )
+        _seed_plan_and_review(store, borg, carried)
+        # Answered after that plan, so it is a decision the plan could not
+        # have accounted for.
+        _seed_answered_round(
+            store, borg, "Which platforms are required?", "Linux and macOS.",
+            assumed=True,
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == [
+            {
+                "question": "Where does the changelog live?",
+                "assumption": "At the repository root.",
+            },
+            {
+                "question": "Which platforms are required?",
+                "assumption": "Linux and macOS.",
+            },
+        ]
+
+
+def test_the_record_does_not_republish_ground_a_person_answered(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The record is published unfiltered, so it must retire on its own.
+
+    Nothing downstream removes a person-answered question from the last
+    resort, which makes the record's own retirement the only thing standing
+    between the operator's answer and a heading saying nobody confirmed it.
+    """
+    silent = dict(_plan())
+    assert "assumptions" not in silent
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-record-retires.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "record-retires"
+        )
+        _seed_answered_round(
+            store, borg, "Which platforms are required?", "Linux only.",
+            assumed=True,
+        )
+        asked = [{"id": "q1", "question": "Which platforms are required?"}]
+        store.append_planning_attempt(
+            PlanningAttempt(
+                borg_id=borg.id,
+                phase="architect_questions",
+                round=2,
+                adapter="mock",
+                model="test-model",
+                status=PlanningAttemptStatus.COMPLETED,
+                finished_at=borg.created_at,
+                result={"decision": "ask_more", "questions": asked},
+            )
+        )
+        answered = PlanningQuestion(
+            borg_id=borg.id,
+            attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+            round=2,
+            questions=asked,
+        )
+        store.append_planning_question(answered)
+        store.answer_planning_question(
+            answered.id, [{"q_id": "q1", "answer": "Linux and macOS."}]
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        # Nothing left for the record to say, so no correction turn either.
+        assert len(adapter.calls) == 2
+        assert "assumptions" not in result.plan
+
+
+def test_an_attended_run_is_never_asked_to_name_assumptions(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Resuming by hand a Borg an unattended run planned must cost nothing.
+
+    An attended plan may not claim assumptions, so sending it a correction
+    asking for them buys an Architect turn for an answer it is forbidden to
+    give, and then publishes the record over a plan that never spoke.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-attended-unasked.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "attended-unasked"
+        )
+        _seed_answered_round(
+            store, borg, "Which platforms are required?", "Linux and macOS.",
+            assumed=True,
+        )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert len(adapter.calls) == 2
+        assert "assumptions" not in result.plan
+
+
 def test_an_attended_revision_carries_the_assumptions_it_inherits(
     committed_git_repo: Path,
     persist_planning_context,
@@ -1093,7 +1427,9 @@ def test_an_attended_revision_drops_an_assumption_the_operator_answered(
             ),
         ).run()
 
-        assert "assumptions" not in result.plan
+        # An empty list rather than an absent field: the plan said it rests
+        # on nothing assumed, and has to still be saying so to the next one.
+        assert result.plan["assumptions"] == []
         assert "## Assumptions" not in render_plan_markdown(result.plan)
 
 

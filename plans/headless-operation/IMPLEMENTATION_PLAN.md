@@ -556,9 +556,16 @@ of several readings stands, but it knows the Architect decided something, so a
 plan mentioning nothing has left the operator no sign of it. Such a plan is
 asked once, shown the decisions on record, and told to state in its own words
 whatever it still rests on. If it names them, that is what the plan carries. If
-it is asked and still says nothing, the record is published in its place: an
-approximate account of the run beats one that reads as though nothing was
-decided for it.
+it is asked and still says nothing, the record is added to what the plan
+already stands on: an approximate account of the run beats one that reads as
+though nothing was decided for it.
+
+Added, rather than put in its place, and only for the rounds answered since the
+last plan that spoke. The record knows the question rounds and nothing else, so
+a requirement the Architect settled without asking appears nowhere in it, and a
+plan that already spoke has accounted for everything decided before it.
+Publishing the record over such a plan would delete the assumptions it named
+that no round produced, and reinstate ones a later plan retired.
 
 Silence is what the plan itself said, not what it was handed. A plan naming
 none of its own inherits the list the plan it supersedes carried, and judging
@@ -606,8 +613,8 @@ command never built itself, and it decides on the same terms as the rest.
   no more: the plan's own account rather than several merged, and nothing over
   ground a person has since answered.
 - A plan that says nothing about assumptions is asked once to state them, and
-  the record is published if it still says nothing. What it inherits does not
-  count as having spoken.
+  the rounds answered since the last plan that spoke are added if it still says
+  nothing. What it inherits does not count as having spoken.
 - A plan naming an empty list has said it rests on nothing assumed, and retires
   what it inherits.
 - Without the unattended option the existing behaviour is unchanged, including
@@ -628,7 +635,11 @@ command never built itself, and it decides on the same terms as the rest.
   follows, and a plan that names its assumptions owns the list.
 - A plan that says nothing about assumptions is shown the decisions on record
   and asked again, including when it inherits a list; one that says nothing
-  twice publishes them.
+  twice keeps what it stands on and gains the rounds answered since.
+- A plan that already spoke is not asked again, and a retirement it made is not
+  reinstated by the plan after it.
+- The record retires a question a person answered before it is published, and
+  an attended run is never asked to name assumptions at all.
 - A plan naming an empty list retires what it inherits, and one that says
   nothing keeps it.
 - An attended revision carries the superseded plan's assumptions, except over

@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -603,7 +604,7 @@ class ArchitectLoop:
                 rejected_plan = payload
                 continue
 
-            unnamed = self._unnamed_assumptions(named_assumptions)
+            unnamed = self._unnamed_assumptions(named_assumptions, current_plan)
             if unnamed and not assumptions_asked:
                 # One ask, not a budget. A plan turn is the most expensive
                 # thing this loop does, and the fallback below is a fair
@@ -627,8 +628,22 @@ class ArchitectLoop:
                 # Asked once and still silent. The record is the poorer
                 # account, because it cannot say which of two readings of the
                 # same ground is current, but publishing it beats letting the
-                # run read as though nothing was decided for it.
-                payload = self._assuming(payload, unnamed)
+                # run read as though nothing was decided for it. It is added
+                # to what the plan already stands on rather than put in its
+                # place: the record knows only the rounds, and a standing
+                # assumption taken without asking is in neither.
+                standing = self._declared_assumptions(payload)
+                spoken_for = {item["question"].casefold() for item in standing}
+                payload = self._assuming(
+                    payload,
+                    standing
+                    + [
+                        item
+                        for item in unnamed
+                        if item["question"].casefold() not in spoken_for
+                    ],
+                    spoke=True,
+                )
 
             with self.store.transaction():
                 completed = self.store.complete_planning_attempt(
@@ -981,8 +996,16 @@ class ArchitectLoop:
         """
         inherited = self._declared_assumptions(superseded or {})
         if not self.unattended or not self._names_assumptions(plan):
-            return self._assuming(plan, self._unsettled(inherited))
-        return self._assuming(plan, self._unsettled(self._declared_assumptions(plan)))
+            return self._assuming(
+                plan,
+                self._unsettled(inherited),
+                spoke=self._names_assumptions(superseded or {}),
+            )
+        return self._assuming(
+            plan,
+            self._unsettled(self._declared_assumptions(plan)),
+            spoke=True,
+        )
 
     @staticmethod
     def _names_assumptions(plan: Mapping[str, Any]) -> bool:
@@ -1034,13 +1057,26 @@ class ArchitectLoop:
 
     @staticmethod
     def _assuming(
-        plan: Mapping[str, Any], assumptions: list[dict[str, str]]
+        plan: Mapping[str, Any],
+        assumptions: list[dict[str, str]],
+        *,
+        spoke: bool,
     ) -> dict[str, Any]:
-        """Replace whatever the plan said about assumptions with this."""
-        plan = {key: value for key, value in plan.items() if key != "assumptions"}
-        return {**plan, "assumptions": assumptions} if assumptions else dict(plan)
+        """Replace whatever the plan said about assumptions with this.
 
-    def _unnamed_assumptions(self, named: bool) -> list[dict[str, str]]:
+        An empty list is kept rather than stripped when a plan spoke, because
+        a revision saying it rests on nothing assumed has to still be saying
+        that to the revision after it. Stripped, its statement would read as
+        silence one turn later and the record would speak over it.
+        """
+        plan = {key: value for key, value in plan.items() if key != "assumptions"}
+        if assumptions or spoke:
+            return {**plan, "assumptions": assumptions}
+        return dict(plan)
+
+    def _unnamed_assumptions(
+        self, named: bool, superseded: PlanningAttempt | None
+    ) -> list[dict[str, str]]:
         """Return the decisions on record that the plan failed to name.
 
         Silence is the one thing the record can still catch. It cannot say
@@ -1050,9 +1086,16 @@ class ArchitectLoop:
         """
         if not self.unattended or named:
             return []
-        return self._recorded_assumptions()
+        # Only rounds the standing plan could not have accounted for. A plan
+        # that spoke settled everything decided before it, so asking again
+        # about those would replace its account with a poorer one.
+        return self._recorded_assumptions(
+            since=superseded.finished_at if superseded is not None else None
+        )
 
-    def _recorded_assumptions(self) -> list[dict[str, str]]:
+    def _recorded_assumptions(
+        self, since: datetime | None = None
+    ) -> list[dict[str, str]]:
         """Return the decisions the record holds, as best it can tell them.
 
         Rounds are folded oldest first under the question's own words, so a
@@ -1068,6 +1111,12 @@ class ArchitectLoop:
         """
         standing: dict[str, dict[str, str]] = {}
         for stored in self.store.list_planning_questions(self.borg_id):
+            if (
+                since is not None
+                and stored.answered_at is not None
+                and stored.answered_at <= since
+            ):
+                continue
             asked = {
                 str(item.get("id")): str(item.get("question") or "").strip()
                 for item in stored.questions
