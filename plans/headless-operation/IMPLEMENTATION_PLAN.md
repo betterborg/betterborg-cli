@@ -568,7 +568,11 @@ already stands on: an approximate account of the run beats one that reads as
 though nothing was decided for it.
 
 Added, rather than put in its place, and only for the rounds answered since the
-last plan that spoke. The record knows the question rounds and nothing else, so
+last plan that spoke. Where the record and the inherited list cover one
+question, the record holds the later reading of it: a plan that says nothing
+inherits what its predecessor named, and a question reopened after that plan
+was answered again since. Keeping the inherited entry there would publish the
+reading the run left and suppress the one it planned against. The record knows the question rounds and nothing else, so
 a requirement the Architect settled without asking appears nowhere in it, and a
 plan that already spoke has accounted for everything decided before it.
 Publishing the record over such a plan would delete the assumptions it named
@@ -582,6 +586,11 @@ is stored, so the list alone cannot say who wrote it. The questions it raised
 can: they are what mark a plan that was never asked. Measured from such a plan,
 the boundary would move past decisions no plan has named and no later window
 would reach back for them.
+
+An empty list is the exception, because it is the one list that says the same
+thing whoever wrote it: this plan rests on nothing assumed. Inherited, it
+retires nothing there was to retire; stated, it retires what came before.
+Reaching back past it would reinstate exactly what it disclaimed.
 
 Silence is what the plan itself said, not what it was handed. A plan naming
 none of its own inherits the list the plan it supersedes carried, and judging
@@ -656,11 +665,14 @@ command never built itself, and it decides on the same terms as the rest.
   reinstated by the plan after it.
 - A plan that only raised questions does not close the window over the
   decisions answered before it, including when it holds a list it inherited
-  and two such plans follow one another.
+  and two such plans follow one another; one that retires with an empty list
+  while raising a question closes it, and the retirement stands.
 - The record retires a question a person answered before it is published, and
   an attended run is never asked to name assumptions at all.
 - A plan naming an empty list retires what it inherits, and one that says
   nothing keeps it.
+- Where the record and an inherited list cover one question, the plan publishes
+  the later reading and not the one the run moved on from.
 - An attended revision carries the superseded plan's assumptions, except over
   a question the operator answered in that run.
 - A question round run unattended yields a plan with no prompt issued, its
@@ -677,7 +689,7 @@ command never built itself, and it decides on the same terms as the rest.
 - A plan changed unattended, and a plan the review sends back, both assume the
   questions their revisions raise.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 13: Preflight requires what the run will use
 

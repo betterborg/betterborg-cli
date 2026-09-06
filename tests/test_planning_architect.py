@@ -3406,3 +3406,214 @@ def _plan() -> dict[str, object]:
         "risks": [],
         "open_questions": [],
     }
+
+
+def test_the_record_publishes_the_reading_the_run_kept_not_the_one_it_left(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Where the record and the inherited list cover one question, the record wins.
+
+    A plan that says nothing inherits the list its predecessor named, and the
+    record holds every round answered since. When a revision reopened one of
+    those questions and the run decided it again, the inherited entry is the
+    reading the Architect moved on from. Publishing it suppresses the decision
+    the run actually planned against, and the operator audits ground the run
+    never stood on.
+    """
+    spoke = dict(_plan())
+    spoke["assumptions"] = [
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux only.",
+        }
+    ]
+    reopening = dict(_plan())
+    reopening["summary"] = "Reconsider the platform matrix."
+    reopening["open_questions"] = ["Which platforms are required?"]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=reopening))
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [{"q_id": "q1", "answer": "Linux and macOS."}]
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-later-reading.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "later-reading"
+        )
+        _seed_answered_round(
+            store,
+            borg,
+            "Which platforms are required?",
+            "Linux only.",
+            assumed=True,
+        )
+        _seed_plan_and_review(store, borg, spoke)
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        published = result.plan["assumptions"]
+        assert [item["assumption"] for item in published] == ["Linux and macOS."]
+        assert "Linux only." not in render_plan_markdown(result.plan)
+
+
+def test_a_retirement_holds_even_when_the_plan_making_it_raised_a_question(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """An empty list says the same thing however the turn that wrote it ended.
+
+    A plan that raised questions was never asked to speak, so a list it holds
+    cannot be told from one it inherited. An empty one can: inherited or
+    stated, it says the plan rests on nothing assumed, and the record must not
+    reach back past it to reinstate what it retired.
+    """
+    retiring = dict(_plan())
+    retiring["summary"] = "Retire the platform assumption."
+    retiring["assumptions"] = []
+    retiring["open_questions"] = ["Which changelog format is required?"]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    # A round answered after the plan that spoke, and before the one that
+    # retires: the only rounds the record's window can disagree about.
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Linux only."}]})
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=retiring))
+    adapter.queue(
+        MockResponse(
+            payload={"answers": [{"q_id": "q1", "answer": "Keep a Changelog."}]}
+        )
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-retire-raising.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "retire-raising"
+        )
+        spoke = dict(_plan())
+        spoke["assumptions"] = []
+        _seed_plan_and_review(store, borg, spoke)
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert [
+            item["question"] for item in result.plan["assumptions"]
+        ] == ["Which changelog format is required?"]
+        assert "Linux only." not in render_plan_markdown(result.plan)
+
+
+def test_a_question_raising_plan_holding_an_inherited_list_closes_nothing(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A list a plan was handed is not a list it spoke.
+
+    Every payload passes through the merge before it is stored, so a plan that
+    named nothing of its own still holds what it inherited. Measured from such
+    a plan the window would start after decisions no plan has ever named, and
+    no later window would reach back for them.
+    """
+    raising = dict(_plan())
+    raising["summary"] = "Reconsider the rollout."
+    raising["open_questions"] = ["Which rollback strategy should be used?"]
+    assert "assumptions" not in raising
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    # A round answered after the plan that spoke, which only a window
+    # measured from that plan can still reach.
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {"id": "q1", "question": "Which platforms are required?"}
+                ],
+            }
+        )
+    )
+    adapter.queue(
+        MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Linux only."}]})
+    )
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    adapter.queue(MockResponse(payload=raising))
+    adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]
+            }
+        )
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-inherited-window.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "inherited-window"
+        )
+        spoke = dict(_plan())
+        spoke["assumptions"] = [
+            {
+                "question": "Which release cadence applies?",
+                "assumption": "Monthly.",
+            }
+        ]
+        _seed_plan_and_review(store, borg, spoke)
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        published = [item["question"] for item in result.plan["assumptions"]]
+        assert "Which platforms are required?" in published
+        assert "Which rollback strategy should be used?" in published

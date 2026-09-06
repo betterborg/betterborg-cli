@@ -633,15 +633,21 @@ class ArchitectLoop:
                 # place: the record knows only the rounds, and a standing
                 # assumption taken without asking is in neither.
                 standing = self._declared_assumptions(payload)
-                spoken_for = {item["question"].casefold() for item in standing}
+                # The plan said nothing, so what it holds is inherited. Where
+                # the record covers the same ground it holds the later reading
+                # of it, because a question reopened after that plan was
+                # answered again since. Keeping the inherited entry there
+                # would publish the reading the run left and suppress the one
+                # it planned against.
+                superseded = {item["question"].casefold() for item in unnamed}
                 payload = self._assuming(
                     payload,
-                    standing
-                    + [
+                    [
                         item
-                        for item in unnamed
-                        if item["question"].casefold() not in spoken_for
-                    ],
+                        for item in standing
+                        if item["question"].casefold() not in superseded
+                    ]
+                    + list(unnamed),
                     spoke=True,
                 )
 
@@ -1096,13 +1102,22 @@ class ArchitectLoop:
         # distinguish them durably is the open questions: a plan turn that
         # raised any completed on its way to having them answered and was
         # never asked to name anything, so it accounts for nothing.
+        #
+        # An empty list is the exception, because it is the one list that
+        # says the same thing whoever wrote it: this plan rests on nothing
+        # assumed. Inherited it retires nothing there was to retire, and
+        # stated it retires what came before, so reaching back past it would
+        # reinstate exactly what it disclaimed.
         spoke = next(
             (
                 attempt
                 for attempt in reversed(self._turns.attempts(_PLAN_PHASE))
                 if attempt.status is PlanningAttemptStatus.COMPLETED
-                and not self._plan_open_questions(attempt.result)
                 and self._names_assumptions(attempt.result or {})
+                and (
+                    not self._plan_open_questions(attempt.result)
+                    or not self._declared_assumptions(attempt.result or {})
+                )
             ),
             None,
         )
