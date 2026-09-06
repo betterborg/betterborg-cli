@@ -126,6 +126,7 @@ def _seed_executable_generation(
 def _execution_result(
     status: ExecutionRunStatus = ExecutionRunStatus.COMPLETED,
     dropped_commands: tuple[HostDroppedCommand, ...] = (),
+    required_secret_names: tuple[str, ...] = (),
 ):
     return SimpleNamespace(
         preflight=HostPreflightPlan(
@@ -135,7 +136,7 @@ def _execution_result(
             materialize_commands=(),
             environment_files=(),
             executables=(),
-            required_secret_names=(),
+            required_secret_names=required_secret_names,
             compose_files=(),
             services=(),
             dropped_commands=dropped_commands,
@@ -1134,6 +1135,77 @@ def test_the_rollup_pull_request_names_a_check_this_host_could_not_run(
     body = body_path.read_text(encoding="utf-8")
     assert body.startswith("## Checks not run on this host")
     assert "missing-runtime" in body
+    assert local_sha == _project_branch_sha(committed_git_repo, name)
+
+
+def test_the_pushed_pull_request_masks_a_secret_a_dropped_check_quoted(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The summary quotes a catalogued command, and this body leaves the host.
+
+    A repository that spells a token into a script has it in the analysis, and
+    a run that could not invoke that script says so on every surface. The one
+    that is pushed to GitHub is the one that cannot be taken back.
+    """
+    name = "masked-pr"
+    _repository, _paths, _borg, _approval, _fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+        )
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "push",
+            str(remote),
+            f"refs/heads/project/{name}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
+    dropped = (
+        HostDroppedCommand(
+            command=HostCommand(
+                stage="test",
+                argv=("missing-runtime", "--token", "s3cr3t-value"),
+                cwd=".",
+                evidence="pyproject.toml",
+            ),
+            reason="host executable is not available: missing-runtime",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(
+            dropped_commands=dropped,
+            required_secret_names=("PACKAGE_TOKEN",),
+        ),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 0, result.output
+    body = body_path.read_text(encoding="utf-8")
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime" in body
+    assert "s3cr3t-value" not in body
+    assert "s3cr3t-value" not in result.output
     assert local_sha == _project_branch_sha(committed_git_repo, name)
 
 

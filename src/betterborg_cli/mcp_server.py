@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import threading
 import time
@@ -20,7 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.selection import select_agent
-from betterborg_cli.host_execution import HostPreflightBlock
+from betterborg_cli.host_execution import (
+    HostPreflightBlock,
+    HostPreflightPlan,
+    redacted_dropped_command_summary,
+)
 from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.prd_session import InteractiveIO
@@ -1344,6 +1349,18 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
     return borg, questions
 
 
+def _dropped_checks(preflight: HostPreflightPlan) -> str:
+    """Return the dropped-check summary, masked, as every surface reports it."""
+    return redacted_dropped_command_summary(
+        preflight,
+        {
+            name: os.environ[name]
+            for name in preflight.required_secret_names
+            if name in os.environ
+        },
+    )
+
+
 def _plan_findings(
     store: SqliteStore, borg: Borg
 ) -> tuple[PlanFindingData, ...]:
@@ -1690,14 +1707,14 @@ def _execute(
         active_operation_id = str(result.active_operation_id)
         # A headless caller has no progress stream, so the checks this host
         # could not run have to travel with the result itself.
-        reason = result.preflight.dropped_command_summary or None
+        reason = _dropped_checks(result.preflight) or None
     else:
         if result.operation_id is None or result.status is None:
             raise RuntimeError("host execution returned no operation")
         status = result.status.value
         operation_id = str(result.operation_id)
         active_operation_id = None
-        reason = result.preflight.dropped_command_summary or None
+        reason = _dropped_checks(result.preflight) or None
     actions = ()
     if result.status not in {ExecutionRunStatus.COMPLETED}:
         actions = (

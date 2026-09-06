@@ -19,6 +19,7 @@ from betterborg_cli.host_execution.environment import (
     HostEnvironmentManager,
     environment_fingerprint,
     package_manager_cache_environment,
+    redacted_dropped_command_summary,
 )
 from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError
 from betterborg_cli.host_execution.guard import (
@@ -134,5 +135,6 @@ __all__ = [
     "environment_fingerprint",
     "compose_project_name",
     "package_manager_cache_environment",
+    "redacted_dropped_command_summary",
     "service_url_environment",
 ]

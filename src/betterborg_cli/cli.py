@@ -49,6 +49,7 @@ from betterborg_cli.host_execution import (
     HostTaskRuntime,
     HostWorktreeManager,
     SafeGit,
+    redacted_dropped_command_summary,
 )
 from betterborg_cli.onboarding import (
     CreateService,
@@ -993,7 +994,7 @@ def execute_borg(
                 prd_session = workflow.prd_session
                 prd_path = prd_session.prd_path if prd_session is not None else None
                 unrun_checks = (
-                    result.preflight.dropped_command_summary
+                    _dropped_checks(result.preflight)
                     if not isinstance(result.preflight, HostPreflightBlock)
                     else None
                 )
@@ -1524,7 +1525,7 @@ def _finish_execution_preflight(
     elif isinstance(result, HostPreflightBlock):
         progress.fail("preflight", result.reason)
     elif result is not None:
-        progress.complete("preflight", result.dropped_command_summary or "ready")
+        progress.complete("preflight", _dropped_checks(result) or "ready")
     else:
         progress.complete("preflight", "ready")
 
@@ -1558,10 +1559,27 @@ def _agent_billing_mode(adapter_name: str) -> BillingMode:
     return BillingMode.API
 
 
+def _dropped_checks(preflight: HostPreflightPlan) -> str:
+    """Return the dropped-check summary, masked, as every surface reports it.
+
+    The values come from the environment the same way execution takes them,
+    so a secret quoted inside a catalogued command is masked wherever this
+    string is read.
+    """
+    return redacted_dropped_command_summary(
+        preflight,
+        {
+            name: os.environ[name]
+            for name in preflight.required_secret_names
+            if name in os.environ
+        },
+    )
+
+
 def _write_host_execution_result(result: HostExecutionResult) -> None:
     if isinstance(result.preflight, HostPreflightBlock):
         raise click.ClickException(result.preflight.reason)
-    dropped = result.preflight.dropped_command_summary
+    dropped = _dropped_checks(result.preflight)
     if dropped:
         click.echo(dropped)
     if result.active_operation_id is not None:

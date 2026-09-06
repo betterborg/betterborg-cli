@@ -2355,3 +2355,47 @@ def test_an_analysis_naming_no_check_at_all_is_refused(
 
     assert isinstance(result, HostPreflightBlock)
     assert "declares no command that verifies the repository" in result.reason
+
+
+def test_a_command_naming_an_agent_scoped_secret_is_refused(
+    committed_git_repo: Path,
+) -> None:
+    """Requiring and delivering must be able to agree, or the run cannot work.
+
+    An agent-scoped secret reaches the agent phases and no command. Accepting
+    a command that names one makes the operator configure a value nothing will
+    hand to that command, and the command fails at sanity after coding, review
+    and merge have been paid for.
+    """
+    binary_dir = committed_git_repo.parent / "agent-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["ci"],
+                "scope": "agent",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "scoped to the agents but named by a command that runs" in result.reason
+    assert "test" in result.reason

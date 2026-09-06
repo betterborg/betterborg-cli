@@ -758,8 +758,12 @@ repetition that says the same thing twice refuses over nothing.
 - A secret no command that will run requires does not block the run, and one a
   surviving command names does block, however that secret's record spells the
   commands that use it, and reaches the command that named it when it runs.
-- Everything a task's outcome quotes from the analysis is masked, including the
-  checks it names as skipped.
+- Everything reported about a run that quotes the analysis is masked, including
+  the checks it names as skipped, on every surface that carries them: the
+  terminal, the task's durable reason, the headless payload, and the pull
+  request body that is pushed.
+- A record that scopes a secret to the agents while a running command names it
+  is refused, because no phase could both require and deliver it.
 - A secret named more than once blocks only when the records disagree.
 - A host that can satisfy everything behaves exactly as it does today.
 - Nothing is dropped silently: a run that dropped a command can be told apart
@@ -780,7 +784,9 @@ repetition that says the same thing twice refuses over nothing.
 - A secret required only by a dropped command does not block the run; one a
   surviving command names blocks even when its record names no catalog stage,
   and is handed to that command when it runs.
-- A dropped command's own words are masked in the task outcome that names it.
+- A dropped command's own words are masked in the task outcome that names it
+  and in the pull request body that leaves the host.
+- A command naming an agent-scoped secret is refused before the run is spent.
 - A materialize command the host cannot run refuses the run rather than being
   dropped, and a program named by path is resolved where its command runs.
 - Identical repeated secret records are accepted; conflicting ones are refused

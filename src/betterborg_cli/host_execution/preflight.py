@@ -839,6 +839,27 @@ class HostPreflight:
             # says so directly; used_by says so for the rest, and nothing in
             # the analyzer contract makes it spell a catalog stage.
             asking_stages = tuple((named_by or {}).get(name, ()))
+            # An agent-scoped secret reaches the agent phases and no command.
+            # A command that names one describes a requirement the run cannot
+            # satisfy: preflight would make the operator configure it, and the
+            # command would still run without it and fail at sanity. Refuse the
+            # contradiction here rather than after the whole spend.
+            if scope == "agent" and asking_stages:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            f"required secret {name!r} is scoped to the agents "
+                            "but named by a command that runs: "
+                            + ", ".join(sorted(set(asking_stages)))
+                        ),
+                        evidence=_evidence(record, "analyzer required_secrets"),
+                        guidance=(
+                            "Scope the secret to build if the command needs it, "
+                            "or drop it from the command's required_secrets, "
+                            "then rerun analysis."
+                        ),
+                    )
+                )
             reaches_run = (
                 scope in {"all", "agent"}
                 or bool(asking_stages)

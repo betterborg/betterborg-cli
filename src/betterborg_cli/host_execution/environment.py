@@ -1138,6 +1138,24 @@ def command_secret_environment(
     return environment, tuple(sorted(set(mask_values), key=len, reverse=True))
 
 
+def redacted_dropped_command_summary(
+    plan: HostPreflightPlan, secret_values: Mapping[str, str]
+) -> str:
+    """Return the dropped-check summary with declared secret values masked.
+
+    The summary quotes a catalogued command's argv and its evidence, and every
+    surface that reports a run carries it: the terminal, the progress line, the
+    task's durable state reason, the MCP payload, and the pull request body
+    that gets pushed. It is masked wherever it is read, like every other
+    quotation of the analysis.
+    """
+
+    return redact_secrets(
+        plan.dropped_command_summary,
+        declared_secret_mask_values(plan, secret_values),
+    )
+
+
 def declared_secret_mask_values(
     plan: HostPreflightPlan, secret_values: Mapping[str, str]
 ) -> tuple[str, ...]:
