@@ -986,6 +986,11 @@ def execute_borg(
                     plan = None
                 prd_session = workflow.prd_session
                 prd_path = prd_session.prd_path if prd_session is not None else None
+                unrun_checks = (
+                    result.preflight.dropped_command_summary
+                    if not isinstance(result.preflight, HostPreflightBlock)
+                    else None
+                )
                 _run_execution_follow_up(
                     progress,
                     "rollup-pr",
@@ -995,6 +1000,7 @@ def execute_borg(
                         name,
                         plan,
                         prd_path,
+                        unrun_checks=unrun_checks,
                         cancel=cancel,
                         command_runner=run_captured,
                         activity=(
@@ -1140,6 +1146,7 @@ def _open_rollup_pull_request(
     plan: dict[str, object] | None,
     prd_path: Path | None,
     *,
+    unrun_checks: str | None = None,
     cancel: CancellationToken | None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]],
     activity: Callable[[AgentActivity], None] | None = None,
@@ -1162,6 +1169,7 @@ def _open_rollup_pull_request(
             prd_markdown=prd_markdown,
             plan=plan,
             project_name=name,
+            unrun_checks=unrun_checks,
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise click.ClickException(f"{failure_prefix}: {error}") from error

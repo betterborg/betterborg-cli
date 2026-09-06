@@ -1421,6 +1421,51 @@ def test_environment_command_program_is_still_required(
     assert "host executable is required: missing-runtime" in result.reason
 
 
+def test_a_service_only_a_dropped_command_uses_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    """A service is selected because something will talk to it.
+
+    One reachable only from a command this host cannot run is a dependency
+    the run does not have, so requiring it refuses over exactly what the drop
+    was supposed to make survivable.
+    """
+    binary_dir = committed_git_repo.parent / "service-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"]},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime"],
+                    "uses_services": ["search"],
+                },
+            ],
+        },
+        "service_dependencies": [
+            {
+                "name": "search",
+                "kind": "external",
+                "url_env": "SEARCH_URL",
+                "source": "pyproject.toml#search",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.services == ()
+    assert [dropped.command.argv[0] for dropped in result.dropped_commands] == [
+        "missing-runtime"
+    ]
+
+
 def test_secret_named_only_by_a_dropped_command_does_not_block(
     committed_git_repo: Path,
 ) -> None:
@@ -1461,6 +1506,47 @@ def test_secret_named_only_by_a_dropped_command_does_not_block(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.required_secret_names == ("DEPLOY_TOKEN", "PACKAGE_TOKEN")
+
+
+def test_a_secret_a_surviving_command_consumes_still_blocks(
+    committed_git_repo: Path,
+) -> None:
+    """Following the commands must not become excusing every secret.
+
+    The surviving half of the rule is the load-bearing one: a command that
+    will run and needs a secret still cannot run without it, and finding that
+    out at preflight is the whole point of asking.
+    """
+    binary_dir = committed_git_repo.parent / "surviving-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "PACKAGE_TOKEN" in result.reason
 
 
 def test_agent_scoped_secret_blocks_because_the_agents_always_run(

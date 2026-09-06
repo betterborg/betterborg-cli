@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -2680,3 +2680,104 @@ mcp_server.run_stdio_server()
     assert responses[-1]["result"]["structuredContent"]["status"] == "completed"
     assert "Processing request" not in "\n".join(map(json.dumps, responses))
     assert "Processing request" in stderr
+
+
+def test_execute_payload_names_the_checks_this_host_could_not_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A headless caller has no terminal, so the drop travels in the result.
+
+    Stage 13 lets a run continue without a check its host cannot run, and the
+    whole trade rests on nobody mistaking that for a run where the check
+    passed. Over MCP this field is the only place it is said.
+    """
+    from types import SimpleNamespace
+
+    from betterborg_cli.agent_runtime import BillingMode
+    from betterborg_cli.execution_estimate import PhaseBilling, estimate_generation
+    from betterborg_cli.host_execution import HostCommand, HostPreflightPlan
+    from betterborg_cli.host_execution.preflight import HostDroppedCommand
+    from betterborg_cli.host_execution.service import (
+        HostExecutionResult,
+        HostSchedulerResult,
+    )
+    from betterborg_cli.store import (
+        TaskComplexity,
+        TaskGeneration,
+        TaskGenerationStatus,
+    )
+
+    preflight = HostPreflightPlan(
+        repository_root=tmp_path,
+        commands=(),
+        prepare_commands=(),
+        materialize_commands=(),
+        environment_files=(),
+        executables=(),
+        required_secret_names=(),
+        compose_files=(),
+        services=(),
+        dropped_commands=(
+            HostDroppedCommand(
+                command=HostCommand(
+                    stage="test",
+                    argv=("missing-runtime", "-m", "pytest"),
+                    cwd=".",
+                    evidence="pyproject.toml",
+                ),
+                reason="host executable is not available: missing-runtime",
+            ),
+        ),
+    )
+    generation = TaskGeneration(
+        borg_id=uuid4(),
+        plan_approval_id=uuid4(),
+        batch_id=uuid4(),
+        digest="sha256:deadbeef",
+        manifest={},
+        status=TaskGenerationStatus.CURRENT,
+        current_at=datetime.now(UTC),
+    )
+    workflow = SimpleNamespace(
+        publication=SimpleNamespace(generation=generation, files=()),
+        estimate=estimate_generation(
+            generation.id,
+            [TaskComplexity.SMALL],
+            [],
+            (
+                PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+                PhaseBilling("review", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+                PhaseBilling("merge", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+            ),
+            priors={},
+        ),
+        host_result=HostExecutionResult(
+            preflight,
+            scheduler=HostSchedulerResult(
+                operation_id=uuid4(),
+                status=ExecutionRunStatus.COMPLETED,
+                acquired=1,
+                total=1,
+                done=1,
+                failed=0,
+                blocked=0,
+                pending=0,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(mcp_server, "_paths", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        mcp_server, "load_repository_config", lambda _paths: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        mcp_server, "execute_workflow", lambda *_args, **_kwargs: workflow
+    )
+
+    result = mcp_server._execute(
+        "borg", mcp_server.McpInteractiveIO(SimpleNamespace())
+    )
+
+    assert result.data.reason is not None
+    assert "missing-runtime" in result.data.reason

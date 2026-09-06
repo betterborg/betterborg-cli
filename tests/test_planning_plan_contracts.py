@@ -464,6 +464,39 @@ def test_builds_bounded_rollup_body_from_prd_and_canonical_plan() -> None:
     assert "truncated to fit GitHub's 65,536-character limit" in oversized
 
 
+def test_the_rollup_body_names_checks_the_host_could_not_run() -> None:
+    """The pull request is what leaves the machine.
+
+    The terminal that ran execute reports a dropped check to whoever was
+    watching it. The reviewer opening the pull request a day later is the one
+    who decides, and a rollup that reads as a green delivery while its tests
+    never ran once is the way a drop still misleads somebody.
+    """
+    body = build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+        unrun_checks="- test: missing-runtime -m pytest",
+    )
+
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime -m pytest" in body
+    assert "# Product need" in body
+
+
+def test_the_rollup_body_is_unchanged_when_every_check_ran() -> None:
+    assert build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+        unrun_checks=None,
+    ) == build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+    )
+
+
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
     (tmp_path / "README.md").write_text("# Repository\n", encoding="utf-8")

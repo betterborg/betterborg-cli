@@ -294,6 +294,7 @@ class HostPreflight:
             services,
         ) = self._services(
             plan,
+            running_records,
             external_urls or {},
             executables,
             failures,
@@ -791,6 +792,7 @@ class HostPreflight:
     def _services(
         self,
         plan: Mapping[str, Any],
+        command_records: Sequence[Mapping[str, Any]],
         external_urls: Mapping[str, str],
         executables: list[HostExecutable],
         failures: list[HostPreflightFailure],
@@ -803,15 +805,16 @@ class HostPreflight:
         list[HostService],
     ]:
         catalog = plan.get("command_catalog")
-        command_records = (
-            _mappings(catalog.get("commands")) if isinstance(catalog, Mapping) else []
-        )
         catalog_evidence = (
             _evidence(catalog, "analyzer command catalog")
             if isinstance(catalog, Mapping)
             else "analyzer command catalog"
         )
         selected: dict[str, list[str]] = {}
+        # Only the commands that survived the drop. A service is selected
+        # because something is going to talk to it, so one reachable only from
+        # a command this host cannot run is a refusal over a dependency the
+        # run does not have, which is the refusal this stage exists to remove.
         for record in command_records:
             for name in record.get("uses_services") or ():
                 if isinstance(name, str):

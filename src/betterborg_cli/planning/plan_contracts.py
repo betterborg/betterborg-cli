@@ -467,9 +467,20 @@ def build_project_pr_body(
     prd_markdown: str | None,
     plan: Mapping[str, Any] | None,
     project_name: str,
+    unrun_checks: str | None = None,
 ) -> str:
-    """Build the bounded rollup PR body from repository-owned planning data."""
+    """Build the bounded rollup PR body from repository-owned planning data.
+
+    Checks the host could not run are named first and never truncated away.
+    The terminal that started the run reports them, but the pull request is
+    what leaves the machine and what the decision is made on, and a rollup
+    that reads as a green delivery while its tests never ran once is the one
+    way a dropped check can still mislead somebody.
+    """
     sections: list[str] = []
+    unrun = (unrun_checks or "").strip()
+    if unrun:
+        sections.append(f"## Checks not run on this host\n\n{unrun}")
     prd = (prd_markdown or "").strip()
     if prd:
         sections.append(prd)

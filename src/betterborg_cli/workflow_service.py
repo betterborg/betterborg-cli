@@ -298,10 +298,7 @@ def execute_workflow(
                     host_result.preflight.reason,
                 )
             else:
-                progress.complete(
-                    _EXECUTION_PREFLIGHT_STAGE_KEY,
-                    host_result.preflight.dropped_command_summary or "ready",
-                )
+                progress.complete(_EXECUTION_PREFLIGHT_STAGE_KEY, "ready")
 
     return ExecutionWorkflowResult(
         borg,
