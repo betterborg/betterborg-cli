@@ -105,6 +105,18 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
         ]
 
 
+def _rollback_plan(planning_plan_response) -> dict[str, object]:
+    """A revision that names the decision its own question produced."""
+    plan = planning_plan_response(summary="Retry, then roll back.")
+    plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+    return plan
+
+
 def test_plan_start_unattended_assumes_answers_and_shows_them_in_the_plan(
     cli_runner: CliRunner,
     committed_git_repo: Path,
@@ -140,7 +152,14 @@ def test_plan_start_unattended_assumes_answers_and_shows_them_in_the_plan(
     architect_adapter.queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
-    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    plan = planning_plan_response()
+    plan["assumptions"] = [
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux and macOS.",
+        }
+    ]
+    architect_adapter.queue(MockResponse(payload=plan))
     tech_lead_adapter.queue(
         MockResponse(payload=tech_lead_approval_response())
     )
@@ -678,7 +697,7 @@ def test_plan_start_unattended_assumes_the_questions_a_review_revision_raises(
         tech_lead_change_request_response("Define rollback behavior."),
         ambiguous_plan,
         {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
-        planning_plan_response(summary="Retry, then roll back."),
+        _rollback_plan(planning_plan_response),
         tech_lead_approval_response(),
     ):
         adapter.queue(MockResponse(payload=payload))
@@ -733,7 +752,7 @@ def test_plan_change_unattended_assumes_the_questions_the_revision_raises(
     original_plan = planning_plan_response(summary="Original plan.")
     ambiguous_plan = planning_plan_response(summary="Stage the rollout.")
     ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
-    revised_plan = planning_plan_response(summary="Retry, then roll back.")
+    revised_plan = _rollback_plan(planning_plan_response)
     adapter = MockAdapter(name="openai")
     for payload in (
         {"decision": "ready_to_plan"},

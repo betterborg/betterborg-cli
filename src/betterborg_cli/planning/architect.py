@@ -273,6 +273,21 @@ acceptance criteria, and do not modify files. Return only the required JSON
 object.
 """
 
+_UNNAMED_ASSUMPTIONS_CORRECTION = """
+## Rejected plan
+
+You answered your own questions on this run, and the plan you returned names
+none of the decisions that produced. Whoever reads it cannot tell which of its
+requirements you were given and which you chose:
+
+{decisions}
+
+Restate the whole plan with an assumptions entry for every decision above that
+the plan still rests on, in whatever words describe it now, and for anything
+else you settled without asking. Leave out only what the confirmed PRD or an
+answered question already settles.
+""".strip()
+
 _PLAN_CONTRACT_CORRECTION = """
 ## Rejected plan
 
@@ -491,6 +506,7 @@ class ArchitectLoop:
         rejected_plan: dict[str, Any] | None = None
         correction: str | None = None
         contract_rounds = 0
+        assumptions_asked = False
         while True:
             completed = self._completed_plan()
             if completed is not None:
@@ -582,6 +598,33 @@ class ArchitectLoop:
                 correction = _PLAN_CONTRACT_CORRECTION.format(error=error)
                 rejected_plan = payload
                 continue
+
+            unnamed = self._unnamed_assumptions(payload)
+            if unnamed and not assumptions_asked:
+                # One ask, not a budget. A plan turn is the most expensive
+                # thing this loop does, and the fallback below is a fair
+                # account of the run even if it is not the plan's own.
+                assumptions_asked = True
+                self.store.complete_planning_attempt(
+                    attempt.id,
+                    status=PlanningAttemptStatus.FAILED,
+                    result=payload,
+                    summary=f"plan names none of {len(unnamed)} decision(s) made",
+                )
+                correction = _UNNAMED_ASSUMPTIONS_CORRECTION.format(
+                    decisions="\n".join(
+                        f"- {item['question']} You decided: {item['assumption']}"
+                        for item in unnamed
+                    )
+                )
+                rejected_plan = payload
+                continue
+            if unnamed:
+                # Asked once and still silent. The record is the poorer
+                # account, because it cannot say which of two readings of the
+                # same ground is current, but publishing it beats letting the
+                # run read as though nothing was decided for it.
+                payload = self._assuming(payload, unnamed)
 
             with self.store.transaction():
                 completed = self.store.complete_planning_attempt(
@@ -919,44 +962,113 @@ class ArchitectLoop:
     ) -> dict[str, Any]:
         """Settle which assumptions the plan carries, rather than the plan.
 
-        Three accounts of the same thing reach here, and the most current one
-        that says anything is the one to publish. The plan being written is
-        first: it was composed with every answered round in front of it and
-        asked to name what it settled, so its list is one coherent statement
-        of the set in force. The record follows, because it holds the rounds
-        as they were answered and an Architect that names nothing cannot
-        thereby leave a run looking certain. The plan being superseded speaks
-        last, and only for the assumptions it took without asking, which are
-        the ones no round recorded.
+        The plan names its own. It is the only party that can: a question has
+        no identity beyond the words it was asked in, and every path that
+        re-raises one writes those words afresh, so nothing outside the plan
+        can tell a decision restated from a second decision. Betterborg
+        matching them by text would publish a reading the Architect abandoned
+        beside the one it replaced, with nothing marking which is live.
 
-        Choosing one account rather than merging them is what keeps the
-        section from growing. The accounts identify a question only by its
-        text, and the Architect rewords freely between rounds, so merging
-        publishes every wording of a decision it has restated. The cost is
-        that a plan naming some of its assumptions is trusted to have named
-        them all, and the record no longer backstops what such a plan leaves
-        out. That is the narrower failure: an incomplete list is still a list
-        of real decisions, while a merged one is a history in which the
-        standing decision cannot be picked out.
-
-        What no account may do is reopen a question a person closed. Their
-        answer is a requirement, and listing it under decisions nobody
-        confirmed sends them to audit the one piece of ground they settled
-        themselves.
+        An attended run names none of its own, because every requirement there
+        was read from the confirmed PRD or got by asking. What it publishes is
+        what the plan it supersedes published: an assumption an earlier
+        unattended pass made is no more confirmed for having been revised by
+        hand, unless a person has since answered the question it rests on.
         """
-        declared = self._declared_assumptions(plan) if self.unattended else []
         carried = self._declared_assumptions(superseded or {})
-        stored, settled = self._stored_assumptions()
-        assumptions: list[dict[str, str]] = []
-        seen: set[str] = set(settled)
-        for assumption in declared or stored or carried:
-            key = assumption["question"].casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            assumptions.append(assumption)
+        declared = self._declared_assumptions(plan) if self.unattended else []
+        return self._assuming(plan, self._unsettled(declared or carried))
+
+    def _unsettled(self, assumptions: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Drop any assumption over ground a person has since answered.
+
+        Their answer is a requirement, and publishing it under decisions
+        nobody confirmed sends them to audit the one piece of ground they
+        settled themselves. A question is recognised by its words, so this
+        catches the account that reuses them and not the one that rewrites
+        them; it removes the case it can see rather than none.
+        """
+        settled = self._settled_questions()
+        return [
+            assumption
+            for assumption in assumptions
+            if assumption["question"].casefold() not in settled
+        ]
+
+    def _settled_questions(self) -> set[str]:
+        """Return the questions whose latest answer came from a person."""
+        settled: set[str] = set()
+        for stored in self.store.list_planning_questions(self.borg_id):
+            asked = {
+                str(item.get("id")): str(item.get("question") or "").strip()
+                for item in stored.questions
+            }
+            for answer in stored.answers or []:
+                question = asked.get(str(answer.get("q_id")), "")
+                if not question:
+                    continue
+                key = question.casefold()
+                if answer.get("assumed"):
+                    settled.discard(key)
+                else:
+                    settled.add(key)
+        return settled
+
+    @staticmethod
+    def _assuming(
+        plan: Mapping[str, Any], assumptions: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """Replace whatever the plan said about assumptions with this."""
         plan = {key: value for key, value in plan.items() if key != "assumptions"}
-        return {**plan, "assumptions": assumptions} if assumptions else plan
+        return {**plan, "assumptions": assumptions} if assumptions else dict(plan)
+
+    def _unnamed_assumptions(self, plan: Mapping[str, Any]) -> list[dict[str, str]]:
+        """Return the decisions on record that the plan failed to name.
+
+        Silence is the one thing the record can still catch. It cannot say
+        which of several readings is current, but it knows the Architect
+        decided something, so a plan mentioning nothing is one that has left
+        the operator no sign of it.
+        """
+        if not self.unattended or plan.get("assumptions"):
+            return []
+        return self._recorded_assumptions()
+
+    def _recorded_assumptions(self) -> list[dict[str, str]]:
+        """Return the decisions the record holds, as best it can tell them.
+
+        Rounds are folded oldest first under the question's own words, so a
+        question asked twice keeps its later answer and one a person answered
+        drops out. That grouping is the best available and not exact: the
+        words are rewritten every time a question is re-raised, so the same
+        ground asked differently reads here as two decisions.
+
+        Nothing published depends on getting it right. This account tells the
+        plan which decisions it has left unnamed, and the plan answers in its
+        own words; it is published only when a plan asked to name them still
+        names none, where an approximate account beats none at all.
+        """
+        standing: dict[str, dict[str, str]] = {}
+        for stored in self.store.list_planning_questions(self.borg_id):
+            asked = {
+                str(item.get("id")): str(item.get("question") or "").strip()
+                for item in stored.questions
+            }
+            for answer in stored.answers or []:
+                question = asked.get(str(answer.get("q_id")), "")
+                if not question:
+                    continue
+                key = question.casefold()
+                if not answer.get("assumed"):
+                    standing.pop(key, None)
+                    continue
+                assumption = str(answer.get("answer") or "").strip()
+                if assumption:
+                    standing[key] = {
+                        "question": question,
+                        "assumption": assumption,
+                    }
+        return list(standing.values())
 
     @staticmethod
     def _declared_assumptions(plan: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -973,46 +1085,6 @@ class ArchitectLoop:
             if question and decision:
                 assumptions.append({"question": question, "assumption": decision})
         return assumptions
-
-    def _stored_assumptions(self) -> tuple[list[dict[str, str]], set[str]]:
-        """Pair the standing answer to each question with the question itself.
-
-        A question can be raised more than once, because an Architect
-        dissatisfied with its own earlier reading restates it as the plan's
-        open question. Rounds are read oldest first and each one supersedes
-        what it re-answers, so what surfaces is the decision the plan was
-        actually built on rather than the one it moved on from. A round a
-        person answered retires the assumption entirely: their answer is a
-        requirement, and listing it under decisions nobody confirmed sends
-        them to audit ground they themselves settled.
-
-        Returned beside the standing assumptions are the questions a person
-        closed, which no other account may reopen as an assumption.
-        """
-        standing: dict[str, dict[str, str]] = {}
-        settled: set[str] = set()
-        for stored in self.store.list_planning_questions(self.borg_id):
-            asked = {
-                str(item.get("id")): str(item.get("question") or "").strip()
-                for item in stored.questions
-            }
-            for answer in stored.answers or []:
-                question = asked.get(str(answer.get("q_id")), "")
-                if not question:
-                    continue
-                key = question.casefold()
-                if not answer.get("assumed"):
-                    standing.pop(key, None)
-                    settled.add(key)
-                    continue
-                settled.discard(key)
-                assumption = str(answer.get("answer") or "").strip()
-                if assumption:
-                    standing[key] = {
-                        "question": question,
-                        "assumption": assumption,
-                    }
-        return list(standing.values()), settled
 
     def _raised_by_a_plan(self, question: PlanningQuestion) -> bool:
         """Say whether a plan turn is what put this round on the table.

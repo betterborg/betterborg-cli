@@ -457,6 +457,14 @@ def test_unattended_revision_assumes_the_questions_it_raises(
     revised_plan = planning_plan_response(
         summary="Use retries before rolling back the release."
     )
+    # The plan names the decision the run made for it, which is what
+    # the unattended directive asks of a real one.
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
     database = committed_git_repo.parent / "tech-lead-unattended.sqlite3"
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
@@ -672,6 +680,12 @@ def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
     revised_plan = planning_plan_response(
         summary="Use retries before rolling back the release."
     )
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
     seen: dict[str, object] = {}
 
     def answer_against_the_plan(spec):

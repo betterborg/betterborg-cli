@@ -160,20 +160,26 @@ uncertainty itself, on the reading the evidence it already read best supports.
 betterborg plan start my-feature --yes --unattended
 ```
 
-The plan `betterborg plan show` renders lists every requirement settled that
-way under `## Assumptions`, so the gaps a run closed on its own stay in front
-of whoever reads it. An Architect that asks anyway is answered the same way
-instead of ending the run, and that answer is stored beside its question,
-marked as assumed rather than answered.
+The plan names those decisions itself, and `betterborg plan show` renders them
+under `## Assumptions`, so the gaps a run closed on its own stay in front of
+whoever reads it. A plan that names none is asked once, shown what it decided,
+and told to say what it still rests on; if it names none again the recorded
+decisions are published in its place. An Architect that asks a question anyway
+is answered the same way instead of ending the run, and that answer is stored
+beside its question, marked as assumed rather than answered.
 
 `betterborg plan change NAME --note ... --unattended` revises the same way, so
 a Borg planned without a terminal can be changed without one.
 
-Without `--unattended` planning still prompts, a prompt that returns nothing
-still stops the run for a person to resume, and a plan that claims an
-assumption is not believed, because there every requirement was given. An
-unattended run's questions are bounded: an Architect that keeps asking past
-the round budget ends the run with its unanswered round preserved, so
+Without `--unattended` planning still prompts, and a prompt that returns
+nothing still stops the run for a person to resume. A plan written that way
+claims no assumptions of its own, because every requirement there was given; it
+keeps the ones the plan it revises already carried, minus any over a question
+the operator has since answered.
+
+An unattended run's questions are bounded per planning cycle, so a Borg that
+spent its budget planning can still be revised. An Architect that keeps asking
+past that budget ends the run with its unanswered round preserved, so
 `betterborg plan start NAME` resumes it with a person answering.
 
 ## Progress output
