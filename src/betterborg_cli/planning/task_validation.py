@@ -72,10 +72,31 @@ class TaskGraphValidationError(ValueError):
 
     def __init__(self, findings: Iterable[TaskGraphFinding]) -> None:
         self.findings = tuple(findings)
-        details = "; ".join(
-            f"{finding.rule}: {finding.message}" for finding in self.findings
-        )
+        details = "; ".join(_finding_detail(finding) for finding in self.findings)
         super().__init__(f"task graph validation failed: {details}")
+
+
+def _finding_detail(finding: TaskGraphFinding) -> str:
+    """Render one defect with the things it is about.
+
+    A finding already knows which plan element or task it is complaining
+    about, and the whoever has to repair it cannot act on the rule alone:
+    "a required element has no owner" asks them to search, while naming the
+    element asks them to assign it. Dropping the references turned every
+    rejection into a hunt and spent the retry budget on guessing.
+    """
+    named = [
+        f"{label} {', '.join(refs)}"
+        for label, refs in (
+            ("plan element", finding.plan_refs),
+            ("task", finding.task_refs),
+            ("dependency", finding.dependency_refs),
+        )
+        if refs
+    ]
+    if not named:
+        return f"{finding.rule}: {finding.message}"
+    return f"{finding.rule}: {finding.message} ({'; '.join(named)})"
 
 
 class NonProgressingTaskRepairError(ValueError):

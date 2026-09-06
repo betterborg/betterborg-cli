@@ -247,6 +247,46 @@ def _rules(findings: Iterable[TaskGraphFinding]) -> set[str]:
     return {finding.rule for finding in findings}
 
 
+def test_a_validation_failure_names_what_it_is_about() -> None:
+    """A rule alone asks the reader to search; the reference asks them to act.
+
+    The Project Manager repairs its own rejected batch from this text and
+    nothing else, so a finding that keeps the element to itself spends the
+    retry budget on guessing which one it meant.
+    """
+    error = TaskGraphValidationError(
+        [
+            TaskGraphFinding(
+                rule="task.traceability.unowned",
+                message="required approved-plan element has no valid task owner",
+                plan_refs=("phase/02-loader/deliverable/1",),
+            ),
+            TaskGraphFinding(
+                rule="task.dependency.same_stage_order",
+                message="same-stage dependency must point to a lexically earlier stem",
+                task_refs=("02-loader/01-cache",),
+                dependency_refs=("02-loader/09-reset",),
+            ),
+        ]
+    )
+
+    detail = str(error)
+
+    assert "phase/02-loader/deliverable/1" in detail
+    assert "02-loader/01-cache" in detail
+    assert "02-loader/09-reset" in detail
+
+
+def test_a_validation_failure_without_references_reads_as_before() -> None:
+    error = TaskGraphValidationError(
+        [TaskGraphFinding(rule="task.batch.empty", message="batch has no tasks")]
+    )
+
+    assert str(error) == (
+        "task graph validation failed: task.batch.empty: batch has no tasks"
+    )
+
+
 def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
     committed_git_repo: Path,
     persist_planning_context,
