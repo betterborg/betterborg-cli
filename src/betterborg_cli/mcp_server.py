@@ -28,6 +28,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
+from betterborg_cli.planning.turns import standing_planning_findings
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
@@ -1377,7 +1378,9 @@ def _plan_findings(
             message=finding.message,
             suggestion=finding.suggestion,
         )
-        for finding in store.list_planning_findings(borg.id)
+        for finding in standing_planning_findings(
+            store, borg.id, "tech_review"
+        )
     )
 
 

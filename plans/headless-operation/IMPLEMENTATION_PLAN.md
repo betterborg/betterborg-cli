@@ -829,7 +829,11 @@ Blocking keeps the findings, and keeping them is worth something only if a
 reader can reach them, so the command the run names for reading them shows
 them, on the surface a person reads and on the one a program calls: a headless
 caller is handed the findings and the call that reaches them, having no
-terminal to be told in. They are the reviewer's own words rendered into a
+terminal to be told in. What stands is narrower than what the record holds. A
+finding belongs to the round that wrote it, rounds restart with each planning
+cycle, and a revision the reviewer went on to approve answered the finding that
+asked for it. Shown whole, the list reads as a page of outstanding objections
+with round numbers that repeat. They are the reviewer's own words rendered into a
 document, so they are escaped like everything else the plan carries. A revision already under way outlives a budget lowered beneath it, and
 the round it leads to is the last one: that is what the reviewer is told, since
 a round numbered past its own budget describes nothing it can use.
@@ -856,7 +860,8 @@ a round numbered past its own budget describes nothing it can use.
 - A lowered budget blocks sooner.
 - A plan unapproved at the budget blocks with its findings intact, and showing
   the plan shows them; a headless caller is handed the same findings and a
-  call that reaches them.
+  call that reaches them. A finding from a cycle a change request closed, and
+  one a later approval answered, are not shown.
 - A finding carrying Markdown of its own renders as text, not as structure.
 - A blocked plan re-entered with a raised budget reports the same result and
   reviews nothing further; one re-entered with progress attached reconstructs

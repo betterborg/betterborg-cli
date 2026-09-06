@@ -2399,3 +2399,40 @@ def test_a_command_naming_an_agent_scoped_secret_is_refused(
     assert isinstance(result, HostPreflightBlock)
     assert "scoped to the agents but named by a command that runs" in result.reason
     assert "test" in result.reason
+
+
+def test_a_secret_only_a_dropped_command_names_is_not_required_to_be_declared(
+    committed_git_repo: Path,
+) -> None:
+    """Following the commands covers the undeclared case as well as the named one.
+
+    A dropped command's requirements are not this run's, so a secret only it
+    names is not one the analysis had to declare either.
+    """
+    binary_dir = committed_git_repo.parent / "undeclared-drop-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"], "verifies": True},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime"],
+                    "verifies": True,
+                    "required_secrets": ["GHOST_TOKEN"],
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ()
+    assert [dropped.command.argv[0] for dropped in result.dropped_commands] == [
+        "missing-runtime"
+    ]

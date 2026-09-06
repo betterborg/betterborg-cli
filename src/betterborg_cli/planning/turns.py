@@ -30,6 +30,7 @@ from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
+    PlanningFinding,
     Repository,
     SqliteStore,
 )
@@ -59,6 +60,31 @@ def completed_planning_phase_attempts(
         item
         for item in attempts
         if item.phase == phase and item.status is PlanningAttemptStatus.COMPLETED
+    ]
+
+
+def standing_planning_findings(
+    store: SqliteStore, borg_id: UUID, phase: str
+) -> list[PlanningFinding]:
+    """Return the review findings the current plan still has to answer.
+
+    The store keeps every finding a Borg ever collected, in append order, and
+    round numbers restart with each planning cycle, so the whole list reads as
+    a page of objections with repeating rounds. What stands is narrower: the
+    findings of this cycle, and only while the latest review is still asking
+    for a revision. Once the reviewer approves, the plan answered them.
+    """
+
+    reviews = completed_planning_phase_attempts(
+        current_planning_cycle_attempts(store, borg_id), phase
+    )
+    if not reviews or (reviews[-1].result or {}).get("decision") == "approve":
+        return []
+    attempt_ids = {attempt.id for attempt in reviews}
+    return [
+        finding
+        for finding in store.list_planning_findings(borg_id)
+        if finding.attempt_id in attempt_ids
     ]
 
 

@@ -1112,3 +1112,54 @@ def test_a_command_directory_must_belong_to_the_repository(
                 artifact_dir=git_repo / "artifacts",
             )
         assert store.list_analyses(repository.id) == []
+
+
+def test_a_catalogued_command_directory_must_belong_to_the_repository(
+    git_repo: Path,
+) -> None:
+    """The rule holds for the catalog as well as for environment commands."""
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose catalogued check cites an image path.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["go", "test", "./..."],
+                    "verifies": True,
+                    "cwd": "/abs",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="cwd"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []

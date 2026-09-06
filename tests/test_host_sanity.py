@@ -720,3 +720,38 @@ def test_the_dropped_summary_is_masked_like_every_other_quotation(
     assert "catalog-test" in result.reason
     assert runtime is not None
     assert "--token build" not in runtime.state_reason
+
+
+def test_a_task_with_no_check_to_run_blocks_rather_than_publishing(
+    tmp_path: Path,
+) -> None:
+    """The gate's last backstop, behind preflight's refusal.
+
+    Preflight refuses a run holding no check, so reaching here means something
+    upstream let one through. Publishing the task anyway would advance the
+    project base on a change nothing verified, and say nothing about it.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = replace(_plan(fixture), commands=())
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "sanity command catalog is empty" in result.reason
+    assert calls == []
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.base_commit
+    )
