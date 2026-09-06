@@ -895,9 +895,11 @@ completion verifies the repository, and the gate runs the ones that do.
 
 The rule that decides it is narrow on purpose. A check runs to completion and
 reports, and the gate reads its exit code and then requires the worktree to be
-unchanged, so a command whose purpose is to rewrite files cannot be one however
-useful it is: a formatter qualifies in the mode that reports and not in the mode
-that writes. Everything the rule does not positively admit falls outside it,
+unchanged, so a command whose purpose is to write into the tree cannot be one
+however useful it is: a formatter qualifies in the mode that reports and not in
+the mode that writes. Nor can one whose purpose is measurement rather than
+correctness: a benchmark suite passes its own exit code and takes as long as it
+takes, and the gate that waits for it times out and blocks every task. Everything the rule does not positively admit falls outside it,
 because the two ways of being wrong are not equal. A check wrongly skipped is a
 gap in what the run proved; a server wrongly admitted never exits, and every
 task blocks when the gate times out, which is the failure this stage exists to

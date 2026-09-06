@@ -354,11 +354,13 @@ required secret, and service must cite a manifest path or inherit a source
 from its containing catalog/environment/service. A source names one path; when
 several files support a claim, cite the one that establishes it. Every
 catalogued command says whether running it verifies the repository. verifies is
-true only for a command that exits on its own and reports whether the
-repository is sound while leaving it unchanged: a build, a test run, a linter,
-or a formatter in a check mode that reports rather than rewrites. It is false
-for everything else, including a command that serves, watches, publishes,
-releases, waits for input, rewrites files, or does not exit on its own.
+true only for a command that exits on its own, reports whether the repository
+is sound, and leaves the working tree unchanged: a build, a test run, a linter,
+a type checker or other static analysis, or a formatter in a check mode that
+reports rather than rewrites. It is false for everything else, including a
+command that serves, watches, publishes, releases, waits for input, writes into
+the working tree, measures performance rather than correctness, or does not
+exit on its own.
 A command's cwd is a directory of this repository written relative to
 its root, never an absolute path and never a working directory inside a
 container image. Service env
