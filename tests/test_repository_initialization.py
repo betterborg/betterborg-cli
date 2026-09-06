@@ -203,6 +203,79 @@ def test_initial_config_pins_and_reuses_the_bootstrap_selection(
         ) == body
 
 
+def test_init_under_a_declared_home_leaves_the_working_tree_untouched(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    git_repo = committed_git_repo
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    paths = RepoPaths.discover(git_repo)
+    _adapter_unused, selected = _adapter(git_repo)
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_repo.parent / "machine-state"))
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: selected
+    )
+
+    result = cli_runner.invoke(cli, ["init", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    config = load_repository_config(paths)
+    assert (home / CONFIG_FILENAME).is_file()
+    assert str(config.repository_id) in result.output
+    assert "Score: 3.00/5 (estimated)" in (home / "score.md").read_text(
+        encoding="utf-8"
+    )
+    for role in PROMPT_ROLES:
+        assert (home / "prompts" / f"{role}.system.md").is_file()
+    assert (home / "prds" / "improvements" / "theme-ci.md").is_file()
+    assert (home / "state" / "betterborg.sqlite3").is_file()
+    assert (home / "state" / "artifacts").is_dir()
+    assert str(home / "prds" / "improvements" / "theme-ci.md") in result.output
+
+    status = subprocess.run(
+        ["git", "-C", str(git_repo), "status", "--short", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+    assert not (git_repo / ".betterborg").exists()
+    assert not paths.gitignore.exists()
+
+
+def test_a_declared_home_refuses_a_second_repository(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    first = committed_git_repo
+    second = tmp_path_factory.mktemp("second-repository")
+    subprocess.run(["git", "init", "--quiet", str(second)], check=True)
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(first.parent / "machine-state"))
+    _adapter_unused, selected = _adapter(first)
+    monkeypatch.setattr(
+        cli_module, "select_agent", lambda *_args, **_kwargs: selected
+    )
+    monkeypatch.chdir(first)
+
+    assert cli_runner.invoke(cli, ["init", "--yes"]).exit_code == 0
+
+    monkeypatch.chdir(second)
+    result = cli_runner.invoke(cli, ["init", "--yes"])
+
+    assert result.exit_code != 0
+    assert "one directory serves one repository" in result.output
+    assert str(first) in result.output
+    assert str(second) in result.output
+
+
 def test_init_creates_outputs_once_and_preserves_repository_identity(
     cli_runner: CliRunner,
     committed_git_repo: Path,

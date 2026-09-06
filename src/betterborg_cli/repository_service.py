@@ -32,6 +32,7 @@ from betterborg_cli.repository_config import (
     AgentStage,
     RepositoryConfig,
     load_repository_config,
+    require_registered_repository,
 )
 from betterborg_cli.repository_files import RepositoryPathError, publish_repository_text
 from betterborg_cli.store import Operation, Repository, RepositoryAnalysis, SqliteStore
@@ -224,14 +225,12 @@ class RepositoryService:
                 "repository is not initialized; run 'betterborg init' first"
             )
         config = load_repository_config(self.paths)
-        repository = self.store.get_repository(config.repository_id)
-        if repository is None or not self._is_initialized(repository):
+        repository = require_registered_repository(
+            self.paths, self.store.get_repository(config.repository_id)
+        )
+        if not self._is_initialized(repository):
             raise RepositoryInitializationError(
                 "repository is not initialized; run 'betterborg init' first"
-            )
-        if repository.root != self.paths.root:
-            raise RepositoryInitializationError(
-                "tracked repository identity belongs to a different repository root"
             )
         return repository, config
 
@@ -250,12 +249,8 @@ class RepositoryService:
         stored = self.store.get_repository(repository.id)
         if stored is None:
             self.store.add_repository(repository)
-        elif stored.root != repository.root:
-            raise RepositoryInitializationError(
-                "tracked repository identity belongs to a different repository root"
-            )
         else:
-            repository = stored
+            repository = require_registered_repository(self.paths, stored)
         return repository, config, bootstrap_agent
 
     def _write_initial_config(self, repository: Repository) -> AnalysisAgent:
@@ -281,7 +276,7 @@ class RepositoryService:
             publish_repository_text(
                 self.paths.tracked_dir / CONFIG_FILENAME,
                 body,
-                root=self.paths.root,
+                root=self.paths.tracked_root,
                 overwrite=False,
             )
         except FileExistsError:
@@ -312,7 +307,9 @@ class RepositoryService:
     def _write_score(self, analysis: RepositoryAnalysis) -> None:
         packages = self.store.list_packages(analysis.id)
         report = render_markdown_report(build_machine_report(analysis, packages))
-        _publish_text(self.paths.score_report, report, root=self.paths.root)
+        _publish_text(
+            self.paths.score_report, report, root=self.paths.tracked_root
+        )
 
     def _seed_retained_prompts(self, repository: Repository) -> frozenset[str]:
         retained_roles = frozenset(
@@ -323,6 +320,7 @@ class RepositoryService:
                 self.store,
                 role=role,
                 path=self.paths.prompts_dir / f"{role}.system.md",
+                root=self.paths.tracked_root,
             )
             is not None
         )

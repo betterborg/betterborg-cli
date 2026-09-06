@@ -555,6 +555,16 @@ def undeclared_sandbox(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("BETTERBORG_SANDBOX", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def undeclared_home(monkeypatch: MonkeyPatch) -> None:
+    """Hold every test to the tracked directory it declares for itself.
+
+    The declaration is an operator's environment variable, so a machine that
+    genuinely sets it would otherwise move every path unrelated tests assert.
+    """
+    monkeypatch.delenv("BETTERBORG_HOME", raising=False)
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """Return Click's isolated command-line test runner."""

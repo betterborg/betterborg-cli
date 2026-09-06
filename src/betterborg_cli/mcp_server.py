@@ -1073,7 +1073,7 @@ def _cli_command(*arguments: str) -> str:
 
 
 def _relative(paths: RepoPaths, path: Path) -> str:
-    return path.resolve().relative_to(paths.root).as_posix()
+    return paths.label(path)
 
 
 def _analysis_artifacts(

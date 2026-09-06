@@ -95,6 +95,7 @@ from betterborg_cli.repository_config import (
     AgentStage,
     RepositoryConfig,
     load_repository_config,
+    require_registered_repository,
 )
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
@@ -361,7 +362,7 @@ def initialize_repository(
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
-        if not database.resolve().is_relative_to(paths.root):
+        if not database.resolve().is_relative_to(paths.tracked_root):
             raise ValueError(f"repository state path escapes repository: {database}")
         with SqliteStore.open(database) as store:
             service = RepositoryService(
@@ -417,7 +418,7 @@ def initialize_repository(
 
     if cancel is not None and cancel.is_set():
         return
-    commands = create_commands(paths.root, result.improvement_prds)
+    commands = create_commands(paths, result.improvement_prds)
     with _suspend_progress(progress):
         if json_output:
             click.echo(
@@ -466,7 +467,7 @@ def analyze_repository(
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
-        if not database.resolve().is_relative_to(paths.root):
+        if not database.resolve().is_relative_to(paths.tracked_root):
             raise ValueError(f"repository state path escapes repository: {database}")
         with SqliteStore.open(database) as store:
             result = RepositoryService(
@@ -553,11 +554,9 @@ def create_borg(
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             if adopt:
                 assert source is not None
                 result = adopt_prd(
@@ -641,11 +640,9 @@ def show_plan(name: str, json_output: bool) -> None:
         paths = RepoPaths.discover()
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(
@@ -1612,11 +1609,9 @@ def _current_task_publication(
     paths = RepoPaths.discover()
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
@@ -1634,11 +1629,9 @@ def _current_task_runtime(
     """Load runtime rows and guard against a concurrent generation change."""
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
@@ -1661,7 +1654,7 @@ def _task_listing_item(
         "complexity": record.complexity.value,
         "dependencies": record.task.get("dependencies", []),
         "digest": record.digest,
-        "path": path.relative_to(paths.root).as_posix(),
+        "path": paths.label(path),
         "position": record.position,
         "stage": record.stage,
         "stem": record.stem,
@@ -1813,7 +1806,7 @@ def approve_plan(
             ) from error
         raise click.ClickException(str(error)) from error
 
-    relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
+    relative_plan = paths.label(workflow.plan_path)
     click.echo(
         f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
     )
@@ -1822,7 +1815,7 @@ def approve_plan(
         click.echo("Current tasks:")
         assert workflow.publication is not None
         for item in workflow.publication.files:
-            click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
+            click.echo(f"  {paths.label(item.path)}")
     else:
         click.echo(f"Task decomposition blocked for Borg {name!r}.")
 
@@ -1880,11 +1873,9 @@ def _continue_planning(
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(

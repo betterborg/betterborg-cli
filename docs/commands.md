@@ -108,6 +108,34 @@ value fails any run that would launch Codex. Like a credential it belongs to
 whoever starts Betterborg, so it is environment-only and not valid tracked
 Betterborg configuration.
 
+## Betterborg's own files
+
+Betterborg keeps its configuration, prompts, PRDs, plans, published tasks and
+score in `.betterborg` inside the repository, and adds a managed block to the
+repository's `.gitignore` so its state directory stays out of Git. For a team
+that owns the repository this is the point: the configuration is reviewed and
+shared like any other checked-in file.
+
+Working on a repository you are only passing through, set `BETTERBORG_HOME` to
+an absolute path outside it:
+
+```console
+BETTERBORG_HOME=~/.betterborg/acme betterborg init --yes
+```
+
+Configuration, prompts, PRDs, plans, tasks, score, state and artifacts all
+move there together, and the repository's working tree and `.gitignore` are
+left exactly as Betterborg found them: with nothing of Betterborg's inside the
+repository there is nothing to ignore, so no managed block is written.
+
+Unset is the default and an empty value is read the same way. A path that
+resolves inside the repository fails the run, because it would reintroduce
+exactly what the variable exists to keep out, and so does a relative path. One
+directory serves one repository: a directory already holding another
+repository's configuration is refused rather than serving both. Like the
+sandbox declaration it belongs to whoever starts Betterborg, so it is
+environment-only and not valid tracked Betterborg configuration.
+
 ## Host integrations
 
 ```console

@@ -19,6 +19,7 @@ from betterborg_cli.prd_session import (
 from betterborg_cli.progress import RunProgress
 from betterborg_cli.repo_analysis import ImprovementPrd
 from betterborg_cli.repo_analysis.text_rendering import terminal_text
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
 
 
@@ -234,7 +235,7 @@ class OnboardingDispatcher:
 
 
 def create_commands(
-    repository_root: Path, improvement_prds: Sequence[ImprovementPrd]
+    paths: RepoPaths, improvement_prds: Sequence[ImprovementPrd]
 ) -> tuple[tuple[str, ...], ...]:
     """Return one shell-free create argv for each ranked generated theme."""
     return tuple(
@@ -243,7 +244,7 @@ def create_commands(
             "create",
             document.suggested_borg_name,
             "--prd",
-            document.path.relative_to(repository_root).as_posix(),
+            paths.label(document.path),
         )
         for document in improvement_prds
     )

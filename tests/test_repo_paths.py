@@ -13,8 +13,10 @@ from pytest import MonkeyPatch
 from betterborg_cli import repository_files as repository_files_module
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.repo_paths import (
+    HOME_VARIABLE,
     MANAGED_IGNORE_BEGIN,
     MANAGED_IGNORE_END,
+    BetterborgHomeError,
     RepoPaths,
     ensure_managed_gitignore,
 )
@@ -154,6 +156,110 @@ def test_managed_ignore_keeps_documents_trackable_and_ignores_state(
             check=False,
         )
         assert ignored.returncode == 0
+
+
+def test_undeclared_home_keeps_every_path_inside_the_repository(
+    git_repo: Path,
+) -> None:
+    paths = RepoPaths.discover(git_repo)
+
+    tracked = git_repo / ".betterborg"
+    assert paths.tracked_dir == tracked
+    assert paths.tracked_in_repository
+    assert paths.tracked_root == git_repo
+    assert paths.state_dir == tracked / "state"
+    assert paths.artifacts_dir == tracked / "state" / "artifacts"
+    assert paths.task_staging_dir == tracked / "state" / "task-staging"
+    assert paths.prompts_dir == tracked / "prompts"
+    assert paths.prds_dir == tracked / "prds"
+    assert paths.improvement_prds_dir == tracked / "prds" / "improvements"
+    assert paths.plans_dir == tracked / "plans"
+    assert paths.tasks_dir == tracked / "tasks"
+    assert paths.score_report == tracked / "score.md"
+
+
+def test_declared_home_moves_every_derived_path_together(
+    git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv(HOME_VARIABLE, str(home))
+
+    paths = RepoPaths.discover(git_repo)
+
+    assert paths.root == git_repo
+    assert paths.tracked_dir == home
+    assert not paths.tracked_in_repository
+    assert paths.tracked_root == home
+    assert paths.state_dir == home / "state"
+    assert paths.artifacts_dir == home / "state" / "artifacts"
+    assert paths.task_staging_dir == home / "state" / "task-staging"
+    assert paths.prompts_dir == home / "prompts"
+    assert paths.prds_dir == home / "prds"
+    assert paths.improvement_prds_dir == home / "prds" / "improvements"
+    assert paths.plans_dir == home / "plans"
+    assert paths.tasks_dir == home / "tasks"
+    assert paths.score_report == home / "score.md"
+    # The worktrees directory is already a sibling of the repository and is
+    # not the operator's to place.
+    assert paths.worktrees_dir == git_repo.parent / ".betterborg-worktrees" / (
+        git_repo.name
+    )
+
+
+def test_declared_home_inside_the_repository_is_refused(
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    inside = git_repo / "nested" / "home"
+    monkeypatch.setenv(HOME_VARIABLE, str(inside))
+
+    with pytest.raises(BetterborgHomeError) as failure:
+        RepoPaths.discover(git_repo)
+
+    message = str(failure.value)
+    assert HOME_VARIABLE in message
+    assert "resolves inside the repository" in message
+    assert str(git_repo) in message
+
+
+def test_declared_home_reached_by_symlink_into_the_repository_is_refused(
+    git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    link = tmp_path_factory.mktemp("outside") / "looks-outside"
+    link.symlink_to(git_repo / "inside-home", target_is_directory=True)
+    monkeypatch.setenv(HOME_VARIABLE, str(link))
+
+    with pytest.raises(BetterborgHomeError, match="resolves inside the repository"):
+        RepoPaths.discover(git_repo)
+
+
+def test_declared_home_must_be_absolute(
+    git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOME_VARIABLE, "betterborg-home")
+
+    with pytest.raises(BetterborgHomeError, match="must name an absolute path"):
+        RepoPaths.discover(git_repo)
+
+
+def test_declared_home_leaves_the_repository_ignore_file_alone(
+    git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    prior = "dist/\n*.log\n"
+    (git_repo / ".gitignore").write_text(prior, encoding="utf-8")
+    monkeypatch.setenv(HOME_VARIABLE, str(tmp_path_factory.mktemp("home")))
+    paths = RepoPaths.discover(git_repo)
+
+    ensure_managed_gitignore(paths)
+
+    assert paths.gitignore.read_text(encoding="utf-8") == prior
 
 
 def test_worktrees_are_placed_in_sibling_repository_directory(git_repo: Path) -> None:

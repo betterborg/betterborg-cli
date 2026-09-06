@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.store.models import Repository
 
 CONFIG_FILENAME = "config.toml"
 CONFIG_VERSION = 1
@@ -100,6 +101,28 @@ class RepositoryConfig:
     default_branch: str
     agents: AgentChoices = field(default_factory=AgentChoices)
     execution: ExecutionLimits = field(default_factory=ExecutionLimits)
+
+
+def require_registered_repository(
+    paths: RepoPaths, repository: Repository | None
+) -> Repository:
+    """Return the repository ``paths`` serves, refusing another's directory.
+
+    One tracked directory serves one repository. Configuration carries the
+    identity it was written for, so a directory whose configuration names a
+    repository registered at another root is refused rather than quietly
+    serving both from one set of files.
+    """
+    if repository is None:
+        raise RepositoryConfigError(
+            "repository is not initialized; run 'betterborg init' first"
+        )
+    if repository.root != paths.root:
+        raise RepositoryConfigError(
+            f"{paths.tracked_dir} holds configuration for {repository.root}, "
+            f"not {paths.root}; one directory serves one repository"
+        )
+    return repository
 
 
 def load_repository_config(paths: RepoPaths) -> RepositoryConfig:

@@ -18,7 +18,7 @@ from betterborg_cli.repo_analysis import (
     build_machine_report,
     render_markdown_report,
 )
-from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repo_paths import TRACKED_DIR_NAME, RepoPaths
 from betterborg_cli.repository_config import CONFIG_FILENAME, load_repository_config
 from betterborg_cli.repository_files import (
     RepositoryPathError,
@@ -202,7 +202,11 @@ def _materialize_context(
     session = store.get_prd_session_for_borg(borg.id)
     if session is None:
         raise PlanningWorktreeError("Borg has no persisted PRD session")
-    prd_body = _read_owned_text(paths.root, session.prd_path, "confirmed PRD")
+    prd_body = _read_owned_text(
+        paths.tracked_root,
+        paths.prds_dir / session.prd_path.name,
+        "confirmed PRD",
+    )
 
     analysis = store.get_prior_ready_analysis(repository.id)
     if analysis is None:
@@ -211,13 +215,13 @@ def _materialize_context(
     prompts = store.get_latest_generated_prompts(repository.id)
 
     plan_path = (
-        Path(".betterborg/plans") / f"{session.prd_path.stem}.md"
+        _in_checkout(paths, paths.plans_dir / f"{session.prd_path.stem}.md")
         if current_plan is not None
         else None
     )
     reserved = {
-        Path(".betterborg") / CONFIG_FILENAME,
-        paths.score_report.relative_to(paths.root),
+        Path(TRACKED_DIR_NAME) / CONFIG_FILENAME,
+        _in_checkout(paths, paths.score_report),
         session.prd_path,
         _MANIFEST_PATH,
         _REPOSITORY_PATH,
@@ -226,7 +230,7 @@ def _materialize_context(
         _CHANGE_REQUESTS_PATH,
         _FINDINGS_PATH,
         *(
-            paths.prompts_dir.relative_to(paths.root) / f"{role}.system.md"
+            _in_checkout(paths, paths.prompts_dir / f"{role}.system.md")
             for role in prompts
         ),
     }
@@ -241,20 +245,20 @@ def _materialize_context(
 
     _publish(
         destination,
-        Path(".betterborg") / CONFIG_FILENAME,
+        Path(TRACKED_DIR_NAME) / CONFIG_FILENAME,
         _read_owned_text(
-            paths.root,
-            Path(".betterborg") / CONFIG_FILENAME,
+            paths.tracked_root,
+            paths.tracked_dir / CONFIG_FILENAME,
             "repository identity",
         ),
     )
     _publish(destination, session.prd_path, prd_body)
     report = render_markdown_report(build_machine_report(analysis, packages))
-    _publish(destination, paths.score_report.relative_to(paths.root), report)
+    _publish(destination, _in_checkout(paths, paths.score_report), report)
 
     prompt_manifest: dict[str, dict[str, Any]] = {}
     for role, prompt in prompts.items():
-        prompt_path = paths.prompts_dir.relative_to(paths.root) / f"{role}.system.md"
+        prompt_path = _in_checkout(paths, paths.prompts_dir / f"{role}.system.md")
         _publish(destination, prompt_path, prompt.body_md)
         prompt_manifest[role] = {
             "analysis_id": str(prompt.analysis_id),
@@ -330,7 +334,7 @@ def _materialize_context(
             "questions": _QUESTIONS_PATH.as_posix(),
             "repository": _REPOSITORY_PATH.as_posix(),
             "schema_version": 1,
-            "score_report": paths.score_report.relative_to(paths.root).as_posix(),
+            "score_report": _in_checkout(paths, paths.score_report).as_posix(),
         },
     )
 
@@ -396,9 +400,19 @@ def _borg_relative_path(path: Path, repository_root: Path) -> Path:
     return candidate
 
 
-def _read_owned_text(repository_root: Path, relative: Path, label: str) -> str:
+def _in_checkout(paths: RepoPaths, path: Path) -> Path:
+    """Name a tracked file by the path it takes inside a checkout.
+
+    A planning worktree always carries Betterborg's context under
+    ``.betterborg``, whether or not this repository's own tracked
+    directory lives there.
+    """
+    return Path(TRACKED_DIR_NAME) / path.relative_to(paths.tracked_dir)
+
+
+def _read_owned_text(root: Path, path: Path, label: str) -> str:
     try:
-        return read_repository_text(relative, root=repository_root)
+        return read_repository_text(path, root=root)
     except RepositoryPathError as error:
         raise PlanningWorktreeError(f"{label} is unsafe: {error}") from error
 

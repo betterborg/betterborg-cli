@@ -13,6 +13,7 @@ from betterborg_cli.onboarding import OnboardingDispatcher, create_commands
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageSpec
 from betterborg_cli.repo_analysis import ImprovementPrd
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Borg, Repository, SqliteStore
 
 
@@ -310,7 +311,9 @@ def test_machine_handoff_commands_are_exact_and_mutation_free(
 ) -> None:
     repository, store = onboarding_context
 
-    commands = create_commands(repository.root, _documents(repository.root))
+    commands = create_commands(
+        RepoPaths.discover(repository.root), _documents(repository.root)
+    )
 
     assert commands == (
         (

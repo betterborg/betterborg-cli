@@ -23,7 +23,7 @@ from betterborg_cli.agent_runtime.selection import (
 )
 from betterborg_cli.agent_runtime.structured import validate_structured_result
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
-from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repo_paths import TRACKED_DIR_NAME, RepoPaths
 from betterborg_cli.repository_files import (
     RepositoryPathError,
     is_windows_reserved_filename,
@@ -187,7 +187,9 @@ class PrdSession:
         confirmation; material questions are returned to the caller instead of
         being prompted.
         """
-        borg, session, prd_path = _new_borg_records(self.repository, name)
+        borg, session, prd_path = _new_borg_records(
+            self.paths, self.repository, name
+        )
         base_result = {
             "borg": borg,
             "session": session,
@@ -306,7 +308,7 @@ class PrdSession:
                 _publish_confirmed_prd(
                     prd_path,
                     body_md,
-                    root=self.repository.root,
+                    root=self.paths.tracked_root,
                 )
             except FileExistsError:
                 raise
@@ -314,7 +316,7 @@ class PrdSession:
                 if not _confirmed_prd_matches(
                     prd_path,
                     body_md,
-                    root=self.repository.root,
+                    root=self.paths.tracked_root,
                 ):
                     raise
             result = PrdSessionResult(
@@ -476,7 +478,7 @@ def adopt_prd(
     paths = RepoPaths.discover(repository.root, cancel=cancel)
     if paths.root != repository.root:
         raise ValueError("repository root does not match its discovered Git root")
-    borg, session, prd_path = _new_borg_records(repository, name)
+    borg, session, prd_path = _new_borg_records(paths, repository, name)
     body_md = _read_source(source)
     _require_unclaimed_borg(store, repository, name, prd_path, source)
     _open_prd_session(store, borg, session, body_md)
@@ -485,11 +487,11 @@ def adopt_prd(
     # body, the publish did its job and a late error unwinding it would
     # otherwise strand a fully written Borg behind a claimed name.
     try:
-        _publish_confirmed_prd(prd_path, body_md, root=repository.root)
+        _publish_confirmed_prd(prd_path, body_md, root=paths.tracked_root)
     except FileExistsError:
         raise
     except BaseException:
-        if not _confirmed_prd_matches(prd_path, body_md, root=repository.root):
+        if not _confirmed_prd_matches(prd_path, body_md, root=paths.tracked_root):
             raise
     return PrdSessionResult(
         borg=borg,
@@ -526,18 +528,23 @@ def validate_borg_name(name: str) -> None:
 
 
 def _new_borg_records(
-    repository: Repository, name: str
+    paths: RepoPaths, repository: Repository, name: str
 ) -> tuple[Borg, StoredPrdSession, Path]:
-    """Return the Borg, its stored session, and its confirmed PRD path."""
+    """Return the Borg, its stored session, and its confirmed PRD path.
+
+    The session records the PRD by the name it carries inside a checkout,
+    which is where planning reads it; the returned path is where this
+    repository's tracked directory actually holds it.
+    """
     validate_borg_name(name)
-    relative_prd_path = Path(".betterborg") / "prds" / f"{name}.md"
+    relative_prd_path = Path(TRACKED_DIR_NAME) / "prds" / f"{name}.md"
     borg = Borg(repository_id=repository.id, name=name)
     session = StoredPrdSession(
         repository_id=repository.id,
         borg_id=borg.id,
         prd_path=relative_prd_path,
     )
-    return borg, session, repository.root / relative_prd_path
+    return borg, session, paths.prds_dir / f"{name}.md"
 
 
 def _require_unclaimed_borg(
