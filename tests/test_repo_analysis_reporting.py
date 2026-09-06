@@ -1050,3 +1050,65 @@ def test_a_catalogued_command_must_say_whether_it_verifies(
                 artifact_dir=git_repo / "artifacts",
             )
         assert store.list_analyses(repository.id) == []
+
+
+def test_a_command_directory_must_belong_to_the_repository(
+    git_repo: Path,
+) -> None:
+    """A Dockerfile's WORKDIR reads like a directory and is one, elsewhere.
+
+    Betterborg runs commands in the checkout, so the only directory it can act
+    on is one relative to the repository root. An absolute path taken off an
+    image build refuses at preflight, after analysis and planning have already
+    been paid for.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose prepare step cites an image WORKDIR.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {"stage": "test", "argv": ["make", "test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "files": ["Dockerfile"],
+            "prepare_commands": [
+                {
+                    "argv": ["go", "mod", "vendor"],
+                    "cwd": "/abs",
+                    "source": "Dockerfile",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="cwd"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []

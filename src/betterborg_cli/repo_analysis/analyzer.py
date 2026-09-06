@@ -65,6 +65,14 @@ _RUBRIC_SCHEMA: dict[str, Any] = {
         dimension: {"$ref": "#/$defs/dimension"} for dimension in DIMENSIONS
     },
 }
+# A command runs somewhere in the repository, and the only paths Betterborg
+# can act on are relative to its root. A Dockerfile's WORKDIR reads like a
+# directory and is one, inside an image nothing here will run.
+_REPOSITORY_DIRECTORY_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "minLength": 1,
+    "pattern": r"^[^/]",
+}
 _COMMAND_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -77,7 +85,7 @@ _COMMAND_STEP_SCHEMA: dict[str, Any] = {
             "minItems": 1,
             "items": {"type": "string", "minLength": 1},
         },
-        "cwd": {"type": "string", "minLength": 1},
+        "cwd": _REPOSITORY_DIRECTORY_SCHEMA,
         "source": {"type": "string", "minLength": 1},
         "uses_services": {
             "type": "array",
@@ -199,7 +207,7 @@ _ENVIRONMENT_COMMAND_SCHEMA: dict[str, Any] = {
             "minItems": 1,
             "items": {"type": "string", "minLength": 1},
         },
-        "cwd": {"type": "string", "minLength": 1},
+        "cwd": _REPOSITORY_DIRECTORY_SCHEMA,
         "source": {"type": "string", "minLength": 1},
     },
 }
@@ -348,7 +356,9 @@ several files support a claim, cite the one that establishes it. Every
 catalogued command says whether running it verifies the repository: verifies is
 true for one that builds, formats, lints, or tests and then exits on its own,
 and false for one that serves, watches, publishes, releases, or waits for
-input. Service env
+input. A command's cwd is a directory of this repository written relative to
+its root, never an absolute path and never a working directory inside a
+container image. Service env
 contains variable names only, never values. Omit an optional category when
 bounded evidence is insufficient. Return only the JSON object required by the
 supplied schema.

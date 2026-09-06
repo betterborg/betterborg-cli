@@ -884,3 +884,40 @@ names does not block.
 - The analyzer schema refuses a catalogued command that does not declare.
 
 **Status**: Complete
+
+
+## Stage 16: A command's directory belongs to the repository
+
+**Goal**: A command the analyzer reports runs somewhere Betterborg can reach,
+and analysis that names anywhere else is refused where it was written.
+
+Betterborg runs a repository's commands in a checkout, so the only directory
+any of them can name is one relative to the repository root. A Dockerfile
+states a working directory too, and it reads exactly like one: `WORKDIR /abs`
+is a real path to a real directory, inside an image nothing in the run will
+enter. An analyzer reading a Dockerfile for a repository's prepare steps takes
+that path along with them.
+
+Preflight already refuses it, correctly and with the right message, but it
+refuses at the start of execution: analysis, planning, review and decomposition
+have all been paid for by then, and the answer is that a directory named in the
+first of them was never usable. The schema the analyzer answers is where that
+belongs, because it is the one place the producer is told before it writes.
+
+The rule is the narrow one the failure shows: a directory a command names is
+written relative to the repository root. Reaching outside the checkout by
+another route is preflight's to catch, where the checkout is known.
+
+**Success Criteria**:
+- A command whose directory is absolute is refused when analysis is validated.
+- The analyzer is told the rule as part of the contract it answers.
+- A repository-relative directory, including the root itself, is accepted.
+- The rule covers catalogued commands and environment commands alike.
+- Preflight's own containment check is unchanged.
+
+**Tests**:
+- An analysis whose prepare command names an absolute directory is refused,
+  and nothing is stored.
+- A catalogued command naming a relative directory is accepted.
+
+**Status**: Complete
