@@ -172,7 +172,7 @@ class HostSanityPhase:
                         TaskRuntimeStatus.MERGING,
                         TaskRuntimeStatus.DONE,
                         resume_phase="done",
-                        state_reason=(
+                        state_reason=self._with_dropped_commands(
                             f"advanced {tip.project_branch} to {published}"
                         ),
                     )
@@ -212,7 +212,9 @@ class HostSanityPhase:
 
         return HostSanityResult(
             TaskRuntimeStatus.DONE,
-            f"sanity passed and advanced {tip.project_branch} to {published}",
+            self._with_dropped_commands(
+                f"sanity passed and advanced {tip.project_branch} to {published}"
+            ),
             published,
             tuple(commands),
         )
@@ -583,12 +585,23 @@ class HostSanityPhase:
             now=context.clock(),
         )
 
+    def _with_dropped_commands(self, reason: str) -> str:
+        """Carry preflight's skipped checks into this task's own outcome.
+
+        A command preflight dropped never ran here, and the operator reads
+        this task's result, not preflight's. Without it a task that skipped
+        its tests reads exactly like one that passed them.
+        """
+        summary = self.plan.dropped_command_summary
+        return f"{reason} ({summary})" if summary else reason
+
     def _block(
         self,
         context: ScheduledTaskContext,
         reason: str,
         commands: tuple[SanityCommandResult, ...],
     ) -> HostSanityResult:
+        reason = self._with_dropped_commands(reason)
         runtime = context.store.get_task_runtime(context.claim.task_id)
         if runtime is not None and runtime.status is TaskRuntimeStatus.MERGING:
             context.transition(

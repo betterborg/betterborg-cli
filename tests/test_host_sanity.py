@@ -25,6 +25,7 @@ from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_cap
 from betterborg_cli.host_execution import (
     HostCommand,
     HostComposeManager,
+    HostDroppedCommand,
     HostEnvironmentManager,
     HostExecutable,
     HostPreflightPlan,
@@ -598,3 +599,79 @@ def test_resume_after_fast_forward_uses_durable_attestation(
     assert runtime is not None and runtime.status is TaskRuntimeStatus.DONE
     assert not Path(runtime.worktree_path).exists()
     assert calls == [("catalog-install",), ("catalog-test",)]
+
+
+def _dropped_catalog_plan(fixture) -> HostPreflightPlan:  # noqa: ANN001
+    """Return the plan a host without ``catalog-test``'s program produces."""
+    original = _plan(fixture)
+    return replace(
+        original,
+        commands=(original.commands[0],),
+        dropped_commands=(
+            HostDroppedCommand(
+                original.commands[1],
+                "host executable is not available: catalog-test "
+                "(evidence: analyzer command catalog)",
+            ),
+        ),
+    )
+
+
+_DROPPED_SUMMARY = (
+    "1 sanity command dropped: catalog-test: host executable is not "
+    "available: catalog-test (evidence: analyzer command catalog)"
+)
+
+
+def test_published_task_names_the_command_the_host_could_not_run(
+    tmp_path: Path,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _dropped_catalog_plan(fixture)
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert calls == [("catalog-install",)]
+    assert _DROPPED_SUMMARY in result.reason
+    assert runtime is not None
+    assert _DROPPED_SUMMARY in runtime.state_reason
+
+
+def test_surviving_command_still_fails_the_task_and_names_the_drop(
+    tmp_path: Path,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _dropped_catalog_plan(fixture)
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 3, stdout="broken", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "sanity command failed with exit code 3" in result.reason
+    assert _DROPPED_SUMMARY in result.reason
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.base_commit
+    )

@@ -165,6 +165,33 @@ and `betterborg execute` as shown by `betterborg COMMAND --help`. Before executi
 published task generation, `betterborg task estimate NAME` shows its P50/P80 work and
 billing-mode estimate.
 
+## Run on a host that has less than the repository names
+
+`betterborg execute` requires what the run will use, not everything the
+repository has ever been able to do. The toolchains and package managers the
+analysis lists are an inventory written for a person to read, so a host with no
+program by one of those names is not refused; every command that runs already
+requires the program it invokes.
+
+A catalog command whose program is missing is dropped from the run rather than
+refusing it, and never silently. The Preflight stage names each dropped
+command, and so does the result of every task that would have run it:
+
+```text
+completed Preflight — 1 sanity command dropped: cargo test: host executable is
+not available: cargo (evidence: Cargo.toml)
+```
+
+A dropped check cannot fail, so a task that skipped one is not the same as a
+task that passed it. The commands the host can run still run, and a task whose
+whole catalog was dropped is blocked rather than published. Commands that build
+the run itself, the analysis's prepare and materialize commands, are never
+dropped; a host that cannot run one of them is refused.
+
+Secrets follow the commands. One that nothing left in the run consumes does not
+block, and a secret the analysis names twice blocks only when the two records
+disagree, in which case the refusal says what they disagree on.
+
 ## Adopt an existing PRD
 
 When the PRD is already written and authoritative, `--adopt` publishes it as

@@ -1643,14 +1643,16 @@ def _execute(
         status = "active"
         operation_id = None
         active_operation_id = str(result.active_operation_id)
-        reason = None
+        # A headless caller has no progress stream, so the checks this host
+        # could not run have to travel with the result itself.
+        reason = result.preflight.dropped_command_summary or None
     else:
         if result.operation_id is None or result.status is None:
             raise RuntimeError("host execution returned no operation")
         status = result.status.value
         operation_id = str(result.operation_id)
         active_operation_id = None
-        reason = None
+        reason = result.preflight.dropped_command_summary or None
     actions = ()
     if result.status not in {ExecutionRunStatus.COMPLETED}:
         actions = (

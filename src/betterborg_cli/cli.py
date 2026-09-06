@@ -1509,6 +1509,8 @@ def _finish_execution_preflight(
             progress.fail("preflight", detail)
     elif isinstance(result, HostPreflightBlock):
         progress.fail("preflight", result.reason)
+    elif result is not None:
+        progress.complete("preflight", result.dropped_command_summary or "ready")
     else:
         progress.complete("preflight", "ready")
 
@@ -1545,6 +1547,9 @@ def _agent_billing_mode(adapter_name: str) -> BillingMode:
 def _write_host_execution_result(result: HostExecutionResult) -> None:
     if isinstance(result.preflight, HostPreflightBlock):
         raise click.ClickException(result.preflight.reason)
+    dropped = result.preflight.dropped_command_summary
+    if dropped:
+        click.echo(dropped)
     if result.active_operation_id is not None:
         click.echo(f"Execution already active: {result.active_operation_id}")
         return

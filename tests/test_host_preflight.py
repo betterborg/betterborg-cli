@@ -15,10 +15,13 @@ import pytest
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
+    HostCommand,
+    HostExecutable,
     HostExecutionService,
     HostPreflight,
     HostPreflightBlock,
     HostPreflightPlan,
+    HostSecret,
     service_url_environment,
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
@@ -606,6 +609,10 @@ def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     plan = _base_plan()
     plan["command_catalog"]["commands"][0]["cwd"] = "../outside"
     plan["command_catalog"]["commands"][0]["uses_services"] = []
+    plan["environment"]["prepare_commands"] = [
+        {"argv": ["example-runtime", "-m", "build"], "source": "pyproject.toml"}
+    ]
+    plan["required_secrets"][0]["used_by"] = ["environment"]
 
     result = _preflight(committed_git_repo).validate(plan)
 
@@ -808,21 +815,29 @@ def test_command_derived_failures_retain_exact_source_evidence(
     committed_git_repo: Path,
 ) -> None:
     source = "pyproject.toml#tool.pytest.ini_options"
+    binary_dir = committed_git_repo.parent / "evidence-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "exit 0")
     plan = {
         "command_catalog": {
             "commands": [
                 {
                     "stage": "test",
-                    "argv": ["missing-runtime", "-m", "pytest"],
+                    "argv": ["example-runtime", "-m", "pytest"],
                     "source": source,
                     "required_secrets": ["PACKAGE_TOKEN"],
                     "uses_services": ["database"],
                 }
             ]
-        }
+        },
+        "environment": {
+            "prepare_commands": [{"argv": ["missing-runtime"], "source": source}]
+        },
     }
 
-    result = _preflight(committed_git_repo).validate(plan)
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
     assert len(result.failures) == 3
@@ -1324,3 +1339,304 @@ def test_unused_service_does_not_require_docker_or_external_url(
     assert isinstance(result, HostPreflightPlan)
     assert result.services == ()
     assert result.compose_files == ()
+
+
+def test_person_readable_toolchain_inventory_does_not_block_a_run(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "inventory-bin"
+    binary_dir.mkdir()
+    runtime = _executable(binary_dir, "example-runtime", "exit 0")
+    plan = {
+        "command_catalog": {
+            "commands": [{"stage": "test", "argv": ["example-runtime"]}]
+        },
+        "environment": {
+            "package_managers": ["Go modules"],
+            "toolchains": [{"name": "Node.js"}, {"name": "Go modules"}],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.dropped_commands == ()
+    assert result.executables == (
+        HostExecutable("example-runtime", runtime, None),
+    )
+    assert [command.argv for command in result.commands] == [("example-runtime",)]
+
+
+def test_command_with_no_host_program_is_dropped_and_named(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "partial-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint", "--all"]},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime", "-m", "pytest"],
+                    "source": "pyproject.toml#test",
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-lint", "--all")
+    ]
+    assert [dropped.command.argv for dropped in result.dropped_commands] == [
+        ("missing-runtime", "-m", "pytest")
+    ]
+    assert result.dropped_command_summary == (
+        "1 sanity command dropped: missing-runtime -m pytest: host executable "
+        "is not available: missing-runtime (evidence: pyproject.toml#test)"
+    )
+
+
+def test_environment_command_program_is_still_required(
+    committed_git_repo: Path,
+) -> None:
+    plan = {
+        "environment": {
+            "prepare_commands": [{"argv": ["missing-runtime", "install"]}]
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "host executable is required: missing-runtime" in result.reason
+
+
+def test_secret_named_only_by_a_dropped_command_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "secret-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"]},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                },
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            },
+            {
+                "name": "DEPLOY_TOKEN",
+                "used_by": ["deploy"],
+                "scope": "build",
+                "source": ".github/workflows/deploy.yml",
+            },
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("DEPLOY_TOKEN", "PACKAGE_TOKEN")
+
+
+def test_agent_scoped_secret_blocks_because_the_agents_always_run(
+    committed_git_repo: Path,
+) -> None:
+    plan = {
+        "required_secrets": [
+            {
+                "name": "AGENT_TOKEN",
+                "used_by": ["coding"],
+                "scope": "agent",
+                "source": "AGENTS.md",
+            }
+        ]
+    }
+
+    result = _preflight(committed_git_repo).validate(
+        plan, available_secret_names=set()
+    )
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: AGENT_TOKEN" in result.reason
+
+
+def test_identically_repeated_secret_records_are_accepted(
+    committed_git_repo: Path,
+) -> None:
+    plan = {
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["build", "test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            },
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test", "build"],
+                "scope": "build",
+                "source": ".github/workflows/release.yml",
+            },
+        ]
+    }
+
+    result = _preflight(committed_git_repo).validate(
+        plan, available_secret_names={"PACKAGE_TOKEN"}
+    )
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.secret_requirements == (
+        HostSecret(
+            "PACKAGE_TOKEN",
+            "build",
+            ("build", "test"),
+            ".github/workflows/ci.yml",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("repeated", "expected"),
+    [
+        (
+            {"used_by": ["test"], "scope": "agent"},
+            "disagree on scope 'build' and 'agent'",
+        ),
+        (
+            {"used_by": ["release"], "scope": "build"},
+            "disagree on used_by ['test'] and ['release']",
+        ),
+    ],
+    ids=["scope", "used_by"],
+)
+def test_conflicting_repeated_secret_records_say_what_disagrees(
+    committed_git_repo: Path,
+    repeated: dict[str, object],
+    expected: str,
+) -> None:
+    plan = {
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            },
+            {
+                "name": "PACKAGE_TOKEN",
+                "source": ".github/workflows/release.yml",
+                **repeated,
+            },
+        ]
+    }
+
+    result = _preflight(committed_git_repo).validate(
+        plan, available_secret_names={"PACKAGE_TOKEN"}
+    )
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret name must be unambiguous: PACKAGE_TOKEN" in (
+        result.reason
+    )
+    assert expected in result.reason
+    assert ".github/workflows/ci.yml, .github/workflows/release.yml" in (
+        result.reason
+    )
+
+
+def test_host_that_satisfies_everything_produces_the_unchanged_plan(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "complete-bin"
+    binary_dir.mkdir()
+    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    npm = _executable(binary_dir, "npm", "exit 0")
+    (committed_git_repo / "runtime.version").write_text(
+        "3.11.9\n", encoding="utf-8"
+    )
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "environment": {
+            "files": ["runtime.version"],
+            "package_managers": ["npm"],
+            "toolchains": [
+                {
+                    "name": "example-runtime",
+                    "version": "3.11.9",
+                    "source": "runtime.version",
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert result == HostPreflightPlan(
+        repository_root=committed_git_repo.resolve(),
+        commands=(
+            HostCommand(
+                "test",
+                ("example-runtime", "-m", "pytest"),
+                ".",
+                "pyproject.toml",
+            ),
+        ),
+        prepare_commands=(),
+        materialize_commands=(),
+        environment_files=(committed_git_repo / "runtime.version",),
+        executables=(
+            HostExecutable("example-runtime", runtime, "3.11.9"),
+            HostExecutable("npm", npm, None),
+        ),
+        required_secret_names=("PACKAGE_TOKEN",),
+        compose_files=(),
+        services=(),
+        package_managers=("npm",),
+        secret_requirements=(
+            HostSecret("PACKAGE_TOKEN", "build", ("test",), "pyproject.toml"),
+        ),
+    )

@@ -35,6 +35,7 @@ from betterborg_cli.host_execution.merge import (
 )
 from betterborg_cli.host_execution.preflight import (
     HostCommand,
+    HostDroppedCommand,
     HostExecutable,
     HostPreflight,
     HostPreflightBlock,
@@ -97,6 +98,7 @@ __all__ = [
     "HostCodingPhase",
     "HostWorktreeManager",
     "HostCommand",
+    "HostDroppedCommand",
     "HostExecutable",
     "HostPreflight",
     "HostPreflightBlock",

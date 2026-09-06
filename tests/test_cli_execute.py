@@ -28,7 +28,12 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.cli import CliRunContext, cli
-from betterborg_cli.host_execution import HostExecutionResult, HostPreflightPlan
+from betterborg_cli.host_execution import (
+    HostCommand,
+    HostDroppedCommand,
+    HostExecutionResult,
+    HostPreflightPlan,
+)
 from betterborg_cli.planning import TaskPublisher
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repository_config import AgentStage
@@ -1874,3 +1879,34 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     assert isinstance(
         observed_kwargs["validated_preflight"], HostPreflightPlan
     )
+
+
+def test_preflight_and_execution_output_name_every_dropped_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dropped = HostDroppedCommand(
+        HostCommand("test", ("missing-runtime", "-m", "pytest"), "."),
+        "host executable is not available: missing-runtime "
+        "(evidence: pyproject.toml)",
+    )
+    result = _execution_result()
+    result.preflight = replace(
+        result.preflight, dropped_commands=(dropped,)
+    )
+    summary = (
+        "1 sanity command dropped: missing-runtime -m pytest: host "
+        "executable is not available: missing-runtime "
+        "(evidence: pyproject.toml)"
+    )
+    progress = RunProgress(enabled=False)
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
+
+    cli_module._finish_execution_preflight(
+        progress, cancel=None, result=result.preflight
+    )
+    cli_module._write_host_execution_result(result)
+
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].result == summary
+    assert summary in capsys.readouterr().out

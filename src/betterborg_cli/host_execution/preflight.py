@@ -61,6 +61,14 @@ class HostCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class HostDroppedCommand:
+    """One catalog command excluded because the host cannot invoke it."""
+
+    command: HostCommand
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class HostExecutable:
     """One resolved host executable and any validated version requirement."""
 
@@ -113,6 +121,27 @@ class HostPreflightPlan:
     compose_build_services: tuple[str, ...] = ()
     package_managers: tuple[str, ...] = ()
     secret_requirements: tuple[HostSecret, ...] = ()
+    dropped_commands: tuple[HostDroppedCommand, ...] = ()
+
+    @property
+    def dropped_command_summary(self) -> str:
+        """Name every catalog command this host could not be given.
+
+        A check that does not run cannot fail, so a run that skipped one has
+        to be tellable apart from a run that passed it. Every surface that
+        reports a validated plan says this, and says nothing when the host
+        could run the whole catalog.
+        """
+        if not self.dropped_commands:
+            return ""
+        count = len(self.dropped_commands)
+        return (
+            f"{count} sanity command{'' if count == 1 else 's'} dropped: "
+            + "; ".join(
+                f"{shlex.join(dropped.command.argv)}: {dropped.reason}"
+                for dropped in self.dropped_commands
+            )
+        )
 
 
 HostPreflightResult = HostPreflightPlan | HostPreflightBlock
@@ -213,17 +242,48 @@ class HostPreflight:
 
         plan = analyzer_plan() if callable(analyzer_plan) else analyzer_plan
         failures: list[HostPreflightFailure] = []
-        commands, prepare_commands, materialize_commands = self._commands(
-            plan, failures
-        )
+        (
+            commands,
+            prepare_commands,
+            materialize_commands,
+            catalog_records,
+        ) = self._commands(plan, failures)
         environment_files = self._environment_files(plan, failures)
-        executables = self._executables(
+        executables, unresolved = self._executables(
             plan,
-            (*commands, *prepare_commands, *materialize_commands),
+            commands,
+            (*prepare_commands, *materialize_commands),
             failures,
         )
+        dropped_commands: list[HostDroppedCommand] = []
+        running_commands: list[HostCommand] = []
+        running_records: list[Mapping[str, Any]] = []
+        for command, record in zip(commands, catalog_records, strict=True):
+            if _command_executable_key(command) in unresolved:
+                dropped_commands.append(
+                    HostDroppedCommand(
+                        command,
+                        f"host executable is not available: {command.argv[0]} "
+                        f"(evidence: {command.evidence})",
+                    )
+                )
+                continue
+            running_commands.append(command)
+            running_records.append(record)
+        commands = running_commands
         secret_requirements = self._required_secrets(
-            plan, available_secret_names, failures
+            plan,
+            running_records,
+            {
+                command.stage
+                for command in (
+                    *commands,
+                    *prepare_commands,
+                    *materialize_commands,
+                )
+            },
+            available_secret_names,
+            failures,
         )
         (
             compose_files,
@@ -262,6 +322,7 @@ class HostPreflight:
                 compose_build_services=tuple(compose_build_services),
                 package_managers=tuple(_package_managers(plan)),
                 secret_requirements=tuple(secret_requirements),
+                dropped_commands=tuple(dropped_commands),
             )
         )
 
@@ -280,7 +341,12 @@ class HostPreflight:
         self,
         plan: Mapping[str, Any],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[HostCommand], list[HostCommand], list[HostCommand]]:
+    ) -> tuple[
+        list[HostCommand],
+        list[HostCommand],
+        list[HostCommand],
+        list[Mapping[str, Any]],
+    ]:
         catalog = plan.get("command_catalog")
         environment = plan.get("environment")
         groups = (
@@ -317,8 +383,14 @@ class HostPreflight:
         )
 
         validated_groups: list[list[HostCommand]] = []
+        # Only a catalog record carries the secrets its command asks for, and
+        # a command is only kept once its argv and cwd survive validation, so
+        # the surviving records are collected alongside the commands they
+        # produced rather than re-derived from the plan later.
+        validated_records: list[list[Mapping[str, Any]]] = []
         for group, records, default_stage, group_evidence in groups:
             commands: list[HostCommand] = []
+            accepted: list[Mapping[str, Any]] = []
             for index, record in enumerate(records):
                 argv = record.get("argv")
                 if not _string_sequence(argv):
@@ -364,9 +436,16 @@ class HostPreflight:
                         evidence=_evidence(record, group_evidence),
                     )
                 )
+                accepted.append(record)
             validated_groups.append(commands)
+            validated_records.append(accepted)
         catalog_commands, prepare_commands, materialize_commands = validated_groups
-        return catalog_commands, prepare_commands, materialize_commands
+        return (
+            catalog_commands,
+            prepare_commands,
+            materialize_commands,
+            validated_records[0],
+        )
 
     def _environment_files(
         self,
@@ -400,13 +479,20 @@ class HostPreflight:
     def _executables(
         self,
         plan: Mapping[str, Any],
-        commands: Sequence[HostCommand],
+        catalog_commands: Sequence[HostCommand],
+        environment_commands: Sequence[HostCommand],
         failures: list[HostPreflightFailure],
-    ) -> list[HostExecutable]:
+    ) -> tuple[list[HostExecutable], set[tuple[str, str]]]:
         requested: dict[tuple[str, str], tuple[str | None, list[str]]] = {}
+        required: set[tuple[str, str]] = set()
 
         def add_request(
-            name: str, cwd: str, version: str | None, evidence: str
+            name: str,
+            cwd: str,
+            version: str | None,
+            evidence: str,
+            *,
+            blocking: bool,
         ) -> None:
             current_version, evidence_values = requested.get(
                 (name, cwd), (None, [])
@@ -415,13 +501,26 @@ class HostPreflight:
                 version if version is not None else current_version,
                 _unique_strings((*evidence_values, evidence)),
             )
+            if blocking:
+                required.add((name, cwd))
 
-        for command in commands:
-            executable_cwd = command.cwd if "/" in command.argv[0] else "."
-            add_request(
-                command.argv[0], executable_cwd, None, command.evidence
-            )
+        # Environment commands build the run itself, so a program one of them
+        # invokes has to be here.  A catalog command is a check, and a check
+        # this host cannot invoke is dropped from the run rather than being
+        # allowed to refuse it.
+        for command, blocking in (
+            *((command, False) for command in catalog_commands),
+            *((command, True) for command in environment_commands),
+        ):
+            name, cwd = _command_executable_key(command)
+            add_request(name, cwd, None, command.evidence, blocking=blocking)
 
+        # The toolchain and package-manager inventory is prose written for a
+        # person: "Go modules" and "Node.js" name no program.  It is resolved
+        # when the name happens to be one, because that is what carries a
+        # version pin onto the executable, but it requires nothing on its own
+        # and adds no coverage, since every command already requires what it
+        # invokes.
         environment = plan.get("environment")
         toolchains: list[Mapping[str, Any]] = []
         if isinstance(environment, Mapping):
@@ -431,6 +530,7 @@ class HostPreflight:
                     ".",
                     None,
                     _evidence(environment, "environment"),
+                    blocking=False,
                 )
             toolchains = _mappings(environment.get("toolchains"))
             for toolchain in toolchains:
@@ -445,27 +545,35 @@ class HostPreflight:
                         _evidence(
                             toolchain, _evidence(environment, "analyzer toolchain")
                         ),
+                        blocking=False,
                     )
 
         resolved_tools: list[HostExecutable] = []
+        unresolved: set[tuple[str, str]] = set()
         for (name, cwd), (version, evidence_values) in requested.items():
-            evidence = _join_evidence(evidence_values)
             path = self._resolve_executable(name, cwd=cwd)
-            if path is None:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=f"host executable is required: {name}",
-                        evidence=evidence,
-                        guidance=(
-                            f"Install {name!r} on the host or update the analyzer "
-                            "command/toolchain evidence; Betterborg will not install "
-                            "runtimes during preflight."
-                        ),
-                    )
+            if path is not None:
+                resolved_tools.append(
+                    HostExecutable(name=name, path=path, version=version)
                 )
                 continue
-            resolved_tools.append(HostExecutable(name=name, path=path, version=version))
+            unresolved.add((name, cwd))
+            if (name, cwd) not in required:
+                continue
+            failures.append(
+                HostPreflightFailure(
+                    requirement=f"host executable is required: {name}",
+                    evidence=_join_evidence(evidence_values),
+                    guidance=(
+                        f"Install {name!r} on the host or update the analyzer "
+                        "command/toolchain evidence; Betterborg will not install "
+                        "runtimes during preflight."
+                    ),
+                )
+            )
 
+        # A version pin can only be checked against a program that is here, so
+        # this reaches exactly the toolchain names that turned out to be one.
         by_name = {tool.name: tool for tool in resolved_tools}
         for toolchain in toolchains:
             name = toolchain.get("name")
@@ -549,11 +657,13 @@ class HostPreflight:
                         ),
                     )
                 )
-        return resolved_tools
+        return resolved_tools, unresolved
 
     def _required_secrets(
         self,
         plan: Mapping[str, Any],
+        command_records: Sequence[Mapping[str, Any]],
+        running_stages: Collection[str],
         available: Collection[str],
         failures: list[HostPreflightFailure],
     ) -> list[HostSecret]:
@@ -561,27 +671,39 @@ class HostPreflight:
         by_name: dict[str, Mapping[str, Any]] = {}
         for record in records:
             name = record.get("name")
-            if isinstance(name, str) and name:
-                if name in by_name:
-                    failures.append(
-                        HostPreflightFailure(
-                            requirement=(
-                                f"required secret name must be unambiguous: {name}"
-                            ),
-                            evidence=_evidence(record, "analyzer required_secrets"),
-                            guidance=(
-                                "Deduplicate the analyzer secret requirements and "
-                                "rerun analysis."
-                            ),
-                        )
+            if not isinstance(name, str) or not name:
+                continue
+            declared = by_name.get(name)
+            # Two workflows naming one secret the same way are two sightings
+            # of one requirement.  Only records that contradict each other
+            # leave preflight without a single answer to act on.
+            disagreements = (
+                _secret_disagreements(declared, record)
+                if declared is not None
+                else ()
+            )
+            if disagreements:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            f"required secret name must be unambiguous: {name}"
+                        ),
+                        evidence=_join_evidence(
+                            (
+                                _evidence(declared, "analyzer required_secrets"),
+                                _evidence(record, "analyzer required_secrets"),
+                            )
+                        ),
+                        guidance=(
+                            "Reconcile the analyzer secret requirements that "
+                            f"disagree on {'; '.join(disagreements)}, then "
+                            "rerun analysis."
+                        ),
                     )
+                )
+            if declared is None:
                 by_name[name] = record
 
-        command_records = _mappings(
-            plan.get("command_catalog", {}).get("commands")
-            if isinstance(plan.get("command_catalog"), Mapping)
-            else None
-        )
         catalog = plan.get("command_catalog")
         catalog_evidence = (
             _evidence(catalog, "analyzer command catalog")
@@ -610,6 +732,7 @@ class HostPreflight:
             )
 
         available_names = set(available)
+        stages = set(running_stages)
         validated: list[HostSecret] = []
         for name, record in by_name.items():
             scope = record.get("scope")
@@ -635,7 +758,14 @@ class HostPreflight:
                     )
                 )
                 continue
-            if name not in available_names:
+            # A secret is this run's requirement when something the run will
+            # execute consumes it: the agent phases always run, and a build
+            # secret reaches every command whose stage its used_by names.  One
+            # that reaches nothing left in the run blocks over nothing.
+            reaches_run = scope in {"all", "agent"} or bool(
+                stages.intersection(used_by)
+            )
+            if reaches_run and name not in available_names:
                 failures.append(
                     HostPreflightFailure(
                         requirement=f"required secret is not configured: {name}",
@@ -1244,6 +1374,49 @@ def _which(name: str, path: str | None) -> str | None:
 
 def _toolchain_executable_name(name: str) -> str:
     return {"rust": "rustc"}.get(name, name)
+
+
+def _command_executable_key(command: HostCommand) -> tuple[str, str]:
+    """Return how one command's program is resolved.
+
+    A program named by path is resolved against the command's own working
+    directory; a bare name is resolved on PATH, where the working directory
+    makes no difference.
+    """
+    return (command.argv[0], command.cwd if "/" in command.argv[0] else ".")
+
+
+def _secret_stages(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return one secret record's used_by stages, order-insensitively.
+
+    The stages are a set of commands, not a sequence of them, so two records
+    listing the same stages in a different order say the same thing.
+    """
+    used_by = record.get("used_by")
+    if isinstance(used_by, Sequence) and not isinstance(used_by, str | bytes):
+        return tuple(sorted(repr(value) for value in used_by))
+    return (repr(used_by),)
+
+
+def _secret_disagreements(
+    declared: Mapping[str, Any], repeated: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Name what two records for one secret say differently.
+
+    Only what preflight acts on is compared. Where the evidence was found
+    differs whenever a secret is named twice, and is never a disagreement
+    about the requirement itself.
+    """
+    disagreements: list[str] = []
+    if declared.get("scope") != repeated.get("scope"):
+        disagreements.append(
+            f"scope {declared.get('scope')!r} and {repeated.get('scope')!r}"
+        )
+    if _secret_stages(declared) != _secret_stages(repeated):
+        disagreements.append(
+            f"used_by {declared.get('used_by')!r} and {repeated.get('used_by')!r}"
+        )
+    return tuple(disagreements)
 
 
 def _package_managers(plan: Mapping[str, Any]) -> list[str]:
