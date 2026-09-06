@@ -1971,3 +1971,125 @@ def test_a_host_that_can_run_no_catalogued_check_is_refused_before_the_spend(
     assert isinstance(result, HostPreflightBlock)
     assert "no catalogued check can run on this host" in result.reason
     assert "absent-cargo test" in result.reason
+
+
+def test_a_catalogue_declaring_no_check_is_refused_before_the_spend(
+    committed_git_repo: Path,
+) -> None:
+    """A catalogue of servers and deploys leaves the same run as a dropped one.
+
+    Nothing left could prove a change safe, so every task would be coded,
+    reviewed and merged and every one would then block. The refusal belongs
+    where the other empty gate is refused, and the reason has to name the
+    declaration that emptied it.
+    """
+    binary_dir = committed_git_repo.parent / "no-check-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "docs-development",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "declares no command that verifies the repository" in result.reason
+    assert "package.json" in result.reason
+
+
+def test_a_non_verifying_command_requires_no_program_and_is_not_a_drop(
+    committed_git_repo: Path,
+) -> None:
+    """A command the gate will not run states no requirement of the host.
+
+    Nor is it a dropped check: nothing was given up, so naming it beside the
+    checks this host could not run would report a loss the run did not take.
+    """
+    binary_dir = committed_git_repo.parent / "non-verifying-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "deploy",
+                    "argv": ["absent-deployer", "ship"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [("example-test",)]
+    assert result.dropped_commands == ()
+    assert result.dropped_command_summary == ""
+    assert [tool.name for tool in result.executables] == ["example-test"]
+
+
+def test_a_service_only_a_non_verifying_command_uses_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    """A service is selected because something the run executes talks to it."""
+    binary_dir = committed_git_repo.parent / "non-verifying-service-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "dev",
+                    "argv": ["example-test", "--serve"],
+                    "verifies": False,
+                    "uses_services": ["search"],
+                },
+            ],
+        },
+        "service_dependencies": [
+            {
+                "name": "search",
+                "kind": "external",
+                "url_env": "SEARCH_URL",
+                "source": "package.json#search",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.services == ()

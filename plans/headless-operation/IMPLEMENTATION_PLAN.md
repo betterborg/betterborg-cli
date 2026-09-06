@@ -749,14 +749,13 @@ repetition that says the same thing twice refuses over nothing.
 - A host missing a program a catalogued command invokes runs, that command is
   dropped rather than the run refused, and the drop is named in the preflight
   result and in each affected task's sanity result.
-- A host that can run none of the catalogued checks is refused, before any
-  task is coded.
+- A run left with no check to run is refused, before any task is coded,
+  whether the host could run none of them or the analysis declared none.
 - A secret no command that will run requires does not block the run, and one a
   surviving command names does block, however that secret's record spells the
   commands that use it.
 - A secret named more than once blocks only when the records disagree.
-- A host that can satisfy everything behaves exactly as it does today,
-  including running every catalogued command.
+- A host that can satisfy everything behaves exactly as it does today.
 - Nothing is dropped silently: a run that dropped a command can be told apart
   from one that ran it, without reading a log, over every surface that reports
   a run.
@@ -768,7 +767,8 @@ repetition that says the same thing twice refuses over nothing.
   named in the sanity result of a task that would have run it.
 - The commands that can run still run, and still fail the task when they fail.
 - A host missing the only catalogued check is refused rather than spending the
-  run and blocking every task at the end of it.
+  run and blocking every task at the end of it, and so is a catalog that
+  declares no check for the host to miss.
 - A secret required only by a dropped command does not block the run, and one a
   surviving command names blocks even when its record names no catalog stage.
 - Identical repeated secret records are accepted; conflicting ones are refused
@@ -870,6 +870,20 @@ the difference between them is what the command does, not what it is called. So
 the entry says it. Each catalogued command declares whether running it to
 completion verifies the repository, and the gate runs the ones that do.
 
+The rule that decides it is narrow on purpose. A check runs to completion and
+reports, and the gate reads its exit code and then requires the worktree to be
+unchanged, so a command whose purpose is to rewrite files cannot be one however
+useful it is: a formatter qualifies in the mode that reports and not in the mode
+that writes. Everything the rule does not positively admit falls outside it,
+because the two ways of being wrong are not equal. A check wrongly skipped is a
+gap in what the run proved; a server wrongly admitted never exits, and every
+task blocks when the gate times out, which is the failure this stage exists to
+remove.
+
+A catalog that declares no check at all leaves the run holding nothing that
+could prove a change safe. That is the same run a host missing every check
+leaves, so it is refused in the same place and for the same reason.
+
 An entry written before the analyzer was asked declares nothing, and is run.
 Reading that silence as "not a check" would quietly stop running a repository's
 tests, and a run that checked nothing would be indistinguishable from one that
@@ -884,13 +898,19 @@ names does not block.
   and analysis is refused when one does not.
 - The sanity gate runs the commands that declare they do, and no others.
 - A catalog recorded before the declaration existed still runs in full.
-- A secret only a non-verifying command names does not block the run.
+- A catalog that declares no check refuses the run before any task is coded.
+- A non-verifying command is not a dropped one: it requires no program of the
+  host, and is reported as no loss.
+- A secret or service only a non-verifying command names does not block the run.
 - Prepare and materialize commands are unaffected; they build the run itself.
 
 **Tests**:
 - A catalog mixing verifying and non-verifying entries runs only the former.
 - A catalog that declares nothing runs every command.
-- A secret named only by a non-verifying command does not block.
+- A catalog declaring no check is refused, naming the declaration as the cause.
+- A non-verifying command whose program is absent neither blocks the run nor
+  appears among the checks the host could not run.
+- A secret, and a service, named only by a non-verifying command do not block.
 - The analyzer schema refuses a catalogued command that does not declare.
 
 **Status**: Complete

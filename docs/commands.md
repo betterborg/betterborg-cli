@@ -175,8 +175,11 @@ requires the program it invokes.
 
 The catalog lists what a repository can do, and only part of it settles
 whether a change broke anything. Each catalogued command says whether running
-it to completion verifies the repository: a build, format, lint, or test does,
-while a command that serves, watches, publishes, or waits for input does not.
+it verifies the repository: a build, a test run, a linter, or a formatter in a
+check mode reports without changing anything, and everything else does not,
+including a command that serves, watches, publishes, rewrites files, or never
+exits on its own. A run whose catalog declares no check at all is refused
+before any task is coded, because nothing in it could prove a change safe.
 The sanity gate runs the ones that do. An analysis recorded before the question
 was asked says nothing, and every command in it still runs.
 
@@ -190,8 +193,8 @@ not available: cargo (evidence: Cargo.toml)
 ```
 
 A dropped check cannot fail, so a task that skipped one is not the same as a
-task that passed it. The commands the host can run still run, and a task whose
-whole catalog was dropped is blocked rather than published. Commands that build
+task that passed it. The checks the host can run still run, and a host that can
+run none of them is refused rather than spending the run. Commands that build
 the run itself, the analysis's prepare and materialize commands, are never
 dropped; a host that cannot run one of them is refused.
 

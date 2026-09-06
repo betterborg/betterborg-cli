@@ -247,6 +247,7 @@ class HostPreflight:
             prepare_commands,
             materialize_commands,
             catalog_records,
+            catalogued,
         ) = self._commands(plan, failures)
         environment_files = self._environment_files(plan, failures)
         executables, unresolved = self._executables(
@@ -270,32 +271,54 @@ class HostPreflight:
                 continue
             running_commands.append(command)
             running_records.append(record)
-        # Dropping trades a weaker run for a run at all, and the trade stops
-        # paying when nothing is left: a task with no check cannot publish, so
-        # every one would be coded, reviewed and merged and then blocked. The
-        # refusal is worth keeping for exactly this case.
-        if dropped_commands and not running_commands:
-            failures.append(
-                HostPreflightFailure(
-                    requirement=(
-                        "no catalogued check can run on this host: "
-                        + "; ".join(
-                            shlex.join(dropped.command.argv)
-                            for dropped in dropped_commands
-                        )
-                    ),
-                    evidence=_join_evidence(
-                        tuple(
-                            dropped.command.evidence
-                            for dropped in dropped_commands
-                        )
-                    ),
-                    guidance=(
-                        "Install one of the repository's checks on this host, "
-                        "or run where one is available."
-                    ),
+        # A run holding no check cannot publish anything: every task would be
+        # coded, reviewed and merged, and every one would then block. Whether
+        # the checks were dropped here or the analysis declared none, the
+        # answer is the same run and the refusal belongs before the spend.
+        if catalogued and not running_commands:
+            if dropped_commands:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            "no catalogued check can run on this host: "
+                            + "; ".join(
+                                shlex.join(dropped.command.argv)
+                                for dropped in dropped_commands
+                            )
+                        ),
+                        evidence=_join_evidence(
+                            tuple(
+                                dropped.command.evidence
+                                for dropped in dropped_commands
+                            )
+                        ),
+                        guidance=(
+                            "Install one of the repository's checks on this "
+                            "host, or run where one is available."
+                        ),
+                    )
                 )
-            )
+            else:
+                failures.append(
+                    HostPreflightFailure(
+                        requirement=(
+                            "the analysis declares no command that verifies "
+                            "the repository, so nothing could prove a change "
+                            "safe to publish"
+                        ),
+                        evidence=_evidence(
+                            plan.get("command_catalog"),
+                            "analyzer command catalog",
+                        )
+                        if isinstance(plan.get("command_catalog"), Mapping)
+                        else "analyzer command catalog",
+                        guidance=(
+                            "Mark the command that shows a change did not "
+                            "break the repository as verifying, then rerun "
+                            "analysis."
+                        ),
+                    )
+                )
         commands = running_commands
         secret_requirements = self._required_secrets(
             plan,
@@ -476,7 +499,13 @@ class HostPreflight:
                 continue
             checks.append(command)
             check_records.append(record)
-        return (checks, prepare_commands, materialize_commands, check_records)
+        return (
+            checks,
+            prepare_commands,
+            materialize_commands,
+            check_records,
+            len(catalog_commands),
+        )
 
     def _environment_files(
         self,
