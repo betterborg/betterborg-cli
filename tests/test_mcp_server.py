@@ -2682,7 +2682,18 @@ mcp_server.run_stdio_server()
     assert "Processing request" in stderr
 
 
+@pytest.mark.parametrize(
+    ("acquired", "run_status", "payload_status"),
+    [
+        (1, ExecutionRunStatus.COMPLETED, "completed"),
+        (0, ExecutionRunStatus.RUNNING, "active"),
+    ],
+    ids=["this-caller-ran-it", "another-caller-is-already-running-it"],
+)
 def test_execute_payload_names_the_checks_this_host_could_not_run(
+    acquired: int,
+    run_status: ExecutionRunStatus,
+    payload_status: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2756,8 +2767,8 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
             preflight,
             scheduler=HostSchedulerResult(
                 operation_id=uuid4(),
-                status=ExecutionRunStatus.COMPLETED,
-                acquired=1,
+                status=run_status,
+                acquired=acquired,
                 total=1,
                 done=1,
                 failed=0,
@@ -2779,5 +2790,8 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
         "borg", mcp_server.McpInteractiveIO(SimpleNamespace())
     )
 
+    # Both branches of the payload carry it: a caller told another operation
+    # is already running is told about the drop by this field too.
+    assert result.status == payload_status
     assert result.data.reason is not None
     assert "missing-runtime" in result.data.reason

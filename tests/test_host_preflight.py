@@ -1897,3 +1897,77 @@ def test_a_secret_only_a_non_verifying_command_names_does_not_block(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.required_secret_names == ("NPM_PUBLISH_TOKEN",)
+
+
+def test_a_surviving_command_makes_the_secret_it_names_this_runs_requirement(
+    committed_git_repo: Path,
+) -> None:
+    """The command that names the secret says it needs it.
+
+    Nothing in the analyzer contract makes a secret's used_by spell a catalog
+    stage; a workflow-derived record plausibly names the job instead. Matching
+    only on that string lets a secret a running command declared slip through
+    preflight and fail the command at sanity, after coding, review and merge
+    have been paid for.
+    """
+    binary_dir = committed_git_repo.parent / "named-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["ci"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
+
+
+def test_a_host_that_can_run_no_catalogued_check_is_refused_before_the_spend(
+    committed_git_repo: Path,
+) -> None:
+    """Dropping is a trade, and it stops paying when nothing survives.
+
+    A run with no check left cannot publish anything: every task would be
+    coded, reviewed and merged, and every one would then block. The refusal
+    the stage removed was worth keeping for exactly this case, where the
+    alternative is not a stricter run but the same no run, after the spend.
+    """
+    plan = {
+        "command_catalog": {
+            "source": "Cargo.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["absent-cargo", "test"],
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "no catalogued check can run on this host" in result.reason
+    assert "absent-cargo test" in result.reason

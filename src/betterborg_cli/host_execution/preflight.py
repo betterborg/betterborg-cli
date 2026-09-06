@@ -270,6 +270,32 @@ class HostPreflight:
                 continue
             running_commands.append(command)
             running_records.append(record)
+        # Dropping trades a weaker run for a run at all, and the trade stops
+        # paying when nothing is left: a task with no check cannot publish, so
+        # every one would be coded, reviewed and merged and then blocked. The
+        # refusal is worth keeping for exactly this case.
+        if dropped_commands and not running_commands:
+            failures.append(
+                HostPreflightFailure(
+                    requirement=(
+                        "no catalogued check can run on this host: "
+                        + "; ".join(
+                            shlex.join(dropped.command.argv)
+                            for dropped in dropped_commands
+                        )
+                    ),
+                    evidence=_join_evidence(
+                        tuple(
+                            dropped.command.evidence
+                            for dropped in dropped_commands
+                        )
+                    ),
+                    guidance=(
+                        "Install one of the repository's checks on this host, "
+                        "or run where one is available."
+                    ),
+                )
+            )
         commands = running_commands
         secret_requirements = self._required_secrets(
             plan,
@@ -772,11 +798,13 @@ class HostPreflight:
                 )
                 continue
             # A secret is this run's requirement when something the run will
-            # execute consumes it: the agent phases always run, and a build
-            # secret reaches every command whose stage its used_by names.  One
-            # that reaches nothing left in the run blocks over nothing.
-            reaches_run = scope in {"all", "agent"} or bool(
-                stages.intersection(used_by)
+            # execute consumes it. A surviving command that names the secret
+            # says so directly; used_by says so for the rest, and nothing in
+            # the analyzer contract makes it spell a catalog stage.
+            reaches_run = (
+                scope in {"all", "agent"}
+                or name in referenced
+                or bool(stages.intersection(used_by))
             )
             if reaches_run and name not in available_names:
                 failures.append(
