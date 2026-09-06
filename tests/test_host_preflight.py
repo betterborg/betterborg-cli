@@ -466,6 +466,16 @@ def test_ordinary_probe_failures_remain_host_blocks(
         command_runner=runner,
     ).validate(
         {
+            "command_catalog": {
+                "source": "pyproject.toml",
+                "commands": [
+                    {
+                        "stage": "test",
+                        "argv": ["example-runtime", "-m", "pytest"],
+                        "verifies": True,
+                    }
+                ],
+            },
             "environment": {
                 "files": ["runtime.version"],
                 "toolchains": [
@@ -475,7 +485,7 @@ def test_ordinary_probe_failures_remain_host_blocks(
                         "source": "runtime.version",
                     }
                 ],
-            }
+            },
         }
     )
 
@@ -789,6 +799,16 @@ def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "verifies": True,
+                }
+            ],
+        },
         "environment": {
             "files": ["runtime.version"],
             "toolchains": [
@@ -798,7 +818,7 @@ def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
                     "source": "missing.version",
                 }
             ],
-        }
+        },
     }
 
     result = _preflight(
@@ -2093,3 +2113,174 @@ def test_a_service_only_a_non_verifying_command_uses_does_not_block(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.services == ()
+
+
+def test_the_secret_a_command_named_reaches_the_command_that_named_it(
+    committed_git_repo: Path,
+) -> None:
+    """Requiring a secret and delivering it must answer the same question.
+
+    Preflight makes the operator configure a secret because a command said it
+    needs one. If the phase that runs the command answers "which commands ask"
+    differently, the command runs without it and fails after coding, review
+    and merge have been paid for: the whole failure preflight exists to move
+    forward in time, moved back again.
+    """
+    from betterborg_cli.host_execution.environment import (
+        command_secret_environment,
+    )
+
+    binary_dir = committed_git_repo.parent / "delivered-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                # The workflow job, not the catalog stage.
+                "used_by": ["ci"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("PACKAGE_TOKEN",)
+    environment, masks = command_secret_environment(
+        result, result.commands[0].stage, {"PACKAGE_TOKEN": "s3cr3t"}
+    )
+    assert environment == {"PACKAGE_TOKEN": "s3cr3t"}
+    assert masks == ("s3cr3t",)
+
+
+def test_a_version_pin_on_a_program_the_run_never_invokes_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    """The inventory stops being a source of requirements, pins included.
+
+    A patch-level mismatch on a runtime no catalogued command calls is the
+    refusal over tools nothing in the run would invoke, arriving through the
+    version instead of through the presence.
+    """
+    binary_dir = committed_git_repo.parent / "uninvoked-pin-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    _executable(binary_dir, "example-runtime", "echo 'example 3.12.0'")
+    (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "files": ["runtime.version"],
+            "toolchains": [
+                {
+                    "name": "example-runtime",
+                    "version": "3.11.9",
+                    "source": "runtime.version",
+                }
+            ],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [("example-lint",)]
+
+
+def test_a_materialize_command_the_host_cannot_run_still_refuses_the_run(
+    committed_git_repo: Path,
+) -> None:
+    """Materialize builds the run itself, so it is never dropped."""
+    plan = {
+        "environment": {
+            "materialize_commands": [{"argv": ["missing-runtime", "sync"]}]
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "host executable is required: missing-runtime" in result.reason
+
+
+def test_a_scope_all_secret_blocks_whatever_the_commands_name(
+    committed_git_repo: Path,
+) -> None:
+    """Scope 'all' reaches every phase, so no command has to ask for it."""
+    binary_dir = committed_git_repo.parent / "scope-all-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "SHARED_TOKEN",
+                "used_by": ["deploy"],
+                "scope": "all",
+                "source": ".env.example",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: SHARED_TOKEN" in result.reason
+
+
+def test_a_program_named_by_path_is_resolved_against_its_own_directory(
+    committed_git_repo: Path,
+) -> None:
+    """A bare name is found on PATH; a path is found where the command runs."""
+    tools = committed_git_repo / "tools"
+    tools.mkdir()
+    _executable(tools, "check.sh", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["./check.sh"],
+                    "cwd": "tools",
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo, environment={"PATH": ""}).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [("./check.sh",)]
+    assert result.dropped_commands == ()

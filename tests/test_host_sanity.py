@@ -675,3 +675,48 @@ def test_surviving_command_still_fails_the_task_and_names_the_drop(
     assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
         tip.base_commit
     )
+
+
+def test_the_dropped_summary_is_masked_like_every_other_quotation(
+    tmp_path: Path,
+) -> None:
+    """This reason is durable, and the summary quotes the analysis verbatim.
+
+    It is stored as the task's state reason, listed back, and carried into the
+    pull request body that is pushed. Everything else this phase quotes from
+    the analysis is masked, and a catalogued argv is no safer than the argv of
+    a command that ran.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    original = _plan(fixture)
+    leaking = replace(
+        original.commands[1],
+        argv=(*original.commands[1].argv, "--token", "build"),
+    )
+    plan = replace(
+        original,
+        commands=(original.commands[0],),
+        dropped_commands=(
+            HostDroppedCommand(
+                leaking, "host executable is not available: catalog-test"
+            ),
+        ),
+    )
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert "--token build" not in result.reason
+    assert "catalog-test" in result.reason
+    assert runtime is not None
+    assert "--token build" not in runtime.state_reason

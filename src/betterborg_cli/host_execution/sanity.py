@@ -134,6 +134,7 @@ class HostSanityPhase:
         existing_stack: ComposeStack | None = None,
     ) -> HostSanityResult:
         """Sanity-check and publish ``tip``, or durably block the task."""
+        masks = declared_secret_mask_values(self.plan, secret_values or {})
         commands: list[SanityCommandResult] = []
         stack_to_stop = existing_stack
         try:
@@ -173,7 +174,8 @@ class HostSanityPhase:
                         TaskRuntimeStatus.DONE,
                         resume_phase="done",
                         state_reason=self._with_dropped_commands(
-                            f"advanced {tip.project_branch} to {published}"
+                            f"advanced {tip.project_branch} to {published}",
+                            masks,
                         ),
                     )
         except (
@@ -204,16 +206,14 @@ class HostSanityPhase:
                         f"{cleanup_error}"
                     )
                 stack_to_stop = None
-            reason = redact_secrets(
-                _error_text(error) + cleanup_detail,
-                declared_secret_mask_values(self.plan, secret_values or {}),
-            )
-            return self._block(context, reason, tuple(commands))
+            reason = redact_secrets(_error_text(error) + cleanup_detail, masks)
+            return self._block(context, reason, tuple(commands), masks)
 
         return HostSanityResult(
             TaskRuntimeStatus.DONE,
             self._with_dropped_commands(
-                f"sanity passed and advanced {tip.project_branch} to {published}"
+                f"sanity passed and advanced {tip.project_branch} to {published}",
+                masks,
             ),
             published,
             tuple(commands),
@@ -585,14 +585,21 @@ class HostSanityPhase:
             now=context.clock(),
         )
 
-    def _with_dropped_commands(self, reason: str) -> str:
+    def _with_dropped_commands(
+        self, reason: str, masks: tuple[str, ...]
+    ) -> str:
         """Carry preflight's skipped checks into this task's own outcome.
 
         A command preflight dropped never ran here, and the operator reads
         this task's result, not preflight's. Without it a task that skipped
         its tests reads exactly like one that passed them.
+
+        The summary quotes a catalogued command's argv and its evidence, and
+        this reason is durable: it is stored, listed, and carried into the
+        pull request body. It is masked like every other quotation of the
+        analysis this phase makes.
         """
-        summary = self.plan.dropped_command_summary
+        summary = redact_secrets(self.plan.dropped_command_summary, masks)
         return f"{reason} ({summary})" if summary else reason
 
     def _block(
@@ -600,8 +607,9 @@ class HostSanityPhase:
         context: ScheduledTaskContext,
         reason: str,
         commands: tuple[SanityCommandResult, ...],
+        masks: tuple[str, ...],
     ) -> HostSanityResult:
-        reason = self._with_dropped_commands(reason)
+        reason = self._with_dropped_commands(reason, masks)
         runtime = context.store.get_task_runtime(context.claim.task_id)
         if runtime is not None and runtime.status is TaskRuntimeStatus.MERGING:
             context.transition(

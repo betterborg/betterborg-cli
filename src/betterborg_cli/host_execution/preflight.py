@@ -320,6 +320,14 @@ class HostPreflight:
                     )
                 )
         commands = running_commands
+        # Which command asks for a secret is answered by the command, and the
+        # answer has to reach the phase that runs it: a stage named here is
+        # the stage the environment is built for.
+        named_by: dict[str, list[str]] = {}
+        for command, record in zip(commands, running_records, strict=True):
+            for secret_name in record.get("required_secrets") or ():
+                if isinstance(secret_name, str) and secret_name:
+                    named_by.setdefault(secret_name, []).append(command.stage)
         secret_requirements = self._required_secrets(
             plan,
             running_records,
@@ -333,6 +341,7 @@ class HostPreflight:
             },
             available_secret_names,
             failures,
+            named_by,
         )
         (
             compose_files,
@@ -568,11 +577,13 @@ class HostPreflight:
         # invokes has to be here.  A catalog command is a check, and a check
         # this host cannot invoke is dropped from the run rather than being
         # allowed to refuse it.
+        invoked: set[str] = set()
         for command, blocking in (
             *((command, False) for command in catalog_commands),
             *((command, True) for command in environment_commands),
         ):
             name, cwd = _command_executable_key(command)
+            invoked.add(name)
             add_request(name, cwd, None, command.evidence, blocking=blocking)
 
         # The toolchain and package-manager inventory is prose written for a
@@ -632,15 +643,18 @@ class HostPreflight:
                 )
             )
 
-        # A version pin can only be checked against a program that is here, so
-        # this reaches exactly the toolchain names that turned out to be one.
+        # A version pin can only be checked against a program that is here,
+        # and it is only this run's requirement when this run invokes it. The
+        # inventory names what the repository uses somewhere; refusing over a
+        # pin on a program nothing in the run calls is the refusal over tools
+        # the run would never invoke that this stage exists to remove.
         by_name = {tool.name: tool for tool in resolved_tools}
         for toolchain in toolchains:
             name = toolchain.get("name")
             if not isinstance(name, str):
                 continue
             executable_name = _toolchain_executable_name(name)
-            if executable_name not in by_name:
+            if executable_name not in by_name or executable_name not in invoked:
                 continue
             version = toolchain.get("version")
             evidence = _evidence(toolchain, "analyzer toolchain")
@@ -726,6 +740,7 @@ class HostPreflight:
         running_stages: Collection[str],
         available: Collection[str],
         failures: list[HostPreflightFailure],
+        named_by: Mapping[str, Sequence[str]] | None = None,
     ) -> list[HostSecret]:
         records = _mappings(plan.get("required_secrets"))
         by_name: dict[str, Mapping[str, Any]] = {}
@@ -830,9 +845,10 @@ class HostPreflight:
             # execute consumes it. A surviving command that names the secret
             # says so directly; used_by says so for the rest, and nothing in
             # the analyzer contract makes it spell a catalog stage.
+            asking_stages = tuple((named_by or {}).get(name, ()))
             reaches_run = (
                 scope in {"all", "agent"}
-                or name in referenced
+                or bool(asking_stages)
                 or bool(stages.intersection(used_by))
             )
             if reaches_run and name not in available_names:
@@ -852,7 +868,10 @@ class HostPreflight:
                 HostSecret(
                     name=name,
                     scope=scope,
-                    used_by=tuple(used_by),
+                    # The stages that use it, whatever the record called them.
+                    # A command that named the secret is one of them, and the
+                    # phase building its environment reads this tuple.
+                    used_by=tuple(dict.fromkeys((*used_by, *asking_stages))),
                     evidence=_evidence(record, "analyzer required_secrets"),
                 )
             )
@@ -1484,18 +1503,6 @@ def _verifies(record: Mapping[str, Any]) -> bool:
     """
 
     return record.get("verifies") is not False
-
-
-def _secret_stages(record: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return one secret record's used_by stages, order-insensitively.
-
-    The stages are a set of commands, not a sequence of them, so two records
-    listing the same stages in a different order say the same thing.
-    """
-    used_by = record.get("used_by")
-    if isinstance(used_by, Sequence) and not isinstance(used_by, str | bytes):
-        return tuple(sorted(repr(value) for value in used_by))
-    return (repr(used_by),)
 
 
 def _secret_disagreements(

@@ -715,7 +715,10 @@ are resolved by looking for an executable of the same name, but nothing ever
 said the name was an executable: the analyzer writes them for a person to read,
 and "Go modules" and "Node.js" name no program. The inventory also adds no
 coverage, because every command that runs already requires the program it
-invokes. It stops being a source of requirements.
+invokes. It stops being a source of requirements, and that covers the version
+it pins as much as the program itself: a pin is this run's requirement only
+where this run invokes the program, so a patch-level mismatch on a runtime no
+command calls is the same refusal arriving by a different route.
 
 The commands are used, and requiring what they invoke is right. What changes is
 the answer when the host cannot invoke one: the command is dropped from the run
@@ -751,9 +754,12 @@ repetition that says the same thing twice refuses over nothing.
   result and in each affected task's sanity result.
 - A run left with no check to run is refused, before any task is coded,
   whether the host could run none of them or the analysis declared none.
+- A version pin on a program the run never invokes does not block.
 - A secret no command that will run requires does not block the run, and one a
   surviving command names does block, however that secret's record spells the
-  commands that use it.
+  commands that use it, and reaches the command that named it when it runs.
+- Everything a task's outcome quotes from the analysis is masked, including the
+  checks it names as skipped.
 - A secret named more than once blocks only when the records disagree.
 - A host that can satisfy everything behaves exactly as it does today.
 - Nothing is dropped silently: a run that dropped a command can be told apart
@@ -769,8 +775,14 @@ repetition that says the same thing twice refuses over nothing.
 - A host missing the only catalogued check is refused rather than spending the
   run and blocking every task at the end of it, and so is a catalog that
   declares no check for the host to miss.
-- A secret required only by a dropped command does not block the run, and one a
-  surviving command names blocks even when its record names no catalog stage.
+- A toolchain version mismatch blocks where a command invokes the program and
+  does not where none does.
+- A secret required only by a dropped command does not block the run; one a
+  surviving command names blocks even when its record names no catalog stage,
+  and is handed to that command when it runs.
+- A dropped command's own words are masked in the task outcome that names it.
+- A materialize command the host cannot run refuses the run rather than being
+  dropped, and a program named by path is resolved where its command runs.
 - Identical repeated secret records are accepted; conflicting ones are refused
   and say what disagrees.
 - A headless caller is told what was dropped whether it started the run or
