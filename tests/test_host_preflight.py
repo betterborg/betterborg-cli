@@ -592,11 +592,20 @@ def test_preserves_prepare_and_materialize_command_phases(
     binary_dir.mkdir()
     _executable(binary_dir, "prepare-environment", "exit 0")
     _executable(binary_dir, "materialize-environment", "exit 0")
+    _executable(binary_dir, "example-test", "exit 0")
     plan = {
+        # A check, so the subject here stays the phases rather than the
+        # refusal a run with no check would take.
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
         "environment": {
             "prepare_commands": [{"argv": ["prepare-environment"]}],
             "materialize_commands": [{"argv": ["materialize-environment"]}],
-        }
+        },
     }
 
     result = _preflight(
@@ -604,7 +613,7 @@ def test_preserves_prepare_and_materialize_command_phases(
     ).validate(plan)
 
     assert isinstance(result, HostPreflightPlan)
-    assert result.commands == ()
+    assert [command.argv for command in result.commands] == [("example-test",)]
     assert [command.argv for command in result.prepare_commands] == [
         ("prepare-environment",)
     ]
@@ -627,8 +636,9 @@ def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     result = _preflight(committed_git_repo).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 4
+    assert len(result.failures) == 5
     assert "repo-relative directory" in result.reason
+    assert "declares no command that verifies the repository" in result.reason
     assert "runtime.version" in result.reason
     assert "host executable is required: example-runtime" in result.reason
     assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
@@ -677,6 +687,12 @@ def test_version_probe_preserves_shim_dispatch_path(
         "3.13.7\n", encoding="utf-8"
     )
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["python3", "-m", "pytest"], "verifies": True}
+            ],
+        },
         "environment": {
             "files": [".python-version"],
             "toolchains": [
@@ -686,7 +702,7 @@ def test_version_probe_preserves_shim_dispatch_path(
                     "source": ".python-version",
                 }
             ],
-        }
+        },
     }
 
     result = _preflight(
@@ -712,12 +728,18 @@ def test_go_version_probe_uses_supported_command_and_output(
         "module example.test/project\n\ngo 1.24.2\n", encoding="utf-8"
     )
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["go", "test", "./..."], "verifies": True}
+            ],
+        },
         "environment": {
             "files": ["go.mod"],
             "toolchains": [
                 {"name": "go", "version": "1.24.2", "source": "go.mod"}
             ],
-        }
+        },
     }
 
     result = _preflight(
@@ -741,9 +763,15 @@ def test_unpinned_toolchain_only_requires_available_executable(
     binary_dir.mkdir()
     executable = _executable(binary_dir, "python", "exit 7")
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["python", "-m", "pytest"], "verifies": True}
+            ],
+        },
         "environment": {
             "toolchains": [{"name": "python", **optional_version}],
-        }
+        },
     }
 
     result = _preflight(
@@ -770,6 +798,12 @@ def test_rust_toolchain_resolves_and_probes_rustc(
         '[toolchain]\nchannel = "1.88.0"\n', encoding="utf-8"
     )
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["rustc", "--version"], "verifies": True}
+            ],
+        },
         "environment": {
             "toolchains": [
                 {
@@ -778,7 +812,7 @@ def test_rust_toolchain_resolves_and_probes_rustc(
                     "source": "rust-toolchain.toml",
                 }
             ],
-        }
+        },
     }
 
     result = _preflight(
@@ -1595,7 +1629,16 @@ def test_agent_scoped_secret_blocks_because_the_agents_always_run(
 def test_identically_repeated_secret_records_are_accepted(
     committed_git_repo: Path,
 ) -> None:
+    binary_dir = committed_git_repo.parent / "repeated-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
         "required_secrets": [
             {
                 "name": "PACKAGE_TOKEN",
@@ -1612,7 +1655,9 @@ def test_identically_repeated_secret_records_are_accepted(
         ]
     }
 
-    result = _preflight(committed_git_repo).validate(
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(
         plan, available_secret_names={"PACKAGE_TOKEN"}
     )
 
@@ -2284,3 +2329,29 @@ def test_a_program_named_by_path_is_resolved_against_its_own_directory(
     assert isinstance(result, HostPreflightPlan)
     assert [command.argv for command in result.commands] == [("./check.sh",)]
     assert result.dropped_commands == ()
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [None, {"source": "Makefile"}, {"source": "Makefile", "commands": []}],
+    ids=["no-catalog", "no-commands-key", "empty-commands"],
+)
+def test_an_analysis_naming_no_check_at_all_is_refused(
+    committed_git_repo: Path,
+    catalog: dict[str, object] | None,
+) -> None:
+    """The commonest way to hold no check is to have catalogued nothing.
+
+    The command catalog is optional, and the analyzer is told to omit a
+    category it has no evidence for, so this is a state the producer is
+    instructed to reach. It leaves the same run as a catalog of servers: every
+    task coded, reviewed and merged, and every one blocked at the end.
+    """
+    plan: dict[str, object] = {}
+    if catalog is not None:
+        plan["command_catalog"] = catalog
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "declares no command that verifies the repository" in result.reason

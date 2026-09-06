@@ -857,7 +857,20 @@ def _persist_repository_analysis(
         analysis_json={
             "packages": [{"path": "."}],
             "themes": [],
-            "command_catalog": {"commands": []},
+            # A repository with a check: a run holding none is refused
+            # before any task is coded, which is not what these fixtures are
+            # about.
+            "command_catalog": {
+                "source": "README.md",
+                "commands": [
+                    {
+                        "stage": "test",
+                        "argv": ["git", "status", "--short"],
+                        "verifies": True,
+                        "source": "README.md",
+                    }
+                ],
+            },
             "environment": {"files": []},
             "required_secrets": [],
             "service_dependencies": [],

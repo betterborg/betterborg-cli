@@ -247,7 +247,6 @@ class HostPreflight:
             prepare_commands,
             materialize_commands,
             catalog_records,
-            catalogued,
         ) = self._commands(plan, failures)
         environment_files = self._environment_files(plan, failures)
         executables, unresolved = self._executables(
@@ -275,7 +274,7 @@ class HostPreflight:
         # coded, reviewed and merged, and every one would then block. Whether
         # the checks were dropped here or the analysis declared none, the
         # answer is the same run and the refusal belongs before the spend.
-        if catalogued and not running_commands:
+        if not running_commands:
             if dropped_commands:
                 failures.append(
                     HostPreflightFailure(
@@ -508,13 +507,7 @@ class HostPreflight:
                 continue
             checks.append(command)
             check_records.append(record)
-        return (
-            checks,
-            prepare_commands,
-            materialize_commands,
-            check_records,
-            len(catalog_commands),
-        )
+        return (checks, prepare_commands, materialize_commands, check_records)
 
     def _environment_files(
         self,

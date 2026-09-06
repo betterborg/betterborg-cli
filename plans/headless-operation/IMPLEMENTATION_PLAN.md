@@ -892,9 +892,12 @@ gap in what the run proved; a server wrongly admitted never exits, and every
 task blocks when the gate times out, which is the failure this stage exists to
 remove.
 
-A catalog that declares no check at all leaves the run holding nothing that
-could prove a change safe. That is the same run a host missing every check
-leaves, so it is refused in the same place and for the same reason.
+A catalog that declares no check leaves the run holding nothing that could
+prove a change safe. That is the same run a host missing every check leaves, so
+it is refused in the same place and for the same reason. Cataloguing nothing at
+all leaves it too, and by the shortest route: the catalog is optional and the
+analyzer is told to omit a category it has no evidence for. The refusal follows
+the empty gate rather than the way it came to be empty.
 
 An entry written before the analyzer was asked declares nothing, and is run.
 Reading that silence as "not a check" would quietly stop running a repository's
@@ -910,7 +913,8 @@ names does not block.
   and analysis is refused when one does not.
 - The sanity gate runs the commands that declare they do, and no others.
 - A catalog recorded before the declaration existed still runs in full.
-- A catalog that declares no check refuses the run before any task is coded.
+- A run holding no check refuses before any task is coded, whether the catalog
+  declared none or catalogued nothing at all.
 - A non-verifying command is not a dropped one: it requires no program of the
   host, and is reported as no loss.
 - A secret or service only a non-verifying command names does not block the run.
@@ -919,7 +923,8 @@ names does not block.
 **Tests**:
 - A catalog mixing verifying and non-verifying entries runs only the former.
 - A catalog that declares nothing runs every command.
-- A catalog declaring no check is refused, naming the declaration as the cause.
+- A catalog declaring no check is refused, naming the declaration as the cause,
+  and so is an analysis with no catalog, no commands key, or an empty one.
 - A non-verifying command whose program is absent neither blocks the run nor
   appears among the checks the host could not run.
 - A secret, and a service, named only by a non-verifying command do not block.
