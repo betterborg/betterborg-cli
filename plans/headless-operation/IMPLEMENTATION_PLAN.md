@@ -670,7 +670,11 @@ command never built itself, and it decides on the same terms as the rest.
 - The record retires a question a person answered before it is published, and
   an attended run is never asked to name assumptions at all.
 - A plan naming an empty list retires what it inherits, and one that says
-  nothing keeps it.
+  nothing keeps it; a blank entry is refused rather than emptying the list.
+
+- An empty list is a statement only where a plan meant to make one, so an
+  assumption whose question or decision is blank is refused where the plan is
+  read, not dropped from it.
 - Where the record and an inherited list cover one question, the plan publishes
   the later reading and not the one the run moved on from, and the record keeps
   the later of two readings it holds itself.

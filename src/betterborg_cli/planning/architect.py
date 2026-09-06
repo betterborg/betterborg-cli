@@ -221,8 +221,14 @@ ARCHITECT_PLAN_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "required": ["question", "assumption"],
                 "properties": {
-                    "question": {"type": "string", "minLength": 1},
-                    "assumption": {"type": "string", "minLength": 1},
+                    # A blank string is a legal minLength-1 string, and one
+                    # here is worse than a missing entry: the plan is read as
+                    # having named a list, the blank is dropped, and the empty
+                    # list left behind retires every assumption the plan
+                    # inherited. The reader is then told the run assumed
+                    # nothing. The producer is told instead.
+                    "question": {"type": "string", "pattern": r"\S"},
+                    "assumption": {"type": "string", "pattern": r"\S"},
                 },
             },
         },

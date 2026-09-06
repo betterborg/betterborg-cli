@@ -3755,3 +3755,31 @@ def test_the_plan_asked_to_name_its_assumptions_is_shown_the_plan_it_restates(
         assert len(seen) == 1
         assert seen[0] is not None
         assert seen[0]["summary"] == "A plan that names nothing."
+
+
+def test_a_blank_assumption_is_refused_rather_than_quietly_scrubbed() -> None:
+    """A blank entry is worse than a missing one, so the producer is told.
+
+    Dropped silently, the plan still reads as having named a list, and the
+    empty list left behind retires every assumption the plan inherited. The
+    reader is then told the run assumed nothing, having just been told what it
+    assumed.
+    """
+    from betterborg_cli.agent_runtime.structured import (
+        StructuredResultError,
+        validate_structured_result,
+    )
+    from betterborg_cli.planning import ARCHITECT_PLAN_SCHEMA
+
+    named = dict(_plan())
+    named["assumptions"] = [
+        {"question": "Where does the changelog live?", "assumption": "At the root."}
+    ]
+    validate_structured_result(named, ARCHITECT_PLAN_SCHEMA)
+
+    for blank in ({"question": "   ", "assumption": "At the root."},
+                  {"question": "Where?", "assumption": "\t\n"}):
+        payload = dict(_plan())
+        payload["assumptions"] = [blank]
+        with pytest.raises(StructuredResultError, match="assumptions"):
+            validate_structured_result(payload, ARCHITECT_PLAN_SCHEMA)
