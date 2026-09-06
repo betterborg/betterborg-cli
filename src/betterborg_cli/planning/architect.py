@@ -562,6 +562,10 @@ class ArchitectLoop:
             # a missing repository rather than as the cancellation it is.
             if self.cancel is not None and self.cancel.is_set():
                 raise ArchitectCancelled("Architect run cancelled")
+            # Asked of the plan itself, before anything it inherits is
+            # written in: otherwise a plan that says nothing is handed the
+            # previous plan's list and then judged to have spoken.
+            named_assumptions = self._names_assumptions(payload)
             payload = self._with_assumptions(payload, plan_to_revise)
             open_questions = self._plan_open_questions(payload)
             borg = self._turns.current_borg()
@@ -599,7 +603,7 @@ class ArchitectLoop:
                 rejected_plan = payload
                 continue
 
-            unnamed = self._unnamed_assumptions(payload)
+            unnamed = self._unnamed_assumptions(named_assumptions)
             if unnamed and not assumptions_asked:
                 # One ask, not a budget. A plan turn is the most expensive
                 # thing this loop does, and the fallback below is a fair
@@ -975,9 +979,23 @@ class ArchitectLoop:
         unattended pass made is no more confirmed for having been revised by
         hand, unless a person has since answered the question it rests on.
         """
-        carried = self._declared_assumptions(superseded or {})
-        declared = self._declared_assumptions(plan) if self.unattended else []
-        return self._assuming(plan, self._unsettled(declared or carried))
+        inherited = self._declared_assumptions(superseded or {})
+        if not self.unattended or not self._names_assumptions(plan):
+            return self._assuming(plan, self._unsettled(inherited))
+        return self._assuming(plan, self._unsettled(self._declared_assumptions(plan)))
+
+    @staticmethod
+    def _names_assumptions(plan: Mapping[str, Any]) -> bool:
+        """Say whether the plan spoke about assumptions at all.
+
+        An empty list is a statement and a missing field is silence, and the
+        two have opposite meanings here: a revision the review settled rests
+        on nothing assumed and says so, while one that forgot must not thereby
+        retire what the plan before it carried. Reading both as "none" leaves
+        an Architect no way to retire an assumption except by inventing
+        another.
+        """
+        return isinstance(plan.get("assumptions"), list)
 
     def _unsettled(self, assumptions: list[dict[str, str]]) -> list[dict[str, str]]:
         """Drop any assumption over ground a person has since answered.
@@ -1022,7 +1040,7 @@ class ArchitectLoop:
         plan = {key: value for key, value in plan.items() if key != "assumptions"}
         return {**plan, "assumptions": assumptions} if assumptions else dict(plan)
 
-    def _unnamed_assumptions(self, plan: Mapping[str, Any]) -> list[dict[str, str]]:
+    def _unnamed_assumptions(self, named: bool) -> list[dict[str, str]]:
         """Return the decisions on record that the plan failed to name.
 
         Silence is the one thing the record can still catch. It cannot say
@@ -1030,7 +1048,7 @@ class ArchitectLoop:
         decided something, so a plan mentioning nothing is one that has left
         the operator no sign of it.
         """
-        if not self.unattended or plan.get("assumptions"):
+        if not self.unattended or named:
             return []
         return self._recorded_assumptions()
 

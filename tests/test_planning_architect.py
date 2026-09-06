@@ -757,6 +757,273 @@ def test_a_reopened_question_publishes_only_the_reading_the_plan_follows(
         assert "Linux only." not in render_plan_markdown(result.plan)
 
 
+def test_a_revision_can_say_it_rests_on_nothing_assumed(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The review settled the ambiguity, so the revision assumes nothing.
+
+    An empty list is a statement; a missing field is silence. Reading both as
+    "none" would leave the Architect no way to retire an assumption except by
+    inventing another, and the plan would keep asserting a guess the review
+    had already answered.
+    """
+    settled = dict(_plan())
+    settled["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+    revised = dict(_plan())
+    revised["summary"] = "Put the changelog under docs/, as the review asked."
+    revised["assumptions"] = []
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=revised))
+
+    database = committed_git_repo.parent / "architect-retired-all.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "retired-all"
+        )
+        for phase, result in (
+            ("architect_plan", settled),
+            ("tech_review", {"decision": "request_changes"}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase=phase,
+                    round=1,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result=result,
+                )
+            )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert "assumptions" not in result.plan
+        assert "## Assumptions" not in render_plan_markdown(result.plan)
+
+
+def test_a_revision_that_says_nothing_still_inherits(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Silence is not a retirement, and it is not an answer either.
+
+    A revision addressing a finding may simply not mention what it still
+    assumes. It keeps what the plan before it carried, and because it named
+    none of its own it is the shape the single ask exists for.
+    """
+    carried = dict(_plan())
+    carried["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+
+    database = committed_git_repo.parent / "architect-silent-revision.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "silent-revision"
+        )
+        for phase, result in (
+            ("architect_plan", carried),
+            ("tech_review", {"decision": "request_changes"}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase=phase,
+                    round=1,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result=result,
+                )
+            )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        assert result.plan["assumptions"] == carried["assumptions"]
+
+
+def test_an_inherited_list_does_not_answer_for_a_plan_that_said_nothing(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """What the plan inherits is not what the plan said.
+
+    A revision here is silent while the record holds a decision the run made
+    for itself, so the ask is owed. Judging it on the merged payload instead
+    would find the inherited list sitting there and count the plan as having
+    spoken, and the ask would never fire for any Borg whose earlier plan
+    carried anything.
+    """
+    asked = [{"id": "q1", "question": "Which platforms are required?"}]
+    carried = dict(_plan())
+    carried["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    silent = dict(_plan())
+    silent["summary"] = "Address the finding."
+    assert "assumptions" not in silent
+    spoken = _plan_assuming("Which platforms are required?", "Linux and macOS.")
+
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=silent))
+    adapter.queue(MockResponse(payload=spoken))
+
+    database = committed_git_repo.parent / "architect-inherited-silence.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "inherited-silence"
+        )
+        store.append_planning_attempt(
+            PlanningAttempt(
+                borg_id=borg.id,
+                phase="architect_questions",
+                round=1,
+                adapter="mock",
+                model="test-model",
+                status=PlanningAttemptStatus.COMPLETED,
+                finished_at=borg.created_at,
+                result={"decision": "ask_more", "questions": asked},
+            )
+        )
+        question = PlanningQuestion(
+            borg_id=borg.id,
+            attempt_id=store.list_planning_attempts(borg.id)[-1].id,
+            round=1,
+            questions=asked,
+        )
+        store.append_planning_question(question)
+        store.answer_planning_question(
+            question.id,
+            [{"q_id": "q1", "answer": "Linux and macOS.", "assumed": True}],
+        )
+        for phase, result in (
+            ("architect_plan", carried),
+            ("tech_review", {"decision": "request_changes"}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase=phase,
+                    round=1,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result=result,
+                )
+            )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+            unattended=True,
+        ).run()
+
+        correction = " ".join(adapter.calls[-1].user_prompt.split())
+        assert "names none of the decisions that produced" in correction
+        assert result.plan["assumptions"] == spoken["assumptions"]
+
+
+def test_an_attended_revision_carries_the_assumptions_it_inherits(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Revising by hand does not confirm what an unattended pass guessed.
+
+    The operator is addressing a finding, not re-deciding every requirement,
+    so the gaps the earlier run closed on its own stay marked as gaps.
+    """
+    unattended_plan = dict(_plan())
+    unattended_plan["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-attended-carry.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "attended-carry"
+        )
+        for phase, result in (
+            ("architect_plan", unattended_plan),
+            ("tech_review", {"decision": "request_changes"}),
+        ):
+            store.append_planning_attempt(
+                PlanningAttempt(
+                    borg_id=borg.id,
+                    phase=phase,
+                    round=1,
+                    adapter="mock",
+                    model="test-model",
+                    status=PlanningAttemptStatus.COMPLETED,
+                    finished_at=borg.created_at,
+                    result=result,
+                )
+            )
+
+        result = ArchitectLoop(
+            repository,
+            borg,
+            store,
+            adapter,
+            io=_io(iter(()), []),
+        ).run()
+
+        assert result.plan["assumptions"] == unattended_plan["assumptions"]
+        assert "## Assumptions" in render_plan_markdown(result.plan)
+
+
 def test_an_attended_revision_drops_an_assumption_the_operator_answered(
     committed_git_repo: Path,
     persist_planning_context,

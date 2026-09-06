@@ -560,6 +560,17 @@ it is asked and still says nothing, the record is published in its place: an
 approximate account of the run beats one that reads as though nothing was
 decided for it.
 
+Silence is what the plan itself said, not what it was handed. A plan naming
+none of its own inherits the list the plan it supersedes carried, and judging
+it after that arrives would find a list there and count it as having spoken, so
+the ask would never fire for any Borg whose earlier plan carried anything.
+
+Naming none and saying nothing are also different answers. An empty list is a
+statement, made by a revision the review has settled, and it retires what came
+before. A missing field is silence, and the Architect that forgot must not
+thereby retire what the plan before it carried. Reading both as "none" would
+leave it no way to retire an assumption except by inventing another.
+
 The price of taking one account rather than merging them is that a plan naming
 some of its assumptions is trusted to have named them all. That is the narrower
 failure. An incomplete list is still a list of real decisions, while a merged
@@ -594,8 +605,11 @@ command never built itself, and it decides on the same terms as the rest.
 - The plan a reader receives names the requirements the run settled itself and
   no more: the plan's own account rather than several merged, and nothing over
   ground a person has since answered.
-- A plan that names none of its assumptions is asked once to state them, and
-  the record is published if it still names none.
+- A plan that says nothing about assumptions is asked once to state them, and
+  the record is published if it still says nothing. What it inherits does not
+  count as having spoken.
+- A plan naming an empty list has said it rests on nothing assumed, and retires
+  what it inherits.
 - Without the unattended option the existing behaviour is unchanged, including
   stopping when a prompt returns nothing and refusing an assumption a plan
   claims for itself.
@@ -613,7 +627,10 @@ command never built itself, and it decides on the same terms as the rest.
 - A question reopened in different words publishes only the reading the plan
   follows, and a plan that names its assumptions owns the list.
 - A plan that says nothing about assumptions is shown the decisions on record
-  and asked again; one that says nothing twice publishes them.
+  and asked again, including when it inherits a list; one that says nothing
+  twice publishes them.
+- A plan naming an empty list retires what it inherits, and one that says
+  nothing keeps it.
 - An attended revision carries the superseded plan's assumptions, except over
   a question the operator answered in that run.
 - A question round run unattended yields a plan with no prompt issued, its

@@ -162,9 +162,11 @@ betterborg plan start my-feature --yes --unattended
 
 The plan names those decisions itself, and `betterborg plan show` renders them
 under `## Assumptions`, so the gaps a run closed on its own stay in front of
-whoever reads it. A plan that names none is asked once, shown what it decided,
-and told to say what it still rests on; if it names none again the recorded
-decisions are published in its place. An Architect that asks a question anyway
+whoever reads it. A plan that says nothing about them is asked once,
+shown what it decided, and told to say what it still rests on; if it says
+nothing again the recorded decisions are published in its place. A revision
+that no longer rests on anything assumed says so with an empty list, which
+retires what it would otherwise inherit. An Architect that asks a question anyway
 is answered the same way instead of ending the run, and that answer is stored
 beside its question, marked as assumed rather than answered.
 
