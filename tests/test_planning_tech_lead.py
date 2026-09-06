@@ -962,6 +962,72 @@ def test_raised_review_budget_approves_on_a_round_the_default_denies(
         ]
 
 
+def test_lowering_the_budget_does_not_strand_a_revision_already_under_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    tech_lead_approval_response,
+) -> None:
+    """The budget bounds what happens next, never what already happened.
+
+    A run interrupted mid-revision is resumable, and the CLI says so. Reading
+    the record through a budget lowered since would hide the rejection the
+    revision belongs to, and the advertised resume could never succeed: the
+    only way back would be restoring a number nothing names.
+    """
+    database = committed_git_repo.parent / "tech-lead-lowered-midflight.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-lowered-midflight"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        # The review asks for a revision, then the run dies before the
+        # Architect can answer it.
+        with pytest.raises((TechLeadError, ArchitectError)):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+                review_rounds=3,
+            ).run()
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.ARCHITECT_WORKING
+
+        # The operator lowers the budget below the round already spent, then
+        # resumes as the CLI told them to.
+        architect.queue(MockResponse(payload=planning_plan_response()))
+        reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+        resumed = TechLeadLoop(
+            repository,
+            interrupted,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+        ).run()
+
+        assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+
+
 def test_lowered_review_budget_blocks_after_its_only_round(
     committed_git_repo: Path,
     persist_planning_context,

@@ -464,6 +464,44 @@ def test_builds_bounded_rollup_body_from_prd_and_canonical_plan() -> None:
     assert "truncated to fit GitHub's 65,536-character limit" in oversized
 
 
+@pytest.mark.parametrize(
+    "pointer",
+    ["README.md", "README.md:12", "README.md:12:5"],
+)
+def test_a_code_pointer_may_name_a_line_in_a_real_file(
+    repository: Path, pointer: str
+) -> None:
+    """A pointer at a line is written the way every reviewer writes one.
+
+    The schema asks for a string and says nothing about form, so a plan that
+    points precisely at real code was rejected for the precision. The file is
+    what has to exist; the line is a position inside it.
+    """
+    plan = _plan()
+    plan["code_pointers"] = [{"path": pointer, "why": "Repository overview."}]
+
+    validate_plan(plan, repository)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    ["MISSING.md", "MISSING.md:12", "README.md/12"],
+)
+def test_a_code_pointer_at_no_real_file_is_still_refused(
+    repository: Path, pointer: str
+) -> None:
+    """Reading the line off must not become accepting anything.
+
+    The pointer still has to reach a file the repository holds; only the
+    position is allowed to be absent from disk.
+    """
+    plan = _plan()
+    plan["code_pointers"] = [{"path": pointer, "why": "Repository overview."}]
+
+    with pytest.raises(PlanValidationError, match="grounded|repository"):
+        validate_plan(plan, repository)
+
+
 def test_the_rollup_body_names_checks_the_host_could_not_run() -> None:
     """The pull request is what leaves the machine.
 

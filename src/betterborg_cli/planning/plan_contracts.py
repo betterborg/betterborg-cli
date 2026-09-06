@@ -347,11 +347,32 @@ def _validate_planned_path(
 
 
 def _validate_existing_path(root: Path, raw_path: str, *, field: str) -> None:
-    candidate = _repository_path(root, raw_path, field=field)
-    if not candidate.exists():
+    if _grounded_path(root, raw_path, field=field) is None:
         raise PlanValidationError(
             f"{field} {raw_path!r} is not grounded in the repository"
         )
+
+
+def _grounded_path(root: Path, raw_path: str, *, field: str) -> Path | None:
+    """Return the repository file a pointer names, or None if it names none.
+
+    A pointer at a line is written the way every editor and reviewer writes
+    one, ``path:line``, and the schema asks only for a string. Read as a
+    filename that names nothing, so a plan pointing accurately at real code
+    was rejected for citing it precisely. The file is what has to exist: the
+    line is a position within it and grounds nothing on its own.
+    """
+    candidate = _repository_path(root, raw_path, field=field)
+    if candidate.exists():
+        return candidate
+
+    located, marker, position = raw_path.rpartition(":")
+    while marker and position.isdigit():
+        candidate = _repository_path(root, located, field=field)
+        if candidate.exists():
+            return candidate
+        located, marker, position = located.rpartition(":")
+    return None
 
 
 def _repository_path(root: Path, raw_path: str, *, field: str) -> Path:

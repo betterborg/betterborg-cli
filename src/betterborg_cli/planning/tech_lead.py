@@ -462,10 +462,16 @@ class TechLeadLoop:
         )
 
     def _revision_reviews(self) -> list[PlanningAttempt]:
+        # No cap: this reads which rejection a revision belongs to, and it is
+        # only ever asked while one is under way. Whether a rejection revised
+        # or blocked was decided when it completed and is held in the Borg's
+        # state, so filtering the record by today's budget would strand a run
+        # whose budget has since been lowered, with no way back but restoring
+        # the old number.
         return planning_request_change_attempts(
             self._cycle_attempts(),
             _TECH_REVIEW_PHASE,
-            round_cap=self.review_rounds,
+            round_cap=None,
         )
 
     @staticmethod
