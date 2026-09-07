@@ -1163,3 +1163,86 @@ def test_a_catalogued_command_directory_must_belong_to_the_repository(
                 artifact_dir=git_repo / "artifacts",
             )
         assert store.list_analyses(repository.id) == []
+
+
+def test_the_analyzer_is_told_what_decides_whether_a_command_verifies() -> None:
+    """The schema forces a boolean; only this sentence decides which one.
+
+    Nothing downstream can recover the answer, so the rule living in one long
+    prompt string is the whole contract. Trimmed or reformatted away, analysis
+    still succeeds and the gate starts running watch servers again.
+    """
+    from betterborg_cli.repo_analysis.analyzer import _SYSTEM_PROMPT
+
+    prompt = " ".join(_SYSTEM_PROMPT.split())
+    assert "verifies is true only for a command that exits on its own" in prompt
+    assert "leaves git status clean after it" in prompt
+    # The admitted kinds, and the closing default that decides everything else.
+    for admitted in ("a test run", "a linter", "a type checker", "a build"):
+        assert admitted in prompt
+    assert "It is false for everything else" in prompt
+    for refused in ("serves", "watches", "publishes", "waits for input"):
+        assert refused in prompt
+    assert "where you cannot tell, verifies is false" in prompt
+    # And the evidence the question depends on.
+    assert ".gitignore" in prompt
+
+
+@pytest.mark.parametrize(
+    "cwd", [".", "package", "services/api", "Backend", "./package"]
+)
+def test_a_repository_relative_command_directory_is_accepted(
+    git_repo: Path,
+    cwd: str,
+) -> None:
+    """The rule refuses paths that leave the repository, and nothing else.
+
+    Narrowing it further refuses a monorepo's whole analysis at the
+    persistence edge, over a directory that was always fine.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    (git_repo / "Makefile").write_text("test:\n\tgo test ./...\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose check runs in a repository directory.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["go", "test", "./..."],
+                    "verifies": True,
+                    "cwd": cwd,
+                    "source": "Makefile",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository, store, adapter, artifact_dir=git_repo / "artifacts"
+        )
+        stored = store.list_analyses(repository.id)
+
+    assert len(stored) == 1
+    assert stored[0].analysis_json["command_catalog"]["commands"][0]["cwd"] == cwd

@@ -958,7 +958,8 @@ names does not block.
   appears among the checks the host could not run, and neither does one whose
   directory is absent; a verifying command's directory must still be there.
 - A secret, and a service, named only by a non-verifying command do not block.
-- The analyzer schema refuses a catalogued command that does not declare.
+- The analyzer schema refuses a catalogued command that does not declare, and
+  the rule that decides which way it declares is stated where it is asked.
 
 **Status**: Complete
 
@@ -994,7 +995,8 @@ another route is preflight's to catch, where the checkout is known.
 **Tests**:
 - An analysis whose prepare command names an absolute directory is refused,
   and nothing is stored.
-- A catalogued command naming a relative directory is accepted.
+- A catalogued command naming a relative directory is accepted, nested and at
+  the root alike, so narrowing the rule cannot pass unnoticed.
 
 **Status**: Complete
 
