@@ -32,6 +32,7 @@ from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
+    PlanningFinding,
     SqliteStore,
 )
 
@@ -1551,3 +1552,107 @@ def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
         confirm=lambda _message, _default: False,
         write=lambda _message: None,
     )
+
+
+def _seed_review(store, borg, phase: str, decision: str, message: str) -> None:
+    """Put one completed review, and the finding it wrote, on the record."""
+    attempt = PlanningAttempt(
+        borg_id=borg.id,
+        phase=phase,
+        round=len(
+            [
+                item
+                for item in store.list_planning_attempts(borg.id)
+                if item.phase == phase
+            ]
+        )
+        + 1,
+        adapter="mock",
+        model="test-model",
+    )
+    store.append_planning_attempt(attempt)
+    store.complete_planning_attempt(
+        attempt.id,
+        status=PlanningAttemptStatus.COMPLETED,
+        result={"decision": decision},
+        summary=message,
+    )
+    if decision == "request_changes":
+        store.append_planning_finding(
+            PlanningFinding(
+                borg_id=borg.id,
+                attempt_id=attempt.id,
+                round=1,
+                severity="major",
+                message=message,
+            )
+        )
+
+
+def test_only_the_findings_the_current_plan_must_answer_still_stand(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Three filters, and the record alone satisfies none of them.
+
+    A finding belongs to the round that wrote it. An approval answers the
+    finding that asked for it. A change request closes the cycle that held it.
+    And a Supervisor's finding is not a Tech Lead's, however alike they read.
+    """
+    from betterborg_cli.planning.turns import standing_planning_findings
+    from betterborg_cli.store import PlanChangeRequest
+
+    database = committed_git_repo.parent / "standing-findings.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "standing-findings"
+        )
+        assert repository is not None
+
+        # A rejection the reviewer then approved: answered, so it stands no more.
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-1 round-1")
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-1 round-1"]
+        _seed_review(store, borg, "tech_review", "approve", "cycle-1 approved")
+        assert standing_planning_findings(store, borg.id, "tech_review") == []
+
+        # A change request closes that cycle; the next one blocks.
+        store.append_plan_change_request(
+            PlanChangeRequest(borg_id=borg.id, round=1, note="Stage the rollout.")
+        )
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-1")
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-2")
+
+        standing = standing_planning_findings(store, borg.id, "tech_review")
+        assert [finding.message for finding in standing] == [
+            "cycle-2 round-1",
+            "cycle-2 round-2",
+        ]
+        assert "cycle-1 round-1" not in [finding.message for finding in standing]
+
+        # A second change request moves the boundary again.
+        store.append_plan_change_request(
+            PlanChangeRequest(borg_id=borg.id, round=2, note="Name the checks.")
+        )
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-3 round-1")
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-3 round-1"]
+
+        # A Supervisor finding is not a Tech Lead one.
+        _seed_review(
+            store, borg, "supervisor_review", "request_changes", "batch objection"
+        )
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-3 round-1"]
+        assert [
+            finding.message
+            for finding in standing_planning_findings(
+                store, borg.id, "supervisor_review"
+            )
+        ] == ["batch objection"]
