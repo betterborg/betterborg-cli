@@ -21,6 +21,7 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_MERGE_RULE,
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
@@ -1121,6 +1122,8 @@ def _render_merge_prompt(
         "base. Resolve every conflicted path, stage the resolutions, and create "
         "the merge commit before returning completed. Do not abort the merge, "
         "switch branches, or modify the primary checkout.",
+        "",
+        EXISTING_TEST_MERGE_RULE,
         "",
         f"Task branch: {task_branch}",
         f"Project branch: {project_branch}",

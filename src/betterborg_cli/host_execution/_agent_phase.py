@@ -27,6 +27,35 @@ from betterborg_cli.store import (
     TaskRuntimeStatus,
 )
 
+# Role system prompts are generated per repository by a model, so a rule placed
+# only in the generator's requirements can be reworded or dropped. These reach
+# the agents in prompts Betterborg renders itself, whatever the generator wrote.
+EXISTING_TEST_RULE = (
+    "An existing test your change fails is a conflict to report, not an edit to "
+    "make: never weaken, delete, or reverse an assertion so the change passes. "
+    "Adding tests is expected. When the task or a review finding requires the "
+    "asserted behaviour to change, change the assertion and say in your summary "
+    "which one and why. When neither does, return status blocked and name the "
+    "assertion in blockers rather than leaving the test failing."
+)
+
+EXISTING_TEST_REVIEW_RULE = (
+    "Treat any assertion the change weakens, deletes, or reverses as a blocker "
+    "unless the assigned task required that behaviour to change. Tests the "
+    "change adds are ordinary; an assertion that already passed is not, whether "
+    "it arrived with the repository or with an earlier round of this task."
+)
+
+#: The merge agent is told to verify the merged tree, so it holds the same
+#: pressure over a tree it may edit, and it is the last judgement in a run:
+#: sanity runs commands, and no agent reads the merge commit after it.
+EXISTING_TEST_MERGE_RULE = (
+    "When the merged tree fails a test either side asserted, resolve the code "
+    "and never the assertion. If the two sides genuinely disagree about the "
+    "behaviour asserted, say so and fail rather than choose one, because "
+    "nothing reviews this merge after you."
+)
+
 
 class HostAgentPhaseError(RuntimeError):
     """Raised when a claimed worktree is not safe or ready for an agent."""

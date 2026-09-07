@@ -34,6 +34,18 @@ from betterborg_cli.host_execution import (
     SafeGit,
     ScheduledTaskContext,
 )
+from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_MERGE_RULE,
+    EXISTING_TEST_REVIEW_RULE,
+    EXISTING_TEST_RULE,
+    VerifiedTaskInputs,
+)
+from betterborg_cli.host_execution.coding import _render_user_prompt
+from betterborg_cli.host_execution.merge import _render_merge_prompt
+from betterborg_cli.host_execution.review import (
+    _render_fix_prompt,
+    _render_review_prompt,
+)
 from betterborg_cli.planning import (
     approved_plan_digest,
     render_task_markdown,
@@ -1143,3 +1155,66 @@ def test_completed_review_resumes_transition_without_replaying_agent(
             attempt.phase
             for attempt in reopened.list_agent_attempts(fixture.task.id)
         ] == ["coding", "review"]
+
+
+def test_every_phase_is_told_not_to_weaken_an_existing_assertion() -> None:
+    """A rule the generated role prompt omits is a rule nobody in a run states.
+
+    A run changed what an omitted slice start means and, rather than fail the
+    repository's existing parser test, edited that test to assert the opposite.
+    Coding, review and the fix round all accepted it, and the fix round is where
+    the move is most tempting, because a finding is already asking for a change.
+    Betterborg renders these three prompts itself, so the rule arrives whatever
+    the model that writes the role prompts produced.
+    """
+    borg = Borg(repository_id=uuid4(), name="prompt-rules")
+    task = _record(
+        uuid4(), borg, position=1, stem="09-run-coding-agent", dependencies=[]
+    )
+    inputs = VerifiedTaskInputs(
+        task=task,
+        task_path=Path(f"{task.stem}.md"),
+        task_markdown=render_task_markdown(task.task),
+        dependencies=(),
+        system_prompt="You are the generated coding agent.\n",
+    )
+
+    assert EXISTING_TEST_RULE in _render_user_prompt(inputs)
+    assert EXISTING_TEST_RULE in _render_fix_prompt(
+        inputs,
+        findings=("the parser must keep the documented omitted-start value",),
+        review_round=1,
+    )
+    assert EXISTING_TEST_REVIEW_RULE in _render_review_prompt(
+        inputs,
+        branch="betterborg/09-run-coding-agent",
+        base_commit="a" * 40,
+        current_commit="b" * 40,
+        review_round=0,
+    )
+    assert EXISTING_TEST_MERGE_RULE in _render_merge_prompt(
+        inputs,
+        task_branch="betterborg/09-run-coding-agent",
+        project_branch="project/demo",
+        approved_commit="b" * 40,
+        base_commit="a" * 40,
+        unresolved=("evaluator/evaluator_test.go",),
+    )
+
+
+def test_the_rules_keep_an_honest_assertion_change_possible() -> None:
+    """A flat prohibition would trade one defect for a worse one.
+
+    Asserting only that a constant appears in a prompt holds for any value of
+    that constant, so the half that forbids the dishonest edit is guarded and
+    the half that permits the honest one is not. A coding agent left with no
+    legal path abandons the finding or defies the rule; a reviewer told to
+    judge only the base commit cannot see an assertion an earlier round of the
+    same task wrote.
+    """
+    assert "When the task or a review finding requires" in EXISTING_TEST_RULE
+    assert "return status blocked" in EXISTING_TEST_RULE
+    assert "unless the assigned task required" in EXISTING_TEST_REVIEW_RULE
+    assert "an earlier round of this task" in EXISTING_TEST_REVIEW_RULE
+    assert "resolve the code" in EXISTING_TEST_MERGE_RULE
+    assert "fail rather than choose one" in EXISTING_TEST_MERGE_RULE

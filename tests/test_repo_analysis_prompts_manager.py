@@ -1103,3 +1103,26 @@ def test_metadata_commit_failure_restores_prior_stable_prompt(
         assert retry_run.ok
         assert retry_run.version == 2
         assert stable_path.read_text(encoding="utf-8") == retry_body
+
+
+def test_the_generator_is_asked_for_the_rule_on_existing_assertions() -> None:
+    """Betterborg states this rule itself in the prompts it renders per task.
+
+    A generated role prompt is the rest of what the agent reads, and one silent
+    about tests the agent may already edit leaves the run relying on a single
+    sentence. Asking the generator for the same rule keeps the two halves of
+    what the agent is told saying one thing.
+    """
+    coding = " ".join(prompts_manager._system_prompt("coding").split())
+    review = " ".join(prompts_manager._system_prompt("review").split())
+    merge = " ".join(prompts_manager._system_prompt("merge").split())
+
+    assert "never weakened, deleted, or reversed to make a change pass" in coding
+    assert "such a conflict is reported instead" in coding
+    assert "reported with its reason" in coding
+
+    assert "weakens, deletes, or reverses as a blocker" in review
+    assert "unless the task required that behaviour to change" in review
+
+    assert "never by weakening an assertion either side made" in merge
+    assert "fails the merge rather than picking a side" in merge

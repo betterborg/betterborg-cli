@@ -69,17 +69,24 @@ _ROLE_REQUIREMENTS = {
     "coding": """The coding prompt must cover mission, runtime inputs, concrete
 source and test layout, exact build/lint/test commands, reuse and locality,
 meaningful tests using established fixtures, commit conventions, completion,
-and the coding agent's final result contract.""",
+and the coding agent's final result contract. It must state that an existing
+assertion is never weakened, deleted, or reversed to make a change pass, that
+such a conflict is reported instead, and that changing an assertion the task
+requires to change is reported with its reason.""",
     "review": """The review prompt must cover mission, runtime inputs, review
 method by file class, duplication/over-abstraction/orphaned-code lenses, test
 value and established test infrastructure, verification commands, sensitive
 paths, blocker/major/minor severity, approval criteria, and the review result
-contract. It must instruct the reviewer to inspect rather than edit.""",
+contract. It must instruct the reviewer to inspect rather than edit, and to
+treat an existing assertion the change weakens, deletes, or reverses as a
+blocker unless the task required that behaviour to change.""",
     "merge": """The merge prompt must cover mission, rebase inputs, conflict
 resolution using surrounding code, append-only migrations when present,
 regeneration of generated code and lock files using discovered commands, Git
 rules, post-merge verification, fail-loud criteria, and the merge result
-contract.""",
+contract. It must state that a conflict is resolved in the code and never by
+weakening an assertion either side made, and that a genuine disagreement about
+asserted behaviour fails the merge rather than picking a side.""",
 }
 
 

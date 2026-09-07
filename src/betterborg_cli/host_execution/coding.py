@@ -18,6 +18,7 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_RULE,
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
@@ -470,6 +471,8 @@ def _render_user_prompt(inputs: VerifiedTaskInputs) -> str:
     sections = [
         "Implement the assigned task in the current worktree. Commit all required "
         "changes before returning completed.",
+        "",
+        EXISTING_TEST_RULE,
         "",
         f"Task file: {inputs.task_path.as_posix()}",
         f"Task digest: {inputs.task.digest}",

@@ -18,6 +18,8 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_REVIEW_RULE,
+    EXISTING_TEST_RULE,
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
@@ -853,6 +855,8 @@ def _render_review_prompt(
         "Compare the declared base commit with the current task commit and return "
         "only the required structured result.",
         "",
+        EXISTING_TEST_REVIEW_RULE,
+        "",
         f"Task file: {inputs.task_path.as_posix()}",
         f"Task digest: {inputs.task.digest}",
         f"Task branch: {branch}",
@@ -890,6 +894,8 @@ def _render_fix_prompt(
         "Fix every persisted review finding in the current worktree. Keep the "
         "change in scope, run relevant verification, and commit the fix before "
         "returning completed.",
+        "",
+        EXISTING_TEST_RULE,
         "",
         f"Task file: {inputs.task_path.as_posix()}",
         f"Task digest: {inputs.task.digest}",
