@@ -22,7 +22,14 @@ class PlanValidationError(ValueError):
     """Raised when an Architect plan cannot safely enter Tech Lead review."""
 
 
-_PHASE_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+#: The one shape a phase name takes. The Architect's schema is built from this
+#: pattern, so a name that schema admits cannot be refused here for its shape.
+#: Anchored with \Z rather than $, because $ also matches before a trailing
+#: newline and the schema searches while this check is a full match, which is
+#: precisely the disagreement the shared pattern exists to end.
+PHASE_NAME_PATTERN = r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*\Z"
+
+_PHASE_NAME = re.compile(PHASE_NAME_PATTERN)
 _GITHUB_PR_BODY_LIMIT = 65_536
 _TRUNCATION_MARKER = (
     "\n\n---\n\n_(Body truncated to fit GitHub's 65,536-character limit; "
@@ -654,6 +661,7 @@ def _nonempty_strings(value: Any) -> list[str]:
 
 
 __all__ = [
+    "PHASE_NAME_PATTERN",
     "PlanValidationError",
     "build_project_pr_body",
     "render_plan_markdown",

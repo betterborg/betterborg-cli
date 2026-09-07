@@ -83,7 +83,10 @@ when it is ready for human approval. Otherwise return concise, actionable
 findings for the Architect. Betterborg performs the delivery around the plan:
 branching, worktrees, commits, review, merge, and the repository's own checks.
 The plan covers the product change only, so never hold it to work Betterborg
-already does. Do not modify files. Return only the required JSON object.
+already does. A phase name is two digits then lowercase words of letters and
+digits, all joined by single hyphens and at most 32 characters, as in
+01-schema-migration, so never ask for a name the Architect cannot use. Do not
+modify files. Return only the required JSON object.
 """
 
 

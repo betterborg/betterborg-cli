@@ -353,6 +353,46 @@ def test_attended_planning_is_not_told_to_answer_its_own_questions(
         assert "under assumptions" not in adapter.calls[1].system_prompt
 
 
+def test_the_architect_is_told_the_rules_its_output_is_judged_by(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Each rule below has ended a real planning turn while stated nowhere.
+
+    The schema carries them as patterns and minimums, which the Architect
+    either guesses or spends a turn discovering. Saying one costs a sentence.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    adapter.queue(MockResponse(payload=_plan()))
+
+    database = committed_git_repo.parent / "architect-stated-rules.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "stated-rules"
+        )
+        ArchitectLoop(
+            repository, borg, store, adapter, io=_io(iter(()), [])
+        ).run()
+
+        questions_prompt = " ".join(adapter.calls[0].system_prompt.split())
+        plan_prompt = " ".join(adapter.calls[1].system_prompt.split())
+
+    assert (
+        "Identify each question with q and its position counted from one"
+        in questions_prompt
+    )
+    assert (
+        "A phase name is two digits then lowercase words of letters and digits, "
+        "all joined by single hyphens and at most 32 characters"
+        in plan_prompt
+    )
+    assert "Number the phases from 01 in the order they run" in plan_prompt
+    assert "a phase depends only on phases numbered before it" in plan_prompt
+    assert "Every phase touches at least one file." in plan_prompt
+
+
 def test_an_unattended_plan_carries_the_requirements_it_settled_itself(
     committed_git_repo: Path,
     persist_planning_context,

@@ -12,7 +12,16 @@ from uuid import UUID
 
 from betterborg_cli.store import TaskComplexity, TaskDependency, TaskRecord
 
-_TASK_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+#: The one shape a stage or stem takes, and a task reference built from two of
+#: them. The Project Manager's schema is built from these, so a name that
+#: schema admits is not refused here for its shape. Anchored with \Z rather
+#: than $, because $ also matches before a trailing newline while the check
+#: below matches in full, which divides the two on exactly that input.
+_TASK_NAME_BODY = r"[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*"
+TASK_NAME_PATTERN = rf"^{_TASK_NAME_BODY}\Z"
+TASK_REFERENCE_PATTERN = rf"^{_TASK_NAME_BODY}/{_TASK_NAME_BODY}\Z"
+
+_TASK_NAME = re.compile(TASK_NAME_PATTERN)
 _VALID_COMPLEXITIES = frozenset(complexity.value for complexity in TaskComplexity)
 
 

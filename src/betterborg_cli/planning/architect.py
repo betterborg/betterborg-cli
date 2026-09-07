@@ -20,7 +20,10 @@ from betterborg_cli.agent_runtime.selection import (
     require_read_only_agent,
     resolve_agent_model,
 )
-from betterborg_cli.planning.plan_contracts import PlanValidationError
+from betterborg_cli.planning.plan_contracts import (
+    PHASE_NAME_PATTERN,
+    PlanValidationError,
+)
 from betterborg_cli.planning.turns import (
     DurablePlanningTurns,
     completed_planning_phase_attempts,
@@ -131,6 +134,13 @@ _CONTRACT_SCHEMA = {
     },
 }
 _NONEMPTY_STRINGS = {"type": "array", "items": {"type": "string", "minLength": 1}}
+#: A phase name and every dependency naming one are the same identity, so one
+#: shape governs both, and it is the shape the checks after the schema apply.
+_PHASE_NAME_SCHEMA = {
+    "type": "string",
+    "pattern": PHASE_NAME_PATTERN,
+    "maxLength": 32,
+}
 
 ARCHITECT_PLAN_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -170,12 +180,7 @@ ARCHITECT_PLAN_SCHEMA: dict[str, Any] = {
                     "deliverables",
                 ],
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "pattern": "^[0-9]{2}-[a-z0-9-]+$",
-                        "minLength": 4,
-                        "maxLength": 32,
-                    },
+                    "name": _PHASE_NAME_SCHEMA,
                     "title": {"type": "string", "minLength": 1, "maxLength": 120},
                     "goal": {"type": "string", "minLength": 1},
                     "technical_approach": {"type": "string", "minLength": 1},
@@ -190,7 +195,7 @@ ARCHITECT_PLAN_SCHEMA: dict[str, Any] = {
                     "acceptance_criteria": {**_NONEMPTY_STRINGS, "minItems": 1},
                     "dependencies_on": {
                         "type": "array",
-                        "items": {"type": "string", "pattern": "^[0-9]{2}-[a-z0-9-]+$"},
+                        "items": _PHASE_NAME_SCHEMA,
                     },
                     "deliverables": {**_NONEMPTY_STRINGS, "minItems": 1},
                     "constraints": _NONEMPTY_STRINGS,
@@ -239,7 +244,9 @@ _QUESTIONS_SYSTEM_PROMPT = """You are the Architect for this project. Inspect th
 materialized repository and planning context before deciding. Ask only genuine
 product questions that the PRD and code cannot answer. Return ask_more with at
 most eight concise questions, or ready_to_plan when no material uncertainty
-remains. Do not modify files. Return only the required JSON object.
+remains. Identify each question with q and its position counted from one: q1,
+q2, q3, and never q01. Do not modify files. Return only the required JSON
+object.
 """
 
 _ANSWERS_SYSTEM_PROMPT = """You are the Architect for this project, and nobody
@@ -280,7 +287,12 @@ acceptance criteria, and do not modify files. Betterborg performs the delivery
 around your plan: branching, worktrees, commits, review, merge, and the
 repository's own checks. Plan the product change only, because a phase for
 preparing, verifying or committing the delivery describes work Betterborg
-already does. Return only the required JSON object.
+already does. A phase name is two digits then lowercase words of letters and
+digits, all joined by single hyphens and at most 32 characters, as in
+01-schema-migration. Number the phases from 01 in the order they run, so the
+third phase is numbered 03, and a phase depends only on phases numbered before
+it. Every phase touches at least one file. Return only
+the required JSON object.
 """
 
 _UNNAMED_ASSUMPTIONS_CORRECTION = """

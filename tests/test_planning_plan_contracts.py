@@ -37,6 +37,59 @@ def test_rejects_invalid_phase_names(repository: Path, name: str) -> None:
         validate_plan(plan, repository)
 
 
+def test_no_name_clears_the_schema_and_fails_the_check_after_it(
+    repository: Path,
+) -> None:
+    """The two agree on every name, not merely on the ones a test names.
+
+    Sharing a pattern string is not enough on its own: the schema searches and
+    the check that follows it matches in full, so an anchor that is generous
+    about a trailing newline divides them again while both still read the same
+    constant.
+    """
+    candidates = [
+        "01-setup",
+        "01-a",
+        "01-cache-search-results",
+        "01-abc\n",
+        "01-abc\r\n",
+        "01-Setup",
+        "01-bad_name",
+        "01--bad",
+        "01-bad-",
+        "1-setup",
+        "01-" + "a" * 30,
+        "01-abc extra",
+        "01-abc\u00e9",
+    ]
+
+    for name in candidates:
+        plan = _plan()
+        plan["phases"][0]["name"] = name
+        try:
+            validate_plan(plan, repository)
+        except PlanValidationError as error:
+            assert "must use the NN-kebab format" not in str(error), (
+                f"{name!r} cleared the schema and was refused for its shape "
+                "by the check after it"
+            )
+
+
+@pytest.mark.parametrize("name", ["01-a--b", "01-a-"])
+def test_one_pattern_governs_a_phase_name(repository: Path, name: str) -> None:
+    """One shape governs a phase name, and the schema is where it is stated.
+
+    These two names split the schema from the check that follows it: admitted
+    by the one the Architect answers and refused by the other, so a plan could
+    satisfy every rule it was given and be rejected anyway.
+    """
+    plan = _plan()
+    plan["phases"][0]["name"] = name
+
+    with pytest.raises(PlanValidationError, match="does not match its schema"):
+        validate_plan(plan, repository)
+
+
 def test_the_assumptions_section_says_who_decided_them(repository: Path) -> None:
     """The heading alone reads as a list of requirements.
 

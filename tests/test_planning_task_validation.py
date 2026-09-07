@@ -2487,6 +2487,61 @@ def test_a_decomposition_budget_that_is_not_a_whole_number_above_zero_is_refused
             )
 
 
+def test_no_stem_clears_the_schema_and_fails_the_graph_check_after_it() -> None:
+    """The Project Manager's schema and the graph check agree on every stem.
+
+    Both read the same constant, but the schema searches while the check
+    matches in full, so an anchor generous about a trailing newline divides
+    them on that one input and costs a decomposition round to discover.
+    """
+
+    from betterborg_cli.agent_runtime.structured import (
+        StructuredResultError,
+        validate_structured_result,
+    )
+    from betterborg_cli.planning.pm import PROJECT_MANAGER_TASKS_SCHEMA
+    from betterborg_cli.planning.task_validation import _TASK_NAME
+
+    schema = {
+        "type": "object",
+        "required": ["stem"],
+        "properties": {
+            "stem": PROJECT_MANAGER_TASKS_SCHEMA["properties"]["tasks"]["items"][
+                "properties"
+            ]["stem"]
+        },
+    }
+
+    for stem in ("01-setup", "01-abc\n", "01-abc\r\n", "01--bad", "01-bad-"):
+        try:
+            validate_structured_result({"stem": stem}, schema)
+        except StructuredResultError:
+            continue
+        assert _TASK_NAME.fullmatch(stem) is not None, (
+            f"{stem!r} cleared the schema and is refused by the graph check"
+        )
+
+
+def test_every_role_that_writes_a_phase_name_is_told_its_shape() -> None:
+    """The Tech Lead writes phase names as surely as the Architect does.
+
+    Its findings are not only a verdict: the revision turn is told to address
+    every persisted finding, so a suggestion that renames a phase becomes the
+    name. A Tech Lead that has not been told the shape can ask for one the
+    Architect is then refused for using, and a finding that cannot be
+    satisfied blocks the run once the rounds run out.
+    """
+    from betterborg_cli.planning.architect import _PLAN_SYSTEM_PROMPT
+    from betterborg_cli.planning.tech_lead import _TECH_LEAD_SYSTEM_PROMPT
+
+    shape = (
+        "A phase name is two digits then lowercase words of letters and "
+        "digits, all joined by single hyphens and at most 32 characters"
+    )
+    for prompt in (_PLAN_SYSTEM_PROMPT, _TECH_LEAD_SYSTEM_PROMPT):
+        assert shape in " ".join(prompt.split())
+
+
 def test_every_planning_role_is_told_what_betterborg_performs() -> None:
     """A role that does not know the harness holds the plan to the harness.
 
