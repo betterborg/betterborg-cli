@@ -3783,3 +3783,47 @@ def test_a_blank_assumption_is_refused_rather_than_quietly_scrubbed() -> None:
         payload["assumptions"] = [blank]
         with pytest.raises(StructuredResultError, match="assumptions"):
             validate_structured_result(payload, ARCHITECT_PLAN_SCHEMA)
+
+
+def test_an_empty_answer_stops_the_run_rather_than_becoming_a_requirement(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A prompt returns nothing two ways, and both stop the run.
+
+    An operator who presses Enter gets an empty string back, not a cancel.
+    Stored, it becomes a requirement nobody stated, which is the invented
+    requirement an attended run exists to avoid.
+    """
+    adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required?",
+                        "why": "It decides the packaging matrix.",
+                    }
+                ],
+            }
+        )
+    )
+
+    database = committed_git_repo.parent / "architect-empty-answer.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "empty-answer"
+        )
+        with pytest.raises(ArchitectError, match="must not be empty"):
+            ArchitectLoop(
+                repository,
+                borg,
+                store,
+                adapter,
+                io=_io(iter([""]), []),
+            ).run()
+
+        stored = store.list_planning_questions(borg.id)
+        assert len(stored) == 1
+        assert stored[0].answers is None

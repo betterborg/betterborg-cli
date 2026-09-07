@@ -688,8 +688,9 @@ command never built itself, and it decides on the same terms as the rest.
 - An answer that repeats a question, skips one, or says nothing is refused, an
   abandoned answers turn is not recovered for a later round, and a decision
   interrupted before its round is answered leaves neither half behind.
-- Interactive planning still prompts, still stops on a cancelled prompt, and
-  still drops an assumption its plan claims.
+- Interactive planning still prompts, still stops on a prompt that returns
+  nothing whether it was cancelled or answered blank, and still drops an
+  assumption its plan claims.
 - An Architect that asks past the round cap still ends the run, and a new
   cycle begins with its budget restored on both halves of it: a cycle
   following a spent one still asks its first question.
