@@ -572,9 +572,11 @@ last plan that spoke. Where the record and the inherited list cover one
 question, the record holds the later reading of it: a plan that says nothing
 inherits what its predecessor named, and a question reopened after that plan
 was answered again since. Keeping the inherited entry there would publish the
-reading the run left and suppress the one it planned against. The record knows the question rounds and nothing else, so
-a requirement the Architect settled without asking appears nowhere in it, and a
-plan that already spoke has accounted for everything decided before it.
+reading the run left and suppress the one it planned against.
+
+The record knows the question rounds and nothing else, so a requirement the
+Architect settled without asking appears nowhere in it, and a plan that already
+spoke has accounted for everything decided before it.
 Publishing the record over such a plan would delete the assumptions it named
 that no round produced, and reinstate ones a later plan retired.
 
@@ -740,8 +742,8 @@ mistaken for a green run that passed them.
 The trade stops paying when nothing survives it. A run holding no check cannot
 publish anything, so every task would be coded, reviewed and merged and every
 one would then block. The alternative there is not a stricter run but the same
-no run, after the whole spend, so a host that can run none of the catalogued
-checks is refused as it was before.
+no run, after the whole spend, so a run left with no check is refused as it was
+before, following the empty gate rather than whatever emptied it.
 
 The secrets follow the commands. One a workflow names but no command that runs
 asks for is not this run's requirement. Which commands ask is answered first by
@@ -758,22 +760,18 @@ repetition that says the same thing twice refuses over nothing.
   dropped rather than the run refused, and the drop is named in the preflight
   result and in each affected task's sanity result.
 - A run left with no check to run is refused, before any task is coded,
-  whether the host could run none of them or the analysis declared none.
+  whether the host could run none of them or the analysis named none.
 - A version pin on a program the run never invokes does not block.
 - A secret no command that will run requires does not block the run, and one a
   surviving command names does block, however that secret's record spells the
   commands that use it, and reaches the command that named it when it runs.
-- Everything reported about a run that quotes the analysis is masked, including
-  the checks it names as skipped, on every surface that carries them: the
-  terminal, the task's durable reason, the headless payload, and the pull
-  request body that is pushed.
+- A secret named more than once blocks only when the records disagree.
 - A record that scopes a secret to the agents while a running command names it
   is refused, because no phase could both require and deliver it.
-- A secret named more than once blocks only when the records disagree.
 - A host that can satisfy everything behaves exactly as it does today.
 - Nothing is dropped silently: a run that dropped a command can be told apart
-  from one that ran it, without reading a log, over every surface that reports
-  a run.
+  from one that ran it, without reading a log, on every surface that reports a
+  run, and everything those surfaces quote from the analysis is masked.
 
 **Tests**:
 - A toolchain the analyzer named for a person, with no executable of that name,
@@ -838,10 +836,12 @@ terminal to be told in. What stands is narrower than what the record holds. A
 finding belongs to the round that wrote it, rounds restart with each planning
 cycle, and a revision the reviewer went on to approve answered the finding that
 asked for it. Shown whole, the list reads as a page of outstanding objections
-with round numbers that repeat. They are the reviewer's own words rendered into a
-document, so they are escaped like everything else the plan carries. A revision already under way outlives a budget lowered beneath it, and
-the round it leads to is the last one: that is what the reviewer is told, since
-a round numbered past its own budget describes nothing it can use.
+with round numbers that repeat. They are the reviewer's own words rendered into
+a document, so they are escaped like everything else the plan carries.
+
+A revision already under way outlives a budget lowered beneath it, and the
+round it leads to is the last one: that is what the reviewer is told, since a
+round numbered past its own budget describes nothing it can use.
 
 **Success Criteria**:
 - A repository can set the number of Tech Lead review rounds its plans get.
@@ -900,15 +900,17 @@ completion verifies the repository, and the gate runs the ones that do.
 
 The rule that decides it is narrow on purpose. A check runs to completion and
 reports, and the gate reads its exit code and then requires the worktree to be
-unchanged, so a command whose purpose is to write into the tree cannot be one
-however useful it is: a formatter qualifies in the mode that reports and not in
-the mode that writes. Nor can one whose purpose is measurement rather than
-correctness: a benchmark suite passes its own exit code and takes as long as it
-takes, and the gate that waits for it times out and blocks every task. Everything the rule does not positively admit falls outside it,
-because the two ways of being wrong are not equal. A check wrongly skipped is a
-gap in what the run proved; a server wrongly admitted never exits, and every
-task blocks when the gate times out, which is the failure this stage exists to
-remove.
+unchanged. So a command whose purpose is to write into the tree cannot be one
+however useful it is, and a formatter qualifies in the mode that reports and
+not in the mode that writes. Nor can one whose purpose is measurement rather
+than correctness: a benchmark passes its own exit code and takes as long as it
+takes.
+
+Everything the rule does not positively admit falls outside it, because the two
+ways of being wrong are not equal. A check wrongly skipped is a gap in what the
+run proved. A command wrongly admitted that does not end on its own holds the
+gate until it times out, and every task blocks, which is the failure this stage
+exists to remove.
 
 A catalog that declares no check leaves the run holding nothing that could
 prove a change safe. That is the same run a host missing every check leaves, so
@@ -949,7 +951,6 @@ names does not block.
 - The analyzer schema refuses a catalogued command that does not declare.
 
 **Status**: Complete
-
 
 ## Stage 16: A command's directory belongs to the repository
 
