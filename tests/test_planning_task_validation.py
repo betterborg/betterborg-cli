@@ -142,7 +142,7 @@ def _valid_graph() -> tuple[dict, list[TaskRecord], list[TaskDependency]]:
     return plan, [foundation, consumer], [dependency]
 
 
-def _pm_payload(plan: dict) -> dict:
+def _pm_payload(plan: dict, *, revision: str = "") -> dict:
     def task(
         stage: str,
         stem: str,
@@ -155,7 +155,7 @@ def _pm_payload(plan: dict) -> dict:
             "stage": stage,
             "stem": stem,
             "repository": "repo",
-            "title": f"Build {stage}",
+            "title": f"Build {stage}{revision}",
             "why": "This task owns one independently testable plan slice.",
             "scope": [f"Implement the concrete {stage} deliverable."],
             "implementation_notes": [],
@@ -2327,3 +2327,65 @@ def test_a_decomposition_budget_below_one_is_refused_at_construction(
                 approved_plan=plan,
                 review_rounds=0,
             )
+
+
+def test_lowering_the_decomposition_budget_does_not_strand_a_revision_under_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The budget bounds what happens next, never what already happened.
+
+    A run interrupted mid-revision is resumable, and the CLI says so. Refusing
+    the round that revision leads to would make the advertised resume
+    impossible, with no way back but restoring a number nothing names.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-strand.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-strand"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        pm_result = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+
+        # Two rejections spent, and the run dies before the third revision.
+        supervisor = MockAdapter(name="openai")
+        for _ in range(2):
+            supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        with pytest.raises((SupervisorError, RuntimeError)):
+            SupervisorLoop(
+                repository,
+                pm_result.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+                review_rounds=3,
+            ).run()
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.PM_WORKING
+
+        # The operator lowers the budget below the rounds already spent, then
+        # resumes as the run told them to.
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" Two.")))
+        supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+        resumed = SupervisorLoop(
+            repository,
+            interrupted,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=2,
+        ).run()
+
+        assert resumed.borg.state is BorgState.BLOCKED
+        assert "the final round." in supervisor.calls[-1].user_prompt
+        assert "of 2." not in supervisor.calls[-1].user_prompt

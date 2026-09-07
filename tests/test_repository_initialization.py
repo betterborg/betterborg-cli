@@ -729,7 +729,9 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
         f"Analyzed repository {config.repository_id}: score 4.00/5 "
         "(previous 3.00/5, delta +1.00).\n"
     )
-    assert "completed Discover evidence — 1 evidence files" in result.output
+    # The README and the repository's own .gitignore, which is what decides
+    # whether a catalogued command leaves the working tree clean.
+    assert "completed Discover evidence — 2 evidence files" in result.output
     assert "completed Analyze repository — score 4.00/5" in result.output
     assert load_repository_config(paths).repository_id == config.repository_id
     assert confirmed_path.read_text(encoding="utf-8") == confirmed_body

@@ -355,12 +355,13 @@ from its containing catalog/environment/service. A source names one path; when
 several files support a claim, cite the one that establishes it. Every
 catalogued command says whether running it verifies the repository. verifies is
 true only for a command that exits on its own, reports whether the repository
-is sound, and leaves the working tree unchanged: a build, a test run, a linter,
-a type checker or other static analysis, or a formatter in a check mode that
-reports rather than rewrites. It is false for everything else, including a
-command that serves, watches, publishes, releases, waits for input, writes into
-the working tree, measures performance rather than correctness, or does not
-exit on its own.
+is sound, and leaves git status clean after it: a test run, a linter, a type
+checker or other static analysis, a formatter in a check mode that reports
+rather than rewrites, or a build whose output the repository ignores. It is
+false for everything else, including a command that serves, watches, publishes,
+releases, waits for input, measures rather than checks, or writes anything the
+repository tracks or would report as untracked. Read .gitignore to decide what
+a command's output does; where you cannot tell, verifies is false.
 A command's cwd is a directory of this repository written relative to
 its root, never an absolute path and never a working directory inside a
 container image. Service env

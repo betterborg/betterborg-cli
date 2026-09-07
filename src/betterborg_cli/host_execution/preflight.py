@@ -467,7 +467,15 @@ class HostPreflight:
                     )
                     continue
                 cwd = record.get("cwd", ".")
-                resolved = self._repository_path(cwd, require_directory=True)
+                # Whether the directory is here is a fact about this host and
+                # this checkout, and a command the gate will not run does not
+                # need it: an uninitialised docs submodule would refuse the
+                # whole run over a directory nothing enters. The shape of the
+                # path is still the analysis's to get right, so it is still
+                # resolved, just not required to exist.
+                resolved = self._repository_path(
+                    cwd, require_directory=_verifies(record) or group != "catalog"
+                )
                 if resolved is None:
                     failures.append(
                         HostPreflightFailure(

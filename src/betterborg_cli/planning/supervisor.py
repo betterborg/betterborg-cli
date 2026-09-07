@@ -345,11 +345,13 @@ class SupervisorLoop:
                 ) from error
             self._require_revision_progress(batch, approval)
 
+            # No refusal here. A revision already under way outlives a budget
+            # lowered beneath it: the round it leads to runs, is told it is the
+            # last one, and blocks after it. Refusing instead would strand the
+            # revision with no way back but restoring the old number. The loop
+            # is still bounded, because a round at or past the budget blocks
+            # rather than asking for another revision.
             review_round = len(self._completed_reviews(approval)) + 1
-            if review_round > self.review_rounds:
-                raise SupervisorError(
-                    "Supervisor review round cap was already exhausted"
-                )
             attempt, payload = self._turns.run(
                 phase=_SUPERVISOR_PHASE,
                 round_number=self._turns.next_round(_SUPERVISOR_PHASE),

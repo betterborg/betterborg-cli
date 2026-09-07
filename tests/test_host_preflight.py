@@ -2436,3 +2436,73 @@ def test_a_secret_only_a_dropped_command_names_is_not_required_to_be_declared(
     assert [dropped.command.argv[0] for dropped in result.dropped_commands] == [
         "missing-runtime"
     ]
+
+
+def test_a_non_verifying_command_needs_no_directory_of_this_host(
+    committed_git_repo: Path,
+) -> None:
+    """Whether a directory is here is a fact about this checkout.
+
+    A command the gate will never enter does not need it: an uninitialised
+    docs submodule would otherwise refuse the whole run over a directory
+    nothing opens. The shape of the path is still the analysis's to get right.
+    """
+    binary_dir = committed_git_repo.parent / "absent-dir-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "docs",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                    "cwd": "website",
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "test")
+    ]
+
+
+def test_a_verifying_command_still_needs_its_directory_to_exist(
+    committed_git_repo: Path,
+) -> None:
+    """The gate will enter this one, so the directory has to be there."""
+    binary_dir = committed_git_repo.parent / "present-dir-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "test"],
+                    "verifies": True,
+                    "cwd": "website",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "repo-relative directory" in result.reason
