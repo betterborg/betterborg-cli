@@ -80,8 +80,10 @@ _TECH_LEAD_SYSTEM_PROMPT = """You are the Tech Lead reviewing an Architect plan.
 Inspect the materialized repository, confirmed PRD, current plan, and complete
 finding history. Verify the plan against the actual code and return approve only
 when it is ready for human approval. Otherwise return concise, actionable
-findings for the Architect. Do not modify files. Return only the required JSON
-object.
+findings for the Architect. Betterborg performs the delivery around the plan:
+branching, worktrees, commits, review, merge, and the repository's own checks.
+The plan covers the product change only, so never hold it to work Betterborg
+already does. Do not modify files. Return only the required JSON object.
 """
 
 

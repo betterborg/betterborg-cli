@@ -1078,19 +1078,27 @@ that was never a task. Nothing downstream can recover: the guard that refuses a
 coding turn with no commit is right, because that is what a failed turn looks
 like too.
 
-So the boundary is stated where the work is asked for. It is the same rule in
-both prompts because it is the same boundary, and the Project Manager is told
-the narrower form it needs: every task changes the repository, and one with
-nothing to commit is not a task.
+So the boundary is stated to every role that touches the plan, because a
+boundary half the room knows is worse than one nobody knows. Told only to the
+two that write, the Architect omits the delivery phases and the Tech Lead
+refuses to approve a plan for omitting them: the same run lost at the other
+end, and harder to read, because the plan is now correct and the reviewer is
+citing its correctness. The two that write are told to plan the product change
+only; the two that judge are told not to require what the other two were told
+to leave out. The Project Manager and the Supervisor also get the narrower form
+they need: every task changes the repository, and one with nothing to commit is
+not a task.
 
 **Success Criteria**:
-- The Architect is told that branching, worktrees, commits, review, merge and
-  the repository's checks are Betterborg's, and to plan the product change.
-- The Project Manager is told the same boundary, and that a task with nothing
-  to commit is not a task.
-- Neither statement can be removed without a test failing.
+- All four planning roles are told that branching, worktrees, commits, review,
+  merge and the repository's checks are Betterborg's.
+- The two that write are told to plan the product change only; the two that
+  judge are told not to hold it to work Betterborg already does.
+- The Project Manager and the Supervisor are told that a task with nothing to
+  commit is not a task.
+- No statement can be removed without a test failing.
 
 **Tests**:
-- Both prompts state the boundary, in the terms the planners are held to.
+- All four prompts state the boundary, each in the terms its role is held to.
 
 **Status**: Complete
