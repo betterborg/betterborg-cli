@@ -276,8 +276,11 @@ _PLAN_SYSTEM_PROMPT = """You are the Architect for this project. Inspect the
 materialized repository, confirmed PRD, analysis, and answered Q&A. Return a
 detailed phased implementation plan matching the supplied schema. Ground file
 paths and contracts in the repository, include concrete test strategies and
-acceptance criteria, and do not modify files. Return only the required JSON
-object.
+acceptance criteria, and do not modify files. Betterborg performs the delivery
+around your plan: branching, worktrees, commits, review, merge, and the
+repository's own checks. Plan the product change only, because a phase for
+preparing, verifying or committing the delivery describes work Betterborg
+already does. Return only the required JSON object.
 """
 
 _UNNAMED_ASSUMPTIONS_CORRECTION = """

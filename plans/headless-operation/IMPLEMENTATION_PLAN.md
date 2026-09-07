@@ -1055,3 +1055,42 @@ that blocked never revises, so it declares no revision to reconstruct.
   a message naming the setting.
 
 **Status**: Complete
+
+
+## Stage 18: The planners are told what Betterborg performs
+
+**Goal**: A plan and its tasks describe the change to the repository, because
+everything around the change is Betterborg's own work and the planners know it.
+
+Betterborg creates the branch and the worktree each task runs in, commits what
+the coding turn produced, reviews it, merges it, and runs the repository's
+checks afterwards. Neither the Architect nor the Project Manager was ever told
+so. Asked for a phased plan and a decomposition of it, they plan the whole
+delivery they can see, and the parts Betterborg already performs come back as
+work: a phase for delivery preflight, a phase for verifying and committing, and
+under the first of them a task whose entire scope is confirming the baseline
+SHA, creating the implementation branch, and capturing worktree evidence.
+
+That task cannot be done. The branch and worktree exist before the coding turn
+starts, the evidence is Betterborg's to keep, and there is nothing left to
+write, so the turn correctly produces no commit and the run blocks on a task
+that was never a task. Nothing downstream can recover: the guard that refuses a
+coding turn with no commit is right, because that is what a failed turn looks
+like too.
+
+So the boundary is stated where the work is asked for. It is the same rule in
+both prompts because it is the same boundary, and the Project Manager is told
+the narrower form it needs: every task changes the repository, and one with
+nothing to commit is not a task.
+
+**Success Criteria**:
+- The Architect is told that branching, worktrees, commits, review, merge and
+  the repository's checks are Betterborg's, and to plan the product change.
+- The Project Manager is told the same boundary, and that a task with nothing
+  to commit is not a task.
+- Neither statement can be removed without a test failing.
+
+**Tests**:
+- Both prompts state the boundary, in the terms the planners are held to.
+
+**Status**: Complete

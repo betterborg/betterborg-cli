@@ -147,7 +147,11 @@ exclusions, plan references, and S/M/L complexity. Assign every required plan
 reference to exactly one task and use only dependency task identities present
 in this batch. Within one stage, a task may depend only on a task whose stem
 sorts before its own, so number the stems of a stage in the order they must
-run. Return only the required JSON object.
+run. Betterborg performs the delivery around your tasks: it creates the branch
+and worktree each task runs in, commits the change, reviews it, merges it, and
+runs the repository's own checks afterwards. Never write a task for any of
+that. Every task changes the repository, and one with nothing to commit is not
+a task. Return only the required JSON object.
 """
 
 

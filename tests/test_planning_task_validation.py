@@ -2485,3 +2485,26 @@ def test_a_decomposition_budget_that_is_not_a_whole_number_above_zero_is_refused
                 approved_plan=plan,
                 review_rounds=budget,
             )
+
+
+def test_both_planners_are_told_what_betterborg_performs() -> None:
+    """A planner that does not know the harness plans the harness's work.
+
+    Betterborg creates the branch and worktree, commits, reviews, merges and
+    runs the checks. Left unsaid, a plan grows a delivery-preflight phase and
+    the batch grows a task whose whole scope is verifying a baseline and
+    creating a branch — which has nothing to commit, so the run blocks on a
+    coding turn that correctly wrote nothing.
+    """
+    from betterborg_cli.planning.architect import _PLAN_SYSTEM_PROMPT
+    from betterborg_cli.planning.pm import _PROJECT_MANAGER_SYSTEM_PROMPT
+
+    plan_prompt = " ".join(_PLAN_SYSTEM_PROMPT.split())
+    assert "Betterborg performs the delivery around your plan" in plan_prompt
+    assert "branching, worktrees, commits, review, merge" in plan_prompt
+    assert "Plan the product change only" in plan_prompt
+
+    pm_prompt = " ".join(_PROJECT_MANAGER_SYSTEM_PROMPT.split())
+    assert "Betterborg performs the delivery around your tasks" in pm_prompt
+    assert "Never write a task for any of that" in pm_prompt
+    assert "one with nothing to commit is not a task" in pm_prompt
