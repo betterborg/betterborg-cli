@@ -2389,3 +2389,99 @@ def test_lowering_the_decomposition_budget_does_not_strand_a_revision_under_way(
         assert resumed.borg.state is BorgState.BLOCKED
         assert "the final round." in supervisor.calls[-1].user_prompt
         assert "of 2." not in supervisor.calls[-1].user_prompt
+
+
+def test_a_raised_budget_reconstructs_every_revision_it_paid_for(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """History is history, however the budget has moved since.
+
+    Read back through a bound the record outgrew, the revisions past that
+    bound disappear from the account of the run, and the reader is shown a
+    decomposition that took fewer attempts than it did.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-raised"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        pm_result = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+
+        # Three rejections, each answered by a revision, then an approval:
+        # more rounds than the default budget allows.
+        supervisor = MockAdapter(name="openai")
+        for index in range(3):
+            supervisor.queue(
+                MockResponse(dynamic=_review_response("request_changes"))
+            )
+            pm.queue(
+                MockResponse(payload=_pm_payload(plan, revision=f" R{index}."))
+            )
+        supervisor.queue(MockResponse(dynamic=_review_response("approve")))
+
+        first = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=5,
+        ).run()
+        assert first.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(supervisor.calls) == 4
+
+        finished = store.get_borg(borg.id)
+        assert finished is not None
+        progress = RunProgress(stream=StringIO())
+        again = SupervisorLoop(
+            repository,
+            finished,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=5,
+            progress=progress,
+        ).run()
+
+        assert again == first
+        assert len(supervisor.calls) == 4
+        children = progress.stages["supervisor"].children
+        assert len(children) == 3
+        assert all(
+            child.state is StageState.COMPLETED for child in children.values()
+        )
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5])
+def test_a_decomposition_budget_that_is_not_a_whole_number_above_zero_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+    budget: object,
+) -> None:
+    """The loop is handed this directly as well as through configuration."""
+    plan = _plan()
+    database = committed_git_repo.parent / f"supervisor-budget-{budget}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"supervisor-budget-{str(budget).strip('-.')}"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(SupervisorError, match="whole number"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                review_rounds=budget,
+            )

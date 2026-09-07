@@ -167,8 +167,10 @@ class SupervisorLoop:
     ) -> None:
         if cancel is not None and cancel.is_set():
             raise SupervisorCancelled("Supervisor run cancelled")
-        if review_rounds < 1:
-            raise SupervisorError("Supervisor review rounds must be at least 1")
+        if not isinstance(review_rounds, int) or review_rounds < 1:
+            raise SupervisorError(
+                "Supervisor review rounds must be a whole number of at least 1"
+            )
         self.review_rounds = review_rounds
         project_manager = pm_agent or agent
         require_read_only_agent(

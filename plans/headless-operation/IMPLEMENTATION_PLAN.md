@@ -1035,7 +1035,8 @@ that blocked never revises, so it declares no revision to reconstruct.
   budget has since become.
 - A round past its budget is named the final round.
 - A budget below one, or not a whole number, is refused when configuration is
-  loaded, and by the loop that is handed one directly.
+  loaded, and by the loop that is handed one directly, which is the only place
+  a caller can supply one configuration never saw.
 
 **Tests**:
 - An unset budget leaves the number of rounds exactly as it is today.
@@ -1044,7 +1045,8 @@ that blocked never revises, so it declares no revision to reconstruct.
   it leads to runs and is named the final one.
 - The configured budget reaches decomposition through `plan approve`.
 - A blocked batch re-entered with a raised budget reports the same result and
-  reviews nothing further.
+  reviews nothing further, and a record holding more revisions than the default
+  allows reconstructs every one of them.
 - A budget of zero, a negative one, and a fractional one are each refused with
   a message naming the setting.
 
