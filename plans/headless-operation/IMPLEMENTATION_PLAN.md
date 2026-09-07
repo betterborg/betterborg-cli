@@ -906,6 +906,12 @@ not in the mode that writes. Nor can one whose purpose is measurement rather
 than correctness: a benchmark passes its own exit code and takes as long as it
 takes.
 
+Whether a command writes into the tree is decided against git's own answer, and
+the file that decides which outputs count is `.gitignore`. The analyzer is
+given it, because a rule the producer cannot evaluate is not a rule: a build
+whose output the repository ignores is the ordinary case the list admits, and
+one whose output it commits blocks every task that runs it.
+
 Everything the rule does not positively admit falls outside it, because the two
 ways of being wrong are not equal. A check wrongly skipped is a gap in what the
 run proved. A command wrongly admitted that does not end on its own holds the
@@ -935,8 +941,11 @@ names does not block.
 - A catalog recorded before the declaration existed still runs in full.
 - A run holding no check refuses before any task is coded, whether the catalog
   declared none or catalogued nothing at all.
-- A non-verifying command is not a dropped one: it requires no program of the
-  host, and is reported as no loss.
+- A non-verifying command is not a dropped one, and states no requirement of
+  this host: neither a program nor a directory. Its own shape is still the
+  analysis's to get right, and is still checked.
+- The evidence the analyzer is given can answer what it is asked, including
+  whether a command's output is one the repository ignores.
 - A secret or service only a non-verifying command names does not block the run.
 - Prepare and materialize commands are unaffected; they build the run itself.
 
@@ -946,7 +955,8 @@ names does not block.
 - A catalog declaring no check is refused, naming the declaration as the cause,
   and so is an analysis with no catalog, no commands key, or an empty one.
 - A non-verifying command whose program is absent neither blocks the run nor
-  appears among the checks the host could not run.
+  appears among the checks the host could not run, and neither does one whose
+  directory is absent; a verifying command's directory must still be there.
 - A secret, and a service, named only by a non-verifying command do not block.
 - The analyzer schema refuses a catalogued command that does not declare.
 
@@ -1030,6 +1040,8 @@ that blocked never revises, so it declares no revision to reconstruct.
 **Tests**:
 - An unset budget leaves the number of rounds exactly as it is today.
 - A lowered budget blocks on its only round, and the round says so.
+- A revision under way when the budget is lowered still finishes, and the round
+  it leads to runs and is named the final one.
 - The configured budget reaches decomposition through `plan approve`.
 - A blocked batch re-entered with a raised budget reports the same result and
   reviews nothing further.
