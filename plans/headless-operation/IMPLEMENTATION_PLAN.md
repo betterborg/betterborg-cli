@@ -787,8 +787,10 @@ repetition that says the same thing twice refuses over nothing.
 - A secret required only by a dropped command does not block the run; one a
   surviving command names blocks even when its record names no catalog stage,
   and is handed to that command when it runs.
-- A dropped command's own words are masked in the task outcome that names it
-  and in the pull request body that leaves the host.
+- A dropped command's own words are masked in the task outcome that names it,
+  in the pull request body that leaves the host, and in the payload a headless
+  caller reads; the refusal that names dropped checks quotes their programs
+  rather than their commands, because a refusal reason is never redacted.
 - A command naming an agent-scoped secret is refused before the run is spent.
 - A materialize command the host cannot run refuses the run rather than being
   dropped, and a program named by path is resolved where its command runs.

@@ -2035,7 +2035,10 @@ def test_a_host_that_can_run_no_catalogued_check_is_refused_before_the_spend(
 
     assert isinstance(result, HostPreflightBlock)
     assert "no catalogued check can run on this host" in result.reason
-    assert "absent-cargo test" in result.reason
+    # The program, not the command: a refusal reason is never redacted, and a
+    # catalogued argv can carry a secret the repository spelled into a script.
+    assert "absent-cargo" in result.reason
+    assert "absent-cargo test" not in result.reason
 
 
 def test_a_catalogue_declaring_no_check_is_refused_before_the_spend(
@@ -2506,3 +2509,31 @@ def test_a_verifying_command_still_needs_its_directory_to_exist(
 
     assert isinstance(result, HostPreflightBlock)
     assert "repo-relative directory" in result.reason
+
+
+def test_the_refusal_does_not_quote_a_catalogued_command_verbatim(
+    committed_git_repo: Path,
+) -> None:
+    """A block reason is never redacted, so it must quote nothing secret.
+
+    It reaches the terminal and the headless payload, and a repository that
+    spells a token into a script has it in the analysis.
+    """
+    plan = {
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["absent-runner", "--token", "s3cr3t-value"],
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "absent-runner" in result.reason
+    assert "s3cr3t-value" not in result.reason

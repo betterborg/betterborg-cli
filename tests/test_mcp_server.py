@@ -2729,14 +2729,14 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
         materialize_commands=(),
         environment_files=(),
         executables=(),
-        required_secret_names=(),
+        required_secret_names=("PACKAGE_TOKEN",),
         compose_files=(),
         services=(),
         dropped_commands=(
             HostDroppedCommand(
                 command=HostCommand(
                     stage="test",
-                    argv=("missing-runtime", "-m", "pytest"),
+                    argv=("missing-runtime", "--token", "s3cr3t-value"),
                     cwd=".",
                     evidence="pyproject.toml",
                 ),
@@ -2781,6 +2781,8 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
         ),
     )
 
+    # The value execution would supply, so the payload has something to mask.
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
     monkeypatch.setattr(mcp_server, "_paths", lambda **_kwargs: SimpleNamespace())
     monkeypatch.setattr(
         mcp_server, "load_repository_config", lambda _paths: SimpleNamespace()
@@ -2798,6 +2800,9 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
     assert result.status == payload_status
     assert result.data.reason is not None
     assert "missing-runtime" in result.data.reason
+    # This payload is what a caller with no terminal reads, so it is masked
+    # like the terminal line and the pull request body beside it.
+    assert "s3cr3t-value" not in result.data.reason
 
 
 def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(

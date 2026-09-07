@@ -278,11 +278,20 @@ class HostPreflight:
             if dropped_commands:
                 failures.append(
                     HostPreflightFailure(
+                        # The programs, not the commands. A refusal reason is
+                        # never redacted, and it reaches the terminal and the
+                        # headless payload; a catalogued argv can carry a
+                        # secret the repository spelled into a script, and a
+                        # program name is what the operator needs anyway.
                         requirement=(
                             "no catalogued check can run on this host: "
-                            + "; ".join(
-                                shlex.join(dropped.command.argv)
-                                for dropped in dropped_commands
+                            + ", ".join(
+                                sorted(
+                                    {
+                                        dropped.command.argv[0]
+                                        for dropped in dropped_commands
+                                    }
+                                )
                             )
                         ),
                         evidence=_join_evidence(
