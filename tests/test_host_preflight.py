@@ -636,9 +636,11 @@ def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     result = _preflight(committed_git_repo).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 5
+    assert len(result.failures) == 4
     assert "repo-relative directory" in result.reason
-    assert "declares no command that verifies the repository" in result.reason
+    # The catalogue named a check; it was refused for its own shape, and that
+    # refusal is the reason. A second one saying none was named would be false.
+    assert "declares no command that verifies" not in result.reason
     assert "runtime.version" in result.reason
     assert "host executable is required: example-runtime" in result.reason
     assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
@@ -2537,3 +2539,38 @@ def test_the_refusal_does_not_quote_a_catalogued_command_verbatim(
     assert isinstance(result, HostPreflightBlock)
     assert "absent-runner" in result.reason
     assert "s3cr3t-value" not in result.reason
+
+
+def test_a_catalogue_refused_for_its_own_shape_is_not_reported_as_empty(
+    committed_git_repo: Path,
+) -> None:
+    """A refusal says one true thing about why the run stopped.
+
+    The catalogue named a check. It was rejected for the directory it names,
+    and that rejection is the reason. Telling the operator the analysis names
+    no check as well sends them to the wrong file.
+    """
+    binary_dir = committed_git_repo.parent / "refused-shape-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "cwd": "absent-directory",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "repo-relative directory" in result.reason
+    assert "declares no command that verifies" not in result.reason

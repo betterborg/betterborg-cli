@@ -741,9 +741,8 @@ mistaken for a green run that passed them.
 
 The trade stops paying when nothing survives it. A run holding no check cannot
 publish anything, so every task would be coded, reviewed and merged and every
-one would then block. The alternative there is not a stricter run but the same
-no run, after the whole spend, so a run left with no check is refused as it was
-before, following the empty gate rather than whatever emptied it.
+one would then block. Dropping every check therefore refuses the run, on the
+terms Stage 15 sets for an empty gate however it came to be empty.
 
 The secrets follow the commands. One a workflow names but no command that runs
 asks for is not this run's requirement. Which commands ask is answered first by
@@ -759,8 +758,8 @@ repetition that says the same thing twice refuses over nothing.
 - A host missing a program a catalogued command invokes runs, that command is
   dropped rather than the run refused, and the drop is named in the preflight
   result and in each affected task's sanity result.
-- A run left with no check to run is refused, before any task is coded,
-  whether the host could run none of them or the analysis named none.
+- Dropping every catalogued check refuses the run, under Stage 15's rule for
+  an empty gate.
 - A version pin on a program the run never invokes does not block.
 - A secret no command that will run requires does not block the run, and one a
   surviving command names does block, however that secret's record spells the
@@ -941,8 +940,10 @@ names does not block.
   and analysis is refused when one does not.
 - The sanity gate runs the commands that declare they do, and no others.
 - A catalog recorded before the declaration existed still runs in full.
-- A run holding no check refuses before any task is coded, whether the catalog
-  declared none or catalogued nothing at all.
+- A run holding no check is refused before any task is coded, however the gate
+  came to be empty: the host could run none of them, the catalog declared none,
+  or it catalogued nothing at all. A catalogue refused for its own shape has
+  already said why, and is not also reported as naming no check.
 - A non-verifying command is not a dropped one, and states no requirement of
   this host: neither a program nor a directory. Its own shape is still the
   analysis's to get right, and is still checked.

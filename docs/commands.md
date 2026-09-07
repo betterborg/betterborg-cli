@@ -175,11 +175,13 @@ requires the program it invokes.
 
 The catalog lists what a repository can do, and only part of it settles
 whether a change broke anything. Each catalogued command says whether running
-it verifies the repository: a build, a test run, a linter, a type checker, or a
-formatter in a check mode reports without changing anything, and everything
-else does not, including a command that serves, watches, publishes, writes into
-the working tree, measures performance rather than correctness, or never exits
-on its own. A run whose catalog declares no check at all is refused
+it verifies the repository: a test run, a linter, a type checker or other
+static analysis, a formatter in a check mode that reports rather than rewrites,
+or a build whose output the repository ignores. Everything else does not,
+including a command that serves, watches, publishes, waits for input, measures
+rather than checks, or writes anything the repository tracks or would report as
+untracked. `.gitignore` decides which outputs count, and where it cannot be
+told, the command is not a check. A run whose catalog declares no check at all is refused
 before any task is coded, because nothing in it could prove a change safe.
 The sanity gate runs the ones that do. An analysis recorded before the question
 was asked says nothing, and every command in it still runs.

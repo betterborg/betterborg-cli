@@ -274,7 +274,10 @@ class HostPreflight:
         # coded, reviewed and merged, and every one would then block. Whether
         # the checks were dropped here or the analysis declared none, the
         # answer is the same run and the refusal belongs before the spend.
-        if not running_commands:
+        # A catalogue whose records were refused already said why, in the
+        # failures those refusals raised. Adding that the analysis names no
+        # check would be a second reason, and a false one: it named several.
+        if not running_commands and not failures:
             if dropped_commands:
                 failures.append(
                     HostPreflightFailure(

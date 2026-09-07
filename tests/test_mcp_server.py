@@ -2864,3 +2864,57 @@ def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
     assert [
         action["arguments"]["action"] for action in started["next_actions"]
     ] == ["show"]
+
+
+def test_the_headless_findings_are_narrowed_to_what_still_stands(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The payload carries the same account the terminal renders.
+
+    The store keeps every finding a Borg collected, and round numbers restart
+    each planning cycle. Handed whole to a caller with no terminal, it reads as
+    a page of outstanding objections with repeating rounds, including ones the
+    reviewer already answered by approving the revision that asked for them.
+    """
+    from betterborg_cli.store import PlanningFinding
+
+    def seed(store, borg, decision: str, message: str) -> None:
+        attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="tech_review",
+            round=len(store.list_planning_attempts(borg.id)) + 1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result={"decision": decision},
+            summary=message,
+        )
+        if decision == "request_changes":
+            store.append_planning_finding(
+                PlanningFinding(
+                    borg_id=borg.id,
+                    attempt_id=attempt.id,
+                    round=1,
+                    severity="major",
+                    message=message,
+                )
+            )
+
+    database = committed_git_repo.parent / "mcp-standing.sqlite3"
+    with SqliteStore.open(database) as store:
+        _repository, borg = persist_planning_context(
+            committed_git_repo, store, "mcp-standing"
+        )
+        seed(store, borg, "request_changes", "answered by the revision")
+        seed(store, borg, "approve", "approved")
+        assert len(store.list_planning_findings(borg.id)) == 1
+
+        # The store holds it; the plan the caller is being handed does not
+        # rest on it any more, because the reviewer approved the revision that
+        # answered it.
+        assert mcp_server._plan_findings(store, borg) == ()

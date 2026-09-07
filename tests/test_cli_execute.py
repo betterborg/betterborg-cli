@@ -2048,3 +2048,40 @@ def test_preflight_and_execution_output_name_every_dropped_command(
     assert progress.stages["preflight"].state is StageState.COMPLETED
     assert progress.stages["preflight"].result == summary
     assert summary in capsys.readouterr().out
+
+
+def test_the_preflight_progress_line_masks_a_secret_a_dropped_check_quoted(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The progress line is a surface that reports the run, and it is durable.
+
+    It is the worked example in the published documentation, and it quotes a
+    catalogued command's argv, so it is masked like the terminal line and the
+    pull request body beside it.
+    """
+    progress = RunProgress(stream=StringIO())
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
+    plan = _execution_result(
+        dropped_commands=(
+            HostDroppedCommand(
+                command=HostCommand(
+                    stage="test",
+                    argv=("missing-runtime", "--token", "s3cr3t-value"),
+                    cwd=".",
+                    evidence="pyproject.toml",
+                ),
+                reason="host executable is not available: missing-runtime",
+            ),
+        ),
+        required_secret_names=("PACKAGE_TOKEN",),
+    ).preflight
+
+    cli_module._finish_execution_preflight(progress, cancel=None, result=plan)
+
+    reported = progress.stages["preflight"].result
+    assert reported is not None
+    assert "missing-runtime" in reported
+    assert "s3cr3t-value" not in reported
