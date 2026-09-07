@@ -217,6 +217,27 @@ def test_safe_git_preserves_files_when_output_option_is_requested(
     assert protected.read_bytes() == original
 
 
+def test_safe_git_reads_only_the_identity_variables(
+    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git parses these while resolving an identity and refuses the command
+    # outright when it cannot; the production caller drops them for that reason.
+    for variable in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.delenv(variable, raising=False)
+    resolved = SafeGit(committed_git_repo).run(["var", "GIT_COMMITTER_IDENT"])
+
+    assert resolved.stdout.strip()
+    # ``git var -l`` would dump resolved configuration into captured output.
+    for arguments in (
+        ["var", "-l"],
+        ["var", "GIT_EDITOR"],
+        ["var"],
+        ["var", "GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"],
+    ):
+        with pytest.raises(UnsafeGitError, match="reads exactly one of"):
+            SafeGit(committed_git_repo).run(arguments)
+
+
 def test_safe_git_rejects_parent_discovery_from_nested_path(
     committed_git_repo: Path,
 ) -> None:

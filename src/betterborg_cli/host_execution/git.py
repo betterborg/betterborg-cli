@@ -44,9 +44,13 @@ _SAFE_SUBCOMMANDS = frozenset(
         "show-ref",
         "status",
         "switch",
+        "var",
         "worktree",
     }
 )
+#: ``git var -l`` would dump resolved configuration into captured output, so
+#: reading is confined to the identities the merge phase has to pin.
+_READABLE_GIT_VARIABLES = frozenset({"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"})
 _BLOCKED_FLAGS = frozenset(
     {
         "--delete",
@@ -191,6 +195,15 @@ def _assert_safe_worktree_args(arguments: Sequence[str]) -> None:
         raise UnsafeGitError("unsupported worktree list arguments")
 
 
+def _assert_safe_var_args(arguments: Sequence[str]) -> None:
+    """Allow only the identity variables the merge phase resolves."""
+    if len(arguments) != 2 or arguments[1] not in _READABLE_GIT_VARIABLES:
+        raise UnsafeGitError(
+            "Git var reads exactly one of "
+            + " and ".join(sorted(_READABLE_GIT_VARIABLES))
+        )
+
+
 def assert_safe_git_args(arguments: Sequence[str]) -> None:
     """Reject destructive flags, discard commands, and unknown subcommands."""
     if not arguments:
@@ -229,6 +242,8 @@ def assert_safe_git_args(arguments: Sequence[str]) -> None:
         _assert_safe_fetch_args(arguments)
     if subcommand == "push":
         _assert_safe_push_args(arguments)
+    if subcommand == "var":
+        _assert_safe_var_args(arguments)
     if subcommand == "worktree":
         _assert_safe_worktree_args(arguments)
     if subcommand == "merge" and any(
