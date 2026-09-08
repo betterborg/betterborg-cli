@@ -348,6 +348,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     }
     impact = report["harness_impact"]
     assert impact["commands"]["commands"] == payload["command_catalog"]["commands"]
+    assert impact["environment"]["files"] == payload["environment"]["files"]
     assert impact["environment"]["toolchains"] == payload["environment"][
         "toolchains"
     ]
@@ -381,6 +382,8 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     assert "PACKAGE_TOKEN" in terminal
     assert r"PACKAGE\_TOKEN" in markdown
     for rendered in (terminal, markdown):
+        assert "Environment file: pyproject.toml" in rendered
+        assert "Environment file: .python-version" in rendered
         assert "python 3.11" in rendered
         assert "java 21" in rendered
         assert "postgres" in rendered

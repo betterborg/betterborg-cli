@@ -432,7 +432,7 @@ is the enforcement.
 - An analysis report still renders its declared environment files — a guard on
   the reporting path, which reads the analysis and not the validated plan.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: Service orchestration leaves the CLI
 

@@ -70,7 +70,7 @@ class HostDroppedCommand:
 
 @dataclass(frozen=True, slots=True)
 class HostExecutable:
-    """One resolved host executable and any validated version requirement."""
+    """One resolved host executable and the version the analyzer declared."""
 
     name: str
     path: Path
@@ -263,7 +263,7 @@ class HostPreflight:
             materialize_commands,
             catalog_records,
         ) = self._commands(plan, failures)
-        environment_files = self._environment_files(plan, failures)
+        environment_files = self._environment_files(plan)
         executables, unresolved = self._executables(
             plan,
             commands,
@@ -544,33 +544,16 @@ class HostPreflight:
             check_records.append(record)
         return (checks, prepare_commands, materialize_commands, check_records)
 
-    def _environment_files(
-        self,
-        plan: Mapping[str, Any],
-        failures: list[HostPreflightFailure],
-    ) -> list[Path]:
+    def _environment_files(self, plan: Mapping[str, Any]) -> list[Path]:
+        """Record the declared evidence files; the run reads none of them."""
         environment = plan.get("environment")
         if not isinstance(environment, Mapping):
             return []
         paths: list[Path] = []
         for value in environment.get("files") or ():
             resolved = self._repository_path(value)
-            if resolved is None or not resolved.is_file():
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            "referenced environment file must exist inside the "
-                            f"repository: {value!r}"
-                        ),
-                        evidence=_evidence(environment, str(value)),
-                        guidance=(
-                            "Restore the referenced file or rerun analysis so its "
-                            "environment evidence is current."
-                        ),
-                    )
-                )
-                continue
-            paths.append(resolved)
+            if resolved is not None:
+                paths.append(resolved)
         return _unique_paths(paths)
 
     def _executables(
@@ -605,23 +588,19 @@ class HostPreflight:
         # invokes has to be here.  A catalog command is a check, and a check
         # this host cannot invoke is dropped from the run rather than being
         # allowed to refuse it.
-        invoked: set[str] = set()
         for command, blocking in (
             *((command, False) for command in catalog_commands),
             *((command, True) for command in environment_commands),
         ):
             name, cwd = _command_executable_key(command)
-            invoked.add(name)
             add_request(name, cwd, None, command.evidence, blocking=blocking)
 
         # The toolchain and package-manager inventory is prose written for a
         # person: "Go modules" and "Node.js" name no program.  It is resolved
-        # when the name happens to be one, because that is what carries a
-        # version pin onto the executable, but it requires nothing on its own
+        # when the name happens to be one, but it requires nothing on its own
         # and adds no coverage, since every command already requires what it
         # invokes.
         environment = plan.get("environment")
-        toolchains: list[Mapping[str, Any]] = []
         if isinstance(environment, Mapping):
             for manager in environment.get("package_managers") or ():
                 add_request(
@@ -631,8 +610,7 @@ class HostPreflight:
                     _evidence(environment, "environment"),
                     blocking=False,
                 )
-            toolchains = _mappings(environment.get("toolchains"))
-            for toolchain in toolchains:
+            for toolchain in _mappings(environment.get("toolchains")):
                 name = toolchain.get("name")
                 if isinstance(name, str) and name:
                     add_request(
@@ -671,94 +649,6 @@ class HostPreflight:
                 )
             )
 
-        # A version pin can only be checked against a program that is here,
-        # and it is only this run's requirement when this run invokes it. The
-        # inventory names what the repository uses somewhere; refusing over a
-        # pin on a program nothing in the run calls is the refusal over tools
-        # the run would never invoke that this stage exists to remove.
-        by_name = {tool.name: tool for tool in resolved_tools}
-        for toolchain in toolchains:
-            name = toolchain.get("name")
-            if not isinstance(name, str):
-                continue
-            executable_name = _toolchain_executable_name(name)
-            if executable_name not in by_name or executable_name not in invoked:
-                continue
-            version = toolchain.get("version")
-            evidence = _evidence(toolchain, "analyzer toolchain")
-            if not isinstance(version, str) or not version.strip():
-                continue
-            cited_source = toolchain.get("source")
-            if isinstance(cited_source, str) and cited_source:
-                source_values = [cited_source]
-            elif isinstance(environment, Mapping):
-                source_values = [environment.get("source")]
-                source_values.extend(environment.get("files") or ())
-            else:
-                source_values = []
-            source_paths = [
-                path
-                for value in source_values
-                if (path := self._source_path(value)) is not None and path.is_file()
-            ]
-            if not source_paths:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"toolchain {name!r} version evidence file must exist "
-                            "inside the repository"
-                        ),
-                        evidence=evidence,
-                        guidance=(
-                            "Restore the version manifest or correct the analyzer "
-                            "source reference."
-                        ),
-                    )
-                )
-                continue
-            version_is_cited = False
-            for source_path in source_paths:
-                try:
-                    source_text = source_path.read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                except OSError as error:
-                    evidence = f"{evidence}: {error}"
-                    continue
-                version_is_cited = version_is_cited or version in source_text
-            if not version_is_cited:
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"toolchain {name!r} version {version!r} must appear "
-                            "in its evidence file"
-                        ),
-                        evidence=evidence,
-                        guidance=(
-                            "Update the repository version pin or rerun analysis "
-                            "with current evidence."
-                        ),
-                    )
-                )
-                continue
-            output = self._version_output(name, by_name[executable_name].path)
-            if output is None or not _contains_version(output, version):
-                observed = (
-                    output.strip().splitlines()[0] if output else "no version output"
-                )
-                failures.append(
-                    HostPreflightFailure(
-                        requirement=(
-                            f"host executable {name!r} must satisfy analyzer "
-                            f"version {version!r}"
-                        ),
-                        evidence=f"{evidence}; observed: {observed}",
-                        guidance=(
-                            "Install the repository-declared "
-                            f"{name} {version} runtime on the host, then retry."
-                        ),
-                    )
-                )
         return resolved_tools, unresolved
 
     def _required_secrets(
@@ -1416,11 +1306,6 @@ class HostPreflight:
             return None
         return resolved
 
-    def _source_path(self, value: object) -> Path | None:
-        if not isinstance(value, str):
-            return None
-        return self._repository_path(value.partition("#")[0])
-
     def _resolve_executable(self, name: str, *, cwd: str = ".") -> Path | None:
         if "/" in name or "\\" in name:
             candidate = self.repository_root / PurePosixPath(cwd) / PurePosixPath(name)
@@ -1434,31 +1319,6 @@ class HostPreflight:
             return None
         found = self._find_executable(name, self._environment.get("PATH"))
         return Path(os.path.abspath(found)) if found else None
-
-    def _version_output(self, name: str, path: Path) -> str | None:
-        if name == "go":
-            arguments = ("version",)
-        elif name == "java":
-            arguments = ("-version",)
-        else:
-            arguments = ("--version",)
-        try:
-            command = [str(path), *arguments]
-            self._report_command(command)
-            result = self._run(
-                command,
-                cwd=self.repository_root,
-                env=self._probe_environment(),
-                check=False,
-                timeout=10,
-                cancel=self._cancel,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            self._raise_if_cancelled(error)
-            return None
-        self._raise_if_cancelled()
-        output = f"{result.stdout}\n{result.stderr}".strip()
-        return output if result.returncode == 0 and output else None
 
     def _compose_version_output(self, docker: Path) -> str | None:
         command = [str(docker), "compose", "version"]
@@ -1730,18 +1590,6 @@ def _compose_profiles(
         )
         return []
     return list(value)
-
-
-def _contains_version(output: str, version: str) -> bool:
-    normalized = version.removeprefix("v")
-    return (
-        re.search(
-            rf"(?<![0-9A-Za-z])(?:v|go)?{re.escape(normalized)}"
-            r"(?![0-9A-Za-z])",
-            output,
-        )
-        is not None
-    )
 
 
 def _supported_compose_version(output: str) -> bool:

@@ -152,7 +152,7 @@ def _complete_probe_plan(repository: Path) -> dict[str, object]:
 
 
 def _probe_name(command: list[str] | tuple[str, ...]) -> str | None:
-    """Identify the five ordered direct probes covered by cancellation tests."""
+    """Identify the four ordered direct probes covered by cancellation tests."""
     argv = tuple(command)
     if argv[-1:] == ("--show-toplevel",):
         return "root"
@@ -162,8 +162,6 @@ def _probe_name(command: list[str] | tuple[str, ...]) -> str | None:
         return "compose-version"
     if argv[-3:] == ("config", "--format", "json"):
         return "topology"
-    if argv[-1:] == ("--version",):
-        return "executable-version"
     return None
 
 
@@ -204,14 +202,13 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
     assert [_probe_name(command) for command, _token in calls] == [
         "root",
         "identity",
-        "executable-version",
         "compose-version",
         "topology",
     ]
     assert all(observed is cancel for _command, observed in calls)
     assert [activity.kind for activity in activities] == [
         AgentActivityKind.COMMAND
-    ] * 5
+    ] * 4
     assert [activity.detail for activity in activities] == [
         shlex.join(command) for command, _token in calls
     ]
@@ -219,7 +216,7 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity", "compose-version", "topology"],
 )
 def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
     committed_git_repo: Path,
@@ -318,7 +315,6 @@ finally:
     assert probes == [
         "root",
         "identity",
-        "executable-version",
         "compose-version",
         "topology",
     ][: probes.index(target) + 1]
@@ -330,7 +326,7 @@ finally:
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity", "compose-version", "topology"],
 )
 def test_cancelled_probe_result_propagates_interruption(
     committed_git_repo: Path,
@@ -375,7 +371,7 @@ def test_cancelled_probe_result_propagates_interruption(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity", "compose-version", "topology"],
 )
 def test_each_concrete_probe_cancels_before_run_or_claim_creation(
     committed_git_repo: Path,
@@ -443,17 +439,16 @@ def test_ordinary_probe_failures_remain_host_blocks(
 ) -> None:
     binary_dir = committed_git_repo.parent / f"ordinary-{outcome}-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
+    _executable(binary_dir, "example-runtime", "exit 0")
+    _compose_executable(binary_dir)
+    plan = _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
         RepoPaths.discover(committed_git_repo), store=store, explicit=True
     )
 
     def runner(command, **kwargs):
-        if _probe_name(command) == "executable-version":
+        if _probe_name(command) == "compose-version":
             if outcome == "timeout":
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])
             return subprocess.CompletedProcess(command, 7, "", "probe failed")
@@ -465,32 +460,13 @@ def test_ordinary_probe_failures_remain_host_blocks(
         environment={"PATH": str(binary_dir)},
         command_runner=runner,
     ).validate(
-        {
-            "command_catalog": {
-                "source": "pyproject.toml",
-                "commands": [
-                    {
-                        "stage": "test",
-                        "argv": ["example-runtime", "-m", "pytest"],
-                        "verifies": True,
-                    }
-                ],
-            },
-            "environment": {
-                "files": ["runtime.version"],
-                "toolchains": [
-                    {
-                        "name": "example-runtime",
-                        "version": "3.11.9",
-                        "source": "runtime.version",
-                    }
-                ],
-            },
-        }
+        plan,
+        available_secret_names={"PACKAGE_TOKEN"},
+        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
     assert isinstance(result, HostPreflightBlock)
-    assert "host executable 'example-runtime' must satisfy" in result.reason
+    assert "Docker Compose plugin must be available" in result.reason
 
 
 def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
@@ -622,7 +598,7 @@ def test_preserves_prepare_and_materialize_command_phases(
     ]
 
 
-def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
+def test_aggregates_cwd_runtime_and_secret_failures_with_evidence(
     committed_git_repo: Path,
 ) -> None:
     plan = _base_plan()
@@ -636,25 +612,63 @@ def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
     result = _preflight(committed_git_repo).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 4
+    assert len(result.failures) == 3
     assert "repo-relative directory" in result.reason
     # The catalogue named a check; it was refused for its own shape, and that
     # refusal is the reason. A second one saying none was named would be false.
     assert "declares no command that verifies" not in result.reason
-    assert "runtime.version" in result.reason
+    assert "referenced environment file must exist" not in result.reason
     assert "host executable is required: example-runtime" in result.reason
     assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
     assert "Betterborg will not install runtimes" in result.reason
     assert "pyproject.toml" in result.reason
 
 
-def test_toolchain_version_must_match_repository_evidence_and_host(
+def test_a_declared_environment_file_that_is_not_there_runs_anyway(
     committed_git_repo: Path,
 ) -> None:
+    """A lockfile the checkout gitignores is still a file the analysis names."""
+    binary_dir = committed_git_repo.parent / "declared-file-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "verifies": True,
+                }
+            ],
+        },
+        "environment": {"files": ["package-lock.json"]},
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
+
+
+def test_a_toolchain_version_the_host_does_not_satisfy_runs_anyway(
+    committed_git_repo: Path,
+) -> None:
+    """Every guard the comparison sat behind is cleared and it still runs.
+
+    The pinned file is here, it cites the pinned version, the toolchain's
+    program resolves, and a validated command invokes it, so the host's own
+    version is the only thing left that could refuse this run.
+    """
     binary_dir = committed_git_repo.parent / "version-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo 'example 3.12.1'")
-    (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
+    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.12.1'")
+    cited = committed_git_repo / "runtime.version"
+    cited.write_text("3.11.9\n", encoding="utf-8")
     plan = _base_plan()
     plan["command_catalog"]["commands"][0]["cwd"] = "."
     plan["command_catalog"]["commands"][0]["uses_services"] = []
@@ -665,9 +679,14 @@ def test_toolchain_version_must_match_repository_evidence_and_host(
         committed_git_repo, environment={"PATH": str(binary_dir)}
     ).validate(plan)
 
-    assert isinstance(result, HostPreflightBlock)
-    assert "must satisfy analyzer version '3.11.9'" in result.reason
-    assert "observed: example 3.12.1" in result.reason
+    assert isinstance(result, HostPreflightPlan)
+    assert result.environment_files == (cited,)
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
+    assert result.executables == (
+        HostExecutable("example-runtime", runtime, "3.11.9"),
+    )
 
 
 def test_version_probe_preserves_shim_dispatch_path(
@@ -714,42 +733,6 @@ def test_version_probe_preserves_shim_dispatch_path(
     assert isinstance(result, HostPreflightPlan)
     assert result.executables[0].path == shim
     assert result.executables[0].path.is_symlink()
-
-
-def test_go_version_probe_uses_supported_command_and_output(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "go-bin"
-    binary_dir.mkdir()
-    _executable(
-        binary_dir,
-        "go",
-        "test \"$1\" = version && echo 'go version go1.24.2 linux/amd64'",
-    )
-    (committed_git_repo / "go.mod").write_text(
-        "module example.test/project\n\ngo 1.24.2\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "test", "argv": ["go", "test", "./..."], "verifies": True}
-            ],
-        },
-        "environment": {
-            "files": ["go.mod"],
-            "toolchains": [
-                {"name": "go", "version": "1.24.2", "source": "go.mod"}
-            ],
-        },
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].version == "1.24.2"
 
 
 @pytest.mark.parametrize(
@@ -827,12 +810,13 @@ def test_rust_toolchain_resolves_and_probes_rustc(
     assert result.executables[0].version == "1.88.0"
 
 
-def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
+def test_a_toolchain_citing_a_file_that_is_not_there_runs_anyway(
     committed_git_repo: Path,
 ) -> None:
+    """A cited version source is evidence a person reads, not a requirement."""
     binary_dir = committed_git_repo.parent / "cited-version-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     plan = {
         "command_catalog": {
@@ -861,10 +845,13 @@ def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
         committed_git_repo, environment={"PATH": str(binary_dir)}
     ).validate(plan)
 
-    assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert "version evidence file must exist" in result.reason
-    assert "missing.version" in result.reason
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
+    assert result.executables == (
+        HostExecutable("example-runtime", runtime, "3.11.9"),
+    )
 
 
 def test_command_derived_failures_retain_exact_source_evidence(
@@ -2216,47 +2203,6 @@ def test_the_secret_a_command_named_reaches_the_command_that_named_it(
         result, result.commands[0].stage, {}, {"PACKAGE_TOKEN": "s3cr3t"}
     )
     assert environment == {"PACKAGE_TOKEN": "s3cr3t"}
-
-
-def test_a_version_pin_on_a_program_the_run_never_invokes_does_not_block(
-    committed_git_repo: Path,
-) -> None:
-    """The inventory stops being a source of requirements, pins included.
-
-    A patch-level mismatch on a runtime no catalogued command calls is the
-    refusal over tools nothing in the run would invoke, arriving through the
-    version instead of through the presence.
-    """
-    binary_dir = committed_git_repo.parent / "uninvoked-pin-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-lint", "exit 0")
-    _executable(binary_dir, "example-runtime", "echo 'example 3.12.0'")
-    (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "lint", "argv": ["example-lint"], "verifies": True}
-            ],
-        },
-        "environment": {
-            "files": ["runtime.version"],
-            "toolchains": [
-                {
-                    "name": "example-runtime",
-                    "version": "3.11.9",
-                    "source": "runtime.version",
-                }
-            ],
-        },
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert [command.argv for command in result.commands] == [("example-lint",)]
 
 
 def test_a_materialize_command_the_host_cannot_run_still_refuses_the_run(
