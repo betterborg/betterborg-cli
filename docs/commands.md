@@ -127,9 +127,8 @@ Configuration, prompts, PRDs, plans, tasks, score, state and artifacts all
 move there together, and the repository's working tree and `.gitignore` are
 left exactly as Betterborg found them: with nothing of Betterborg's inside the
 repository there is nothing to ignore, so no managed block is written. The
-task and environment worktrees Betterborg mints are unaffected; they are
-siblings of the repository under `.betterborg-worktrees` and
-`.betterborg-environments`, and are not the operator's to place.
+task worktrees Betterborg mints are unaffected; they are siblings of the
+repository under `.betterborg-worktrees`, and are not the operator's to place.
 
 Unset is the default and an empty value is read the same way. A path that
 resolves inside the repository fails the run, because it would reintroduce

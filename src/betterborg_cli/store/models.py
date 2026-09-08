@@ -859,11 +859,7 @@ class TaskClaim:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentAttempt:
-    """Immutable record of one environment preparation or materialization.
-
-    Reusable preparation may be owned by the execution run before a task is
-    claimed. Checkout-local materialization always remains claim-owned.
-    """
+    """Immutable record of preparing one claimed task's checkout."""
 
     run_id: UUID
     claim_id: UUID | None

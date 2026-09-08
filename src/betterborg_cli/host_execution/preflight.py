@@ -144,6 +144,21 @@ class HostPreflightPlan:
         )
 
 
+def selected_preparation_commands(
+    *,
+    prepare_commands: Sequence[HostCommand],
+    materialize_commands: Sequence[HostCommand],
+) -> tuple[HostCommand, ...]:
+    """Return the one declared list a task worktree is prepared by.
+
+    Two lists are declared and exactly one runs. Everything that needs that
+    answer asks here, so no site restates the rule: the materialization that
+    executes the commands, and the key that decides whether a worktree has
+    already run them.
+    """
+    return tuple(materialize_commands or prepare_commands)
+
+
 HostPreflightResult = HostPreflightPlan | HostPreflightBlock
 AnalyzerPlanLoader = Callable[[], Mapping[str, Any]]
 ActivitySink = Callable[[AgentActivity], None]

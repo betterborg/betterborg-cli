@@ -33,7 +33,6 @@ from betterborg_cli.agent_runtime import (
 )
 from betterborg_cli.host_execution import (
     ComposeCleanupResult,
-    EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
     HostCommand,
@@ -906,9 +905,9 @@ def test_service_setup_reaps_cancelled_environment_command(
                 "service-environment.child.pid"
             )
             cancel.cancel()
-            with pytest.raises(KeyboardInterrupt):
-                result.result(timeout=5)
+            cancelled = result.result(timeout=5)
 
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
         real_process_harness.assert_tree_absent("service-environment")
         assert observed_tokens == [cancel]
         assert activities == [
@@ -1465,19 +1464,15 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         )
         assert len(set(fixture.compose.up_projects)) == 4
         assert fixture.compose.active == set()
-        environment_attempts = [
-            attempt
+        # Each task is prepared once before coding and once at the sanity
+        # gate, which asks for the merged tip whatever reuse would say.
+        assert [
+            [
+                attempt.kind
+                for attempt in fixture.store.list_environment_attempts(task.id)
+            ]
             for task in fixture.tasks
-            for attempt in fixture.store.list_environment_attempts(task.id)
-        ]
-        preparations = [
-            attempt for attempt in environment_attempts if attempt.kind == "prepare"
-        ]
-        assert len(preparations) == 1
-        assert preparations[0].result["prepared_before_dispatch"] is True
-        assert (
-            sum(attempt.kind == "materialize" for attempt in environment_attempts) == 2
-        )
+        ] == [["materialize", "materialize"]] * 2
         project_tip = _git(
             fixture.store.get_repository(fixture.borg.repository_id).root,
             "rev-parse",
@@ -1571,7 +1566,7 @@ def test_a_completed_run_under_a_declared_home_leaves_the_repository_untouched(
         fixture.store.close()
 
 
-def test_predispatch_preparation_failure_is_a_durable_environment_attempt(
+def test_preparation_failure_is_a_durable_attempt_that_blocks_before_coding(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1587,26 +1582,21 @@ def test_predispatch_preparation_failure_is_a_durable_environment_attempt(
 
     monkeypatch.setattr(fixture.environment, "_run", fail_preparation)
     try:
-        with pytest.raises(
-            EnvironmentMaterializationError,
-            match="dependency setup failed",
-        ):
-            fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+        fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         task = fixture.tasks[0]
         attempts = fixture.store.list_environment_attempts(task.id)
         assert len(attempts) == 1
         attempt = attempts[0]
-        assert attempt.claim_id is None
+        assert attempt.claim_id is not None
         assert attempt.status is ExecutionAttemptStatus.FAILED
-        assert attempt.kind == "prepare"
+        assert attempt.kind == "materialize"
         assert attempt.fingerprint.startswith("sha256:")
         assert attempt.commands == [["git", "status", "--short"]]
         assert attempt.error is not None
         assert "dependency setup failed" in attempt.error
-        assert attempt.result is not None
-        assert attempt.result["prepared_before_dispatch"] is True
-        assert fixture.store.list_task_claims(attempt.run_id) == []
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
         assert fixture.coding.calls == []
     finally:
         fixture.store.close()
@@ -1916,7 +1906,7 @@ def test_concrete_dependent_starts_from_published_prerequisite(
         fixture.store.close()
 
 
-def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
+def test_concrete_dependent_with_earlier_position_refreshes_before_coding(
     tmp_path: Path,
 ) -> None:
     fixture = _concrete_host_fixture(
@@ -1935,16 +1925,12 @@ def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
 
         assert dependent.position < prerequisite.position
         assert dependent.stem > prerequisite.stem
-        preparations = [
-            attempt
-            for attempt in fixture.store.list_environment_attempts(dependent.id)
-            if attempt.kind == "prepare"
+        preparations = fixture.store.list_environment_attempts(dependent.id)
+        assert [attempt.kind for attempt in preparations] == [
+            "materialize",
+            "materialize",
         ]
-        assert len(preparations) == 1
-        preparation = preparations[0]
-        assert preparation.claim_id is None
-        assert preparation.result is not None
-        assert preparation.result["prepared_before_dispatch"] is True
+        assert all(attempt.claim_id is not None for attempt in preparations)
         assert result.status is ExecutionRunStatus.COMPLETED, [
             fixture.store.get_task_runtime(task.id).state_reason
             for task in fixture.tasks
@@ -2180,6 +2166,8 @@ def test_concrete_retry_exhaustion_stops_and_resumes_coding(
             attempts[0].result["_betterborg"]["outcome_reason"]
         )
 
+        before_resume = len(fixture.store.list_environment_attempts(task.id))
+
         monkeypatch.setattr(MockAdapter, "run", adapter_run)
         fixture.clock.advance(timedelta(seconds=1))
         resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
@@ -2188,6 +2176,13 @@ def test_concrete_retry_exhaustion_stops_and_resumes_coding(
         assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 1
+        # The re-claim reuses what the cancelled run prepared, so the only
+        # further install is the sanity gate's, which asks for the merged
+        # tip whatever reuse would say.
+        assert (
+            before_resume,
+            len(fixture.store.list_environment_attempts(task.id)),
+        ) == (1, 2)
     finally:
         fixture.store.close()
 
@@ -3288,56 +3283,6 @@ def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
         assert calls.index("stale-cleanup") < calls.index("worktrees")
         assert store.list_stale_compose_resources(previous.run_id) == []
         assert store.list_task_claims(previous.run_id)[0].released_at == expired_at
-    finally:
-        store.close()
-
-
-def test_reusable_cache_preparation_precedes_task_dispatch(tmp_path: Path) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    worktree = tmp_path / "prepared-worktree"
-    worktree.mkdir()
-    plan = HostPreflightPlan(
-        repository_root=tmp_path / "repository",
-        commands=(),
-        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
-        materialize_commands=(),
-        environment_files=(),
-        executables=(),
-        required_secret_names=(),
-        compose_files=(),
-        services=(),
-    )
-
-    class PreparedWorktrees(_Worktrees):
-        def prepare_current_task_worktrees(self, *args, **kwargs):
-            super().prepare_current_task_worktrees(*args, **kwargs)
-            return [SimpleNamespace(task_id=records[0].id, path=worktree)]
-
-    @dataclass
-    class PreparedRuntime(_ConcurrentRuntime):
-        def prepare_reusable_caches(
-            self, store, run_id, owner_token, worktrees, *, secret_values
-        ):
-            assert tuple(worktrees) == ((records[0].id, worktree),)
-            calls.append("cache")
-            return ("fingerprint",)
-
-        def __call__(self, context) -> TaskRuntimeStatus:
-            calls.append("dispatch")
-            return super().__call__(context)
-
-    try:
-        result = HostExecutionService(
-            store,
-            _Preflight(plan, calls),
-            PreparedRuntime(plan),
-            worktree_manager=PreparedWorktrees(calls),
-            compose_manager=_Compose(calls),
-        ).run(borg.id, generation.id, {})
-
-        assert result.status is ExecutionRunStatus.COMPLETED
-        assert calls[:4] == ["preflight", "worktrees", "cache", "dispatch"]
     finally:
         store.close()
 

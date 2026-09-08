@@ -353,7 +353,7 @@ introduces.
   worktree whose marker agrees is not — the pair that pins the conjunction
   rather than either conjunct alone.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: Declared environment evidence stops gating the run
 

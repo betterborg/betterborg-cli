@@ -390,6 +390,7 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert test_env["XDG_CACHE_HOME"] == str(fixture.repository.parent / "cache")
     assert len(attempts) == len(before_attempts) + 1
     assert attempts[-1].kind == "materialize"
+    assert sanity_events[-1].payload["preparation_key"] == attempts[-1].fingerprint
     assert result.commands[0].command.argv == ("catalog-install", "[REDACTED]")
     assert secret not in repr(result)
     persisted = json.dumps(sanity_events[-1].payload)
@@ -399,6 +400,76 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert persisted.count("[REDACTED]") == 7
     assert len(compose.started) == 1
     assert compose.stopped == []
+
+
+def test_sanity_judges_the_catalog_on_the_merged_dependencies(
+    tmp_path: Path,
+) -> None:
+    """The gate prepares the merged tip whatever the reuse rule would say.
+
+    The worktree was prepared before the merge, and a digest of the declared
+    commands cannot tell a merged tree from the tree it replaced, so the
+    catalog would otherwise judge the dependencies of the tree the merge
+    already replaced.
+    """
+    fixture = _approved_merge_fixture(tmp_path)
+    subdir = fixture.repository / "package"
+    subdir.mkdir()
+    (subdir / ".keep").write_text("package\n", encoding="utf-8")
+    _git(fixture.repository, "add", "package/.keep")
+    _git(fixture.repository, "commit", "--quiet", "-m", "add package directory")
+
+    installer = tmp_path / "install-dependencies"
+    installer.write_text(
+        '#!/bin/sh\nset -eu\ncat README.md > "$1"\n', encoding="utf-8"
+    )
+    installer.chmod(0o755)
+    installed = tmp_path / "installed-dependencies"
+    original_plan = _plan(fixture)
+    plan = replace(
+        original_plan,
+        materialize_commands=(
+            HostCommand("environment", (str(installer), str(installed)), "."),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        HostEnvironmentManager(
+            fixture.repository,
+            environment={"PATH": os.environ["PATH"]},
+        ).materialize_claimed_task(
+            store, plan, fixture.claim, fixture.owner_token
+        )
+    before_merge = installed.read_text(encoding="utf-8")
+
+    merged_readme = "# Fixture\n\nbase descriptor changed\n"
+    _advance_project_base(fixture, "README.md", merged_readme)
+    repository_lock = RecordingLock()
+    with SqliteStore.open(fixture.database) as store:
+        merged = merge_phase(fixture, MockAdapter(), repository_lock).run(
+            fixture.context(store)
+        )
+    assert merged.tip is not None
+
+    compose = _RecordingCompose(repository_lock, with_stack=False)
+    judged: list[str] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        judged.append(installed.read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(
+            fixture, plan, repository_lock, compose, runner
+        ).run(
+            fixture.context(store),
+            merged.tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert before_merge != merged_readme
+    assert judged == [merged_readme, merged_readme]
 
 
 def test_sanity_failure_stops_exact_stack_and_never_advances(

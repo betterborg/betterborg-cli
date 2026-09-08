@@ -156,11 +156,10 @@ class HostWorktreeManager:
     ) -> bool:
         """Fast-forward one newly claimed task to the latest project base.
 
-        Worktrees are allocated before scheduling so cache preparation can use
-        them.  A dependent may not become claimable until an earlier task has
-        advanced the shared project branch, however, so its still-clean branch
-        must be refreshed at the last responsible moment before materializing
-        the task environment.
+        Worktrees are allocated before scheduling, but a dependent may not
+        become claimable until an earlier task has advanced the shared
+        project branch, so its still-clean branch must be refreshed at the
+        last responsible moment before materializing the task environment.
         """
         if runtime.status is not TaskRuntimeStatus.CLAIMED:
             raise WorktreeError("only a newly claimed task worktree may be refreshed")

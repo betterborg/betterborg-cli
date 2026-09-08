@@ -2784,26 +2784,18 @@ class SqliteStore:
         fingerprint: str,
         *,
         kind: str,
-        task_id: UUID | None = None,
+        task_id: UUID,
     ) -> EnvironmentAttempt | None:
-        """Return the newest successful attempt matching an exact descriptor.
+        """Return one task's newest successful attempt for an exact key.
 
-        Preparation caches are reusable across tasks and execution runs, while
-        checkout materialization is task-local.  The optional task filter lets
-        callers enforce that distinction without treating failed, cancelled,
-        or interrupted attempts as cache hits.
+        Failed, cancelled, and interrupted attempts are never returned, so a
+        caller reading this cannot mistake one for work already done.
         """
         if not fingerprint.strip() or not kind.strip():
             raise ValueError("environment fingerprint and kind must not be empty")
-        task_filter = (
-            "AND environment_attempts.task_id = ?" if task_id is not None else ""
-        )
-        parameters: list[str] = [fingerprint, kind]
-        if task_id is not None:
-            parameters.append(str(task_id))
         with self.locked_connection() as connection:
             row = connection.execute(
-                f"""
+                """
                 SELECT environment_attempts.*,
                        terminal.kind AS terminal_kind,
                        terminal.payload_json AS terminal_payload_json,
@@ -2817,7 +2809,7 @@ class SqliteStore:
                  )
                 WHERE environment_attempts.fingerprint = ?
                   AND environment_attempts.kind = ?
-                  {task_filter}
+                  AND environment_attempts.task_id = ?
                   AND (
                     (
                       terminal.kind = 'environment.attempt_finished'
@@ -2833,7 +2825,7 @@ class SqliteStore:
                          environment_attempts.id DESC
                 LIMIT 1
                 """,
-                parameters,
+                (fingerprint, kind, str(task_id)),
             ).fetchone()
         return _row_to_environment_attempt(row) if row is not None else None
 

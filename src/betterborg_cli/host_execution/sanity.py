@@ -274,6 +274,10 @@ class HostSanityPhase:
                         activity=context.activity,
                     )
                     prior_stack = None
+                # The catalog judges this merged tree, and a digest of the
+                # declared commands cannot tell it from the tree it replaced,
+                # so reuse would otherwise skip the install the catalog is
+                # about to be run against.
                 materialization = self._environment_manager.materialize_claimed_task(
                     context.store,
                     self.plan,
@@ -281,6 +285,7 @@ class HostSanityPhase:
                     context.owner_token,
                     secret_values=secret_values,
                     task_transition=context.transition,
+                    force_preparation=True,
                 )
                 sanity_stack = self._compose_manager.start_claimed_sanity_stack(
                     context.store,
@@ -354,7 +359,7 @@ class HostSanityPhase:
                 "project_branch": tip.project_branch,
                 "base_commit": tip.base_commit,
                 "commit_sha": tip.commit_sha,
-                "environment_fingerprint": materialization.fingerprint,
+                "preparation_key": materialization.preparation_key,
                 "commands": [
                     {
                         "argv": [

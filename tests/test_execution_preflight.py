@@ -1,15 +1,13 @@
-"""Shared cache/materialization scaffold for host execution preflight."""
+"""Shared materialization and service scaffold for host execution preflight."""
 
 from __future__ import annotations
 
 import contextlib
 import json
-import multiprocessing
 import os
 import shutil
 import subprocess
 import threading
-import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -57,8 +55,6 @@ from betterborg_cli.store import (
 class ExecutionPreflightFixture:
     repository: Path
     database: Path
-    cache_root: Path
-    preparation_root: Path
     worktree_paths: tuple[Path, ...]
     task_ids: tuple[UUID, ...]
     run_id: UUID
@@ -81,8 +77,6 @@ class ExecutionPreflightFixture:
 
         return HostEnvironmentManager(
             self.repository,
-            cache_root=self.cache_root,
-            preparation_root=self.preparation_root,
             environment={"PATH": os.environ["PATH"]},
             command_runner=runner,
         )
@@ -146,9 +140,13 @@ def execution_preflight_fixture(tmp_path: Path):
             encoding="utf-8",
         )
         (repository / ".gitignore").write_text(
-            ".dependencies/\n", encoding="utf-8"
+            ".dependencies/\nuntracked.lock\n", encoding="utf-8"
         )
         _write_fake_package_manager(repository / "fake-package-manager")
+        nested = repository / "packages"
+        nested.mkdir()
+        _write_fake_package_manager(nested / "fake-package-manager")
+        (nested / "package.lock").write_text("lock-v1\n", encoding="utf-8")
         ensure_managed_gitignore(RepoPaths.discover(repository))
 
         database = tmp_path / f"state-{uuid4().hex}.sqlite3"
@@ -227,8 +225,6 @@ def execution_preflight_fixture(tmp_path: Path):
         return ExecutionPreflightFixture(
             repository=repository,
             database=database,
-            cache_root=repository / ".betterborg/state/environment-cache",
-            preparation_root=tmp_path / f"preparation-{uuid4().hex}",
             worktree_paths=tuple(spec.path for spec in specs),
             task_ids=tuple(task.id for task in tasks),
             run_id=acquisition.run_id,
@@ -238,35 +234,188 @@ def execution_preflight_fixture(tmp_path: Path):
     return create
 
 
-def test_prepares_once_per_fingerprint_and_materializes_every_worktree(
+def test_the_unselected_command_list_never_runs(
     execution_preflight_fixture,
 ) -> None:
+    """Exactly one declared list prepares a worktree, in that worktree.
+
+    The assertion has to be that the prepare command never ran: its output
+    was always discarded with the disposable worktree it ran in, so a
+    worktree-shaped assertion would hold either way.
+    """
     fixture = execution_preflight_fixture(task_count=2)
     plan = _plan(fixture.repository)
 
     with SqliteStore.open(fixture.database) as store:
-        first_claim = fixture.claim(store)
-        first = fixture.manager().materialize_claimed_task(
-            store, plan, first_claim, fixture.owner_token
-        )
-        assert first.preparation_reused is False
-        assert first.materialization_reused is False
+        for _ in fixture.worktree_paths:
+            claim = fixture.claim(store)
+            fixture.manager().materialize_claimed_task(
+                store, plan, claim, fixture.owner_token
+            )
+        kinds = {
+            attempt.kind
+            for task_id in fixture.task_ids
+            for attempt in store.list_environment_attempts(task_id)
+        }
 
-    # Reopening both the durable store and manager simulates a process restart.
-    with SqliteStore.open(fixture.database) as reopened:
-        second_claim = fixture.claim(reopened)
-        second = fixture.manager().materialize_claimed_task(
-            reopened, plan, second_claim, fixture.owner_token
-        )
-        assert second.fingerprint == first.fingerprint
-        assert second.preparation_reused is True
-        assert second.materialization_reused is False
-
+    assert kinds == {"materialize"}
+    assert _command_count(fixture, "prepare") == 0
+    assert _command_count(fixture, "materialize") == 2
     for worktree in fixture.worktree_paths:
         assert (worktree / ".dependencies/materialized").is_file()
-    assert _command_count(fixture, "prepare") == 1
+        assert not (worktree / ".dependencies/prepared").exists()
     assert _git(fixture.repository, "status", "--porcelain") == ""
-    assert not any(fixture.preparation_root.iterdir())
+
+
+def test_editing_the_unselected_command_list_does_not_reinstall(
+    execution_preflight_fixture,
+) -> None:
+    """The key carries the list that runs, so the other one cannot invalidate.
+
+    A repository declaring both lists never runs its prepare command, and an
+    edit to a command that will never run must not re-install every worktree
+    that already ran the one that does.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository)
+    edited = replace(
+        plan,
+        prepare_commands=(
+            replace(
+                plan.prepare_commands[0],
+                argv=("./fake-package-manager", "prepare", "edited"),
+            ),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        first = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        second = fixture.manager().materialize_claimed_task(
+            store, edited, claim, fixture.owner_token
+        )
+
+    assert second.preparation_key == first.preparation_key
+    assert second.materialization_reused is True
+    assert _command_count(fixture, "materialize") == 1
+    assert _command_count(fixture, "prepare") == 0
+
+
+def test_the_key_separates_one_command_run_in_two_directories(
+    execution_preflight_fixture,
+) -> None:
+    """A declared command is its working directory as much as its argv.
+
+    Moving a declared install into a subdirectory installs somewhere else,
+    so a worktree prepared by the one must not be called prepared for the
+    other while the argv they share stays identical.
+    """
+    fixture = execution_preflight_fixture()
+    at_root = _plan(fixture.repository, prepare_action=None)
+    in_package = _plan(fixture.repository, prepare_action=None, cwd="packages")
+    assert at_root.materialize_commands[0].argv == (
+        in_package.materialize_commands[0].argv
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        first = fixture.manager().materialize_claimed_task(
+            store, at_root, claim, fixture.owner_token
+        )
+        moved = fixture.manager().materialize_claimed_task(
+            store, in_package, claim, fixture.owner_token
+        )
+
+    assert moved.preparation_key != first.preparation_key
+    assert moved.materialization_reused is False
+    assert _command_count(fixture, "materialize") == 2
+    worktree = fixture.worktree_paths[0]
+    assert (worktree / "packages/.dependencies/materialized").is_file()
+
+
+def test_no_cache_directory_and_no_cache_marker_is_created(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository)
+    state = fixture.repository / ".betterborg/state"
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        materialization = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        attempts = store.list_environment_attempts(claim.task_id)
+
+    assert [set(attempt.result) for attempt in attempts] == [{"commands"}]
+    assert not (state / "environment-cache").exists()
+    assert not (fixture.repository.parent / ".betterborg-environments").exists()
+    assert list(state.rglob(".betterborg-prepared")) == []
+    marker = (
+        fixture.worktree_paths[0]
+        / ".betterborg/state/environment-materialization"
+    )
+    assert marker.read_text(encoding="utf-8").strip() == (
+        materialization.preparation_key
+    )
+
+
+def test_a_repository_declaring_no_preparation_command_reaches_coding(
+    execution_preflight_fixture,
+) -> None:
+    fixture = execution_preflight_fixture()
+    plan = _plan(
+        fixture.repository, prepare_action=None, materialize_action=None
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        runtime = store.get_task_runtime(claim.task_id)
+        attempts = store.list_environment_attempts(claim.task_id)
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+    assert [attempt.commands for attempt in attempts] == [[]]
+    assert fixture.commands == []
+
+
+def test_a_gitignored_lockfile_does_not_block_any_task(
+    execution_preflight_fixture,
+) -> None:
+    """A declared file the repository ignores is in no task worktree.
+
+    Preflight sees it in the primary checkout, and a task worktree holds
+    tracked files only, so requiring it there blocked every task a
+    repository with a normal ignore rule had.
+    """
+    fixture = execution_preflight_fixture(task_count=2)
+    lockfile = fixture.repository / "untracked.lock"
+    lockfile.write_text("lock-v1\n", encoding="utf-8")
+    plan = replace(
+        _plan(fixture.repository, prepare_action=None),
+        environment_files=(lockfile,),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        for _ in fixture.worktree_paths:
+            claim = fixture.claim(store)
+            fixture.manager().materialize_claimed_task(
+                store, plan, claim, fixture.owner_token
+            )
+        statuses = [
+            store.get_task_runtime(task_id).status
+            for task_id in fixture.task_ids
+        ]
+
+    assert not any(
+        (worktree / "untracked.lock").exists()
+        for worktree in fixture.worktree_paths
+    )
+    assert statuses == [TaskRuntimeStatus.CODING, TaskRuntimeStatus.CODING]
 
 
 def test_environment_command_runs_in_the_operator_environment(
@@ -294,8 +443,6 @@ def test_environment_command_runs_in_the_operator_environment(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment=operator,
         command_runner=runner,
     )
@@ -332,8 +479,6 @@ def test_environment_command_cannot_block_on_a_credential_prompt(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={
             "PATH": os.environ["PATH"],
             "GIT_TERMINAL_PROMPT": "1",
@@ -349,19 +494,7 @@ def test_environment_command_cannot_block_on_a_credential_prompt(
     assert [observed["GIT_TERMINAL_PROMPT"] for observed in environments] == ["0"]
 
 
-def test_repository_local_cache_must_be_ignored(
-    execution_preflight_fixture,
-) -> None:
-    fixture = execution_preflight_fixture()
-    (fixture.repository / ".gitignore").write_text(
-        ".dependencies/\n", encoding="utf-8"
-    )
-
-    with pytest.raises(EnvironmentMaterializationError, match="not ignored"):
-        fixture.manager()
-
-
-def test_falls_back_to_preparation_in_each_task_worktree(
+def test_a_repository_declaring_only_a_prepare_list_is_prepared_by_it(
     execution_preflight_fixture,
 ) -> None:
     fixture = execution_preflight_fixture()
@@ -374,8 +507,7 @@ def test_falls_back_to_preparation_in_each_task_worktree(
         )
 
     assert (fixture.worktree_paths[0] / ".dependencies/prepared").is_file()
-    # One run happened in the disposable preparer and one in the task fallback.
-    assert _command_count(fixture, "prepare") == 2
+    assert _command_count(fixture, "prepare") == 1
 
 
 def test_restart_reuses_matching_successful_materialization(
@@ -409,57 +541,21 @@ def test_restart_reuses_matching_successful_materialization(
             store, plan, claim, fixture.owner_token
         )
 
-    assert resumed.preparation_reused is True
     assert resumed.materialization_reused is True
     assert _command_count(fixture, "materialize") == 1
 
 
-def test_same_task_descriptor_change_rematerializes_before_sanity(
+def test_only_a_changed_declared_command_prepares_a_worktree_again(
     execution_preflight_fixture,
 ) -> None:
+    """The key carries the selected command list and nothing else.
+
+    An edit to a declared file no longer reinstalls a worktree, which is
+    what keeps an interrupted task from paying for its agent's dependency
+    twice; an edit to the command that installs it still does.
+    """
     fixture = execution_preflight_fixture()
-    plan = _plan(fixture.repository)
-
-    with SqliteStore.open(fixture.database) as store:
-        claim = fixture.claim(store)
-        first = fixture.manager().materialize_claimed_task(
-            store, plan, claim, fixture.owner_token
-        )
-
-        changed_worktree = fixture.worktree_paths[0]
-        (changed_worktree / "README.md").write_text(
-            "coding work\n", encoding="utf-8"
-        )
-        (changed_worktree / "package.lock").write_text(
-            "lock-v2\n", encoding="utf-8"
-        )
-
-        second = fixture.manager().materialize_claimed_task(
-            store, plan, claim, fixture.owner_token
-        )
-        runtime = store.get_task_runtime(claim.task_id)
-        preparations = [
-            attempt
-            for attempt in store.list_environment_attempts(claim.task_id)
-            if attempt.kind == "prepare"
-        ]
-
-    assert second.fingerprint != first.fingerprint
-    assert second.preparation_reused is False
-    assert _command_count(fixture, "prepare") == 2
-    assert [
-        result["stdout"] for result in preparations[-1].result["commands"]
-    ] == ["lock-v2\n"]
-    assert (changed_worktree / "README.md").read_text() == "coding work\n"
-    assert (changed_worktree / "package.lock").read_text() == "lock-v2\n"
-    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
-
-
-def test_reverted_fingerprint_rematerializes_checkout_local_dependencies(
-    execution_preflight_fixture,
-) -> None:
-    fixture = execution_preflight_fixture()
-    plan = _plan(fixture.repository)
+    plan = _plan(fixture.repository, prepare_action=None)
     worktree = fixture.worktree_paths[0]
 
     with SqliteStore.open(fixture.database) as store:
@@ -467,75 +563,164 @@ def test_reverted_fingerprint_rematerializes_checkout_local_dependencies(
         first = fixture.manager().materialize_claimed_task(
             store, plan, claim, fixture.owner_token
         )
-        assert (worktree / ".dependencies/materialized").read_text() == (
-            "lock-v1\n"
-        )
 
         (worktree / "package.lock").write_text("lock-v2\n", encoding="utf-8")
-        second = fixture.manager().materialize_claimed_task(
-            store, plan, claim, fixture.owner_token
-        )
-        assert second.fingerprint != first.fingerprint
-        assert (worktree / ".dependencies/materialized").read_text() == (
-            "lock-v2\n"
-        )
-
-        (worktree / "package.lock").write_text("lock-v1\n", encoding="utf-8")
-        reverted = fixture.manager().materialize_claimed_task(
+        unchanged_command = fixture.manager().materialize_claimed_task(
             store, plan, claim, fixture.owner_token
         )
 
-    assert reverted.fingerprint == first.fingerprint
-    assert reverted.materialization_reused is False
-    assert (worktree / ".dependencies/materialized").read_text() == "lock-v1\n"
-    assert _command_count(fixture, "materialize") == 3
-
-
-def test_preparation_is_coordinated_across_processes(
-    execution_preflight_fixture,
-) -> None:
-    fixture = execution_preflight_fixture(task_count=2)
-    plan = _plan(fixture.repository, prepare_action="prepare-slow")
-    with SqliteStore.open(fixture.database) as store:
-        claims = (fixture.claim(store), fixture.claim(store))
-
-    context = multiprocessing.get_context("spawn")
-    start = fixture.preparation_root.with_name(
-        f"{fixture.preparation_root.name}-start"
-    )
-    result_paths = tuple(
-        fixture.preparation_root.with_name(
-            f"{fixture.preparation_root.name}-result-{index}"
-        )
-        for index in range(len(claims))
-    )
-    processes = [
-        context.Process(
-            target=_materialize_in_process,
-            args=(
-                fixture,
-                plan,
-                claim,
-                start,
-                result_path,
+        edited = replace(
+            plan,
+            materialize_commands=(
+                replace(
+                    plan.materialize_commands[0],
+                    argv=("./fake-package-manager", "materialize", "--offline"),
+                ),
             ),
         )
-        for claim, result_path in zip(claims, result_paths, strict=True)
-    ]
-    for process in processes:
-        process.start()
-    start.touch()
-    for process in processes:
-        process.join(timeout=20)
+        changed_command = fixture.manager().materialize_claimed_task(
+            store, edited, claim, fixture.owner_token
+        )
+        runtime = store.get_task_runtime(claim.task_id)
 
-    assert [process.exitcode for process in processes] == [0, 0]
-    outcomes = [
-        json.loads(result_path.read_text(encoding="utf-8"))
-        for result_path in result_paths
-    ]
-    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
-    assert sorted(outcome[1] for outcome in outcomes) == [False, True]
-    assert _attempt_count(fixture, "prepare") == 1
+    assert unchanged_command.preparation_key == first.preparation_key
+    assert unchanged_command.materialization_reused is True
+    assert changed_command.preparation_key != first.preparation_key
+    assert changed_command.materialization_reused is False
+    assert _command_count(fixture, "materialize") == 2
+    assert (worktree / "package.lock").read_text() == "lock-v2\n"
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+
+
+def test_a_disagreeing_marker_prepares_again_and_an_agreeing_one_does_not(
+    execution_preflight_fixture,
+) -> None:
+    """The stored attempt and the checkout's marker are one condition.
+
+    A completed attempt outlives the dependencies it installed, so a
+    checkout that lost them must not be treated as prepared however
+    confidently the store remembers the install.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository, prepare_action=None)
+    marker = (
+        fixture.worktree_paths[0]
+        / ".betterborg/state/environment-materialization"
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        first = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        agreeing = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+
+        marker.write_text("sha256:another-checkout\n", encoding="utf-8")
+        disagreeing = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        completed = store.find_completed_environment_attempt(
+            first.preparation_key, kind="materialize", task_id=claim.task_id
+        )
+
+    assert agreeing.materialization_reused is True
+    assert disagreeing.materialization_reused is False
+    assert completed is not None
+    assert disagreeing.preparation_key == first.preparation_key
+    assert marker.read_text(encoding="utf-8").strip() == first.preparation_key
+    assert _command_count(fixture, "materialize") == 2
+
+
+def test_a_marker_without_a_completed_attempt_prepares_again(
+    execution_preflight_fixture,
+) -> None:
+    """The marker is written before the attempt recording it completes.
+
+    A process that dies in that window leaves the key on a checkout with no
+    completed attempt behind it. Only running the commands again can make
+    the pair agree, so the stored attempt has to be consulted even when the
+    marker already holds the key.
+    """
+    fixture = execution_preflight_fixture(task_count=2)
+    plan = _plan(fixture.repository, prepare_action=None)
+
+    with SqliteStore.open(fixture.database) as store:
+        prepared = fixture.manager().materialize_claimed_task(
+            store, plan, fixture.claim(store), fixture.owner_token
+        )
+        claim = fixture.claim(store)
+        runtime = store.get_task_runtime(claim.task_id)
+        assert runtime is not None and runtime.worktree_path is not None
+        marker = (
+            Path(runtime.worktree_path)
+            / ".betterborg/state/environment-materialization"
+        )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{prepared.preparation_key}\n", encoding="utf-8")
+
+        materialization = fixture.manager().materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+        attempts = store.list_environment_attempts(claim.task_id)
+
+    assert materialization.preparation_key == prepared.preparation_key
+    assert materialization.materialization_reused is False
+    assert [attempt.kind for attempt in attempts] == ["materialize"]
+    assert _command_count(fixture, "materialize") == 2
+
+
+def test_an_interrupted_preparation_between_two_identical_ones_reinstalls(
+    execution_preflight_fixture,
+) -> None:
+    """An interrupted preparation may already have replaced what it installed.
+
+    Returning to the command that succeeded before finds its own completed
+    attempt still in the store, so only invalidating the marker up front
+    stops the checkout being called prepared when the interruption left it
+    half written.
+    """
+    fixture = execution_preflight_fixture()
+    prepared = _plan(fixture.repository, prepare_action=None)
+    interrupted = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="fail-dirty",
+    )
+    dependencies = fixture.worktree_paths[0] / ".dependencies/materialized"
+    cancel = CancellationToken()
+
+    def interrupt_once_dirty(argv, **kwargs):  # noqa: ANN001, ANN003
+        result = run_captured(argv, **kwargs)
+        cancel.cancel()
+        return result
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        fixture.manager().materialize_claimed_task(
+            store, prepared, claim, fixture.owner_token
+        )
+        assert dependencies.read_text(encoding="utf-8") == "lock-v1\n"
+
+        with pytest.raises(KeyboardInterrupt):
+            HostEnvironmentManager(
+                fixture.repository,
+                environment={"PATH": os.environ["PATH"]},
+                command_runner=interrupt_once_dirty,
+                cancel=cancel,
+            ).materialize_claimed_task(
+                store, interrupted, claim, fixture.owner_token
+            )
+        assert dependencies.read_text(encoding="utf-8") == "half-installed\n"
+
+        restored = fixture.manager().materialize_claimed_task(
+            store, prepared, claim, fixture.owner_token
+        )
+
+    assert restored.materialization_reused is False
+    assert dependencies.read_text(encoding="utf-8") == "lock-v1\n"
+    assert _command_count(fixture, "materialize") == 2
 
 
 def test_environment_command_contaminating_primary_checkout_blocks_task(
@@ -556,8 +741,6 @@ def test_environment_command_contaminating_primary_checkout_blocks_task(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={"PATH": os.environ["PATH"]},
         command_runner=contaminate_primary,
     )
@@ -646,8 +829,6 @@ def test_encoded_build_secret_is_redacted_from_materialization_result(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={"PATH": os.environ["PATH"]},
         command_runner=emit_encoded_secret,
     )
@@ -729,8 +910,6 @@ def test_declared_secret_is_subtracted_from_the_operator_environment(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={"PATH": os.environ["PATH"], "PACKAGE_TOKEN": token},
     )
     with SqliteStore.open(fixture.database) as store:
@@ -781,8 +960,6 @@ def test_build_secret_is_redacted_outside_used_by_stage(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={"PATH": os.environ["PATH"]},
         command_runner=emit_secret,
     )
@@ -851,8 +1028,6 @@ def test_environment_command_reports_redacted_activity_and_reaps_on_cancel(
 
     manager = HostEnvironmentManager(
         fixture.repository,
-        cache_root=fixture.cache_root,
-        preparation_root=fixture.preparation_root,
         environment={"PATH": os.environ["PATH"]},
         command_runner=runner,
         activity=activities.append,
@@ -2015,6 +2190,7 @@ def _plan(
     prepare_action: str | None = "prepare",
     materialize_action: str | None = "materialize",
     secrets: tuple[HostSecret, ...] = (),
+    cwd: str = ".",
 ) -> HostPreflightPlan:
     def commands(action: str | None) -> tuple[HostCommand, ...]:
         if action is None:
@@ -2023,7 +2199,7 @@ def _plan(
             HostCommand(
                 stage="environment",
                 argv=("./fake-package-manager", action),
-                cwd=".",
+                cwd=cwd,
                 evidence="fixture",
             ),
         )
@@ -2464,8 +2640,7 @@ def _write_fake_package_manager(path: Path) -> None:
         "set -eu\n"
         "action=$1\n"
         "case \"$action\" in\n"
-        "  prepare|prepare-slow)\n"
-        "    if [ \"$action\" = prepare-slow ]; then sleep 0.5; fi\n"
+        "  prepare)\n"
         "    cat package.lock\n"
         "    mkdir -p .dependencies\n"
         "    printf 'local\\n' > .dependencies/prepared\n"
@@ -2481,6 +2656,11 @@ def _write_fake_package_manager(path: Path) -> None:
         "    mkdir -p .dependencies\n"
         "    printf '%s\\n' \"${PACKAGE_TOKEN:-unset}\" > .dependencies/secret\n"
         "    ;;\n"
+        "  fail-dirty)\n"
+        "    mkdir -p .dependencies\n"
+        "    printf 'half-installed\\n' > .dependencies/materialized\n"
+        "    exit 7\n"
+        "    ;;\n"
         "  fail)\n"
         "    printf '%s\\n' \"${PACKAGE_TOKEN:-package failed}\" >&2\n"
         "    exit 7\n"
@@ -2494,43 +2674,6 @@ def _write_fake_package_manager(path: Path) -> None:
 def _command_count(fixture: ExecutionPreflightFixture, action: str) -> int:
     """Count the environment commands the fixture's manager actually ran."""
     return sum(1 for argv in fixture.commands if action in argv)
-
-
-def _attempt_count(fixture: ExecutionPreflightFixture, kind: str) -> int:
-    """Count the durable attempts of one kind across every fixture task."""
-    with SqliteStore.open(fixture.database) as store:
-        return sum(
-            1
-            for task_id in fixture.task_ids
-            for attempt in store.list_environment_attempts(task_id)
-            if attempt.kind == kind
-        )
-
-
-def _materialize_in_process(
-    fixture: ExecutionPreflightFixture,
-    plan: HostPreflightPlan,
-    claim: TaskClaim,
-    start: Path,
-    result_path: Path,
-) -> None:
-    try:
-        deadline = time.monotonic() + 10
-        while not start.exists():
-            if time.monotonic() >= deadline:
-                raise RuntimeError("concurrent preparation did not start")
-            time.sleep(0.01)
-        with SqliteStore.open(fixture.database) as store:
-            materialization = fixture.manager().materialize_claimed_task(
-                store,
-                plan,
-                claim,
-                fixture.owner_token,
-            )
-        outcome = ("ok", materialization.preparation_reused)
-    except BaseException as error:
-        outcome = ("error", repr(error))
-    result_path.write_text(json.dumps(outcome), encoding="utf-8")
 
 
 def _git(repository: Path, *arguments: str) -> str:

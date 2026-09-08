@@ -17,7 +17,6 @@ from betterborg_cli.host_execution.environment import (
     EnvironmentMaterialization,
     EnvironmentMaterializationError,
     HostEnvironmentManager,
-    environment_fingerprint,
     redacted_dropped_command_summary,
 )
 from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError
@@ -131,7 +130,6 @@ __all__ = [
     "UnsafeGitError",
     "WorktreeError",
     "WorktreeSpec",
-    "environment_fingerprint",
     "compose_project_name",
     "redacted_dropped_command_summary",
     "service_url_environment",

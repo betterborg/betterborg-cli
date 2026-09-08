@@ -187,7 +187,6 @@ class HostTaskRuntime:
         merge: HostMergePhase,
         sanity: HostSanityPhase,
         secret_values: Mapping[str, str] | None = None,
-        task_activity: TaskActivitySink | None = None,
         publication_lock: Any | None = None,
     ) -> None:
         self.plan = plan
@@ -198,7 +197,6 @@ class HostTaskRuntime:
         self._merge = merge
         self._sanity = sanity
         self._secret_values = dict(secret_values or {})
-        self._task_activity = task_activity
         self._publication_lock = publication_lock or Lock()
 
     def with_secret_values(
@@ -215,45 +213,7 @@ class HostTaskRuntime:
             merge=self._merge,
             sanity=self._sanity,
             secret_values=secret_values,
-            task_activity=self._task_activity,
             publication_lock=self._publication_lock,
-        )
-
-    def with_task_activity(
-        self, task_activity: TaskActivitySink | None
-    ) -> HostTaskRuntime:
-        """Bind one acquired run's already-redacting task reporter."""
-        return HostTaskRuntime(
-            self.plan,
-            environment_manager=self._environment,
-            compose_manager=self._compose,
-            coding=self._coding,
-            review_fix=self._review_fix,
-            merge=self._merge,
-            sanity=self._sanity,
-            secret_values=self._secret_values,
-            task_activity=task_activity,
-            publication_lock=self._publication_lock,
-        )
-
-    def prepare_reusable_caches(
-        self,
-        store: SqliteStore,
-        run_id: UUID,
-        owner_token: str,
-        worktrees,
-        *,
-        secret_values: Mapping[str, str],
-    ) -> tuple[str, ...]:
-        """Complete shared preparation before the scheduler may claim work."""
-        return self._environment.prepare_reusable_caches(
-            store,
-            self.plan,
-            run_id,
-            owner_token,
-            tuple(worktrees),
-            secret_values=secret_values,
-            activity=self._task_activity,
         )
 
     def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
@@ -500,13 +460,6 @@ class HostExecutionService:
         behavior = self._runtime
         if acquisition.acquired:
             runtime = self._runtime.with_secret_values(secrets)
-            task_activity = (
-                activity.emit
-                if self._activity is not None or self._progress is not None
-                else None
-            )
-            if isinstance(runtime, HostTaskRuntime):
-                runtime = runtime.with_task_activity(task_activity)
             owner_token = acquisition.owner_token
             if owner_token is None:
                 raise HostExecutionError("acquired execution run has no owner token")
@@ -531,7 +484,7 @@ class HostExecutionService:
                     self._cleanup_stale(cancel=cancel, activity=activity.emit)
                 )
                 heartbeats.checkpoint()
-                prepared = self._worktrees.prepare_current_task_worktrees(
+                self._worktrees.prepare_current_task_worktrees(
                     self._store,
                     run_id=acquisition.run_id,
                     owner_token=owner_token,
@@ -539,24 +492,6 @@ class HostExecutionService:
                     project_name=borg.name,
                     now=self._now(),
                 )
-                heartbeats.checkpoint()
-                if validated.prepare_commands:
-                    preparation_worktrees = []
-                    for spec in prepared:
-                        if not spec.path.is_dir():
-                            continue
-                        if spec.task_id is None:
-                            raise HostExecutionError(
-                                "prepared task worktree has no durable task identity"
-                            )
-                        preparation_worktrees.append((spec.task_id, spec.path))
-                    runtime.prepare_reusable_caches(
-                        self._store,
-                        acquisition.run_id,
-                        owner_token,
-                        preparation_worktrees,
-                        secret_values=secrets,
-                    )
                 heartbeats.checkpoint()
             except BaseException as setup_error:
                 try:
@@ -626,15 +561,7 @@ class HostExecutionService:
     ) -> TaskRuntimeStatus:
         """Refresh a never-started claim before entering concrete phases."""
         task_id = context.claim.task_id
-        # Run-owned cache preparation happens before dispatch and does not
-        # establish task-local state.  Only claim-owned setup or agent work
-        # makes a later claim a resume that must preserve its checkout.
-        claim_environment_attempts = (
-            attempt
-            for attempt in self._store.list_environment_attempts(task_id)
-            if attempt.claim_id is not None
-        )
-        unstarted = not any(claim_environment_attempts) and not (
+        unstarted = not self._store.list_environment_attempts(task_id) and not (
             self._store.list_agent_attempts(task_id)
         )
         if unstarted:

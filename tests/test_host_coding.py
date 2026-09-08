@@ -644,6 +644,37 @@ def test_missing_materialization_marker_blocks_before_invocation(
     assert adapter.calls == []
 
 
+def test_a_drifted_materialization_marker_blocks_before_invocation(
+    tmp_path: Path,
+) -> None:
+    """The stored attempt and the checkout's marker have to agree.
+
+    A completed attempt outlives the dependencies it installed, so an agent
+    is only let into a checkout whose marker still names what the store
+    recorded for it.
+    """
+    fixture = _coding_fixture(tmp_path)
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+        assert runtime is not None and runtime.worktree_path is not None
+        marker = (
+            Path(runtime.worktree_path)
+            / ".betterborg/state/environment-materialization"
+        )
+        marker.write_text("sha256:another-preparation\n", encoding="utf-8")
+        adapter = MockAdapter().queue(_committing_response(fixture.task))
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        blocked = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert blocked is not None and "marker has drifted" in blocked.state_reason
+    assert adapter.calls == []
+
+
 def _relocated_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, CodingFixture]:
