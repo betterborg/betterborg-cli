@@ -1501,6 +1501,35 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         fixture.store.close()
 
 
+def test_agent_runs_in_the_operator_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An agent's whole job is to build and test the repository.
+
+    Preparing a worktree against the operator's package store and then
+    running its tests against an empty one is the same defect in a new
+    place, so the agent gets the environment the commands got.
+    """
+    monkeypatch.setenv("OPERATOR_TOOLCHAIN", str(tmp_path / "operator-toolchain"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "operator-cache"))
+    fixture = _concrete_host_fixture(tmp_path)
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        spec = fixture.coding.calls[0]
+        assert spec.env["OPERATOR_TOOLCHAIN"] == str(tmp_path / "operator-toolchain")
+        assert spec.env["XDG_CACHE_HOME"] == str(tmp_path / "operator-cache")
+        assert spec.env["HOME"] == os.environ["HOME"]
+        assert "BETTERBORG_ENVIRONMENT_ROOT" not in spec.env
+    finally:
+        fixture.store.close()
+
+
 def test_a_completed_run_under_a_declared_home_leaves_the_repository_untouched(
     tmp_path: Path,
     monkeypatch,

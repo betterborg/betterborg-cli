@@ -39,14 +39,6 @@ from betterborg_cli.store import (
 from betterborg_cli.store.models import utcnow
 
 _CACHE_CONTRACT_VERSION = 1
-_SAFE_HOST_ENVIRONMENT = (
-    "LANG",
-    "LC_ALL",
-    "PATH",
-    "PATHEXT",
-    "SYSTEMROOT",
-    "TMPDIR",
-)
 
 
 class EnvironmentMaterializationError(RuntimeError):
@@ -202,82 +194,6 @@ def _fingerprint_descriptors(
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def package_manager_cache_environment(
-    cache_path: Path, package_managers: Sequence[str]
-) -> dict[str, str]:
-    """Return stable package-manager cache variables for one fingerprint."""
-    cache = Path(cache_path).resolve()
-    managers = {manager.lower() for manager in package_managers}
-    result = {
-        "BETTERBORG_ENVIRONMENT_ROOT": str(cache),
-        "XDG_CACHE_HOME": str(cache / "xdg" / "cache"),
-        "XDG_DATA_HOME": str(cache / "xdg" / "data"),
-        "XDG_STATE_HOME": str(cache / "xdg" / "state"),
-    }
-
-    if managers & {"npm", "node"}:
-        result.update(
-            {
-                "COREPACK_HOME": str(cache / "corepack"),
-                "npm_config_cache": str(cache / "npm" / "cache"),
-            }
-        )
-    if "pnpm" in managers:
-        store = str(cache / "pnpm" / "store")
-        result.update(
-            {
-                "COREPACK_HOME": str(cache / "corepack"),
-                "PNPM_HOME": str(cache / "pnpm" / "home"),
-                "PNPM_STORE_DIR": store,
-                "npm_config_cache": str(cache / "npm" / "cache"),
-                "npm_config_store_dir": store,
-                "pnpm_config_store_dir": store,
-            }
-        )
-    if "yarn" in managers:
-        result.update(
-            {
-                "COREPACK_HOME": str(cache / "corepack"),
-                "YARN_CACHE_FOLDER": str(cache / "yarn" / "cache"),
-                "YARN_ENABLE_GLOBAL_CACHE": "true",
-                "YARN_GLOBAL_FOLDER": str(cache / "yarn" / "berry"),
-            }
-        )
-    if managers & {"pip", "python"}:
-        result["PIP_CACHE_DIR"] = str(cache / "pip" / "cache")
-    if "uv" in managers:
-        result["UV_CACHE_DIR"] = str(cache / "uv" / "cache")
-    if "poetry" in managers:
-        result.update(
-            {
-                "POETRY_CACHE_DIR": str(cache / "poetry" / "cache"),
-                "POETRY_DATA_DIR": str(cache / "poetry" / "data"),
-                "POETRY_VIRTUALENVS_IN_PROJECT": "true",
-            }
-        )
-    if managers & {"cargo", "rust"}:
-        result.update(
-            {
-                "CARGO_HOME": str(cache / "cargo"),
-                "RUSTUP_HOME": str(cache / "rustup"),
-            }
-        )
-    if "go" in managers:
-        result.update(
-            {
-                "GOCACHE": str(cache / "go" / "cache"),
-                "GOMODCACHE": str(cache / "go" / "pkg" / "mod"),
-                "GOPATH": str(cache / "go"),
-            }
-        )
-    if managers & {"bundler", "bundle", "ruby"}:
-        # BUNDLE_PATH and GEM_HOME are installation locations, not download
-        # caches.  Setting either here would put the consumer's installed gems
-        # in shared state instead of its own checkout.
-        result["BUNDLE_USER_CACHE"] = str(cache / "bundler")
-    return result
-
-
 class HostEnvironmentManager:
     """Prepare one reusable cache and materialize every claimed worktree."""
 
@@ -352,7 +268,7 @@ class HostEnvironmentManager:
             fingerprint = _fingerprint_descriptors(plan, descriptors)
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
-            base_environment = self._base_command_environment(plan, cache_path)
+            base_environment = self._base_command_environment()
             command_environments = self._command_environments(
                 plan, base_environment, secret_values or {}
             )
@@ -456,7 +372,7 @@ class HostEnvironmentManager:
             fingerprint = _fingerprint_descriptors(plan, descriptors)
             cache_path = self._cache_path(fingerprint)
             cache_path.mkdir(parents=True, exist_ok=True)
-            base_environment = self._base_command_environment(plan, cache_path)
+            base_environment = self._base_command_environment()
             command_environments = self._command_environments(
                 plan, base_environment, secret_values or {}
             )
@@ -852,28 +768,16 @@ class HostEnvironmentManager:
             raise KeyboardInterrupt
         raise KeyboardInterrupt from cause
 
-    def _base_command_environment(
-        self,
-        plan: HostPreflightPlan,
-        cache_path: Path,
-    ) -> dict[str, str]:
-        base_environment = {
-            name: self._environment[name]
-            for name in _SAFE_HOST_ENVIRONMENT
-            if name in self._environment
-        }
-        base_environment.update(
-            package_manager_cache_environment(cache_path, plan.package_managers)
-        )
-        home = cache_path / "home"
-        home.mkdir(parents=True, exist_ok=True)
-        base_environment.update(
-            {
-                "GIT_TERMINAL_PROMPT": "0",
-                "HOME": str(home),
-                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-            }
-        )
+    def _base_command_environment(self) -> dict[str, str]:
+        """Return the operator environment every repository command runs in.
+
+        A repository builds on this machine, in this shell, with these
+        toolchains and these warm caches. Only the credential prompt is
+        suppressed: a command runs with no timeout and inherits a stdin, so
+        one reaching a private dependency would otherwise block forever.
+        """
+        base_environment = dict(self._environment)
+        base_environment["GIT_TERMINAL_PROMPT"] = "0"
         return base_environment
 
     def _command_environments(
@@ -889,13 +793,10 @@ class HostEnvironmentManager:
         mask_values = declared_secret_mask_values(plan, secret_values)
         environments: dict[str, tuple[dict[str, str], tuple[str, ...]]] = {}
         for stage in stages:
-            environment = dict(base_environment)
-            secrets, _ = command_secret_environment(
-                plan, stage, secret_values
-            )
-            environment.update(secrets)
             environments[stage] = (
-                environment,
+                command_secret_environment(
+                    plan, stage, base_environment, secret_values
+                ),
                 mask_values,
             )
         return environments
@@ -1119,11 +1020,20 @@ def command_cwd(worktree: Path, value: str) -> Path:
 def command_secret_environment(
     plan: HostPreflightPlan,
     stage: str,
+    base_environment: Mapping[str, str],
     secret_values: Mapping[str, str],
-) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Return only build secrets declared for one command stage."""
-    environment: dict[str, str] = {}
-    mask_values: list[str] = []
+) -> dict[str, str]:
+    """Return one stage's environment holding only the secrets it declared.
+
+    Commands run in the operator's environment, so a declared secret the
+    stage did not name has to be subtracted as well as withheld. Both halves
+    live here because two call sites compose their own environment and two
+    independently written filters would disagree the next time the secret
+    model changes.
+    """
+    environment = dict(base_environment)
+    for secret in plan.secret_requirements:
+        environment.pop(secret.name, None)
     for secret in plan.secret_requirements:
         if secret.scope not in {"all", "build"} or stage not in secret.used_by:
             continue
@@ -1133,9 +1043,7 @@ def command_secret_environment(
                 f"build-scoped secret value is unavailable: {secret.name}"
             )
         environment[secret.name] = value
-        if value:
-            mask_values.append(value)
-    return environment, tuple(sorted(set(mask_values), key=len, reverse=True))
+    return environment
 
 
 def redacted_dropped_command_summary(

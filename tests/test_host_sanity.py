@@ -153,7 +153,11 @@ def _sanity_phase(
             fixture.repository,
             environment={
                 "PATH": os.environ["PATH"],
+                "HOME": str(fixture.repository.parent),
+                "XDG_CACHE_HOME": str(fixture.repository.parent / "cache"),
                 "UNDECLARED_HOST": "no",
+                "BUILD_TOKEN": "operator-shell-value",
+                "AGENT_TOKEN": "operator-shell-value",
             },
             cancel=cancel,
             git=git,
@@ -377,26 +381,15 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert "BUILD_TOKEN" not in test_env
     assert "AGENT_TOKEN" not in install_env | test_env
     assert "UNDECLARED_TOKEN" not in install_env | test_env
-    assert "UNDECLARED_HOST" not in install_env | test_env
+    assert install_env["UNDECLARED_HOST"] == "no"
+    assert test_env["UNDECLARED_HOST"] == "no"
     assert install_env["REGISTRY_URL"] == "https://registry.example.test"
-    assert install_env["HOME"] == test_env["HOME"]
-    assert install_env["XDG_CACHE_HOME"] == test_env["XDG_CACHE_HOME"]
-    assert install_env["CARGO_HOME"] == test_env["CARGO_HOME"]
-    assert install_env["GOCACHE"] == test_env["GOCACHE"]
-    assert install_env["PNPM_STORE_DIR"] == test_env["PNPM_STORE_DIR"]
+    assert install_env["HOME"] == str(fixture.repository.parent)
+    assert test_env["HOME"] == str(fixture.repository.parent)
+    assert install_env["XDG_CACHE_HOME"] == str(fixture.repository.parent / "cache")
+    assert test_env["XDG_CACHE_HOME"] == str(fixture.repository.parent / "cache")
     assert len(attempts) == len(before_attempts) + 1
     assert attempts[-1].kind == "materialize"
-    cache_path = Path(attempts[-1].result["cache_path"])
-    assert all(
-        Path(value).is_relative_to(cache_path)
-        for value in (
-            install_env["HOME"],
-            install_env["XDG_CACHE_HOME"],
-            install_env["CARGO_HOME"],
-            install_env["GOCACHE"],
-            install_env["PNPM_STORE_DIR"],
-        )
-    )
     assert result.commands[0].command.argv == ("catalog-install", "[REDACTED]")
     assert secret not in repr(result)
     persisted = json.dumps(sanity_events[-1].payload)

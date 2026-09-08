@@ -411,10 +411,9 @@ class HostSanityPhase:
             environment = dict(materialization_environment)
             environment["CI"] = "true"
             environment.update(service_environment)
-            command_secrets, _ = command_secret_environment(
-                self.plan, command.stage, secret_values
+            environment = command_secret_environment(
+                self.plan, command.stage, environment, secret_values
             )
-            environment.update(command_secrets)
             redacted_command = HostCommand(
                 redact_secrets(command.stage, masks),
                 tuple(redact_secrets(argument, masks) for argument in command.argv),

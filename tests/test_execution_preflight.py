@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -33,7 +33,6 @@ from betterborg_cli.host_execution import (
     HostService,
     HostWorktreeManager,
     compose_project_name,
-    package_manager_cache_environment,
     service_url_environment,
 )
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
@@ -64,6 +63,7 @@ class ExecutionPreflightFixture:
     task_ids: tuple[UUID, ...]
     run_id: UUID
     owner_token: str
+    commands: list[list[str]] = field(default_factory=list)
 
     def claim(self, store: SqliteStore) -> TaskClaim:
         claim = store.claim_dependency_ready_task(
@@ -75,11 +75,16 @@ class ExecutionPreflightFixture:
         return claim
 
     def manager(self) -> HostEnvironmentManager:
+        def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+            self.commands.append(list(argv))
+            return run_captured(argv, **kwargs)
+
         return HostEnvironmentManager(
             self.repository,
             cache_root=self.cache_root,
             preparation_root=self.preparation_root,
             environment={"PATH": os.environ["PATH"]},
+            command_runner=runner,
         )
 
     def compose_manager(self, runner=None) -> HostComposeManager:
@@ -259,30 +264,89 @@ def test_prepares_once_per_fingerprint_and_materializes_every_worktree(
 
     for worktree in fixture.worktree_paths:
         assert (worktree / ".dependencies/materialized").is_file()
-    assert _preparation_count(fixture.cache_root) == 1
+    assert _command_count(fixture, "prepare") == 1
     assert _git(fixture.repository, "status", "--porcelain") == ""
     assert not any(fixture.preparation_root.iterdir())
 
 
-def test_package_manager_caches_are_fingerprint_local(tmp_path: Path) -> None:
-    cache = tmp_path / "fingerprint"
+def test_environment_command_runs_in_the_operator_environment(
+    execution_preflight_fixture, tmp_path: Path
+) -> None:
+    """A repository builds on this machine, so build it the way it builds.
 
-    environment = package_manager_cache_environment(
-        cache,
-        ("pnpm", "yarn", "uv", "poetry", "cargo", "go", "bundler"),
+    A synthesized environment hides a toolchain that lives under the real
+    home and cold-starts caches that are already warm, and the failure it
+    produces is one the operator cannot reproduce by hand.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository, materialize_action=None)
+    operator = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path / "operator-home"),
+        "XDG_CACHE_HOME": str(tmp_path / "operator-cache"),
+        "OPERATOR_TOOLCHAIN": str(tmp_path / "operator-toolchain"),
+    }
+    environments: list[dict[str, str]] = []
+
+    def runner(argv, *, env, **kwargs):  # noqa: ANN001, ANN003
+        environments.append(dict(env))
+        return run_captured(argv, env=env, **kwargs)
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment=operator,
+        command_runner=runner,
     )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        materialization = manager.materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
 
-    assert environment["XDG_CACHE_HOME"].startswith(str(cache))
-    assert environment["PNPM_STORE_DIR"] == str(cache / "pnpm/store")
-    assert environment["pnpm_config_store_dir"] == str(cache / "pnpm/store")
-    assert environment["YARN_GLOBAL_FOLDER"] == str(cache / "yarn/berry")
-    assert environment["UV_CACHE_DIR"] == str(cache / "uv/cache")
-    assert environment["POETRY_CACHE_DIR"] == str(cache / "poetry/cache")
-    assert environment["CARGO_HOME"] == str(cache / "cargo")
-    assert environment["GOMODCACHE"] == str(cache / "go/pkg/mod")
-    assert environment["BUNDLE_USER_CACHE"] == str(cache / "bundler")
-    assert "BUNDLE_PATH" not in environment
-    assert "GEM_HOME" not in environment
+    assert environments
+    for observed in environments:
+        assert observed["HOME"] == operator["HOME"]
+        assert observed["XDG_CACHE_HOME"] == operator["XDG_CACHE_HOME"]
+        assert observed["OPERATOR_TOOLCHAIN"] == operator["OPERATOR_TOOLCHAIN"]
+        assert set(observed) == set(operator) | {"GIT_TERMINAL_PROMPT"}
+    assert "BETTERBORG_ENVIRONMENT_ROOT" not in materialization.environment
+
+
+def test_environment_command_cannot_block_on_a_credential_prompt(
+    execution_preflight_fixture,
+) -> None:
+    """Preparation runs with no timeout and inherits a stdin.
+
+    A command that reaches a private dependency would otherwise wait on a
+    credential prompt with nothing left to end it.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository, prepare_action=None)
+    environments: list[dict[str, str]] = []
+
+    def runner(argv, *, env, **kwargs):  # noqa: ANN001, ANN003
+        environments.append(dict(env))
+        return run_captured(argv, env=env, **kwargs)
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={
+            "PATH": os.environ["PATH"],
+            "GIT_TERMINAL_PROMPT": "1",
+        },
+        command_runner=runner,
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager.materialize_claimed_task(
+            store, plan, claim, fixture.owner_token
+        )
+
+    assert [observed["GIT_TERMINAL_PROMPT"] for observed in environments] == ["0"]
 
 
 def test_repository_local_cache_must_be_ignored(
@@ -311,7 +375,7 @@ def test_falls_back_to_preparation_in_each_task_worktree(
 
     assert (fixture.worktree_paths[0] / ".dependencies/prepared").is_file()
     # One run happened in the disposable preparer and one in the task fallback.
-    assert _preparation_count(fixture.cache_root) == 2
+    assert _command_count(fixture, "prepare") == 2
 
 
 def test_restart_reuses_matching_successful_materialization(
@@ -347,7 +411,7 @@ def test_restart_reuses_matching_successful_materialization(
 
     assert resumed.preparation_reused is True
     assert resumed.materialization_reused is True
-    assert _materialization_count(fixture.cache_root) == 1
+    assert _command_count(fixture, "materialize") == 1
 
 
 def test_same_task_descriptor_change_rematerializes_before_sanity(
@@ -374,13 +438,18 @@ def test_same_task_descriptor_change_rematerializes_before_sanity(
             store, plan, claim, fixture.owner_token
         )
         runtime = store.get_task_runtime(claim.task_id)
+        preparations = [
+            attempt
+            for attempt in store.list_environment_attempts(claim.task_id)
+            if attempt.kind == "prepare"
+        ]
 
     assert second.fingerprint != first.fingerprint
     assert second.preparation_reused is False
-    assert _preparation_count(fixture.cache_root) == 2
-    assert (second.cache_path / "xdg/cache/prepared-lock").read_text() == (
-        "lock-v2\n"
-    )
+    assert _command_count(fixture, "prepare") == 2
+    assert [
+        result["stdout"] for result in preparations[-1].result["commands"]
+    ] == ["lock-v2\n"]
     assert (changed_worktree / "README.md").read_text() == "coding work\n"
     assert (changed_worktree / "package.lock").read_text() == "lock-v2\n"
     assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
@@ -419,7 +488,7 @@ def test_reverted_fingerprint_rematerializes_checkout_local_dependencies(
     assert reverted.fingerprint == first.fingerprint
     assert reverted.materialization_reused is False
     assert (worktree / ".dependencies/materialized").read_text() == "lock-v1\n"
-    assert _materialization_count(fixture.cache_root) == 3
+    assert _command_count(fixture, "materialize") == 3
 
 
 def test_preparation_is_coordinated_across_processes(
@@ -466,7 +535,7 @@ def test_preparation_is_coordinated_across_processes(
     ]
     assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
     assert sorted(outcome[1] for outcome in outcomes) == [False, True]
-    assert _preparation_count(fixture.cache_root) == 1
+    assert _attempt_count(fixture, "prepare") == 1
 
 
 def test_environment_command_contaminating_primary_checkout_blocks_task(
@@ -622,6 +691,51 @@ def test_build_secret_is_not_exposed_outside_used_by_stage(
     with SqliteStore.open(fixture.database) as store:
         claim = fixture.claim(store)
         fixture.manager().materialize_claimed_task(
+            store,
+            plan,
+            claim,
+            fixture.owner_token,
+            secret_values={"PACKAGE_TOKEN": token},
+        )
+
+    captured = fixture.worktree_paths[0] / ".dependencies/secret"
+    assert captured.read_text(encoding="utf-8") == "unset\n"
+
+
+def test_declared_secret_is_subtracted_from_the_operator_environment(
+    execution_preflight_fixture,
+) -> None:
+    """An inherited environment has to be subtracted from, not just added to.
+
+    The operator exports the credential a build stage needs, so a stage that
+    did not declare it would otherwise inherit it from the shell rather than
+    from the declaration that names the stages allowed to see it.
+    """
+    fixture = execution_preflight_fixture()
+    token = "operator-shell-package-token"
+    plan = _plan(
+        fixture.repository,
+        prepare_action=None,
+        materialize_action="capture-secret",
+        secrets=(
+            HostSecret(
+                name="PACKAGE_TOKEN",
+                scope="build",
+                used_by=("test",),
+                evidence="fixture",
+            ),
+        ),
+    )
+
+    manager = HostEnvironmentManager(
+        fixture.repository,
+        cache_root=fixture.cache_root,
+        preparation_root=fixture.preparation_root,
+        environment={"PATH": os.environ["PATH"], "PACKAGE_TOKEN": token},
+    )
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        manager.materialize_claimed_task(
             store,
             plan,
             claim,
@@ -2349,17 +2463,14 @@ def _write_fake_package_manager(path: Path) -> None:
         "#!/bin/sh\n"
         "set -eu\n"
         "action=$1\n"
-        "mkdir -p \"$XDG_CACHE_HOME\"\n"
         "case \"$action\" in\n"
         "  prepare|prepare-slow)\n"
         "    if [ \"$action\" = prepare-slow ]; then sleep 0.5; fi\n"
-        "    printf 'prepare\\n' >> \"$XDG_CACHE_HOME/preparations.log\"\n"
-        "    cp package.lock \"$XDG_CACHE_HOME/prepared-lock\"\n"
+        "    cat package.lock\n"
         "    mkdir -p .dependencies\n"
         "    printf 'local\\n' > .dependencies/prepared\n"
         "    ;;\n"
         "  materialize)\n"
-        "    printf 'materialize\\n' >> \"$XDG_CACHE_HOME/materializations.log\"\n"
         "    mkdir -p .dependencies\n"
         "    cp package.lock .dependencies/materialized\n"
         "    ;;\n"
@@ -2380,18 +2491,20 @@ def _write_fake_package_manager(path: Path) -> None:
     path.chmod(0o755)
 
 
-def _preparation_count(cache_root: Path) -> int:
-    return sum(
-        path.read_text(encoding="utf-8").count("prepare\n")
-        for path in cache_root.rglob("preparations.log")
-    )
+def _command_count(fixture: ExecutionPreflightFixture, action: str) -> int:
+    """Count the environment commands the fixture's manager actually ran."""
+    return sum(1 for argv in fixture.commands if action in argv)
 
 
-def _materialization_count(cache_root: Path) -> int:
-    return sum(
-        path.read_text(encoding="utf-8").count("materialize\n")
-        for path in cache_root.rglob("materializations.log")
-    )
+def _attempt_count(fixture: ExecutionPreflightFixture, kind: str) -> int:
+    """Count the durable attempts of one kind across every fixture task."""
+    with SqliteStore.open(fixture.database) as store:
+        return sum(
+            1
+            for task_id in fixture.task_ids
+            for attempt in store.list_environment_attempts(task_id)
+            if attempt.kind == kind
+        )
 
 
 def _materialize_in_process(

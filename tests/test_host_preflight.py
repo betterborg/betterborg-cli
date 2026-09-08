@@ -2212,11 +2212,10 @@ def test_the_secret_a_command_named_reaches_the_command_that_named_it(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
-    environment, masks = command_secret_environment(
-        result, result.commands[0].stage, {"PACKAGE_TOKEN": "s3cr3t"}
+    environment = command_secret_environment(
+        result, result.commands[0].stage, {}, {"PACKAGE_TOKEN": "s3cr3t"}
     )
     assert environment == {"PACKAGE_TOKEN": "s3cr3t"}
-    assert masks == ("s3cr3t",)
 
 
 def test_a_version_pin_on_a_program_the_run_never_invokes_does_not_block(
