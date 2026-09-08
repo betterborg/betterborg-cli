@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from threading import Event, RLock, Thread
+from typing import NoReturn
 from uuid import UUID
 
 import click
@@ -1863,7 +1864,7 @@ def approve_plan(
         for item in workflow.publication.files:
             click.echo(f"  {paths.label(item.path)}")
     else:
-        click.echo(f"Task decomposition blocked for Borg {name!r}.")
+        _stop_blocked(f"Task decomposition blocked for Borg {name!r}.")
 
 @plan.command(name="change")
 @click.argument("name")
@@ -2031,18 +2032,30 @@ def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
     )
 
 
+def _stop_blocked(first: str, *rest: str) -> NoReturn:
+    """Report a blocked gate and end the command, exiting non-zero.
+
+    Raising Exit rather than a ClickException puts these lines on stdout with
+    no "Error: " prefix in front of them: a caller learns that the run stopped
+    from the status, and why from what it reads.
+    """
+    for line in (first, *rest):
+        click.echo(line)
+    raise click.exceptions.Exit(1)
+
+
 def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
-    """Report the actionable terminal gate reached by a planning lifecycle."""
+    """Report the terminal gate reached, stopping on any but approval pending."""
     if borg.state is BorgState.PLAN_APPROVAL_PENDING:
         suffix = " after applying the change" if changed else ""
         click.echo(f"Plan approval pending for Borg {name!r}{suffix}.")
         click.echo(f"Review it with: betterborg plan show {name}")
     elif borg.state is BorgState.BLOCKED:
         suffix = " while applying the change" if changed else ""
-        click.echo(f"Planning blocked for Borg {name!r}{suffix}.")
-        click.echo(
+        _stop_blocked(
+            f"Planning blocked for Borg {name!r}{suffix}.",
             f"Review the saved Tech Lead findings with: "
-            f"betterborg plan show {name}"
+            f"betterborg plan show {name}",
         )
     else:
         raise click.ClickException(

@@ -5,7 +5,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
+import click
 import pytest
 from click.testing import CliRunner
 from pytest import MonkeyPatch
@@ -23,6 +25,7 @@ from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
+    Borg,
     BorgState,
     PlanChangeRequest,
     PlanningAttempt,
@@ -90,8 +93,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert result.exit_code == 0, result.output
     assert prompts == ["Which platforms are required?"]
     assert outputs == ["Why this matters: This controls the test matrix."]
-    assert "Plan approval pending" in result.output
-    assert "betterborg plan show inline-plan" in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Plan approval pending for Borg 'inline-plan'.",
+        "Review it with: betterborg plan show inline-plan",
+    ]
     assert architect_adapter is not tech_lead_adapter
     assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
     assert len(architect_adapter.calls) == 3
@@ -360,6 +365,7 @@ def test_plan_start_resumes_directly_with_tech_lead_agent(
 
 def test_plan_start_reports_review_cap_as_blocked(
     cli_runner: CliRunner,
+    capsys: pytest.CaptureFixture[str],
     committed_git_repo: Path,
     planning_cli_repository,
     planning_plan_response,
@@ -401,9 +407,16 @@ def test_plan_start_reports_review_cap_as_blocked(
 
     result = cli_runner.invoke(cli, ["plan", "start", "blocked-plan", "--yes"])
 
-    assert result.exit_code == 0, result.output
-    assert "Planning blocked" in result.output
-    assert "betterborg plan show blocked-plan" in result.output
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Planning blocked for Borg 'blocked-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show blocked-plan",
+    ]
     assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
     assert len(architect_adapter.calls) == 4
     assert len(tech_lead_adapter.calls) == 3
@@ -420,6 +433,16 @@ def test_plan_start_reports_review_cap_as_blocked(
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
         assert len(store.list_planning_findings(borg.id)) == 3
+
+    # The runner above exits through Click's standalone branch; the binary
+    # takes the other one, and a blocked Borg reports the same gate on resume.
+    capsys.readouterr()
+    assert cli_module.main(["plan", "start", "blocked-plan", "--yes"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "Planning blocked for Borg 'blocked-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show blocked-plan",
+    ]
 
     # Keeping the findings is worth something only where the run said to read
     # them, so the command it named shows every one of them.
@@ -481,8 +504,16 @@ def test_plan_start_honors_the_repository_review_round_budget(
 
     result = cli_runner.invoke(cli, ["plan", "start", "budgeted-plan", "--yes"])
 
-    assert result.exit_code == 0, result.output
-    assert "Planning blocked" in result.output
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Planning blocked for Borg 'budgeted-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show budgeted-plan",
+    ]
     assert len(architect_adapter.calls) == 2
     assert len(tech_lead_adapter.calls) == 1
     assert "review round 1 of 1" in tech_lead_adapter.calls[0].user_prompt
@@ -1200,6 +1231,97 @@ def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> N
     assert "change" in result.output
     assert "question" not in result.output
     assert "answer" not in result.output
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_planning_gate_exits_non_zero_when_blocked_and_zero_when_pending(
+    capsys: pytest.CaptureFixture[str],
+    changed: bool,
+) -> None:
+    """Blocked is the failure a script has to see; pending is a finished start.
+
+    Both `plan start` and `plan change` report through this gate, so the change
+    a run made to a plan does not change which gate is an error.
+    """
+    repository_id = uuid4()
+
+    cli_module._write_planning_gate(
+        "gate-borg",
+        Borg(
+            repository_id=repository_id,
+            name="gate-borg",
+            state=BorgState.PLAN_APPROVAL_PENDING,
+        ),
+        changed=changed,
+    )
+
+    pending_suffix = " after applying the change" if changed else ""
+    assert capsys.readouterr().out.splitlines() == [
+        f"Plan approval pending for Borg 'gate-borg'{pending_suffix}.",
+        "Review it with: betterborg plan show gate-borg",
+    ]
+
+    with pytest.raises(click.exceptions.Exit) as blocked:
+        cli_module._write_planning_gate(
+            "gate-borg",
+            Borg(
+                repository_id=repository_id,
+                name="gate-borg",
+                state=BorgState.BLOCKED,
+            ),
+            changed=changed,
+        )
+
+    assert blocked.value.exit_code == 1
+    blocked_suffix = " while applying the change" if changed else ""
+    assert capsys.readouterr().out.splitlines() == [
+        f"Planning blocked for Borg 'gate-borg'{blocked_suffix}.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show gate-borg",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code", "first_line"),
+    [
+        (BorgState.BLOCKED, 1, "Planning blocked for Borg 'gate-borg'."),
+        (
+            BorgState.PLAN_APPROVAL_PENDING,
+            0,
+            "Plan approval pending for Borg 'gate-borg'.",
+        ),
+    ],
+)
+def test_main_returns_the_planning_gate_exit_code(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: BorgState,
+    expected_code: int,
+    first_line: str,
+) -> None:
+    """A shell sees the gate through `main`, which Click does not exit for.
+
+    Every other test here runs Click in standalone mode, where Click calls
+    sys.exit itself; `main` asks it not to and returns what it is handed back.
+    """
+    borg = Borg(
+        repository_id=uuid4(),
+        name="gate-borg",
+        state=state,
+    )
+
+    @click.group()
+    def command() -> None:
+        pass
+
+    @command.command(name="gate")
+    def gate() -> None:
+        cli_module._write_planning_gate("gate-borg", borg, changed=False)
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    assert cli_module.main(["gate"], prog_name="betterborg") == expected_code
+    assert capsys.readouterr().out.splitlines()[0] == first_line
 
 
 def _planning_snapshot(store: SqliteStore, borg_id):

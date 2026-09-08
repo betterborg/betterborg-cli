@@ -259,6 +259,11 @@ spent its budget planning can still be revised. An Architect that keeps asking
 past that budget ends the run with its unanswered round preserved, so
 `betterborg plan start NAME` resumes it with a person answering.
 
+A run that blocks says so and exits non-zero, so a script driving Betterborg
+with nobody watching stops on it rather than carrying on. A plan waiting for
+approval is the ordinary end of `betterborg plan start NAME` and exits zero,
+because it is what an unattended plan is meant to reach.
+
 ## Choose how many revisions a plan gets
 
 The Tech Lead reviews the Architect's plan, and where it finds something wrong

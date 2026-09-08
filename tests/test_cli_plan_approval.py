@@ -840,8 +840,14 @@ def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(
 
     result = cli_runner.invoke(cli, ["plan", "approve", "blocked-tasks", "--yes"])
 
-    assert result.exit_code == 0, result.output
-    assert "Task decomposition blocked" in result.output
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-1] == (
+        "Task decomposition blocked for Borg 'blocked-tasks'."
+    )
     assert "approval pending" not in result.output.casefold()
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-tasks")
@@ -904,8 +910,14 @@ def test_plan_approve_honors_the_repository_decomposition_budget(
 
     result = cli_runner.invoke(cli, ["plan", "approve", "budgeted-tasks", "--yes"])
 
-    assert result.exit_code == 0, result.output
-    assert "Task decomposition blocked" in result.output
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-1] == (
+        "Task decomposition blocked for Borg 'budgeted-tasks'."
+    )
     # One review, not the three the default would have spent.
     assert len(adapter.calls) == 2
     assert "in round 1 of 1." in adapter.calls[-1].user_prompt
