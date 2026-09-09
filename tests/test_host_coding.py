@@ -355,7 +355,27 @@ def _completed_payload(task: TaskRecord) -> dict:
     }
 
 
-def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
+UNRESOLVED_BLOCKER = "tests/test_timeouts.py::test_write_timeout was already red"
+UNRESOLVED_FOLLOW_UP = "Resolve the pre-existing warning, then rerun the suite"
+
+
+def _unfinished_payload(task: TaskRecord, *, status: str) -> dict:
+    """One agent report that did the work and says the task is not finished."""
+    return {
+        **_completed_payload(task),
+        "status": status,
+        "summary": "Implemented the feature; the suite has an unrelated failure.",
+        "blockers": [UNRESOLVED_BLOCKER],
+        "follow_ups": [UNRESOLVED_FOLLOW_UP],
+    }
+
+
+def _committing_response(
+    task: TaskRecord,
+    *,
+    usage: AgentUsage | None = None,
+    payload: dict | None = None,
+):
     def commit(spec):
         (spec.cwd / "feature.txt").write_text("implemented\n", encoding="utf-8")
         _git(spec.cwd, "add", "feature.txt")
@@ -363,7 +383,7 @@ def _committing_response(task: TaskRecord, *, usage: AgentUsage | None = None):
         transcript = spec.cwd / ".betterborg/state/provider-transcript.txt"
         transcript.write_text("immutable transcript\n", encoding="utf-8")
         return MockResponse(
-            payload=_completed_payload(task),
+            payload=payload or _completed_payload(task),
             usage=usage,
             billing_mode=spec.billing_mode,
             artifacts=(AgentArtifact(transcript, kind="transcript"),),
@@ -439,6 +459,7 @@ def _fixing_response(
     *,
     usage: AgentUsage | None = None,
     activities: tuple[AgentActivity, ...] = (),
+    payload: dict | None = None,
 ):
     def commit(spec):
         feature = spec.cwd / "feature.txt"
@@ -446,7 +467,7 @@ def _fixing_response(
         _git(spec.cwd, "add", "feature.txt")
         _git(spec.cwd, "commit", "--quiet", "-m", "fix review finding")
         return MockResponse(
-            payload=_completed_payload(task),
+            payload=payload or _completed_payload(task),
             usage=usage,
             billing_mode=spec.billing_mode,
             activities=activities,
@@ -460,6 +481,7 @@ def _prepare_review(
     store: SqliteStore,
     *,
     usage: AgentUsage | None = None,
+    coding_payload: dict | None = None,
 ) -> None:
     coding_prompt = store.get_latest_generated_prompts(
         fixture.borg.repository_id
@@ -472,7 +494,11 @@ def _prepare_review(
     )
     status = HostCodingPhase(
         fixture.repository,
-        MockAdapter().queue(_committing_response(fixture.task, usage=usage)),
+        MockAdapter().queue(
+            _committing_response(
+                fixture.task, usage=usage, payload=coding_payload
+            )
+        ),
         config=HostCodingConfig(model="coding-model"),
     ).run(fixture.context(store))
     assert status is TaskRuntimeStatus.REVIEW
@@ -1245,3 +1271,164 @@ def test_the_rules_keep_an_honest_assertion_change_possible() -> None:
     assert "an earlier round of this task" in EXISTING_TEST_REVIEW_RULE
     assert "resolve the code" in EXISTING_TEST_MERGE_RULE
     assert "fail rather than choose one" in EXISTING_TEST_MERGE_RULE
+
+
+def test_a_committed_partial_reaches_review_rather_than_being_discarded(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    adapter = MockAdapter().queue(
+        _committing_response(
+            fixture.task,
+            payload=_unfinished_payload(fixture.task, status="partial"),
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.REVIEW
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.REVIEW
+    head = _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
+    assert runtime.state_reason == f"coding reported partial and committed {head}"
+
+
+def test_a_partial_that_committed_nothing_still_blocks(tmp_path: Path) -> None:
+    fixture = _coding_fixture(tmp_path)
+
+    def leave_uncommitted(spec):
+        (spec.cwd / "unfinished.txt").write_text("keep me\n", encoding="utf-8")
+        return _unfinished_payload(fixture.task, status="partial")
+
+    adapter = MockAdapter().queue(MockResponse(dynamic=leave_uncommitted))
+    with SqliteStore.open(fixture.database) as store:
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert "without producing a commit" in runtime.state_reason
+    assert (Path(runtime.worktree_path) / "unfinished.txt").is_file()
+
+
+def test_a_blocked_status_stays_terminal_even_holding_a_commit(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    adapter = MockAdapter().queue(
+        _committing_response(
+            fixture.task,
+            payload=_unfinished_payload(fixture.task, status="blocked"),
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.state_reason == "coding agent reported blocked"
+
+
+def test_review_is_told_what_the_coding_agent_left_unfinished(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(payload=_review_payload(fixture.task, status="approved"))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(
+            fixture,
+            store,
+            coding_payload=_unfinished_payload(fixture.task, status="partial"),
+        )
+        HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+
+    prompt = review.calls[0].user_prompt
+    assert "did not report the task finished" in prompt
+    assert "'partial'" in prompt
+    assert UNRESOLVED_BLOCKER in prompt
+    assert UNRESOLVED_FOLLOW_UP in prompt
+
+
+def test_review_hears_nothing_unfinished_when_coding_reported_completed(
+    tmp_path: Path,
+) -> None:
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(payload=_review_payload(fixture.task, status="approved"))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+
+    assert "did not report the task finished" not in review.calls[0].user_prompt
+
+
+def test_a_committed_partial_fix_returns_to_review(tmp_path: Path) -> None:
+    fixture = _coding_fixture(tmp_path)
+    finding = "feature.txt must include the reviewed fix"
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task, status="issues_found", findings=[finding]
+                )
+            )
+        )
+        .queue(
+            MockResponse(payload=_review_payload(fixture.task, status="approved"))
+        )
+    )
+    fix = MockAdapter().queue(
+        _fixing_response(
+            fixture.task,
+            payload=_unfinished_payload(fixture.task, status="partial"),
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", fix_model="fix-model"
+            ),
+        ).run(fixture.context(store))
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert [attempt.phase for attempt in attempts] == [
+        "coding",
+        "review",
+        "fix",
+        "review",
+    ]

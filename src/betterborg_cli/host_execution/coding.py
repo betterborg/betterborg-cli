@@ -86,6 +86,14 @@ CODING_RESULT_SCHEMA: dict[str, Any] = {
 }
 
 
+#: Statuses whose commit is worth reviewing. ``completed`` is the agent saying
+#: the task is done and ``partial`` is it saying the task is not, and both leave
+#: work that review exists to judge; discarding the second would throw away a
+#: reviewed-quality commit over the agent's own honesty about it. ``blocked``
+#: asks for a decision no later phase can make, so it stays terminal.
+REVIEWABLE_CODING_STATUSES = frozenset({"completed", "partial"})
+
+
 class CodingPhaseError(RuntimeError):
     """Raised when a claimed task is not safe or ready for coding."""
 
@@ -408,24 +416,30 @@ class HostCodingPhase:
         if result.status is AgentStatus.FAILED:
             return TaskRuntimeStatus.FAILED, result.error or "coding agent failed"
         payload_status = (result.payload or {}).get("status")
-        if payload_status != "completed":
-            status = (
-                TaskRuntimeStatus.FAILED
-                if payload_status == "failed"
-                else TaskRuntimeStatus.BLOCKED
+        if payload_status == "failed":
+            return TaskRuntimeStatus.FAILED, "coding agent reported failed"
+        if payload_status not in REVIEWABLE_CODING_STATUSES:
+            return (
+                TaskRuntimeStatus.BLOCKED,
+                f"coding agent reported {payload_status or 'no status'}",
             )
-            return status, f"coding agent reported {payload_status or 'no status'}"
         if final_head == base_head:
             return (
                 TaskRuntimeStatus.BLOCKED,
-                "coding completed without producing a commit; worktree preserved",
+                f"coding reported {payload_status} without producing a commit; "
+                "worktree preserved",
             )
         if not git.is_ancestor(base_head, final_head):
             return (
                 TaskRuntimeStatus.BLOCKED,
                 "coding commit does not descend from the claimed worktree HEAD",
             )
-        return TaskRuntimeStatus.REVIEW, f"coding committed {final_head}"
+        if payload_status == "completed":
+            return TaskRuntimeStatus.REVIEW, f"coding committed {final_head}"
+        return (
+            TaskRuntimeStatus.REVIEW,
+            f"coding reported {payload_status} and committed {final_head}",
+        )
 
     def _artifact_ref(self, path: Path) -> str:
         return AgentAttemptArtifacts(

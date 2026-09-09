@@ -29,7 +29,10 @@ from betterborg_cli.host_execution._agent_phase import (
     result_summary,
     verified_task_inputs,
 )
-from betterborg_cli.host_execution.coding import CODING_RESULT_SCHEMA
+from betterborg_cli.host_execution.coding import (
+    CODING_RESULT_SCHEMA,
+    REVIEWABLE_CODING_STATUSES,
+)
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
@@ -265,6 +268,7 @@ class HostReviewFixPhase:
             base_commit=base_commit,
             current_commit=current_commit,
             review_round=runtime.review_round,
+            unfinished=_unfinished_coding_report(context),
         )
         return self._invoke(
             context,
@@ -618,6 +622,7 @@ class HostReviewFixPhase:
                 runtime.review_round,
                 "fix",
             )
+        payload_status = (result.payload or {}).get("status")
         if actual_branch != expected_branch:
             reason = "fix agent changed the task branch"
         elif result.status is AgentStatus.CANCELLED:
@@ -634,26 +639,35 @@ class HostReviewFixPhase:
                 runtime.review_round,
                 "fix",
             )
-        elif (result.payload or {}).get("status") != "completed":
-            payload_status = (result.payload or {}).get("status")
-            if payload_status == "failed":
-                return _PhaseOutcome(
-                    TaskRuntimeStatus.FAILED,
-                    "fix agent reported failed",
-                    runtime.review_round,
-                    "fix",
-                )
+        elif payload_status == "failed":
+            return _PhaseOutcome(
+                TaskRuntimeStatus.FAILED,
+                "fix agent reported failed",
+                runtime.review_round,
+                "fix",
+            )
+        elif payload_status not in REVIEWABLE_CODING_STATUSES:
             reason = f"fix agent reported {payload_status or 'no status'}"
         elif final_commit == previous_commit:
-            reason = "fix completed without producing a commit; worktree preserved"
+            reason = (
+                f"fix reported {payload_status} without producing a commit; "
+                "worktree preserved"
+            )
         elif not git.is_ancestor(previous_commit, final_commit):
             reason = "fix commit does not descend from the reviewed commit"
         elif after_status:
             reason = "fix agent left uncommitted work after its commit"
-        else:
+        elif payload_status == "completed":
             return _PhaseOutcome(
                 TaskRuntimeStatus.REVIEW,
                 f"fix committed {final_commit}",
+                runtime.review_round,
+                "review",
+            )
+        else:
+            return _PhaseOutcome(
+                TaskRuntimeStatus.REVIEW,
+                f"fix reported {payload_status} and committed {final_commit}",
                 runtime.review_round,
                 "review",
             )
@@ -842,6 +856,35 @@ def _blocked_outcome(runtime: TaskRuntime, reason: str) -> _PhaseOutcome:
     )
 
 
+def _unfinished_coding_report(
+    context: ScheduledTaskContext,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return the coding agent's own account of what it did not finish.
+
+    A commit reaches review whenever coding left one, including when the agent
+    said the task is not done. Review is the first reader able to weigh that
+    claim against the tree, and it cannot weigh what it is not told.
+    """
+    attempts = [
+        attempt
+        for attempt in context.store.list_agent_attempts(context.claim.task_id)
+        if attempt.phase == "coding"
+    ]
+    if not attempts:
+        return None
+    result = attempts[-1].result or {}
+    status = result.get("status")
+    if not isinstance(status, str) or status == "completed":
+        return None
+    notes = tuple(
+        text
+        for key in ("blockers", "follow_ups")
+        for item in (result.get(key) or ())
+        if (text := str(item).strip())
+    )
+    return status, notes
+
+
 def _render_review_prompt(
     inputs: VerifiedTaskInputs,
     *,
@@ -849,6 +892,7 @@ def _render_review_prompt(
     base_commit: str,
     current_commit: str,
     review_round: int,
+    unfinished: tuple[str, tuple[str, ...]] | None = None,
 ) -> str:
     sections = [
         "Review the assigned implementation without modifying the worktree.",
@@ -863,11 +907,30 @@ def _render_review_prompt(
         f"Declared base commit: {base_commit}",
         f"Current task commit: {current_commit}",
         f"Review round: {review_round}",
-        "",
-        "## Assigned task",
-        "",
-        inputs.task_markdown.rstrip(),
     ]
+    if unfinished is not None:
+        status, notes = unfinished
+        sections.extend(
+            [
+                "",
+                "## The coding agent did not report the task finished",
+                "",
+                f"It committed this work and returned status {status!r}. Judge "
+                "the commit on the assigned task as you would any other, and "
+                "read what follows as the coder's own account rather than as "
+                "findings: report only what you can still see in the tree.",
+            ]
+        )
+        if notes:
+            sections.extend(["", *(f"- {note}" for note in notes)])
+    sections.extend(
+        [
+            "",
+            "## Assigned task",
+            "",
+            inputs.task_markdown.rstrip(),
+        ]
+    )
     if inputs.dependencies:
         sections.extend(["", "## Dependency tasks"])
         for task, path, markdown in inputs.dependencies:
