@@ -21,6 +21,10 @@ EXCLUDED_DIRECTORIES = {
     "build",
     "dist",
 }
+#: Ignored output roots, matched as a path prefix rather than a bare name so
+#: a directory that merely shares the name is still scanned. What a benchmark
+#: run writes here is never published and holds databases and captured logs.
+EXCLUDED_PATH_PREFIXES = (("benchmarks", "runs"),)
 PRIVATE_PATH_PARTS = {"private", "proprietary"}
 CREDENTIAL_SUFFIXES = {".key", ".kubeconfig", ".p12", ".pem", ".pfx"}
 UNAUTHORIZED_SUFFIXES = {
@@ -52,6 +56,11 @@ def _public_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         relative_parts = path.relative_to(root).parts
         if any(part in EXCLUDED_DIRECTORIES for part in relative_parts):
+            continue
+        if any(
+            relative_parts[: len(prefix)] == prefix
+            for prefix in EXCLUDED_PATH_PREFIXES
+        ):
             continue
         if path.is_file():
             yield path
