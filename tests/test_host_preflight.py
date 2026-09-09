@@ -23,6 +23,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import PreparationMode
 from betterborg_cli.store import SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
@@ -1879,3 +1880,47 @@ def test_a_run_whose_gate_is_off_is_not_refused_for_holding_no_check(
     # The drop is still recorded: what could not run is what the operator reads
     # to learn the gate had nothing to run even had it been on.
     assert "absent-cargo" in ungated.dropped_command_summary
+
+
+@pytest.mark.parametrize(
+    "preparation",
+    [PreparationMode.OPTIONAL, PreparationMode.SKIPPED],
+)
+def test_a_preparation_program_is_required_only_where_preparation_is(
+    committed_git_repo: Path, preparation: PreparationMode
+) -> None:
+    """The refusal rests on preparation being able to end a task.
+
+    A preparation program has to exist because a preparation failure ends the
+    task that needed it. Where a failure no longer does, and where the
+    commands do not run at all, a missing program refuses a run that would
+    have completed without it.
+    """
+    binary_dir = committed_git_repo.parent / f"prep-bin-{preparation.value}"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "prepare_commands": [{"argv": ["missing-runtime", "install"]}]
+        },
+    }
+
+    required = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+    relaxed = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, preparation=preparation)
+
+    assert isinstance(required, HostPreflightBlock)
+    assert "host executable is required: missing-runtime" in required.reason
+    assert isinstance(relaxed, HostPreflightPlan)
+    assert [command.argv for command in relaxed.prepare_commands] == [
+        ("missing-runtime", "install")
+    ]

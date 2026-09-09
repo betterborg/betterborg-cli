@@ -1655,6 +1655,7 @@ def _invoke_host_execution(
             analyzer_plan,
             available_secret_names=os.environ.keys(),
             sanity=config.execution.sanity,
+            preparation=config.execution.preparation,
         )
     except BaseException as error:
         _finish_execution_preflight(progress, cancel=cancel, error=error)
@@ -1686,7 +1687,12 @@ def _invoke_host_execution(
         trust_requirement=execution_trust,
     )
     git = SafeGit(paths.root, cancel=cancel)
-    environment = HostEnvironmentManager(paths.root, cancel=cancel, git=git)
+    environment = HostEnvironmentManager(
+        paths.root,
+        cancel=cancel,
+        git=git,
+        preparation=config.execution.preparation,
+    )
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,

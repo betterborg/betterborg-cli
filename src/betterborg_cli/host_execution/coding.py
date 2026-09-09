@@ -161,6 +161,7 @@ class HostCodingPhase:
         context: ScheduledTaskContext,
         *,
         environment: Mapping[str, str] | None = None,
+        preparation_note: str | None = None,
     ) -> TaskRuntimeStatus:
         """Invoke coding once, persist its outcome, and require a new commit."""
         try:
@@ -195,7 +196,9 @@ class HostCodingPhase:
             artifacts = AgentAttemptArtifacts(
                 self.repository_root, attempt_dir, worktree, "coding"
             )
-            user_prompt = _render_user_prompt(inputs)
+            user_prompt = _render_user_prompt(
+                inputs, preparation_note=preparation_note
+            )
             artifacts.write_text("system-prompt.md", inputs.system_prompt)
             artifacts.write_text("user-prompt.md", user_prompt)
             artifacts.write_text(
@@ -481,7 +484,9 @@ class HostCodingPhase:
         return TaskRuntimeStatus.BLOCKED
 
 
-def _render_user_prompt(inputs: VerifiedTaskInputs) -> str:
+def _render_user_prompt(
+    inputs: VerifiedTaskInputs, *, preparation_note: str | None = None
+) -> str:
     sections = [
         "Implement the assigned task in the current worktree. Commit all required "
         "changes before returning completed.",
@@ -490,11 +495,32 @@ def _render_user_prompt(inputs: VerifiedTaskInputs) -> str:
         "",
         f"Task file: {inputs.task_path.as_posix()}",
         f"Task digest: {inputs.task.digest}",
-        "",
-        "## Assigned task",
-        "",
-        inputs.task_markdown.rstrip(),
     ]
+    if preparation_note is not None:
+        # Told rather than discovered: an agent that learns this from the
+        # first command it runs spends a turn on it, and one that never
+        # learns it reports a broken repository instead of a bare checkout.
+        sections.extend(
+            [
+                "",
+                "## This checkout is not installed",
+                "",
+                f"{preparation_note}. Dependencies, virtual environments and "
+                "generated files the repository's tooling expects may be "
+                "absent, so a command that fails for want of them is telling "
+                "you about this checkout and not about your change. Do not "
+                "try to install them. Say in your summary which checks you "
+                "could not run.",
+            ]
+        )
+    sections.extend(
+        [
+            "",
+            "## Assigned task",
+            "",
+            inputs.task_markdown.rstrip(),
+        ]
+    )
     if inputs.dependencies:
         sections.extend(["", "## Dependency tasks"])
         for task, path, markdown in inputs.dependencies:

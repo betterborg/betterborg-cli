@@ -1432,3 +1432,43 @@ def test_a_committed_partial_fix_returns_to_review(tmp_path: Path) -> None:
         "fix",
         "review",
     ]
+
+
+def test_coding_is_told_when_its_checkout_was_never_installed(
+    tmp_path: Path,
+) -> None:
+    """An agent that is not told spends a turn finding out, or misreports.
+
+    A command failing for want of a dependency is a fact about the checkout
+    and not about the change, and only the run knows which it is.
+    """
+    fixture = _coding_fixture(tmp_path)
+    adapter = MockAdapter().queue(_committing_response(fixture.task))
+    note = "preparation did not complete: environment command failed"
+
+    with SqliteStore.open(fixture.database) as store:
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store), preparation_note=note)
+
+    assert status is TaskRuntimeStatus.REVIEW
+    prompt = adapter.calls[0].user_prompt
+    assert "This checkout is not installed" in prompt
+    assert note in prompt
+    assert "Do not try to install them" in prompt
+
+
+def test_a_prepared_checkout_says_nothing_about_itself(tmp_path: Path) -> None:
+    fixture = _coding_fixture(tmp_path)
+    adapter = MockAdapter().queue(_committing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+
+    assert "This checkout is not installed" not in adapter.calls[0].user_prompt

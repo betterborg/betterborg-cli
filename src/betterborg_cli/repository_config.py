@@ -52,6 +52,22 @@ class AgentStage(StrEnum):
     MERGE = "merge"
 
 
+class PreparationMode(StrEnum):
+    """What a run does about the commands that install a repository.
+
+    ``required`` is the contract every run had before there was a choice: the
+    programs preparation names must exist, the commands must succeed, and they
+    must leave the checkout as they found it. ``optional`` runs them and
+    survives all three, because a repository whose install is broken or
+    undeclared still has work an agent can do. ``skipped`` does not run them,
+    for a caller whose environment is already whatever the run needs.
+    """
+
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    SKIPPED = "skipped"
+
+
 @dataclass(frozen=True)
 class AgentChoice:
     """Optional adapter selection for one agent stage."""
@@ -103,6 +119,7 @@ class ExecutionLimits:
     #: the run, so a repository turns this off only when something outside
     #: Betterborg judges the result.
     sanity: bool = True
+    preparation: PreparationMode = PreparationMode.REQUIRED
 
 
 @dataclass(frozen=True)
@@ -265,7 +282,9 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
 
     execution_document = _optional_table(document, "execution")
     _require_only_keys(
-        execution_document, {"jobs", "review_passes", "sanity"}, section="execution"
+        execution_document,
+        {"jobs", "review_passes", "sanity", "preparation"},
+        section="execution",
     )
     jobs = _optional_int(execution_document, "jobs", default=1, section="execution")
     review_passes = _optional_int(
@@ -275,6 +294,13 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         raise RepositoryConfigError("execution.jobs must be in 1..10")
     sanity = _optional_bool(
         execution_document, "sanity", default=True, section="execution"
+    )
+    preparation = _optional_choice(
+        execution_document,
+        "preparation",
+        default=PreparationMode.REQUIRED,
+        section="execution",
+        choices=PreparationMode,
     )
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
@@ -304,7 +330,10 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         default_branch=default_branch,
         agents=AgentChoices(**agent_choices),
         execution=ExecutionLimits(
-            jobs=jobs, review_passes=review_passes, sanity=sanity
+            jobs=jobs,
+            review_passes=review_passes,
+            sanity=sanity,
+            preparation=preparation,
         ),
         planning=PlanningLimits(
             review_rounds=review_rounds,
@@ -398,6 +427,24 @@ def _optional_bool(
     if not isinstance(value, bool):
         raise RepositoryConfigError(f"{section}.{key} must be true or false")
     return value
+
+
+def _optional_choice(
+    document: Mapping[str, Any],
+    key: str,
+    *,
+    default: StrEnum,
+    section: str,
+    choices: type[StrEnum],
+) -> Any:
+    value = document.get(key, default)
+    try:
+        return choices(value)
+    except ValueError:
+        permitted = ", ".join(member.value for member in choices)
+        raise RepositoryConfigError(
+            f"{section}.{key} must be one of: {permitted}"
+        ) from None
 
 
 def _require_nonempty_string(

@@ -325,6 +325,29 @@ good — a grader, a CI pipeline, a person reading the branch — and leave it o
 otherwise. A task published this way says so in its outcome, so a result never
 reads as having passed checks that never ran.
 
+`preparation` says what a run does about the commands that install the
+repository. `required`, the default, is the contract every run had before there
+was a choice: the programs those commands name must exist, the commands must
+succeed, and they must leave the checkout as they found it. `optional` runs
+them and survives a missing program and a failing command, so a repository
+whose install is broken or undeclared still gets the work an agent can do
+without it. `skipped` does not run them at all:
+
+```toml
+[execution]
+preparation = "optional"
+```
+
+Neither relaxed mode will keep what a failed preparation wrote into the
+checkout. Those writes are not the task's work and would be delivered as
+though they were, and undoing them needs the destructive Git that Betterborg
+withholds from every worktree it manages, so a preparation command that
+changes tracked files still ends the task under all three settings.
+
+A task whose checkout was not prepared is told so, in the same words its
+outcome records, because a command that fails for want of a dependency is a
+fact about the checkout rather than about the change.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

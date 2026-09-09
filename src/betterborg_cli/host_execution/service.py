@@ -232,6 +232,7 @@ class HostTaskRuntime:
                         **task_environment,
                         **self._agent_secrets(),
                     },
+                    preparation_note=materialization.preparation_note,
                 )
             if context.cancel.is_set():
                 return self._durable_status(context)

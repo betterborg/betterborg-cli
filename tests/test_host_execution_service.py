@@ -219,7 +219,9 @@ class _Environment:
         else:
             transition(TaskRuntimeStatus.CLAIMED, TaskRuntimeStatus.ENVIRONMENT)
             transition(TaskRuntimeStatus.ENVIRONMENT, TaskRuntimeStatus.CODING)
-        return SimpleNamespace(environment={"CACHE": "prepared"})
+        return SimpleNamespace(
+            environment={"CACHE": "prepared"}, preparation_note=None
+        )
 
 
 class _Coding:
@@ -236,8 +238,12 @@ class _Coding:
         context,
         *,
         environment=None,
+        preparation_note=None,
     ) -> TaskRuntimeStatus:
         assert environment == self.expected_environment
+        # A prepared checkout has nothing to say about itself, and the note is
+        # what the agent is told when it is not prepared.
+        assert preparation_note is None
         self.calls.append("coding")
         context.transition(TaskRuntimeStatus.CODING, TaskRuntimeStatus.REVIEW)
         return TaskRuntimeStatus.REVIEW
@@ -981,7 +987,9 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             )
 
     class ActivityCoding(_Coding):
-        def run(self, context, *, environment=None) -> TaskRuntimeStatus:
+        def run(
+            self, context, *, environment=None, preparation_note=None
+        ) -> TaskRuntimeStatus:
             for agent_label in ("coding", "review", "fix", "merge"):
                 activity_sink = context.activity_sink(agent_label)
                 assert activity_sink is not None
@@ -1154,7 +1162,9 @@ def test_service_settles_durable_task_before_render_failure_escapes(
     observed: list[AgentActivity] = []
 
     class BlockingActivityCoding(_Coding):
-        def run(self, context, *, environment=None) -> TaskRuntimeStatus:
+        def run(
+            self, context, *, environment=None, preparation_note=None
+        ) -> TaskRuntimeStatus:
             started.set()
             assert release.wait(timeout=2)
             activity = context.activity_sink("coding")
@@ -1256,7 +1266,9 @@ def test_cancellation_during_materialization_does_not_start_coding(
                 expected_status=TaskRuntimeStatus.CLAIMED,
                 new_status=TaskRuntimeStatus.CODING,
             )
-            return SimpleNamespace(environment={"CACHE": "prepared"})
+            return SimpleNamespace(
+                environment={"CACHE": "prepared"}, preparation_note=None
+            )
 
     runtime = HostTaskRuntime(
         plan,

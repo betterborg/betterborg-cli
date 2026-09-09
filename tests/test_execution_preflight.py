@@ -26,6 +26,7 @@ from betterborg_cli.host_execution import (
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
 from betterborg_cli.progress import AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
+from betterborg_cli.repository_config import PreparationMode
 from betterborg_cli.store import (
     Borg,
     ExecutionAttemptStatus,
@@ -60,7 +61,9 @@ class ExecutionPreflightFixture:
         assert claim is not None
         return claim
 
-    def manager(self) -> HostEnvironmentManager:
+    def manager(
+        self, preparation: PreparationMode = PreparationMode.REQUIRED
+    ) -> HostEnvironmentManager:
         def runner(argv, **kwargs):  # noqa: ANN001, ANN003
             self.commands.append(list(argv))
             return run_captured(argv, **kwargs)
@@ -69,6 +72,7 @@ class ExecutionPreflightFixture:
             self.repository,
             environment={"PATH": os.environ["PATH"]},
             command_runner=runner,
+            preparation=preparation,
         )
 
 
@@ -1165,3 +1169,106 @@ def _git(repository: Path, *arguments: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def test_skipped_preparation_runs_nothing_and_says_so(
+    execution_preflight_fixture,
+) -> None:
+    """A caller whose environment is already right runs no command at all.
+
+    The checkout then holds exactly what its commit tracks, which is a fact
+    the agent working in it has to be told rather than discover.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(fixture.repository)
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        materialization = fixture.manager(
+            PreparationMode.SKIPPED
+        ).materialize_claimed_task(store, plan, claim, fixture.owner_token)
+        runtime = store.get_task_runtime(fixture.task_ids[0])
+
+    assert fixture.commands == []
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+    assert materialization.preparation_note is not None
+    assert "skipped by configuration" in materialization.preparation_note
+
+
+def test_optional_preparation_survives_a_command_that_fails(
+    execution_preflight_fixture,
+) -> None:
+    """A repository whose install is broken still has work an agent can do.
+
+    Required preparation ends the task here, which is right when the run
+    depends on it. Optional preparation reports the failure and lets the task
+    proceed against the checkout as it stands.
+    """
+    fixture = execution_preflight_fixture()
+    plan = _plan(
+        fixture.repository, prepare_action=None, materialize_action="fail-dirty"
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        materialization = fixture.manager(
+            PreparationMode.OPTIONAL
+        ).materialize_claimed_task(store, plan, claim, fixture.owner_token)
+        runtime = store.get_task_runtime(fixture.task_ids[0])
+
+    assert fixture.commands == [["./fake-package-manager", "fail-dirty"]]
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
+    assert materialization.preparation_note is not None
+    assert "preparation did not complete" in materialization.preparation_note
+    assert "exit code 7" in materialization.preparation_note
+
+
+def test_optional_preparation_still_refuses_what_it_cannot_clean_up(
+    execution_preflight_fixture,
+) -> None:
+    """Surviving a failure is not the same as keeping its writes.
+
+    Anything preparation leaves in the checkout is graded as the task's own
+    work, which is why a dirtied checkout is refused at all. Undoing those
+    writes would need the destructive Git the worktree guard withholds, so
+    optional preparation survives exactly the failures that leave the
+    checkout alone and blocks on the one that does not.
+    """
+    fixture = execution_preflight_fixture()
+    worktree = fixture.worktree_paths[0]
+    plan = _plan(
+        fixture.repository, prepare_action=None, materialize_action="tracked"
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with pytest.raises(
+            EnvironmentMaterializationError, match="unexpected tracked changes"
+        ):
+            fixture.manager(
+                PreparationMode.OPTIONAL
+            ).materialize_claimed_task(store, plan, claim, fixture.owner_token)
+        runtime = store.get_task_runtime(fixture.task_ids[0])
+
+    assert (worktree / "README.md").read_text() == "changed\n"
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+
+
+def test_required_preparation_still_ends_a_task_on_a_failure(
+    execution_preflight_fixture,
+) -> None:
+    """The default is unchanged, and the other two modes are departures."""
+    fixture = execution_preflight_fixture()
+    plan = _plan(
+        fixture.repository, prepare_action=None, materialize_action="fail-dirty"
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        claim = fixture.claim(store)
+        with pytest.raises(EnvironmentMaterializationError, match="exit code 7"):
+            fixture.manager().materialize_claimed_task(
+                store, plan, claim, fixture.owner_token
+            )
+        runtime = store.get_task_runtime(fixture.task_ids[0])
+
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED

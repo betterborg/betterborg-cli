@@ -26,6 +26,7 @@ from betterborg_cli.host_execution.preflight import (
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import PreparationMode
 from betterborg_cli.store import (
     EnvironmentAttempt,
     ExecutionAttemptStatus,
@@ -50,6 +51,10 @@ class EnvironmentMaterialization:
     preparation_key: str
     materialization_reused: bool
     environment: Mapping[str, str] = field(repr=False, hash=False)
+    #: Why the checkout is not prepared, when it is not. A task that ran
+    #: without its toolchain must not read like one that ran with it, so this
+    #: reaches the task's outcome and the agent working in the checkout.
+    preparation_note: str | None = None
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -114,8 +119,10 @@ class HostEnvironmentManager:
         clock: Clock = utcnow,
         cancel: CancellationToken | None = None,
         git: SafeGit | None = None,
+        preparation: PreparationMode = PreparationMode.REQUIRED,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
+        self.preparation = PreparationMode(preparation)
         self._paths = RepoPaths.discover(self.repository_root, cancel=cancel)
         if self._paths.root != self.repository_root:
             raise EnvironmentMaterializationError(
@@ -205,17 +212,40 @@ class HostEnvironmentManager:
             command_environments = self._command_environments(
                 plan, base_environment, secret_values or {}
             )
-            materialization_reused = self._materialize_worktree(
-                store,
-                plan,
-                claim,
-                owner_token,
-                preparation_key=preparation_key,
-                worktree=worktree,
-                command_environments=command_environments,
-                force_preparation=force_preparation,
-                activity=activity,
-            )
+            materialization_reused = False
+            preparation_note: str | None = None
+            if self.preparation is PreparationMode.SKIPPED:
+                preparation_note = (
+                    "preparation is skipped by configuration; the checkout "
+                    "holds only what its commit tracks"
+                )
+            else:
+                try:
+                    materialization_reused = self._materialize_worktree(
+                        store,
+                        plan,
+                        claim,
+                        owner_token,
+                        preparation_key=preparation_key,
+                        worktree=worktree,
+                        command_environments=command_environments,
+                        force_preparation=force_preparation,
+                        activity=activity,
+                    )
+                except EnvironmentMaterializationError as error:
+                    if self.preparation is PreparationMode.REQUIRED:
+                        raise
+                    # Optional preparation survives a command that fails and
+                    # leaves the checkout as it found it. It cannot survive
+                    # one that wrote into the checkout: those writes are not
+                    # the task's work and would be graded as if they were,
+                    # and discarding them needs the destructive Git the
+                    # worktree guard deliberately withholds. So this refuses
+                    # exactly what it cannot clean up, and says which it was.
+                    self._assert_no_tracked_changes(
+                        worktree, "after preparation failed"
+                    )
+                    preparation_note = f"preparation did not complete: {error}"
         except BaseException as error:
             self._raise_if_cancelled(error)
             self._block_environment_task(
@@ -241,6 +271,7 @@ class HostEnvironmentManager:
             preparation_key=preparation_key,
             materialization_reused=materialization_reused,
             environment=MappingProxyType(dict(base_environment)),
+            preparation_note=preparation_note,
         )
 
     def _materialize_worktree(

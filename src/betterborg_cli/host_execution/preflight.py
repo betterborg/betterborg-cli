@@ -15,6 +15,7 @@ from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import PreparationMode
 from betterborg_cli.workspace_trust import (
     TrustStore,
     UntrustedWorkspaceError,
@@ -180,6 +181,7 @@ class HostPreflight:
         *,
         available_secret_names: Collection[str] = (),
         sanity: bool = True,
+        preparation: PreparationMode = PreparationMode.REQUIRED,
     ) -> HostPreflightResult:
         """Return a complete plan or every actionable reason it is blocked.
 
@@ -187,6 +189,11 @@ class HostPreflight:
         repository's own checks. It is the premise of the catalogue refusal
         below, and a run that will not gate on checks must not be refused for
         holding none.
+
+        ``preparation`` states the same thing about the commands that install
+        the repository. Their programs are required because a preparation
+        failure ends a task; where it no longer does, a missing program is a
+        dropped command like any other rather than a refusal.
         """
         self._report_command(
             [
@@ -233,9 +240,13 @@ class HostPreflight:
         ) = self._commands(plan, failures)
         unresolved = self._unrunnable_programs(
             commands,
-            selected_preparation_commands(
-                prepare_commands=prepare_commands,
-                materialize_commands=materialize_commands,
+            (
+                selected_preparation_commands(
+                    prepare_commands=prepare_commands,
+                    materialize_commands=materialize_commands,
+                )
+                if preparation is PreparationMode.REQUIRED
+                else ()
             ),
             failures,
         )
