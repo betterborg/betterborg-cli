@@ -13,6 +13,7 @@ benchmarks/runs/
 
 # Planning and design documents are working notes, not project documentation.
 plans/
+benchmarks/INTERNAL_NOTES.md
 
 # >>> Betterborg managed ignores >>>
 .betterborg/state/
