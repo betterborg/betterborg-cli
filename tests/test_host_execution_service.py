@@ -35,7 +35,6 @@ from betterborg_cli.host_execution import (
     HostCodingPhase,
     HostCommand,
     HostEnvironmentManager,
-    HostExecutable,
     HostExecutionService,
     HostMergeConfig,
     HostMergePhase,
@@ -313,8 +312,6 @@ def _plan(tmp_path: Path) -> HostPreflightPlan:
         commands=(),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(),
-        executables=(),
         required_secret_names=(),
     )
 
@@ -666,8 +663,6 @@ def _concrete_host_fixture(
                 HostCommand("prepare", ("git", "status", "--short"), "."),
             ),
             materialize_commands=(),
-            environment_files=(repository_root / "README.md",),
-            executables=(HostExecutable("git", Path("/validated/git")),),
             required_secret_names=(),
         )
     )

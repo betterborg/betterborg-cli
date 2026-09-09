@@ -134,8 +134,6 @@ def _execution_result(
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
             required_secret_names=required_secret_names,
             dropped_commands=dropped_commands,
         ),
@@ -802,8 +800,6 @@ preflight = HostPreflightPlan(
     commands=(),
     prepare_commands=(),
     materialize_commands=(),
-    environment_files=(),
-    executables=(),
     required_secret_names=(),
 )
 cli_module.RunProgress = FastProgress
@@ -1486,8 +1482,6 @@ preflight = HostPreflightPlan(
     commands=(),
     prepare_commands=(),
     materialize_commands=(),
-    environment_files=(),
-    executables=(),
     required_secret_names=(),
 )
 cli_module.RunProgress = FastProgress

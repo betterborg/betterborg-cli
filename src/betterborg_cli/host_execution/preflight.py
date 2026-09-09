@@ -64,15 +64,6 @@ class HostDroppedCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class HostExecutable:
-    """One resolved host executable and the version the analyzer declared."""
-
-    name: str
-    path: Path
-    version: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class HostSecret:
     """One analyzer-declared secret and its permitted execution scope."""
 
@@ -90,10 +81,7 @@ class HostPreflightPlan:
     commands: tuple[HostCommand, ...]
     prepare_commands: tuple[HostCommand, ...]
     materialize_commands: tuple[HostCommand, ...]
-    environment_files: tuple[Path, ...]
-    executables: tuple[HostExecutable, ...]
     required_secret_names: tuple[str, ...]
-    package_managers: tuple[str, ...] = ()
     secret_requirements: tuple[HostSecret, ...] = ()
     dropped_commands: tuple[HostDroppedCommand, ...] = ()
 
@@ -127,8 +115,8 @@ def selected_preparation_commands(
 
     Two lists are declared and exactly one runs. Everything that needs that
     answer asks here, so no site restates the rule: the materialization that
-    executes the commands, and the key that decides whether a worktree has
-    already run them.
+    executes the commands, the key that decides whether a worktree has already
+    run them, and the check of which programs this host must be able to run.
     """
     return tuple(materialize_commands or prepare_commands)
 
@@ -236,11 +224,12 @@ class HostPreflight:
             materialize_commands,
             catalog_records,
         ) = self._commands(plan, failures)
-        environment_files = self._environment_files(plan)
-        executables, unresolved = self._executables(
-            plan,
+        unresolved = self._unrunnable_programs(
             commands,
-            (*prepare_commands, *materialize_commands),
+            selected_preparation_commands(
+                prepare_commands=prepare_commands,
+                materialize_commands=materialize_commands,
+            ),
             failures,
         )
         dropped_commands: list[HostDroppedCommand] = []
@@ -353,12 +342,9 @@ class HostPreflight:
                 commands=tuple(commands),
                 prepare_commands=tuple(prepare_commands),
                 materialize_commands=tuple(materialize_commands),
-                environment_files=tuple(environment_files),
-                executables=tuple(executables),
                 required_secret_names=tuple(
                     secret.name for secret in secret_requirements
                 ),
-                package_managers=tuple(_package_managers(plan)),
                 secret_requirements=tuple(secret_requirements),
                 dropped_commands=tuple(dropped_commands),
             )
@@ -497,98 +483,38 @@ class HostPreflight:
             check_records.append(record)
         return (checks, prepare_commands, materialize_commands, check_records)
 
-    def _environment_files(self, plan: Mapping[str, Any]) -> list[Path]:
-        """Record the declared evidence files; the run reads none of them."""
-        environment = plan.get("environment")
-        if not isinstance(environment, Mapping):
-            return []
-        paths: list[Path] = []
-        for value in environment.get("files") or ():
-            resolved = self._repository_path(value)
-            if resolved is not None:
-                paths.append(resolved)
-        return _unique_paths(paths)
-
-    def _executables(
+    def _unrunnable_programs(
         self,
-        plan: Mapping[str, Any],
         catalog_commands: Sequence[HostCommand],
-        environment_commands: Sequence[HostCommand],
+        preparation_commands: Sequence[HostCommand],
         failures: list[HostPreflightFailure],
-    ) -> tuple[list[HostExecutable], set[tuple[str, str]]]:
-        requested: dict[tuple[str, str], tuple[str | None, list[str]]] = {}
+    ) -> set[tuple[str, str]]:
+        """Name the programs this host cannot run, refusing the required ones."""
+        requested: dict[tuple[str, str], list[str]] = {}
         required: set[tuple[str, str]] = set()
 
-        def add_request(
-            name: str,
-            cwd: str,
-            version: str | None,
-            evidence: str,
-            *,
-            blocking: bool,
-        ) -> None:
-            current_version, evidence_values = requested.get(
-                (name, cwd), (None, [])
-            )
-            requested[(name, cwd)] = (
-                version if version is not None else current_version,
-                _unique_strings((*evidence_values, evidence)),
-            )
-            if blocking:
-                required.add((name, cwd))
-
-        # Environment commands build the run itself, so a program one of them
-        # invokes has to be here.  A catalog command is a check, and a check
-        # this host cannot invoke is dropped from the run rather than being
-        # allowed to refuse it.
+        # A preparation command builds the run itself, so a program it invokes
+        # has to be here.  A catalog command is a check, and a check this host
+        # cannot invoke is dropped from the run rather than being allowed to
+        # refuse it.
         for command, blocking in (
             *((command, False) for command in catalog_commands),
-            *((command, True) for command in environment_commands),
+            *((command, True) for command in preparation_commands),
         ):
-            name, cwd = _command_executable_key(command)
-            add_request(name, cwd, None, command.evidence, blocking=blocking)
+            key = _command_executable_key(command)
+            requested[key] = _unique_strings(
+                (*requested.get(key, ()), command.evidence)
+            )
+            if blocking:
+                required.add(key)
 
-        # The toolchain and package-manager inventory is prose written for a
-        # person: "Go modules" and "Node.js" name no program.  It is resolved
-        # when the name happens to be one, but it requires nothing on its own
-        # and adds no coverage, since every command already requires what it
-        # invokes.
-        environment = plan.get("environment")
-        if isinstance(environment, Mapping):
-            for manager in environment.get("package_managers") or ():
-                add_request(
-                    str(manager),
-                    ".",
-                    None,
-                    _evidence(environment, "environment"),
-                    blocking=False,
-                )
-            for toolchain in _mappings(environment.get("toolchains")):
-                name = toolchain.get("name")
-                if isinstance(name, str) and name:
-                    add_request(
-                        _toolchain_executable_name(name),
-                        ".",
-                        toolchain.get("version")
-                        if isinstance(toolchain.get("version"), str)
-                        else None,
-                        _evidence(
-                            toolchain, _evidence(environment, "analyzer toolchain")
-                        ),
-                        blocking=False,
-                    )
-
-        resolved_tools: list[HostExecutable] = []
         unresolved: set[tuple[str, str]] = set()
-        for (name, cwd), (version, evidence_values) in requested.items():
-            path = self._resolve_executable(name, cwd=cwd)
-            if path is not None:
-                resolved_tools.append(
-                    HostExecutable(name=name, path=path, version=version)
-                )
+        for key, evidence_values in requested.items():
+            name, cwd = key
+            if self._can_run(name, cwd=cwd):
                 continue
-            unresolved.add((name, cwd))
-            if (name, cwd) not in required:
+            unresolved.add(key)
+            if key not in required:
                 continue
             failures.append(
                 HostPreflightFailure(
@@ -596,13 +522,13 @@ class HostPreflight:
                     evidence=_join_evidence(evidence_values),
                     guidance=(
                         f"Install {name!r} on the host or update the analyzer "
-                        "command/toolchain evidence; Betterborg will not install "
+                        "command evidence; Betterborg will not install "
                         "runtimes during preflight."
                     ),
                 )
             )
 
-        return resolved_tools, unresolved
+        return unresolved
 
     def _required_secrets(
         self,
@@ -770,7 +696,7 @@ class HostPreflight:
         return sorted(validated, key=lambda secret: secret.name)
 
     def _repository_path(
-        self, value: object, *, require_directory: bool = False
+        self, value: object, *, require_directory: bool
     ) -> Path | None:
         if not isinstance(value, str) or not value:
             return None
@@ -784,19 +710,21 @@ class HostPreflight:
             return None
         return resolved
 
-    def _resolve_executable(self, name: str, *, cwd: str = ".") -> Path | None:
+    def _can_run(self, name: str, *, cwd: str = ".") -> bool:
+        """Answer whether this host can invoke one command's program.
+
+        Nothing records where the program was found, so nothing resolves it
+        beyond the question a refusal is made of.
+        """
         if "/" in name or "\\" in name:
             candidate = self.repository_root / PurePosixPath(cwd) / PurePosixPath(name)
             resolved = candidate.resolve()
-            if (
+            return (
                 resolved.is_relative_to(self.repository_root)
                 and resolved.is_file()
                 and os.access(resolved, os.X_OK)
-            ):
-                return Path(os.path.abspath(candidate))
-            return None
-        found = self._find_executable(name, self._environment.get("PATH"))
-        return Path(os.path.abspath(found)) if found else None
+            )
+        return self._find_executable(name, self._environment.get("PATH")) is not None
 
     def _report_command(self, command: Sequence[str]) -> None:
         """Publish the current secret-free probe without affecting validation."""
@@ -820,10 +748,6 @@ class HostPreflight:
 
 def _which(name: str, path: str | None) -> str | None:
     return shutil.which(name, path=path)
-
-
-def _toolchain_executable_name(name: str) -> str:
-    return {"rust": "rustc"}.get(name, name)
 
 
 def _command_executable_key(command: HostCommand) -> tuple[str, str]:
@@ -884,18 +808,6 @@ def _secret_disagreements(
     return tuple(disagreements)
 
 
-def _package_managers(plan: Mapping[str, Any]) -> list[str]:
-    environment = plan.get("environment")
-    if not isinstance(environment, Mapping):
-        return []
-    values = environment.get("package_managers")
-    if not isinstance(values, Sequence) or isinstance(values, str | bytes):
-        return []
-    return _unique_strings(
-        [value for value in values if isinstance(value, str) and value]
-    )
-
-
 def _mappings(value: object) -> list[Mapping[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, str | bytes):
         return []
@@ -914,10 +826,6 @@ def _string_sequence(value: object) -> bool:
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:
     source = record.get("source")
     return source if isinstance(source, str) and source else fallback
-
-
-def _unique_paths(paths: Sequence[Path]) -> list[Path]:
-    return list(dict.fromkeys(paths))
 
 
 def _unique_strings(values: Sequence[str]) -> list[str]:

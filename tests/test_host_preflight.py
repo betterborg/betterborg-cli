@@ -15,7 +15,6 @@ import pytest
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
 from betterborg_cli.host_execution import (
     HostCommand,
-    HostExecutable,
     HostExecutionService,
     HostPreflight,
     HostPreflightBlock,
@@ -405,14 +404,14 @@ def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
     assert "betterborg trust --yes" in result.reason
 
 
-def test_declared_services_and_compose_files_leave_the_plan(
+def test_declared_inventory_and_services_leave_the_plan(
     committed_git_repo: Path,
 ) -> None:
-    """The analysis still names services; the validated plan no longer does.
+    """The analysis still names all of it; the validated plan names none of it.
 
-    Nothing on this host can run Docker, and the analysis selects a Compose
-    service and an external one. Both used to refuse the run before a task
-    was claimed.
+    Declared files, package managers, toolchains and services are evidence a
+    person reads. Nothing on this host can run Docker, the declared package
+    manager or the second toolchain, and the run is accepted anyway.
     """
     binary_dir = committed_git_repo.parent / "host-bin"
     binary_dir.mkdir()
@@ -423,22 +422,25 @@ def test_declared_services_and_compose_files_leave_the_plan(
         "services:\n  postgres:\n    image: postgres:16\n",
         encoding="utf-8",
     )
+    plan = _base_plan()
+    plan["environment"]["package_managers"] = ["absent-manager"]
+    plan["environment"]["toolchains"].append({"name": "absent-toolchain"})
 
     result = _preflight(
         committed_git_repo,
         environment={"PATH": str(binary_dir)},
     ).validate(
-        lambda: _base_plan(),
+        lambda: plan,
         available_secret_names={"PACKAGE_TOKEN"},
     )
 
     assert isinstance(result, HostPreflightPlan)
     assert result.commands[0].cwd == "package"
-    assert result.environment_files == (committed_git_repo / "runtime.version",)
-    assert {tool.name for tool in result.executables} == {"example-runtime"}
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
-    assert result.package_managers == ()
     assert [secret.scope for secret in result.secret_requirements] == ["build"]
+    assert not hasattr(result, "environment_files")
+    assert not hasattr(result, "package_managers")
+    assert not hasattr(result, "executables")
     assert not hasattr(result, "services")
     assert not hasattr(result, "compose_files")
     assert not hasattr(result, "compose_profiles")
@@ -552,7 +554,7 @@ def test_a_toolchain_version_the_host_does_not_satisfy_runs_anyway(
     """
     binary_dir = committed_git_repo.parent / "version-bin"
     binary_dir.mkdir()
-    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.12.1'")
+    _executable(binary_dir, "example-runtime", "echo 'example 3.12.1'")
     cited = committed_git_repo / "runtime.version"
     cited.write_text("3.11.9\n", encoding="utf-8")
     plan = _base_plan()
@@ -566,134 +568,9 @@ def test_a_toolchain_version_the_host_does_not_satisfy_runs_anyway(
     ).validate(plan)
 
     assert isinstance(result, HostPreflightPlan)
-    assert result.environment_files == (cited,)
     assert [command.argv for command in result.commands] == [
         ("example-runtime", "-m", "pytest")
     ]
-    assert result.executables == (
-        HostExecutable("example-runtime", runtime, "3.11.9"),
-    )
-
-
-def test_version_probe_preserves_shim_dispatch_path(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "shim-bin"
-    binary_dir.mkdir()
-    dispatcher = _executable(
-        binary_dir,
-        "runtime-manager",
-        (
-            "test \"${0##*/} $1\" = 'python3 --version' "
-            "&& echo 'Python 3.13.7'"
-        ),
-    )
-    shim = binary_dir / "python3"
-    shim.symlink_to(dispatcher.name)
-    (committed_git_repo / ".python-version").write_text(
-        "3.13.7\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "test", "argv": ["python3", "-m", "pytest"], "verifies": True}
-            ],
-        },
-        "environment": {
-            "files": [".python-version"],
-            "toolchains": [
-                {
-                    "name": "python3",
-                    "version": "3.13.7",
-                    "source": ".python-version",
-                }
-            ],
-        },
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].path == shim
-    assert result.executables[0].path.is_symlink()
-
-
-@pytest.mark.parametrize(
-    "optional_version",
-    [{}, {"version": None}],
-    ids=["omitted", "null"],
-)
-def test_unpinned_toolchain_only_requires_available_executable(
-    committed_git_repo: Path,
-    optional_version: dict[str, None],
-) -> None:
-    binary_dir = committed_git_repo.parent / f"{committed_git_repo.name}-unpinned-bin"
-    binary_dir.mkdir()
-    executable = _executable(binary_dir, "python", "exit 7")
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "test", "argv": ["python", "-m", "pytest"], "verifies": True}
-            ],
-        },
-        "environment": {
-            "toolchains": [{"name": "python", **optional_version}],
-        },
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].name == "python"
-    assert result.executables[0].path == executable
-    assert result.executables[0].version is None
-
-
-def test_rust_toolchain_resolves_and_probes_rustc(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "rust-bin"
-    binary_dir.mkdir()
-    rustc = _executable(
-        binary_dir,
-        "rustc",
-        "test \"$1\" = --version && echo 'rustc 1.88.0 (example)'",
-    )
-    (committed_git_repo / "rust-toolchain.toml").write_text(
-        '[toolchain]\nchannel = "1.88.0"\n', encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "test", "argv": ["rustc", "--version"], "verifies": True}
-            ],
-        },
-        "environment": {
-            "toolchains": [
-                {
-                    "name": "rust",
-                    "version": "1.88.0",
-                    "source": "rust-toolchain.toml",
-                }
-            ],
-        },
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].name == "rustc"
-    assert result.executables[0].path == rustc
-    assert result.executables[0].version == "1.88.0"
 
 
 def test_a_toolchain_citing_a_file_that_is_not_there_runs_anyway(
@@ -702,7 +579,7 @@ def test_a_toolchain_citing_a_file_that_is_not_there_runs_anyway(
     """A cited version source is evidence a person reads, not a requirement."""
     binary_dir = committed_git_repo.parent / "cited-version-bin"
     binary_dir.mkdir()
-    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     plan = {
         "command_catalog": {
@@ -735,9 +612,6 @@ def test_a_toolchain_citing_a_file_that_is_not_there_runs_anyway(
     assert [command.argv for command in result.commands] == [
         ("example-runtime", "-m", "pytest")
     ]
-    assert result.executables == (
-        HostExecutable("example-runtime", runtime, "3.11.9"),
-    )
 
 
 def test_command_derived_failures_retain_exact_source_evidence(
@@ -783,7 +657,7 @@ def test_person_readable_toolchain_inventory_does_not_block_a_run(
 ) -> None:
     binary_dir = committed_git_repo.parent / "inventory-bin"
     binary_dir.mkdir()
-    runtime = _executable(binary_dir, "example-runtime", "exit 0")
+    _executable(binary_dir, "example-runtime", "exit 0")
     plan = {
         "command_catalog": {
             "commands": [{"stage": "test", "argv": ["example-runtime"]}]
@@ -800,9 +674,6 @@ def test_person_readable_toolchain_inventory_does_not_block_a_run(
 
     assert isinstance(result, HostPreflightPlan)
     assert result.dropped_commands == ()
-    assert result.executables == (
-        HostExecutable("example-runtime", runtime, None),
-    )
     assert [command.argv for command in result.commands] == [("example-runtime",)]
 
 
@@ -856,6 +727,122 @@ def test_environment_command_program_is_still_required(
 
     assert isinstance(result, HostPreflightBlock)
     assert "host executable is required: missing-runtime" in result.reason
+
+
+def test_the_preparation_command_that_runs_must_be_runnable(
+    committed_git_repo: Path,
+) -> None:
+    """Both lists are declared, so the materialize list prepares the worktree.
+
+    A host that cannot run its program fails every task individually instead
+    of refusing the run once, so the refusal belongs here and names it.
+    """
+    binary_dir = committed_git_repo.parent / "selected-preparation-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "prepare-environment", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "prepare_commands": [{"argv": ["prepare-environment"]}],
+            "materialize_commands": [{"argv": ["absent-materializer", "sync"]}],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert [failure.requirement for failure in result.failures] == [
+        "host executable is required: absent-materializer"
+    ]
+
+
+def test_the_preparation_command_that_will_not_run_needs_no_program(
+    committed_git_repo: Path,
+) -> None:
+    """A program nothing will invoke is not a program this host needs.
+
+    The materialize list prepares the worktree, so the prepare list never
+    runs and its program is neither required nor dropped.
+    """
+    binary_dir = committed_git_repo.parent / "unselected-preparation-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "materialize-environment", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "prepare_commands": [{"argv": ["absent-preparer", "install"]}],
+            "materialize_commands": [{"argv": ["materialize-environment"]}],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.dropped_commands == ()
+
+
+def test_both_declared_preparation_lists_are_shape_checked(
+    committed_git_repo: Path,
+) -> None:
+    """A malformed command is a malformed analysis whichever list is selected.
+
+    Only runnability follows the selection, so both halves of the shape check
+    refuse the analysis in either list: an argument list that is not one, and
+    a working directory that is not in this checkout. The prepare list here
+    never runs and is checked anyway; the materialize list is checked before
+    anything has selected it.
+    """
+    binary_dir = committed_git_repo.parent / "unselected-shape-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "materialize-environment", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "prepare_commands": [
+                {"argv": []},
+                {"argv": ["prepare-environment"], "cwd": "absent-directory"},
+            ],
+            "materialize_commands": [
+                {"argv": ["materialize-environment"]},
+                {"argv": ["materialize-environment"], "cwd": "absent-directory"},
+            ],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert [failure.requirement for failure in result.failures] == [
+        "prepare command 1 must have a non-empty argv",
+        "prepare command cwd must be an existing repo-relative directory: "
+        "'absent-directory'",
+        "materialize command cwd must be an existing repo-relative directory: "
+        "'absent-directory'",
+    ]
 
 
 def test_secret_named_only_by_a_dropped_command_does_not_block(
@@ -1112,8 +1099,8 @@ def test_host_that_satisfies_everything_produces_the_unchanged_plan(
 ) -> None:
     binary_dir = committed_git_repo.parent / "complete-bin"
     binary_dir.mkdir()
-    runtime = _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    npm = _executable(binary_dir, "npm", "exit 0")
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _executable(binary_dir, "npm", "exit 0")
     (committed_git_repo / "runtime.version").write_text(
         "3.11.9\n", encoding="utf-8"
     )
@@ -1165,13 +1152,7 @@ def test_host_that_satisfies_everything_produces_the_unchanged_plan(
         ),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(committed_git_repo / "runtime.version",),
-        executables=(
-            HostExecutable("example-runtime", runtime, "3.11.9"),
-            HostExecutable("npm", npm, None),
-        ),
         required_secret_names=("PACKAGE_TOKEN",),
-        package_managers=("npm",),
         secret_requirements=(
             HostSecret("PACKAGE_TOKEN", "build", ("test",), "pyproject.toml"),
         ),
@@ -1453,7 +1434,6 @@ def test_a_non_verifying_command_requires_no_program_and_is_not_a_drop(
     assert [command.argv for command in result.commands] == [("example-test",)]
     assert result.dropped_commands == ()
     assert result.dropped_command_summary == ""
-    assert [tool.name for tool in result.executables] == ["example-test"]
 
 
 def test_the_secret_a_command_named_reaches_the_command_that_named_it(
@@ -1611,6 +1591,46 @@ def test_an_analysis_naming_no_check_at_all_is_refused(
     assert "declares no command that verifies the repository" in result.reason
 
 
+def test_a_secret_declared_without_a_valid_scope_is_refused(
+    committed_git_repo: Path,
+) -> None:
+    """A declaration the operator can fix is refused, not silently skipped.
+
+    Dropping the record instead would let a command reference a secret the
+    run never resolves, turning an analysis the operator could correct into
+    a failure inside a task.
+    """
+    binary_dir = committed_git_repo.parent / "invalid-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {"name": "PACKAGE_TOKEN", "scope": "everywhere", "used_by": ["test"]}
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightBlock)
+    assert [failure.requirement for failure in result.failures] == [
+        "required secret 'PACKAGE_TOKEN' must declare a valid scope "
+        "and non-empty used_by stages"
+    ]
+
+
 def test_a_command_naming_an_agent_scoped_secret_is_refused(
     committed_git_repo: Path,
 ) -> None:
@@ -1652,6 +1672,7 @@ def test_a_command_naming_an_agent_scoped_secret_is_refused(
 
     assert isinstance(result, HostPreflightBlock)
     assert "scoped to the agents but named by a command that runs" in result.reason
+    assert "PACKAGE_TOKEN" in result.reason
     assert "test" in result.reason
 
 

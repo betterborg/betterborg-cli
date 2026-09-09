@@ -1028,8 +1028,6 @@ def test_cancelled_execute_is_durable_before_request_returns(
                 commands=(),
                 prepare_commands=(),
                 materialize_commands=(),
-                environment_files=(),
-                executables=(),
                 required_secret_names=(),
             ),
             scheduler=scheduler,
@@ -2148,8 +2146,6 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
             required_secret_names=(),
         ),
     )
@@ -2723,8 +2719,6 @@ def test_execute_payload_names_the_checks_this_host_could_not_run(
         commands=(),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(),
-        executables=(),
         required_secret_names=("PACKAGE_TOKEN",),
         dropped_commands=(
             HostDroppedCommand(

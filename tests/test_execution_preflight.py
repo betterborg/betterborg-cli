@@ -331,19 +331,17 @@ def test_a_repository_declaring_no_preparation_command_reaches_coding(
 def test_a_gitignored_lockfile_does_not_block_any_task(
     execution_preflight_fixture,
 ) -> None:
-    """A declared file the repository ignores is in no task worktree.
+    """A repository whose only lockfile is gitignored reaches coding.
 
-    Preflight sees it in the primary checkout, and a task worktree holds
-    tracked files only, so requiring it there blocked every task a
-    repository with a normal ignore rule had.
+    A task worktree holds tracked files only, so the file is in none of
+    them. Nothing in the run looks for it there any more, which is the
+    defect that motivated the change: every task in a repository with a
+    normal ignore rule used to block before its first agent ran.
     """
     fixture = execution_preflight_fixture(task_count=2)
     lockfile = fixture.repository / "untracked.lock"
     lockfile.write_text("lock-v1\n", encoding="utf-8")
-    plan = replace(
-        _plan(fixture.repository, prepare_action=None),
-        environment_files=(lockfile,),
-    )
+    plan = _plan(fixture.repository, prepare_action=None)
 
     with SqliteStore.open(fixture.database) as store:
         for _ in fixture.worktree_paths:
@@ -1111,10 +1109,7 @@ def _plan(
         commands=(),
         prepare_commands=commands(prepare_action),
         materialize_commands=commands(materialize_action),
-        environment_files=(repository / "package.lock",),
-        executables=(),
         required_secret_names=tuple(secret.name for secret in secrets),
-        package_managers=("pip",),
         secret_requirements=secrets,
     )
 

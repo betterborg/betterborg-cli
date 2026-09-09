@@ -73,10 +73,7 @@ def _plan(fixture) -> HostPreflightPlan:  # noqa: ANN001
         ),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(fixture.repository / "README.md",),
-        executables=(),
         required_secret_names=("BUILD_TOKEN", "AGENT_TOKEN"),
-        package_managers=("cargo", "go", "pnpm"),
         secret_requirements=(
             HostSecret("BUILD_TOKEN", "build", ("install",), "fixture"),
             HostSecret("AGENT_TOKEN", "agent", ("install", "test"), "fixture"),

@@ -197,8 +197,9 @@ not available: cargo (evidence: Cargo.toml)
 A dropped check cannot fail, so a task that skipped one is not the same as a
 task that passed it. The checks the host can run still run, and a host that can
 run none of them is refused rather than spending the run. Commands that build
-the run itself, the analysis's prepare and materialize commands, are never
-dropped; a host that cannot run one of them is refused.
+the run itself are never dropped: a worktree is prepared by the analysis's
+materialize commands when it declares any and by its prepare commands
+otherwise, and a host that cannot run a program that list names is refused.
 
 Secrets follow the commands. One that nothing left in the run consumes does not
 block, and a secret the analysis names twice blocks only when the two records

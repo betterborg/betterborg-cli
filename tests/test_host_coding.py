@@ -324,8 +324,6 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
             required_secret_names=(),
         )
         HostEnvironmentManager(repository_root).materialize_claimed_task(

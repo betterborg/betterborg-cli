@@ -656,7 +656,7 @@ removes, so they change with it rather than surviving untouched.
   Stage 4 lands, as is the absence of the service and Compose fields, which that
   stage removes; these three absences are what this stage adds.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Documentation
 
