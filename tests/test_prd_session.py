@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
 
 import pytest
-from progress_test_support import FakeClock, TTYStringIO
+from progress_test_support import FailingStringIO, TTYStringIO
 
 from betterborg_cli import prd_session as prd_session_module
 from betterborg_cli.agent_runtime.api_tools import ApiAgentRole
@@ -325,18 +326,15 @@ def test_draft_editor_and_confirmations_suspend_renderer_heartbeats(
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     stream = TTYStringIO()
-    clock = FakeClock()
     progress = RunProgress(
         stream=stream,
-        clock=clock,
-        heartbeat_interval=5,
+        heartbeat_interval=0.02,
     )
     snapshots: list[tuple[str, str]] = []
 
     def cross_heartbeat() -> None:
         before = stream.getvalue()
-        clock.now += 10
-        progress.refresh()
+        time.sleep(0.05)
         snapshots.append((before, stream.getvalue()))
 
     confirmations = iter((True, True))
@@ -374,6 +372,51 @@ def test_draft_editor_and_confirmations_suspend_renderer_heartbeats(
     assert result.confirmed
     assert len(snapshots) == 6
     assert all(before == after for before, after in snapshots)
+    progress.stop_display()
+
+
+def test_draft_suspension_propagates_renderer_failure_and_fails_stage(
+    repository_store,
+) -> None:
+    repository, store = repository_store
+    stream = FailingStringIO()
+    progress = RunProgress(stream=stream, heartbeat_interval=0.01)
+    agent = _responses(
+        {"questions": [], "prd_markdown": "# Draft\n\nNeeds review."}
+    )
+    run_agent = agent.run
+
+    def fail_during_agent_run(*args, **kwargs):
+        stream.fail_next_write()
+        deadline = time.monotonic() + 1
+        while progress._cadence_worker is not None:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        return run_agent(*args, **kwargs)
+
+    agent.run = fail_during_agent_run
+    session = PrdSession(
+        repository,
+        store,
+        agent,
+        io=InteractiveIO(
+            prompt=lambda _message: pytest.fail("prompt must not run"),
+            confirm=lambda _message, _default: pytest.fail(
+                "confirmation must not run"
+            ),
+            write=lambda _message: pytest.fail("draft must not render"),
+        ),
+        progress=progress,
+    )
+
+    with pytest.raises(RuntimeError, match="progress heartbeat failed"):
+        session.run("RendererFailure")
+
+    record = progress.stages["requirements"]
+    assert record.state is StageState.FAILED
+    assert record.result == "progress heartbeat failed"
+    progress.raise_if_render_failed()
+    progress.stop_display()
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,8 @@ from betterborg_cli.repo_analysis import (
     AnalyzerError,
     run_analyzer,
 )
+from betterborg_cli.repo_analysis import analyzer as analyzer_module
+from betterborg_cli.repo_analysis.discovery import DiscoveryFile, DiscoveryManifest
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
     AgentChoice,
@@ -358,12 +360,42 @@ def test_git_head_keeps_ordinary_unreadable_head_classification(
 
 def test_analyzer_forwards_agent_activity_and_completes_after_persistence(
     git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _commit_repository(git_repo)
     repository = Repository(root=git_repo)
     activity = AgentActivity(AgentActivityKind.READING, "README.md")
-    adapter = MockAdapter(name="openai").queue(
+    adapter = MockAdapter(name="claude").queue(
         MockResponse(payload=_payload(), activities=(activity,))
+    )
+    selected = SelectedAgent(
+        role=ApiAgentRole.ANALYSIS,
+        adapter=adapter,
+        paths=RepoPaths.discover(git_repo),
+        model="opus-4-8",
+    )
+    manifest = DiscoveryManifest(
+        repo_name=git_repo.name,
+        files=[
+            DiscoveryFile(
+                path="README.md" if number == 0 else f"src/file-{number}.py",
+                workspace_path=(
+                    "files/README.md"
+                    if number == 0
+                    else f"files/src/file-{number}.py"
+                ),
+                category="source",
+                size_bytes=1,
+                copied_bytes=1,
+            )
+            for number in range(142)
+        ],
+        total_copied_bytes=1_800_000,
+    )
+    monkeypatch.setattr(
+        analyzer_module,
+        "build_discovery_workspace",
+        lambda *_args, **_kwargs: manifest,
     )
     progress = RunProgress(
         [
@@ -378,7 +410,7 @@ def test_analyzer_forwards_agent_activity_and_completes_after_persistence(
         analysis = run_analyzer(
             repository,
             store,
-            adapter,
+            selected,
             artifact_dir=git_repo / "artifacts",
             progress=progress,
         )
@@ -386,10 +418,11 @@ def test_analyzer_forwards_agent_activity_and_completes_after_persistence(
         assert store.list_analyses(repository.id) == [analysis]
 
     assert progress.stages["discover"].state is StageState.COMPLETED
+    assert progress.stages["discover"].result == "142 files · 1.8 MB"
     analyze = progress.stages["analyze"]
     assert analyze.state is StageState.COMPLETED
     assert analyze.activity == activity
-    assert analyze.result == "score 3.00/5"
+    assert analyze.result == "claude · opus-4-8"
 
 
 def test_analyzer_resolves_the_anthropic_default_model(git_repo: Path) -> None:

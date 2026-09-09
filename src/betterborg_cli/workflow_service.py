@@ -48,7 +48,7 @@ from betterborg_cli.store import (
 )
 
 PlanningAgentFactory = Callable[[], Any]
-_EXECUTION_PREFLIGHT_STAGE_KEY = "preflight"
+EXECUTION_PREFLIGHT_STAGE = StageSpec("preflight", "Preflight")
 
 
 class HostInvoker(Protocol):
@@ -176,6 +176,7 @@ def execute_workflow(
     *,
     decide: Callable[[dict[str, Any]], ExecutionDecisionRequest | None],
     invoke_host: HostInvoker,
+    requested_follow_ups: tuple[StageSpec, ...] = (),
     cancel: CancellationToken | None = None,
     progress: RunProgress | None = None,
 ) -> ExecutionWorkflowResult:
@@ -191,6 +192,17 @@ def execute_workflow(
             store,
             cancel=cancel,
         ).inspect_current_task_files(borg.id)
+        task_specs = tuple(
+            StageSpec(str(item.task.id), item.task.title)
+            for item in publication.files
+        )
+        if progress is not None:
+            progress.preview_pending(
+                (EXECUTION_PREFLIGHT_STAGE, *task_specs, *requested_follow_ups),
+                cohort_keys=tuple(
+                    spec.key for spec in (*task_specs, *requested_follow_ups)
+                ),
+            )
         generation = publication.generation
         approval = next(
             (
@@ -265,10 +277,8 @@ def execute_workflow(
                 "current generation has an unsupported execution decision"
             )
         if progress is not None:
-            progress.declare(
-                StageSpec(_EXECUTION_PREFLIGHT_STAGE_KEY, "Preflight")
-            )
-            progress.start(_EXECUTION_PREFLIGHT_STAGE_KEY)
+            progress.declare(EXECUTION_PREFLIGHT_STAGE)
+            progress.start(EXECUTION_PREFLIGHT_STAGE.key)
         try:
             host_result = invoke_host(
                 paths,
@@ -287,19 +297,19 @@ def execute_workflow(
                 if isinstance(error, KeyboardInterrupt) or (
                     cancel is not None and cancel.is_set()
                 ):
-                    progress.stop(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+                    progress.stop(EXECUTION_PREFLIGHT_STAGE.key, detail)
                 else:
-                    progress.fail(_EXECUTION_PREFLIGHT_STAGE_KEY, detail)
+                    progress.fail(EXECUTION_PREFLIGHT_STAGE.key, detail)
             raise
         if _preflight_is_running(progress):
             assert progress is not None
             if isinstance(host_result.preflight, HostPreflightBlock):
                 progress.fail(
-                    _EXECUTION_PREFLIGHT_STAGE_KEY,
+                    EXECUTION_PREFLIGHT_STAGE.key,
                     host_result.preflight.reason,
                 )
             else:
-                progress.complete(_EXECUTION_PREFLIGHT_STAGE_KEY, "ready")
+                progress.complete(EXECUTION_PREFLIGHT_STAGE.key, "ready")
 
     return ExecutionWorkflowResult(
         borg,
@@ -316,7 +326,7 @@ def execute_workflow(
 def _preflight_is_running(progress: RunProgress | None) -> bool:
     return (
         progress is not None
-        and progress.stages[_EXECUTION_PREFLIGHT_STAGE_KEY].state
+        and progress.stages[EXECUTION_PREFLIGHT_STAGE.key].state
         is StageState.RUNNING
     )
 

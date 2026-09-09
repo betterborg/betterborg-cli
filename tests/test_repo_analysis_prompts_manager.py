@@ -165,6 +165,7 @@ def test_generates_all_role_metadata_at_stable_paths(git_repo: Path) -> None:
 
 def test_role_children_run_concurrently_and_reconcile_durable_activity(
     git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = Repository(root=git_repo)
     barrier = Barrier(len(PROMPT_ROLES))
@@ -195,19 +196,30 @@ def test_role_children_run_concurrently_and_reconcile_durable_activity(
         paths=RepoPaths.discover(git_repo),
         model="prompt-model",
     )
+    progress_stream = StringIO()
     progress = RunProgress(
         [
             StageSpec(
                 "prompts",
                 "Generate role prompts",
-                tuple(
-                    ChildSpec(role, f"{role.title()} prompt")
-                    for role in PROMPT_ROLES
-                ),
+                tuple(ChildSpec(role, role) for role in PROMPT_ROLES),
             )
         ],
-        stream=StringIO(),
+        stream=progress_stream,
     )
+    completed_child_frames: list[list[str]] = []
+    complete_child = progress.complete_child
+
+    def capture_completed_child(
+        stage_key: str, child_key: str, result: object | None = None
+    ):
+        child = complete_child(stage_key, child_key, result)
+        completed_child_frames.append(
+            [line.plain for line in progress._live_lines()]
+        )
+        return child
+
+    monkeypatch.setattr(progress, "complete_child", capture_completed_child)
 
     with SqliteStore.open(git_repo / "state.sqlite3") as store:
         store.add_repository(repository)
@@ -233,6 +245,7 @@ def test_role_children_run_concurrently_and_reconcile_durable_activity(
     parent = progress.stages["prompts"]
     assert parent.state is StageState.COMPLETED
     assert parent.result == "3 prompts"
+    assert parent.detail == "3 agents"
     for role in PROMPT_ROLES:
         child = parent.children[role]
         assert child.state is StageState.COMPLETED
@@ -242,6 +255,20 @@ def test_role_children_run_concurrently_and_reconcile_durable_activity(
             f"{role}.toml",
         )
         assert child.result == "prompt v1"
+
+    assert any(
+        any(f"├ {role} " in line and "✔" in line for line in frame)
+        for role in PROMPT_ROLES[:-1]
+        for frame in completed_child_frames
+    )
+    permanent_output = progress_stream.getvalue()
+    permanent_tree = [
+        line
+        for line in permanent_output.splitlines()
+        if line.startswith(("├ ✔ ", "└ ✔ "))
+    ]
+    for role in PROMPT_ROLES:
+        assert sum(role in line for line in permanent_tree) == 1
 
 
 def test_cancellation_during_prompt_root_discovery_starts_no_prompt_work(

@@ -10,21 +10,24 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import threading
 import time
+import weakref
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TextIO
+from typing import TextIO, TypeVar
 
 from rich.cells import cell_len, chop_cells
 from rich.console import Console, Group
 from rich.live import Live
-from rich.text import Text
+from rich.spinner import Spinner
+from rich.text import Span, Text
 
 
 class StageState(StrEnum):
@@ -144,6 +147,58 @@ class ChildRenderState:
     earlier_attempt_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RecordSnapshot:
+    """Immutable rendering state copied from one authoritative record."""
+
+    key: str
+    label: str
+    state: StageState
+    detail: str | None
+    activity: AgentActivity | None
+    result: str | None
+    duration_seconds: float | None
+    retained: bool
+    _activity_is_latest: bool
+    dynamic: bool = False
+    is_child: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _StageSnapshot:
+    """Immutable rendering state for a parent and its declared children."""
+
+    record: _RecordSnapshot
+    children: tuple[_RecordSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionSnapshot:
+    """One atomic view of authoritative records and display-only previews."""
+
+    stages: tuple[_StageSnapshot, ...]
+    previews: tuple[StageSpec, ...]
+    cohort_keys: frozenset[str]
+    startup_label: str | None
+    elapsed_seconds: float
+    cancelling: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _DetachedDisplay:
+    """Renderer resources detached while the reporter lock is held."""
+
+    live: Live | None
+    worker: threading.Thread | None
+    stopped: threading.Event | None
+    teardown_complete: threading.Event | None = None
+
+
+_ChildRenderRecord = TypeVar(
+    "_ChildRenderRecord", ChildRecord, _RecordSnapshot
+)
+
+
 class ProgressError(ValueError):
     """Raised when a requested progress lifecycle operation is illegal."""
 
@@ -151,6 +206,36 @@ class ProgressError(ValueError):
 Clock = Callable[[], float]
 
 _MAX_LIVE_ROWS = 8
+_LABEL_COLUMN_WIDTH = 21
+_CHILD_LABEL_COLUMN_WIDTH = 7
+_DOTS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_DOTS_FRAME = _DOTS_FRAMES[0]
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_TOKEN_SUBSTITUTIONS = {
+    "✔": "[OK]",
+    "✖": "[X]",
+    "■": "[-]",
+    "◦": "[.]",
+    **dict.fromkeys(_DOTS_FRAMES, "*"),
+    "│": "|",
+    "├": "+-",
+    "└": r"\-",
+    "·": "-",
+    "…": "...",
+    "—": "-",
+}
+_STATE_GLYPHS = {
+    StageState.PENDING: "◦",
+    StageState.COMPLETED: "✔",
+    StageState.FAILED: "✖",
+    StageState.STOPPED: "■",
+}
+_STATE_STYLES = {
+    StageState.PENDING: "dim",
+    StageState.COMPLETED: "green",
+    StageState.FAILED: "red",
+    StageState.STOPPED: "dim cyan",
+}
 
 
 class RunProgress:
@@ -167,6 +252,8 @@ class RunProgress:
         machine_readable: bool = False,
         attempt_history_limit: int = 2,
         heartbeat_interval: float = 30.0,
+        startup_label: str | None = None,
+        startup_pending: tuple[str, ...] = (),
     ) -> None:
         if width is not None and width <= 0:
             raise ValueError("width must be positive")
@@ -174,8 +261,12 @@ class RunProgress:
             raise ValueError("attempt_history_limit must be at least one")
         if heartbeat_interval <= 0 or not math.isfinite(heartbeat_interval):
             raise ValueError("heartbeat_interval must be a finite positive value")
+        if startup_label is not None:
+            _require_text(startup_label, "startup label")
         self._stream = sys.stderr if stream is None else stream
         self._clock = clock
+        self._started_at = self._clock()
+        self._spinner_started_at = time.monotonic()
         self._width = width
         self._enabled = enabled and not machine_readable
         self._attempt_history_limit = attempt_history_limit
@@ -183,15 +274,39 @@ class RunProgress:
         self._interactive = self._enabled and _is_interactive(self._stream)
         self._console: Console | None = None
         self._live: Live | None = None
+        self._live_empty = False
         self._next_heartbeat_at: float | None = None
+        self._cadence_worker: threading.Thread | None = None
+        self._cadence_stop: threading.Event | None = None
+        self._render_failure: BaseException | None = None
+        self._render_failed = False
+        self._display_stopped = False
+        self._display_stop_complete = threading.Event()
+        self._display_teardowns: set[threading.Event] = set()
+        self._closing = False
         self._stages: dict[str, StageRecord] = {}
+        self._preview_specs: tuple[StageSpec, ...] = ()
+        self._cohort_keys: frozenset[str] = frozenset()
+        self._startup_label = startup_label
         self._cancelling = False
         self._closed = False
         self._suspension_depth = 0
-        self._queued_lines: list[str] = []
+        self._suspended_starts: list[
+            tuple[StageRecord | ChildRecord, str | None]
+        ] = []
+        self._queued_lines: list[Text] = []
+        self._has_permanent_output = False
         self._lock = threading.RLock()
+        self._initializing = True
         for spec in stages:
             self.declare(spec)
+        startup_specs = tuple(StageSpec(label, label) for label in startup_pending)
+        previews, cohort_keys = self._validated_preview(startup_specs, None)
+        self._preview_specs = previews
+        self._cohort_keys = cohort_keys
+        self._initializing = False
+        if self._interactive:
+            self._refresh_safely()
 
     @property
     def stages(self) -> Mapping[str, StageRecord]:
@@ -240,7 +355,39 @@ class RunProgress:
                 }
             )
             self._stages[spec.key] = record
+            adopted_preview_keys = {
+                preview.key
+                for preview in self._preview_specs
+                if preview.key == spec.key
+                or preview.key == preview.label == spec.label
+            }
+            self._preview_specs = tuple(
+                preview
+                for preview in self._preview_specs
+                if preview.key not in adopted_preview_keys
+            )
+            if adopted_preview_keys.intersection(self._cohort_keys):
+                self._cohort_keys = frozenset(
+                    (*self._cohort_keys.difference(adopted_preview_keys), spec.key)
+                )
+            if not self._initializing:
+                self._refresh_safely()
             return record
+
+    def preview_pending(
+        self,
+        specs: tuple[StageSpec, ...],
+        *,
+        cohort_keys: tuple[str, ...] | None = None,
+    ) -> None:
+        """Atomically replace display-only pending stages and count membership."""
+
+        with self._lock:
+            self._require_open()
+            previews, selected_keys = self._validated_preview(specs, cohort_keys)
+            self._preview_specs = previews
+            self._cohort_keys = selected_keys
+            self._refresh_safely()
 
     def start(self, stage_key: str) -> StageRecord:
         """Start a fresh parent timer exactly once."""
@@ -249,7 +396,7 @@ class RunProgress:
             record = self._stage(stage_key)
             self._require_new_work_allowed()
             self._start_record(record, f"stage {stage_key!r}")
-            self._refresh_transient(started=record)
+            self._refresh_safely(started=record)
             return record
 
     def update(self, stage_key: str, detail: str | None) -> StageRecord:
@@ -260,7 +407,7 @@ class RunProgress:
             self._require_running(record, f"stage {stage_key!r}")
             record.detail = detail
             record._activity_is_latest = False
-            self._refresh_transient()
+            self._refresh_safely()
             return record
 
     def activity(self, stage_key: str, activity: AgentActivity) -> StageRecord:
@@ -271,7 +418,7 @@ class RunProgress:
             self._require_running(record, f"stage {stage_key!r}")
             record.activity = _require_activity(activity)
             record._activity_is_latest = True
-            self._refresh_transient()
+            self._refresh_safely()
             return record
 
     def seed_completed(
@@ -339,7 +486,7 @@ class RunProgress:
             self._require_new_work_allowed()
             self._require_running(parent, f"stage {stage_key!r}")
             self._start_record(child, f"child {child_key!r}")
-            self._refresh_transient(started=child, parent_label=parent.label)
+            self._refresh_safely(started=child, parent_label=parent.label)
             return child
 
     def update_child(
@@ -352,7 +499,7 @@ class RunProgress:
             self._require_running(child, f"child {child_key!r}")
             child.detail = detail
             child._activity_is_latest = False
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def child_activity(
@@ -368,7 +515,7 @@ class RunProgress:
             self._require_running(child, f"child {child_key!r}")
             child.activity = _require_activity(activity)
             child._activity_is_latest = True
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def seed_child_completed(
@@ -388,7 +535,7 @@ class RunProgress:
             self._require_pending(child, f"child {child_key!r}")
             duration = _validate_duration(duration_seconds)
             self._seed_record(child, StageState.COMPLETED, result, duration)
-            self._emit_terminal(child, parent_label=parent.label)
+            self._refresh_safely()
             return child
 
     def complete_child(
@@ -430,23 +577,12 @@ class RunProgress:
 
         with self._lock:
             parent = self._stage(stage_key)
-            fixed = [child for child in parent._children.values() if not child.dynamic]
-            attempts = [child for child in parent._children.values() if child.dynamic]
-            active = [child for child in attempts if child.state not in TERMINAL_STATES]
-            active_keys = {child.key for child in active}
-            remaining_slots = max(self._attempt_history_limit - len(active), 0)
-            latest_terminal = [
-                child for child in attempts if child.state in TERMINAL_STATES
-            ][-remaining_slots:]
-            if remaining_slots == 0:
-                latest_terminal = []
-            visible_keys = active_keys | {child.key for child in latest_terminal}
-            visible_attempts = [
-                child for child in attempts if child.key in visible_keys
-            ]
+            children, earlier_attempt_count = _select_render_children(
+                parent._children.values(), self._attempt_history_limit
+            )
             return ChildRenderState(
-                children=tuple(fixed + visible_attempts),
-                earlier_attempt_count=len(attempts) - len(visible_attempts),
+                children=children,
+                earlier_attempt_count=earlier_attempt_count,
             )
 
     def refresh(self) -> None:
@@ -454,7 +590,13 @@ class RunProgress:
 
         with self._lock:
             self._require_open()
-            self._refresh_transient()
+            self._refresh_safely()
+
+    def raise_if_render_failed(self) -> None:
+        """Consume and raise the first autonomous renderer failure, if any."""
+
+        with self._lock:
+            self._raise_if_render_failed_locked()
 
     def begin_cancellation(self) -> bool:
         """Acknowledge cancellation once without changing any record state."""
@@ -464,37 +606,83 @@ class RunProgress:
             if self._cancelling:
                 return False
             self._cancelling = True
-            self._emit("stopping...")
-            self._refresh_transient()
+            self._startup_label = None
+            self._emit(Text("stopping…", style="dim cyan"))
+            self._refresh_safely()
             return True
 
     @contextmanager
     def suspend(self) -> Iterator[RunProgress]:
         """Queue permanent output until the outermost suspension exits."""
 
+        self.raise_if_render_failed()
+        detached = _DetachedDisplay(None, None, None)
+        body_failed = False
         with self._lock:
             self._require_open()
             if self._suspension_depth == 0:
-                self._stop_live()
-            self._suspension_depth += 1
+                self._suspension_depth = 1
+                detached = self._detach_display()
+            else:
+                self._suspension_depth += 1
         try:
-            yield self
+            self._teardown_display(detached)
+            self.raise_if_render_failed()
+            try:
+                yield self
+            except BaseException:
+                body_failed = True
+                raise
         finally:
             with self._lock:
                 self._suspension_depth -= 1
                 if self._suspension_depth == 0:
+                    suspended_starts, self._suspended_starts = (
+                        self._suspended_starts,
+                        [],
+                    )
                     queued, self._queued_lines = self._queued_lines, []
                     for line in queued:
-                        self._write_permanent(line)
-                    self._reset_heartbeat()
-                    self._refresh_transient()
+                        if self._render_failed or self._display_stopped:
+                            break
+                        try:
+                            self._write_permanent(line)
+                        except BaseException as error:
+                            self._latch_render_failure(error)
+                    if not self._render_failed and not self._display_stopped:
+                        self._reset_heartbeat()
+                        try:
+                            if self._interactive:
+                                self._refresh_safely()
+                            else:
+                                running_starts = tuple(
+                                    (record, parent_label)
+                                    for record, parent_label in suspended_starts
+                                    if record.state is StageState.RUNNING
+                                )
+                                if running_starts:
+                                    for record, parent_label in running_starts:
+                                        self._refresh_safely(
+                                            started=record,
+                                            parent_label=parent_label,
+                                        )
+                                else:
+                                    self._refresh_safely()
+                        except BaseException as error:
+                            if not body_failed:
+                                raise
+                            self._render_failure = error
+        self.raise_if_render_failed()
 
     def close(self) -> None:
         """Close only after every started parent and child is terminal."""
 
+        detached = _DetachedDisplay(None, None, None)
         with self._lock:
             if self._closed:
                 return
+            if self._closing:
+                raise ProgressError("progress is already closing")
             running = [
                 f"stage {stage.key!r}"
                 for stage in self._stages.values()
@@ -513,9 +701,47 @@ class RunProgress:
                 )
             if self._suspension_depth:
                 raise ProgressError("cannot close progress while output is suspended")
-            self._stop_live()
-            self._emit(_format_summary_line(self._stages.values()))
+            self._preview_specs = ()
+            self._cohort_keys = frozenset()
+            self._startup_label = None
+            self._closing = True
+            detached = self._detach_display()
+        self._teardown_display(detached)
+        with self._lock:
+            elapsed_seconds = max(0.0, self._clock() - self._started_at)
+            if self._enabled and not self._render_failed and not self._display_stopped:
+                try:
+                    self._write_permanent(
+                        _format_summary_line(self._stages.values(), elapsed_seconds)
+                    )
+                except BaseException as error:
+                    self._latch_render_failure(error)
             self._closed = True
+            self._closing = False
+
+    def stop_display(self) -> None:
+        """Permanently dispose renderer resources without changing lifecycle."""
+
+        with self._lock:
+            if self._display_stopped:
+                detached = None
+            else:
+                self._display_stopped = True
+                self._preview_specs = ()
+                self._cohort_keys = frozenset()
+                self._startup_label = None
+                self._queued_lines = []
+                detached = self._detach_display()
+                pending_teardowns = tuple(self._display_teardowns)
+        if detached is None:
+            self._display_stop_complete.wait()
+            return
+        try:
+            self._teardown_display(detached)
+            for teardown_complete in pending_teardowns:
+                teardown_complete.wait()
+        finally:
+            self._display_stop_complete.set()
 
     def _seed_stage(
         self,
@@ -531,7 +757,7 @@ class RunProgress:
             duration = _validate_duration(duration_seconds)
             self._require_terminal_children(record)
             self._seed_record(record, state, result, duration)
-            self._emit_terminal(record)
+            self._emit_terminal_tree(record)
             return record
 
     def _finish_stage(
@@ -539,6 +765,8 @@ class RunProgress:
     ) -> StageRecord:
         with self._lock:
             record = self._stage(stage_key)
+            if state is StageState.COMPLETED:
+                self._raise_if_render_failed_locked()
             self._require_open()
             self._require_running(record, f"stage {stage_key!r}")
             if state is StageState.STOPPED:
@@ -546,8 +774,8 @@ class RunProgress:
             else:
                 self._require_terminal_children(record)
             self._finish_record(record, state, result)
-            self._emit_terminal(record)
-            self._refresh_transient()
+            self._emit_terminal_tree(record)
+            self._refresh_safely()
             return record
 
     def _finish_child(
@@ -563,8 +791,7 @@ class RunProgress:
             self._require_parent_nonterminal(parent)
             self._require_running(child, f"child {child_key!r}")
             self._finish_record(child, state, result)
-            self._emit_terminal(child, parent_label=parent.label)
-            self._refresh_transient()
+            self._refresh_safely()
             return child
 
     def _stage(self, stage_key: str) -> StageRecord:
@@ -573,6 +800,36 @@ class RunProgress:
             return self._stages[stage_key]
         except KeyError as exc:
             raise ProgressError(f"unknown stage {stage_key!r}") from exc
+
+    def _validated_preview(
+        self,
+        specs: tuple[StageSpec, ...],
+        cohort_keys: tuple[str, ...] | None,
+    ) -> tuple[tuple[StageSpec, ...], frozenset[str]]:
+        candidates = tuple(specs)
+        if any(not isinstance(spec, StageSpec) for spec in candidates):
+            raise TypeError("pending previews must be StageSpec instances")
+        spec_keys = tuple(spec.key for spec in candidates)
+        available_keys = set(spec_keys)
+        if len(available_keys) != len(spec_keys):
+            raise ValueError("pending previews have duplicate stage keys")
+
+        selected = spec_keys if cohort_keys is None else tuple(cohort_keys)
+        if any(not isinstance(key, str) or not key for key in selected):
+            raise ValueError("cohort keys must be non-empty strings")
+        if len(set(selected)) != len(selected):
+            raise ValueError("cohort keys must be unique")
+        unknown = [key for key in selected if key not in available_keys]
+        if unknown:
+            raise ValueError(
+                "cohort keys must be members of pending previews: "
+                + ", ".join(repr(key) for key in unknown)
+            )
+
+        previews = tuple(
+            spec for spec in candidates if spec.key not in self._stages
+        )
+        return previews, frozenset(selected)
 
     def _child(self, stage_key: str, child_key: str) -> tuple[StageRecord, ChildRecord]:
         parent = self._stage(stage_key)
@@ -587,6 +844,7 @@ class RunProgress:
         self._require_pending(record, name)
         record.state = StageState.RUNNING
         record.started_at = self._clock()
+        self._startup_label = None
 
     def _seed_record(
         self,
@@ -599,6 +857,7 @@ class RunProgress:
         record.result = result
         record.duration_seconds = duration_seconds
         record.retained = True
+        self._startup_label = None
 
     def _finish_record(
         self,
@@ -614,7 +873,11 @@ class RunProgress:
         record.finished_at = finished_at
         record.duration_seconds = max(0.0, finished_at - record.started_at)
 
-    def _elapsed(self, record: StageRecord | ChildRecord) -> float | None:
+    def _elapsed(
+        self, record: StageRecord | ChildRecord | _RecordSnapshot
+    ) -> float | None:
+        if isinstance(record, _RecordSnapshot):
+            return record.duration_seconds
         if record.duration_seconds is not None or record.state in TERMINAL_STATES:
             return record.duration_seconds
         if record.started_at is None:
@@ -622,7 +885,7 @@ class RunProgress:
         return max(0.0, self._clock() - record.started_at)
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise ProgressError("progress is already closed")
 
     def _require_not_cancelling(self, action: str) -> None:
@@ -680,17 +943,56 @@ class RunProgress:
     def _emit_terminal(
         self, record: StageRecord | ChildRecord, *, parent_label: str | None = None
     ) -> None:
-        self._emit(_format_terminal_line(record, parent_label=parent_label))
+        self._emit(
+            _format_terminal_line(
+                record,
+                parent_label=parent_label,
+                compact=(
+                    isinstance(record, StageRecord)
+                    and len(self._cohort_keys) > _MAX_LIVE_ROWS
+                    and record.key in self._cohort_keys
+                ),
+            )
+        )
 
-    def _emit(self, line: str) -> None:
-        if not self._enabled:
+    def _emit_terminal_tree(self, parent: StageRecord) -> None:
+        self._emit_terminal(parent)
+        children = self.child_render_state(parent.key).children
+        for index, child in enumerate(children):
+            branch = "└" if index == len(children) - 1 else "├"
+            self._emit(_format_child_terminal_line(child, branch=branch))
+
+    def _emit(self, line: Text) -> None:
+        if not self._enabled or self._render_failed or self._display_stopped:
             return
         if self._suspension_depth:
             self._queued_lines.append(line)
             return
-        if self._interactive:
-            self._refresh_transient()
-        self._write_permanent(line)
+        try:
+            if self._interactive:
+                snapshot = self._projection_snapshot()
+                if self._project_live_lines(snapshot):
+                    self._refresh_transient()
+            self._write_permanent(line)
+            if self._interactive:
+                self._refresh_transient()
+        except BaseException as error:
+            self._latch_render_failure(error)
+            self._render_failure = None
+            raise
+
+    def _refresh_safely(
+        self,
+        *,
+        started: StageRecord | ChildRecord | None = None,
+        parent_label: str | None = None,
+    ) -> None:
+        try:
+            self._refresh_transient(started=started, parent_label=parent_label)
+        except BaseException as error:
+            self._latch_render_failure(error)
+            self._render_failure = None
+            raise
 
     def _refresh_transient(
         self,
@@ -698,36 +1000,54 @@ class RunProgress:
         started: StageRecord | ChildRecord | None = None,
         parent_label: str | None = None,
     ) -> None:
-        if not self._enabled or self._suspension_depth:
+        if self._suspension_depth:
+            if started is not None:
+                self._suspended_starts.append((started, parent_label))
             return
+        if (
+            not self._enabled
+            or self._render_failed
+            or self._display_stopped
+            or self._closing
+            or self._closed
+        ):
+            return
+        snapshot = self._projection_snapshot()
         if self._interactive:
-            lines = self._live_lines()
+            lines = self._project_live_lines(snapshot)
             if not lines:
-                self._stop_live()
+                if self._live is not None and not self._live_empty:
+                    self._live.update(Text(""), refresh=True)
+                    self._live_empty = True
                 return
-            renderable = Group(
-                *(Text(self._truncate(line), no_wrap=True) for line in lines)
-            )
+            renderable = Group(*self._interactive_live_renderables(lines))
             if self._live is None:
                 self._live = Live(
                     renderable,
                     console=self._output_console(),
                     auto_refresh=False,
                     transient=True,
+                    redirect_stdout=False,
+                    redirect_stderr=False,
                 )
                 self._live.start(refresh=True)
             else:
                 self._live.update(renderable, refresh=True)
+            self._live_empty = False
+            self._ensure_cadence_worker()
             return
 
-        lines = self._active_lines()
+        lines = self._plain_active_lines(snapshot)
         if not lines:
             self._next_heartbeat_at = None
             return
         now = self._clock()
         if started is not None:
+            started_snapshot = self._record_snapshot(started, now)
             self._write_plain(
-                self._format_running_line(started, parent_label=parent_label)
+                self._format_running_line(
+                    started_snapshot, parent_label=parent_label
+                )
             )
             if self._next_heartbeat_at is None:
                 self._next_heartbeat_at = now + self._heartbeat_interval
@@ -735,87 +1055,521 @@ class RunProgress:
             for line in lines:
                 self._write_plain(line)
             self._next_heartbeat_at = now + self._heartbeat_interval
+        self._ensure_cadence_worker()
 
-    def _live_lines(self) -> list[str]:
-        lines: list[str] = []
-        for stage in self._stages.values():
-            if stage.state is not StageState.RUNNING:
-                continue
-            lines.append(self._format_running_line(stage))
-            child_state = self.child_render_state(stage.key)
-            lines.extend(
-                self._format_child_live_line(child, parent_label=stage.label)
-                for child in child_state.children
+    def _live_lines(self) -> list[Text]:
+        return self._project_live_lines(self._projection_snapshot())
+
+    def _projection_snapshot(self) -> _ProjectionSnapshot:
+        with self._lock:
+            now = self._clock()
+            stages = tuple(
+                _StageSnapshot(
+                    record=self._record_snapshot(stage, now),
+                    children=tuple(
+                        self._record_snapshot(child, now)
+                        for child in stage._children.values()
+                    ),
+                )
+                for stage in self._stages.values()
             )
-            if child_state.earlier_attempt_count:
-                count = child_state.earlier_attempt_count
-                noun = "attempt" if count == 1 else "attempts"
-                lines.append(f"{stage.label}: … {count} earlier {noun}")
-        return self._bound_live_lines(lines)
+            return _ProjectionSnapshot(
+                stages=stages,
+                previews=self._preview_specs,
+                cohort_keys=self._cohort_keys,
+                startup_label=self._startup_label,
+                elapsed_seconds=max(0.0, now - self._started_at),
+                cancelling=self._cancelling,
+            )
 
-    def _active_lines(self) -> list[str]:
-        lines: list[str] = []
-        for stage in self._stages.values():
-            if stage.state is StageState.RUNNING:
-                lines.append(self._format_running_line(stage))
+    def _record_snapshot(
+        self, record: StageRecord | ChildRecord, now: float
+    ) -> _RecordSnapshot:
+        duration = record.duration_seconds
+        if duration is None and record.state is StageState.RUNNING:
+            if record.started_at is None:
+                raise AssertionError("running record has no start time")
+            duration = max(0.0, now - record.started_at)
+        return _RecordSnapshot(
+            key=record.key,
+            label=record.label,
+            state=record.state,
+            detail=record.detail,
+            activity=record.activity,
+            result=None if record.result is None else str(record.result),
+            duration_seconds=duration,
+            retained=record.retained,
+            _activity_is_latest=record._activity_is_latest,
+            dynamic=isinstance(record, ChildRecord) and record.dynamic,
+            is_child=isinstance(record, ChildRecord),
+        )
+
+    def _project_live_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
+        projected_lines: list[tuple[Text, StageState | None]] = []
+        stages_by_key = {stage.record.key: stage for stage in snapshot.stages}
+        aggregate_cohort = len(snapshot.cohort_keys) > _MAX_LIVE_ROWS
+
+        if snapshot.startup_label is not None:
+            projected_lines.append(
+                (
+                    self._format_startup_line(
+                        snapshot.startup_label, snapshot.elapsed_seconds
+                    ),
+                    StageState.RUNNING,
+                )
+            )
+
+        for stage in snapshot.stages:
+            record = stage.record
+            if record.state is StageState.RUNNING:
+                has_activity_detail = (
+                    record._activity_is_latest
+                    and record.activity is not None
+                    and record.detail is not None
+                    and record.detail.strip()
+                )
+                projected_lines.append(
+                    (
+                        self._format_live_running_line(
+                            record,
+                            cancelling=snapshot.cancelling,
+                            prefer_detail=has_activity_detail,
+                            compact=(
+                                aggregate_cohort
+                                and record.key in snapshot.cohort_keys
+                            ),
+                        ),
+                        StageState.RUNNING,
+                    )
+                )
+                if has_activity_detail:
+                    projected_lines.append(
+                        (
+                            Text(
+                                f"      └ {_format_record_activity(record)}",
+                                style="dim",
+                            ),
+                            StageState.RUNNING,
+                        )
+                    )
+                children, earlier_attempt_count = _select_render_children(
+                    stage.children, self._attempt_history_limit
+                )
+                # Assign branches after applying the same active-row priority
+                # used by _bound_live_lines so the final child tree stays valid.
+                children = tuple(
+                    sorted(
+                        children,
+                        key=lambda child: child.state is StageState.PENDING,
+                    )
+                )
+                projected_lines.extend(
+                    (
+                        self._format_child_live_line(
+                            child,
+                            branch=(
+                                "└" if index == len(children) - 1 else "├"
+                            ),
+                            cancelling=snapshot.cancelling,
+                        ),
+                        (
+                            StageState.RUNNING
+                            if child.state in TERMINAL_STATES
+                            else child.state
+                        ),
+                    )
+                    for index, child in enumerate(children)
+                )
+                if earlier_attempt_count:
+                    noun = "attempt" if earlier_attempt_count == 1 else "attempts"
+                    projected_lines.append(
+                        (
+                            Text(
+                                f"… {earlier_attempt_count} earlier {noun}",
+                                style="dim",
+                            ),
+                            None,
+                        )
+                    )
+            elif record.state is StageState.PENDING and not (
+                aggregate_cohort and record.key in snapshot.cohort_keys
+            ):
+                projected_lines.append(
+                    (_format_pending_stage_line(record.label), StageState.PENDING)
+                )
+
+        projected_lines.extend(
+            (_format_pending_stage_line(spec.label), StageState.PENDING)
+            for spec in snapshot.previews
+            if not (aggregate_cohort and spec.key in snapshot.cohort_keys)
+        )
+
+        work_lines = self._bound_live_lines(
+            projected_lines,
+            limit=(
+                _MAX_LIVE_ROWS - 1
+                if aggregate_cohort and not snapshot.cancelling
+                else _MAX_LIVE_ROWS
+            ),
+        )
+        if not work_lines and not aggregate_cohort and not snapshot.cancelling:
+            return []
+        if snapshot.cancelling:
+            footer = Text("stopping…", style="dim cyan")
+        elif aggregate_cohort:
+            counts = Text("  ")
+            counts.append_text(self._format_cohort_counts(snapshot, stages_by_key))
+            work_lines.insert(0, counts)
+            footer = Text("  ctrl-c to stop", style="dim")
+        else:
+            footer = Text("  ctrl-c to stop", style="dim")
+        return [*work_lines, Text(""), footer]
+
+    def _format_cohort_counts(
+        self,
+        snapshot: _ProjectionSnapshot,
+        stages_by_key: Mapping[str, _StageSnapshot],
+    ) -> Text:
+        preview_keys = {spec.key for spec in snapshot.previews}
+        states = [
+            stages_by_key[key].record.state
+            if key in stages_by_key
+            else StageState.PENDING
+            for key in snapshot.cohort_keys
+            if key in stages_by_key or key in preview_keys
+        ]
+        counts = Counter(states)
+        done = sum(counts[state] for state in TERMINAL_STATES)
+        return Text(
+            f"{done} done · {counts[StageState.RUNNING]} running · "
+            f"{counts[StageState.PENDING]} pending",
+            style="dim",
+        )
+
+    def _format_startup_line(self, label: str, elapsed: float) -> Text:
+        normalized = _normalize_cell(label)
+        line = Text(_DOTS_FRAME, style="cyan")
+        line.append(" ")
+        line.append(normalized)
+        line.append(" " * _column_gap(normalized))
+        line.append(_format_duration(elapsed), style="dim")
+        line.append("  thinking")
+        return line
+
+    def _plain_active_lines(self, snapshot: _ProjectionSnapshot) -> list[Text]:
+        lines: list[Text] = []
+        for stage in snapshot.stages:
+            if stage.record.state is StageState.RUNNING:
+                lines.append(
+                    self._format_running_line(
+                        stage.record, cancelling=snapshot.cancelling
+                    )
+                )
             lines.extend(
-                self._format_running_line(child, parent_label=stage.label)
-                for child in stage._children.values()
+                self._format_running_line(
+                    child,
+                    parent_label=stage.record.label,
+                    cancelling=snapshot.cancelling,
+                )
+                for child in stage.children
                 if child.state is StageState.RUNNING
             )
         return lines
 
     @staticmethod
-    def _bound_live_lines(lines: list[str]) -> list[str]:
-        if len(lines) <= _MAX_LIVE_ROWS:
-            return lines
-        hidden = len(lines) - (_MAX_LIVE_ROWS - 1)
-        return [*lines[: _MAX_LIVE_ROWS - 1], f"… {hidden} more running"]
+    def _bound_live_lines(
+        lines: list[tuple[Text, StageState | None]],
+        *,
+        limit: int = _MAX_LIVE_ROWS,
+    ) -> list[Text]:
+        prioritized = sorted(
+            lines, key=lambda line: line[1] is not StageState.RUNNING
+        )
+        if len(prioritized) <= limit:
+            return [line for line, _state in prioritized]
+        visible = prioritized[: limit - 1]
+        hidden = prioritized[limit - 1 :]
+        hidden_states = {state for _line, state in hidden}
+        suffix = ""
+        if hidden_states == {StageState.RUNNING}:
+            suffix = " running"
+        elif hidden_states == {StageState.PENDING}:
+            suffix = " pending"
+        return [
+            *(line for line, _state in visible),
+            Text(f"… {len(hidden)} more{suffix}", style="dim"),
+        ]
 
     def _format_child_live_line(
-        self, child: ChildRecord, *, parent_label: str
-    ) -> str:
+        self,
+        child: ChildRecord | _RecordSnapshot,
+        *,
+        branch: str,
+        cancelling: bool | None = None,
+    ) -> Text:
+        label = _normalize_cell(child.label)
+        line = Text("      ")
+        line.append(branch, style="dim")
+        line.append(" ")
+        line.append(label)
+        line.append(" " * _child_column_gap(label))
         if child.state is StageState.RUNNING:
-            return self._format_running_line(child, parent_label=parent_label)
+            line.append(self._current_spinner_frame(child), style="cyan")
+            line.append(" ")
+            line.append(_format_duration(self._elapsed(child)), style="dim")
+            line.append("  ")
+            work = _format_current_work(child)
+            if self._cancelling if cancelling is None else cancelling:
+                work = "stopping…"
+            line.append(work)
+            return line
+        glyph = _STATE_GLYPHS[child.state]
+        line.append(glyph, style=_STATE_STYLES[child.state])
         if child.state is StageState.PENDING:
-            return f"pending {parent_label}: {child.label}"
-        return _format_terminal_line(child, parent_label=parent_label)
+            return line
+        line.append(" ")
+        line.append(_format_duration(child.duration_seconds), style="dim")
+        if child.retained:
+            result = _terminal_result(child)
+            if result:
+                line.append("  ")
+                line.append(result)
+        return line
+
+    def _current_spinner_frame(
+        self,
+        record: ChildRecord | _RecordSnapshot | None = None,
+    ) -> str:
+        elapsed = max(0.0, time.monotonic() - self._spinner_started_at)
+        index = int(elapsed / 0.08)
+        is_child = isinstance(record, ChildRecord) or (
+            isinstance(record, _RecordSnapshot) and record.is_child
+        )
+        if record is not None and not is_child:
+            index += 1
+        return _DOTS_FRAMES[index % len(_DOTS_FRAMES)]
 
     def _format_running_line(
         self,
-        record: StageRecord | ChildRecord,
+        record: StageRecord | ChildRecord | _RecordSnapshot,
         *,
         parent_label: str | None = None,
-    ) -> str:
-        label = record.label
-        if parent_label is not None:
-            label = f"{parent_label}: {label}"
+        cancelling: bool | None = None,
+        prefer_detail: bool = False,
+        label_column_width: int = _LABEL_COLUMN_WIDTH,
+    ) -> Text:
+        label = _format_label(record, parent_label=parent_label)
         elapsed = self._elapsed(record)
-        line = f"running {label} ({0.0 if elapsed is None else elapsed:.1f}s)"
-        if record._activity_is_latest and record.activity is not None:
-            activity = record.activity.kind
-            if record.activity.detail:
-                detail = record.activity.detail.replace("\r\n", " ")
-                detail = detail.replace("\r", " ").replace("\n", " ")
-                activity += f": {detail}"
-            line += f" — {activity}"
-        elif record.detail:
-            line += f" — {record.detail}"
-        if self._cancelling:
-            line += " [stopping]"
+        work = (
+            _normalize_cell(record.detail)
+            if prefer_detail and record.detail is not None
+            else _format_current_work(record)
+        )
+        if self._cancelling if cancelling is None else cancelling:
+            work = "stopping…"
+        line = Text(_DOTS_FRAME, style="cyan")
+        line.append(" ")
+        line.append(label)
+        line.append(" " * _column_gap(label, width=label_column_width))
+        line.append(_format_duration(elapsed), style="dim")
+        line.append("  ")
+        line.append(work)
+        return line
+
+    def _format_live_running_line(
+        self,
+        record: StageRecord | _RecordSnapshot,
+        *,
+        cancelling: bool,
+        prefer_detail: bool = False,
+        compact: bool = False,
+    ) -> Text:
+        line = self._format_running_line(
+            record,
+            cancelling=cancelling,
+            prefer_detail=prefer_detail,
+            label_column_width=14 if compact else _LABEL_COLUMN_WIDTH,
+        )
+        spinner = self._current_spinner_frame(record)
+        return Text.assemble(
+            "  ",
+            (spinner, "cyan"),
+            line[1:],
+        )
+
+    def _live_renderable(self, line: Text) -> Text | Spinner:
+        line = self._truncate(line)
+        is_spinner = line.plain.startswith(_DOTS_FRAME)
+        line = self._stream_safe(line)
+        if is_spinner and _can_encode(_DOTS_FRAMES, self._stream_encoding()):
+            spinner_text = line[2:]
+            spinner_text.no_wrap = True
+            spinner = Spinner("dots", text=spinner_text, style="cyan")
+            spinner.start_time = self._spinner_started_at
+            return spinner
+        line.no_wrap = True
         return line
 
     def _reset_heartbeat(self) -> None:
         self._next_heartbeat_at = (
             self._clock() + self._heartbeat_interval
-            if self._active_lines()
+            if self._plain_active_lines(self._projection_snapshot())
             else None
         )
 
-    def _stop_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+    def _ensure_cadence_worker(self) -> None:
+        if self._cadence_worker is not None and self._cadence_worker.is_alive():
+            return
+        if not self._cadence_work_pending():
+            return
+        stopped = threading.Event()
+        progress_ref = weakref.ref(self, lambda _reference: stopped.set())
+        interval = 0.1 if self._interactive else self._heartbeat_interval
+        worker = threading.Thread(
+            target=_run_cadence_worker,
+            args=(progress_ref, stopped, interval),
+            name="betterborg-progress-renderer",
+            daemon=True,
+        )
+        self._cadence_stop = stopped
+        self._cadence_worker = worker
+        worker.start()
+
+    def _cadence_work_pending(self) -> bool:
+        snapshot = self._projection_snapshot()
+        if self._interactive:
+            return snapshot.startup_label is not None or any(
+                stage.record.state is StageState.RUNNING
+                or any(
+                    child.state is StageState.RUNNING
+                    for child in stage.children
+                )
+                for stage in snapshot.stages
+            )
+        return bool(self._plain_active_lines(snapshot))
+
+    def _render_cadence_frame(self, stopped: threading.Event) -> bool:
+        try:
+            with self._lock:
+                if (
+                    stopped is not self._cadence_stop
+                    or stopped.is_set()
+                    or self._suspension_depth
+                    or self._render_failed
+                    or self._display_stopped
+                    or self._closing
+                    or self._closed
+                ):
+                    return False
+                if not self._cadence_work_pending():
+                    return False
+                snapshot = self._projection_snapshot()
+                if self._interactive:
+                    lines = self._project_live_lines(snapshot)
+                    renderable = Group(*self._interactive_live_renderables(lines))
+                    if self._live is None:
+                        self._live = Live(
+                            renderable,
+                            console=self._output_console(),
+                            auto_refresh=False,
+                            transient=True,
+                            redirect_stdout=False,
+                            redirect_stderr=False,
+                        )
+                        self._live.start(refresh=True)
+                    else:
+                        self._live.update(renderable, refresh=True)
+                    self._live_empty = False
+                else:
+                    for line in self._plain_active_lines(snapshot):
+                        self._write_plain(line)
+                    self._next_heartbeat_at = (
+                        self._clock() + self._heartbeat_interval
+                    )
+                return True
+        except BaseException as error:
+            with self._lock:
+                self._latch_render_failure(error)
+                detached = self._register_display_teardown(
+                    self._detach_live(), None, None
+                )
+                self._next_heartbeat_at = None
+            self._teardown_display(detached)
+            return False
+
+    def _cadence_worker_finished(
+        self, worker: threading.Thread, stopped: threading.Event
+    ) -> None:
+        with self._lock:
+            if self._cadence_worker is worker and self._cadence_stop is stopped:
+                self._cadence_worker = None
+                self._cadence_stop = None
+                if (
+                    not self._suspension_depth
+                    and not self._render_failed
+                    and not self._display_stopped
+                    and not self._closing
+                    and not self._closed
+                ):
+                    self._ensure_cadence_worker()
+
+    def _latch_render_failure(self, error: BaseException) -> None:
+        if not self._render_failed:
+            self._render_failure = error
+        self._render_failed = True
+        if self._cadence_stop is not None:
+            self._cadence_stop.set()
+
+    def _raise_if_render_failed_locked(self) -> None:
+        failure = self._render_failure
+        self._render_failure = None
+        if failure is not None:
+            raise failure
+
+    def _detach_display(self) -> _DetachedDisplay:
+        live = self._detach_live()
+        worker, self._cadence_worker = self._cadence_worker, None
+        stopped, self._cadence_stop = self._cadence_stop, None
+        if stopped is not None:
+            stopped.set()
+        self._next_heartbeat_at = None
+        return self._register_display_teardown(live, worker, stopped)
+
+    def _register_display_teardown(
+        self,
+        live: Live | None,
+        worker: threading.Thread | None,
+        stopped: threading.Event | None,
+    ) -> _DetachedDisplay:
+        teardown_complete = None
+        if live is not None or worker is not None:
+            teardown_complete = threading.Event()
+            self._display_teardowns.add(teardown_complete)
+        return _DetachedDisplay(live, worker, stopped, teardown_complete)
+
+    def _detach_live(self) -> Live | None:
+        live, self._live = self._live, None
+        self._live_empty = False
+        return live
+
+    def _teardown_display(self, detached: _DetachedDisplay) -> None:
+        try:
+            if detached.live is not None:
+                try:
+                    detached.live.stop()
+                except BaseException as error:
+                    with self._lock:
+                        self._latch_render_failure(error)
+            if (
+                detached.worker is not None
+                and detached.worker is not threading.current_thread()
+            ):
+                detached.worker.join()
+        finally:
+            if detached.teardown_complete is not None:
+                with self._lock:
+                    self._display_teardowns.discard(detached.teardown_complete)
+                detached.teardown_complete.set()
 
     def _output_console(self) -> Console:
         if self._console is None:
@@ -830,59 +1584,287 @@ class RunProgress:
             self._console = Console(**options)
         return self._console
 
-    def _write_permanent(self, line: str) -> None:
-        line = self._truncate(line)
+    def _write_permanent(self, line: Text) -> None:
         if self._interactive:
-            self._output_console().print(Text(line), soft_wrap=True)
+            line = self._stream_safe(self._truncate(line))
+            self._output_console().print(line, soft_wrap=True)
+            self._has_permanent_output = True
         else:
             self._write_plain(line)
 
-    def _write_plain(self, line: str) -> None:
-        self._stream.write(self._truncate(line) + "\n")
+    def _interactive_live_renderables(self, lines: list[Text]) -> list[Text | Spinner]:
+        renderables: list[Text | Spinner] = []
+        if self._has_permanent_output:
+            renderables.append(Text(""))
+        renderables.extend(self._live_renderable(line) for line in lines)
+        return renderables
+
+    def _write_plain(self, line: Text) -> None:
+        line = self._stream_safe(self._truncate(line))
+        self._stream.write(line.plain + "\n")
         self._stream.flush()
 
-    def _truncate(self, line: str) -> str:
-        if self._width is None or cell_len(line) <= self._width:
+    def _stream_safe(self, line: Text) -> Text:
+        return _degrade_text(line, self._stream_encoding())
+
+    def _stream_encoding(self) -> str:
+        encoding = getattr(self._stream, "encoding", None)
+        return encoding if isinstance(encoding, str) and encoding else "utf-8"
+
+    def _truncate(self, line: Text) -> Text:
+        if self._width is None or cell_len(line.plain) <= self._width:
             return line
         if self._width == 1:
-            return "…"
-        return chop_cells(line, self._width - 1)[0] + "…"
+            return Text("…", style=line.style)
+        prefix = chop_cells(line.plain, self._width - 1)[0]
+        truncated = line[: len(prefix)]
+        truncated.append("…")
+        return truncated
+
+
+def _run_cadence_worker(
+    progress_ref: weakref.ReferenceType[RunProgress],
+    stopped: threading.Event,
+    interval: float,
+) -> None:
+    """Refresh one reporter without retaining it after its owner releases it."""
+
+    worker = threading.current_thread()
+    try:
+        while not stopped.wait(interval):
+            progress = progress_ref()
+            if progress is None:
+                return
+            keep_running = progress._render_cadence_frame(stopped)
+            del progress
+            if not keep_running:
+                return
+    finally:
+        progress = progress_ref()
+        if progress is not None:
+            progress._cadence_worker_finished(worker, stopped)
 
 
 def _format_terminal_line(
-    record: StageRecord | ChildRecord, *, parent_label: str | None = None
-) -> str:
-    label = record.label
-    if parent_label is not None:
-        label = f"{parent_label}: {label}"
-    duration = (
-        "—"
-        if record.duration_seconds is None
-        else f"{record.duration_seconds:.1f}s"
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+    *,
+    parent_label: str | None = None,
+    compact: bool = False,
+) -> Text:
+    label = _format_label(record, parent_label=parent_label)
+    glyph = _STATE_GLYPHS[record.state]
+    line = Text(glyph, style=_STATE_STYLES[record.state])
+    line.append(" ")
+    line.append(label)
+    line.append(
+        " "
+        * _column_gap(
+            label,
+            width=15 if compact else _LABEL_COLUMN_WIDTH,
+        )
     )
-    result = "" if record.result is None else f" — {record.result}"
-    retained = " [retained]" if record.retained else ""
-    return f"{record.state.value} {label}{result} ({duration}){retained}"
+    line.append(_format_duration(record.duration_seconds), style="dim")
+    result = _terminal_result(record)
+    if result:
+        line.append("  ")
+        line.append(result)
+    return line
 
 
-def _format_summary_line(records: Iterable[StageRecord]) -> str:
-    records = tuple(records)
-    counts = Counter(record.state for record in records)
-    retained = sum(record.retained for record in records)
-    return (
-        f"summary: {counts[StageState.COMPLETED]} completed, "
-        f"{counts[StageState.FAILED]} failed, "
-        f"{counts[StageState.STOPPED]} stopped — {retained} retained"
+def _format_child_terminal_line(child: ChildRecord, *, branch: str) -> Text:
+    return Text.assemble((branch, "dim"), " ", _format_terminal_line(child))
+
+
+def _terminal_result(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
+    parts = []
+    if record.result is not None:
+        parts.append(_normalize_cell(str(record.result)))
+    if record.retained:
+        parts.append("reused from earlier run")
+    return " · ".join(parts)
+
+
+def _format_pending_stage_line(label: str) -> Text:
+    return Text(
+        f"  {_STATE_GLYPHS[StageState.PENDING]} {_normalize_cell(label)}",
+        style=_STATE_STYLES[StageState.PENDING],
+    )
+
+
+def _format_label(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+    *,
+    parent_label: str | None = None,
+) -> str:
+    label = _normalize_cell(record.label)
+    if parent_label is not None:
+        label = f"{_normalize_cell(parent_label)}: {label}"
+    return label
+
+
+def _column_gap(label: str, *, width: int = _LABEL_COLUMN_WIDTH) -> int:
+    return max(2, width - cell_len(label) + 2)
+
+
+def _child_column_gap(label: str) -> int:
+    return max(2, _CHILD_LABEL_COLUMN_WIDTH - cell_len(label) + 2)
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    whole_seconds = int(seconds)
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _format_current_work(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
+    if record._activity_is_latest and record.activity is not None:
+        return _format_record_activity(record)
+    if record.detail is not None:
+        detail = _normalize_cell(record.detail)
+        if detail.strip():
+            return detail
+    return "thinking"
+
+
+def _format_record_activity(
+    record: StageRecord | ChildRecord | _RecordSnapshot,
+) -> str:
+    """Format activity without repeating its current phase label."""
+    activity = record.activity
+    if activity is None:
+        return "thinking"
+    detail = activity.detail
+    current_work = record.detail
+    if detail is not None and current_work is not None:
+        label, separator, provider_detail = detail.partition(": ")
+        if separator and (
+            current_work == label
+            or current_work.startswith(f"{label} (")
+            or current_work.startswith(f"{label}:")
+        ):
+            activity = AgentActivity(activity.kind, provider_detail)
+    return _format_activity(activity)
+
+
+def _format_activity(activity: AgentActivity) -> str:
+    if activity.kind is AgentActivityKind.THINKING:
+        return "thinking"
+    detail = "" if activity.detail is None else _normalize_cell(activity.detail)
+    if not detail.strip():
+        return "thinking"
+    if activity.kind is AgentActivityKind.READING:
+        return f"reading {detail}"
+    if activity.kind is AgentActivityKind.SEARCHING:
+        return f'searching "{detail}"'
+    if activity.kind is AgentActivityKind.COMMAND:
+        return f"running {detail}"
+    return f"writing {detail}"
+
+
+def _normalize_cell(value: str) -> str:
+    return _CONTROL_RE.sub(" ", value)
+
+
+def _degrade_text(text: Text, encoding: str) -> Text:
+    if _can_encode(text.plain, encoding):
+        return text
+
+    parts: list[str] = []
+    offsets = [0]
+    for character in text.plain:
+        replacement = character
+        if not _can_encode(character, encoding):
+            replacement = _TOKEN_SUBSTITUTIONS.get(character)
+            if replacement is None:
+                replacement = character.encode(
+                    encoding, errors="backslashreplace"
+                ).decode(encoding)
+        parts.append(replacement)
+        offsets.append(offsets[-1] + len(replacement))
+
+    spans = [
+        Span(offsets[span.start], offsets[span.end], span.style)
+        for span in text.spans
+    ]
+    return Text(
+        "".join(parts),
+        style=text.style,
+        justify=text.justify,
+        overflow=text.overflow,
+        no_wrap=text.no_wrap,
+        end=text.end,
+        tab_size=text.tab_size,
+        spans=spans,
+    )
+
+
+def _can_encode(value: str, encoding: str) -> bool:
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _format_summary_line(
+    records: Iterable[StageRecord], elapsed_seconds: float
+) -> Text:
+    participating = tuple(
+        record for record in records if record.state is not StageState.PENDING
+    )
+    counts = Counter(record.state for record in participating)
+    stage_word = "stage" if len(participating) == 1 else "stages"
+    outcome = "none failed or stopped"
+    if counts[StageState.FAILED] or counts[StageState.STOPPED]:
+        outcome = (
+            f"{counts[StageState.FAILED]} failed and "
+            f"{counts[StageState.STOPPED]} stopped"
+        )
+    return Text(
+        f"{counts[StageState.COMPLETED]} of {len(participating)} {stage_word} "
+        f"finished in {_format_duration(elapsed_seconds)}; {outcome}.",
+        style="dim",
     )
 
 
 def _is_interactive(stream: TextIO) -> bool:
-    if os.environ.get("TERM", "").casefold() == "dumb":
+    if (
+        "CI" in os.environ
+        or "NO_COLOR" in os.environ
+        or os.environ.get("TERM", "").casefold() == "dumb"
+    ):
         return False
     try:
         return bool(stream.isatty())
     except (AttributeError, OSError):
         return False
+
+
+def _select_render_children(
+    children: Iterable[_ChildRenderRecord], history_limit: int
+) -> tuple[tuple[_ChildRenderRecord, ...], int]:
+    """Select fixed children and one bounded window of dynamic attempts."""
+
+    records = tuple(children)
+    fixed = [child for child in records if not child.dynamic]
+    attempts = [child for child in records if child.dynamic]
+    active = [child for child in attempts if child.state not in TERMINAL_STATES]
+    active_keys = {child.key for child in active}
+    remaining_slots = max(history_limit - len(active), 0)
+    terminal = [child for child in attempts if child.state in TERMINAL_STATES]
+    latest_terminal = terminal[-remaining_slots:] if remaining_slots else []
+    visible_keys = active_keys | {child.key for child in latest_terminal}
+    visible_attempts = [child for child in attempts if child.key in visible_keys]
+    return tuple(fixed + visible_attempts), len(attempts) - len(visible_attempts)
 
 
 def _require_activity(activity: AgentActivity) -> AgentActivity:
