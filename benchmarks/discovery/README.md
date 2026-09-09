@@ -34,13 +34,13 @@ image build resolves nothing.
 | Step | Gap | What it fakes |
 |---|---|---|
 | `docker-stub` | 1 | a `docker` that logs and exits 0, because preparation's program is always required |
-| `npm-shim` | 3 | rewrites a plain `npm install` to `npm ci`, because preparation may not modify tracked files |
-| `land` | 4 | merges `project/benchmark` onto the checkout, because execution leaves its work on its own branch |
-| running as `root` | 5 | the worktrees directory is derived from the checkout's parent and cannot be placed |
-| `seed-config` | 6 | a hand-written `config.toml`, because configuration cannot be supplied before analysis runs |
-| `git-identity` | 7 | a global git identity, because the coding phase requires a commit and supplies none |
-| the note appended in `write-prd` | 8 | states a plan-schema rule no prompt states; this one contaminates the task contract and is the most urgent to remove |
-| the greps in `plan` and `approve` | 12 | reads output for a blocked gate; the pinned build exits non-zero on one, so this now only guards against an older build |
+| `npm-shim` | 2 | rewrites a plain `npm install` to `npm ci`, because preparation may not modify tracked files |
+| `land` | 3 | merges `project/benchmark` onto the checkout, because execution leaves its work on its own branch |
+| running as `root` | 4 | the worktrees directory is derived from the checkout's parent and cannot be placed |
+| `seed-config` | 5 | a hand-written `config.toml`, because configuration cannot be supplied before analysis runs |
+| `git-identity` | 6 | a global git identity, because the coding phase requires a commit and supplies none |
+| the note appended in `write-prd` | 7 | states a plan-schema rule no prompt states; this one contaminates the task contract and is the most urgent to remove |
+| the greps in `plan` and `approve` | 11 | reads output for a blocked gate; the pinned build exits non-zero on one, so this now only guards against an older build |
 
 ## What is not an improvisation
 
