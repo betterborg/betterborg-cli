@@ -215,7 +215,8 @@ class BetterborgPierAgent(Codex):
             environment,
             "docker-stub",
             "printf '%s\\n' '#!/bin/sh' "
-            "'echo \"[docker-stub] skipped: $*\" >> /logs/agent/betterborg/docker-stub.log' "
+            "'echo \"[docker-stub] skipped: $*\" "
+            ">> /logs/agent/betterborg/docker-stub.log' "
             "'exit 0' > /usr/local/bin/docker && chmod +x /usr/local/bin/docker "
             "&& docker build -t probe . && cat /logs/agent/betterborg/docker-stub.log",
             cwd="/",
@@ -344,7 +345,8 @@ SHIM
         # and the stage tables it would have generated.
         seed = (
             "import uuid, subprocess, pathlib\n"
-            "branch = subprocess.run(['git','-C','/app','rev-parse','--abbrev-ref','HEAD'],"
+            "branch = subprocess.run("
+            "['git','-C','/app','rev-parse','--abbrev-ref','HEAD'],"
             "capture_output=True, text=True).stdout.strip() or 'master'\n"
             "stages = ['analysis','requirements','architect','tech_lead','pm',"
             "'supervisor','coding','review','merge']\n"
@@ -399,7 +401,8 @@ SHIM
         await self._step(
             environment,
             "save-codex-sessions",
-            f"cp -r {self._REMOTE_CODEX_HOME.as_posix()}/sessions {_STATE}/ 2>/dev/null; "
+            f"cp -r {self._REMOTE_CODEX_HOME.as_posix()}/sessions "
+            f"{_STATE}/ 2>/dev/null; "
             f"find {_STATE} -name '*.jsonl' | head -5; "
             f"du -sh {_STATE} 2>/dev/null",
             cwd="/",
@@ -435,7 +438,8 @@ SHIM
             "save-plan",
             f"mkdir -p {_STATE}/planning && "
             f"cp {_TRACKED}/state/betterborg.sqlite3 {_STATE}/planning/ && "
-            f"{{ cp -r {_TRACKED}/plans {_STATE}/planning/ || echo 'NO PLANS DIR'; }} && "
+            f"{{ cp -r {_TRACKED}/plans {_STATE}/planning/ "
+            "|| echo 'NO PLANS DIR'; } && "
             f"{{ cp -r {_TRACKED}/state/planning/context {_STATE}/planning/ "
             "|| echo 'NO CONTEXT DIR'; } && "
             f"find {_STATE}/planning -type f | head -30",
@@ -505,7 +509,8 @@ SHIM
         await self._step(
             environment,
             "diff",
-            f"git add -A && git -c user.email=a@b -c user.name=bb commit -q -m benchmark "
+            "git add -A && git -c user.email=a@b "
+            "-c user.name=bb commit -q -m benchmark "
             f"|| true; git diff --stat {base_sha} HEAD",
         )
         # The task declares the artifact pier collects, and separately declares
