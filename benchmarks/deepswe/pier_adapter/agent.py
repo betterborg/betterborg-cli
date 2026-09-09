@@ -1,8 +1,8 @@
-"""Throwaway Pier agent: run Betterborg unattended in a DeepSWE task container.
+"""Pier agent that runs Betterborg unattended in a DeepSWE task container.
 
-This exists to discover what Betterborg CLI lacks for unattended container use.
-It is deliberately crude and is not the adapter we ship. Every Betterborg step
-is run, logged, and allowed to fail, because the failures ARE the output.
+Every Betterborg step is run and logged, and a failing step does not end the
+job: the report records what each step did, so a run can be read after the
+container is gone.
 
     PYTHONPATH=<this dir> pier run -p /tmp/deep-swe/tasks/<task> \
         --agent-import-path pier_adapter.agent:BetterborgPierAgent
@@ -19,8 +19,8 @@ from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
-# Betterborg commit under test. A commit rather than a release: this run exists
-# to find what the product still lacks, so it names the exact code that ran.
+# Betterborg build the container installs. A commit rather than a release, so
+# a result names the exact code that produced it. It must be on the remote.
 BETTERBORG_COMMIT = "ec313d7662a93de9da37eaa72f10d1339db36574"
 BETTERBORG_REPO = "https://github.com/betterborg/betterborg-cli"
 
@@ -278,11 +278,10 @@ class BetterborgPierAgent(Codex):
         base_sha = (getattr(base, "stdout", "") or "").strip()
         _BASE_SHA[0] = base_sha
 
-        # The Pier instruction is the PRD. The appended note is throwaway
-        # scaffolding, not part of the task contract: run 4 died three times on
-        # a phase name that broke the schema's own naming rule, which the
-        # architect prompt never states. It exists to test whether that is what
-        # blocks planning, and the product fix is Gap 8, not this note.
+        # The Pier instruction is the PRD. The appended note is a naming rule
+        # the plan schema enforces but no prompt states, so planning can fail
+        # repeatedly on a phase name alone. It adds nothing to what the task
+        # asks for and is not part of the task contract.
         prd = (
             f"{instruction}\n\n"
             "Plan structure note: name each phase as a short slug of the form "
