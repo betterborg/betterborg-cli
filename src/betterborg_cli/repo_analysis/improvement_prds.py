@@ -147,7 +147,7 @@ def generate_improvement_prds(
             publish_repository_text(
                 document.path,
                 document.body_md,
-                root=paths.root,
+                root=paths.tracked_root,
                 overwrite=True,
             )
         except RepositoryPathError as error:
@@ -159,7 +159,7 @@ def generate_improvement_prds(
     _remove_obsolete_prds(
         paths.improvement_prds_dir,
         {document.path.name for document in documents},
-        root=paths.root,
+        root=paths.tracked_root,
         cancel=cancel,
     )
     _raise_if_cancelled(cancel)

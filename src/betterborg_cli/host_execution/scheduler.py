@@ -190,7 +190,7 @@ class HostTaskScheduler:
             Callable[[UUID, AgentActivity], AgentActivity] | None
         ) = None,
         progress: RunProgress | None = None,
-        interruption_cleanup: Callable[[], None] | None = None,
+        expired_run_sweep: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._behavior = behavior
@@ -198,7 +198,7 @@ class HostTaskScheduler:
         self._clock = clock
         self._activity_handoff = activity_handoff
         self._progress = progress
-        self._interruption_cleanup = interruption_cleanup
+        self._expired_run_sweep = expired_run_sweep
         self._progress_projection_lock = Lock()
         self._render_error: BaseException | None = None
 
@@ -390,8 +390,8 @@ class HostTaskScheduler:
                 token.cancel()
                 try:
                     self._drain(active)
-                    if self._interruption_cleanup is not None:
-                        self._interruption_cleanup()
+                    if self._expired_run_sweep is not None:
+                        self._expired_run_sweep()
                 finally:
                     self._reconcile_interrupted_progress(
                         acquisition.run_id, generation_id
@@ -739,8 +739,8 @@ class HostTaskScheduler:
                 reason="execution cancelled",
                 now=self._clock(),
             )
-            if self._interruption_cleanup is not None:
-                self._interruption_cleanup()
+            if self._expired_run_sweep is not None:
+                self._expired_run_sweep()
         finally:
             self._reconcile_interrupted_progress(run_id, generation_id)
 

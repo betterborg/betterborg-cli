@@ -12,6 +12,7 @@ from betterborg_cli.planning import (
     PlanValidationError,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     validate_plan,
     validate_plan_json,
 )
@@ -33,6 +34,108 @@ def test_rejects_invalid_phase_names(repository: Path, name: str) -> None:
     plan["phases"][0]["name"] = name
 
     with pytest.raises(PlanValidationError, match="phase|schema"):
+        validate_plan(plan, repository)
+
+
+def test_no_name_clears_the_schema_and_fails_the_check_after_it(
+    repository: Path,
+) -> None:
+    """The two agree on every name, not merely on the ones a test names.
+
+    Sharing a pattern string is not enough on its own: the schema searches and
+    the check that follows it matches in full, so an anchor that is generous
+    about a trailing newline divides them again while both still read the same
+    constant.
+    """
+    candidates = [
+        "01-setup",
+        "01-a",
+        "01-cache-search-results",
+        "01-abc\n",
+        "01-abc\r\n",
+        "01-Setup",
+        "01-bad_name",
+        "01--bad",
+        "01-bad-",
+        "1-setup",
+        "01-" + "a" * 30,
+        "01-abc extra",
+        "01-abc\u00e9",
+    ]
+
+    for name in candidates:
+        plan = _plan()
+        plan["phases"][0]["name"] = name
+        try:
+            validate_plan(plan, repository)
+        except PlanValidationError as error:
+            assert "must use the NN-kebab format" not in str(error), (
+                f"{name!r} cleared the schema and was refused for its shape "
+                "by the check after it"
+            )
+
+
+@pytest.mark.parametrize("name", ["01-a--b", "01-a-"])
+def test_one_pattern_governs_a_phase_name(repository: Path, name: str) -> None:
+    """One shape governs a phase name, and the schema is where it is stated.
+
+    These two names split the schema from the check that follows it: admitted
+    by the one the Architect answers and refused by the other, so a plan could
+    satisfy every rule it was given and be rejected anyway.
+    """
+    plan = _plan()
+    plan["phases"][0]["name"] = name
+
+    with pytest.raises(PlanValidationError, match="does not match its schema"):
+        validate_plan(plan, repository)
+
+
+def test_the_assumptions_section_says_who_decided_them(repository: Path) -> None:
+    """The heading alone reads as a list of requirements.
+
+    What separates it from one is the sentence underneath, so that sentence
+    is the feature: without it the section quietly becomes the opposite of
+    what it is for.
+    """
+    plan = _two_phase_plan()
+    plan["assumptions"] = [
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux and macOS.",
+        }
+    ]
+
+    rendered = render_plan_markdown(plan)
+
+    assert "## Assumptions" in rendered
+    assert "The Architect decided these itself; nobody confirmed them." in rendered
+
+
+@pytest.mark.parametrize(
+    ("assumption", "message"),
+    [
+        (
+            {"question": "   ", "assumption": "Linux only."},
+            r"assumptions\[0\].question",
+        ),
+        (
+            {"question": "Which platforms?", "assumption": " "},
+            r"assumptions\[0\].assumption",
+        ),
+    ],
+)
+def test_rejects_an_assumption_with_nothing_in_it(
+    repository: Path, assumption: dict[str, str], message: str
+) -> None:
+    """An assumption that says nothing warns the reader about nothing.
+
+    Whitespace clears the schema's minimum length, so only the completeness
+    pass separates a disclosed decision from an empty one.
+    """
+    plan = _two_phase_plan()
+    plan["assumptions"] = [assumption]
+
+    with pytest.raises(PlanValidationError, match=message):
         validate_plan(plan, repository)
 
 
@@ -415,6 +518,77 @@ def test_builds_bounded_rollup_body_from_prd_and_canonical_plan() -> None:
     assert "truncated to fit GitHub's 65,536-character limit" in oversized
 
 
+@pytest.mark.parametrize(
+    "pointer",
+    ["README.md", "README.md:12", "README.md:12:5"],
+)
+def test_a_code_pointer_may_name_a_line_in_a_real_file(
+    repository: Path, pointer: str
+) -> None:
+    """A pointer at a line is written the way every reviewer writes one.
+
+    The schema asks for a string and says nothing about form, so a plan that
+    points precisely at real code was rejected for the precision. The file is
+    what has to exist; the line is a position inside it.
+    """
+    plan = _plan()
+    plan["code_pointers"] = [{"path": pointer, "why": "Repository overview."}]
+
+    validate_plan(plan, repository)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    ["MISSING.md", "MISSING.md:12", "README.md/12"],
+)
+def test_a_code_pointer_at_no_real_file_is_still_refused(
+    repository: Path, pointer: str
+) -> None:
+    """Reading the line off must not become accepting anything.
+
+    The pointer still has to reach a file the repository holds; only the
+    position is allowed to be absent from disk.
+    """
+    plan = _plan()
+    plan["code_pointers"] = [{"path": pointer, "why": "Repository overview."}]
+
+    with pytest.raises(PlanValidationError, match="grounded|repository"):
+        validate_plan(plan, repository)
+
+
+def test_the_rollup_body_names_checks_the_host_could_not_run() -> None:
+    """The pull request is what leaves the machine.
+
+    The terminal that ran execute reports a dropped check to whoever was
+    watching it. The reviewer opening the pull request a day later is the one
+    who decides, and a rollup that reads as a green delivery while its tests
+    never ran once is the way a drop still misleads somebody.
+    """
+    body = build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+        unrun_checks="- test: missing-runtime -m pytest",
+    )
+
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime -m pytest" in body
+    assert "# Product need" in body
+
+
+def test_the_rollup_body_is_unchanged_when_every_check_ran() -> None:
+    assert build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+        unrun_checks=None,
+    ) == build_project_pr_body(
+        prd_markdown="# Product need\n\nShip it.",
+        plan={"title": "Delivery plan", "summary": "Build and verify it."},
+        project_name="delivery",
+    )
+
+
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
     (tmp_path / "README.md").write_text("# Repository\n", encoding="utf-8")
@@ -497,3 +671,35 @@ def _multi_repository_plan() -> dict:
         }
     )
     return plan
+
+
+def test_a_finding_is_agent_text_and_is_escaped_like_the_rest_of_the_plan() -> None:
+    """A finding is free-form model output rendered into a Markdown document.
+
+    Left unescaped it can open a heading, break the list it belongs to, or
+    close a code span, so the account a reader gets of why a plan blocked is
+    not the account the reviewer wrote.
+    """
+    from uuid import uuid4
+
+    from betterborg_cli.store import PlanningFinding
+
+    finding = PlanningFinding(
+        borg_id=uuid4(),
+        attempt_id=uuid4(),
+        round=1,
+        severity="major",
+        message="Phase 1 is underspecified:\n- name the rollback checks\n# heading",
+        suggestion="use `make test`",
+    )
+
+    rendered = render_planning_findings_markdown([finding])
+
+    body = rendered.splitlines()
+    assert body[0] == "## Tech Lead findings"
+    entries = [line for line in body if line.startswith("- Round ")]
+    assert len(entries) == 1
+    assert "\n" not in entries[0]
+    # Escaped, so neither opens a heading nor closes a code span.
+    assert "\\# heading" in rendered
+    assert "\\`make test\\`" in rendered

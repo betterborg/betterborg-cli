@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from threading import RLock
+from typing import NoReturn
 from uuid import UUID
 
 import click
@@ -33,7 +34,6 @@ from betterborg_cli.execution_estimate import (
 from betterborg_cli.host_execution import (
     HostCodingConfig,
     HostCodingPhase,
-    HostComposeManager,
     HostEnvironmentManager,
     HostExecutionResult,
     HostExecutionService,
@@ -49,6 +49,7 @@ from betterborg_cli.host_execution import (
     HostTaskRuntime,
     HostWorktreeManager,
     SafeGit,
+    redacted_dropped_command_summary,
 )
 from betterborg_cli.onboarding import (
     CreateService,
@@ -66,18 +67,24 @@ from betterborg_cli.planning import (
     TechLeadLoop,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     render_task_markdown,
     task_markdown_digest,
 )
 from betterborg_cli.planning.turns import (
     current_planning_cycle_attempts,
     latest_planning_review_requests_changes,
+    standing_planning_findings,
 )
 from betterborg_cli.plugins import (
     SUPPORTED_PLUGIN_HOSTS,
     PluginInstaller,
 )
-from betterborg_cli.prd_session import InteractiveIO, validate_borg_name
+from betterborg_cli.prd_session import (
+    InteractiveIO,
+    adopt_prd,
+    validate_borg_name,
+)
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
@@ -91,6 +98,7 @@ from betterborg_cli.repository_config import (
     AgentStage,
     RepositoryConfig,
     load_repository_config,
+    require_registered_repository,
 )
 from betterborg_cli.repository_files import read_repository_text
 from betterborg_cli.repository_service import RepositoryService
@@ -422,7 +430,12 @@ def install_plugins(all_hosts: bool, host: str | None) -> None:
 
 
 def _stdin_is_interactive() -> bool:
-    return click.get_text_stream("stdin").isatty()
+    # A process started with file descriptor 0 closed has no stdin stream at
+    # all. That is emphatically not a terminal, so report it as one more
+    # noninteractive case rather than letting the absent stream raise: a daemon
+    # or queue worker closes the descriptor instead of redirecting it.
+    stream = click.get_text_stream("stdin")
+    return stream is not None and stream.isatty()
 
 
 def _repository_progress(machine_readable: bool) -> RunProgress | None:
@@ -563,7 +576,7 @@ def initialize_repository(
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
-        if not database.resolve().is_relative_to(paths.root):
+        if not database.resolve().is_relative_to(paths.tracked_root):
             raise ValueError(f"repository state path escapes repository: {database}")
         with SqliteStore.open(database) as store:
             service = RepositoryService(
@@ -602,6 +615,7 @@ def initialize_repository(
                                 progress=progress,
                             )
                             OnboardingDispatcher(
+                                paths,
                                 result.repository,
                                 store,
                                 io,
@@ -631,7 +645,7 @@ def initialize_repository(
 
             if cancel is not None and cancel.is_set():
                 return
-            commands = create_commands(paths.root, result.improvement_prds)
+            commands = create_commands(paths, result.improvement_prds)
 
             def write_result() -> None:
                 if json_output:
@@ -689,7 +703,7 @@ def analyze_repository(
     interactive = _stdin_is_interactive() and not json_output
     progress = _repository_progress(json_output)
     try:
-        if not database.resolve().is_relative_to(paths.root):
+        if not database.resolve().is_relative_to(paths.tracked_root):
             raise ValueError(f"repository state path escapes repository: {database}")
         with SqliteStore.open(database) as store:
             result = RepositoryService(
@@ -743,7 +757,13 @@ def analyze_repository(
     "--prd",
     "source",
     type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True),
-    help="Optional local Markdown PRD to improve.",
+    help="Local Markdown PRD to improve, or to adopt with --adopt.",
+)
+@click.option(
+    "--adopt",
+    "adopt",
+    is_flag=True,
+    help="Adopt the --prd file verbatim, without an interview, agent, or terminal.",
 )
 @click.option(
     "--yes",
@@ -757,38 +777,46 @@ def create_borg(
     cancel: CancellationToken | None,
     name: str,
     source: Path | None,
+    adopt: bool,
 ) -> None:
-    """Brainstorm or improve a PRD and create a named Borg."""
+    """Brainstorm, improve, or adopt a PRD and create a named Borg."""
+    if adopt and source is None:
+        raise click.UsageError("--adopt requires --prd")
     try:
         _validate_create_name(name)
     except ValueError as error:
         raise click.ClickException(str(error)) from error
-    if not _stdin_is_interactive():
+    # Only the interview needs a person at a terminal to answer it.
+    if not adopt and not _stdin_is_interactive():
         raise click.ClickException("betterborg create requires an interactive terminal")
-    progress = _repository_progress(False)
+    progress = None if adopt else _repository_progress(False)
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
+            if adopt:
+                assert source is not None
+                result = adopt_prd(
+                    repository, store, name, source, cancel=cancel
                 )
-            io = _interactive_io()
-            result = CreateService(
-                repository,
-                store,
-                select_agent(
-                    config,
-                    AgentStage.REQUIREMENTS,
-                    paths,
-                    interactive=True,
-                ),
-                io=io,
-                editor=_edit_markdown,
-                cancel=cancel,
-                progress=progress,
-            ).create(name, source)
+            else:
+                io = _interactive_io()
+                result = CreateService(
+                    repository,
+                    store,
+                    select_agent(
+                        config,
+                        AgentStage.REQUIREMENTS,
+                        paths,
+                        interactive=True,
+                    ),
+                    io=io,
+                    editor=_edit_markdown,
+                    cancel=cancel,
+                    progress=progress,
+                ).create(name, source)
     except click.Abort:
         raise
     except (OSError, RuntimeError, ValueError) as error:
@@ -817,6 +845,12 @@ def plan() -> None:
 @plan.command(name="start")
 @click.argument("name")
 @click.option(
+    "--unattended",
+    "unattended",
+    is_flag=True,
+    help="Plan with nobody to ask: the Architect settles its own questions.",
+)
+@click.option(
     "--yes",
     "explicit_trust",
     is_flag=True,
@@ -827,9 +861,10 @@ def start_plan(
     paths: RepoPaths,
     cancel: CancellationToken | None,
     name: str,
+    unattended: bool,
 ) -> None:
     """Start or resume planning for the named Borg."""
-    borg = _continue_planning(paths, name, cancel=cancel)
+    borg = _continue_planning(paths, name, cancel=cancel, unattended=unattended)
     _write_after_progress(
         _repository_progress(False),
         lambda: _write_planning_gate(name, borg, changed=False),
@@ -850,11 +885,9 @@ def show_plan(name: str, json_output: bool) -> None:
         paths = RepoPaths.discover()
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(
@@ -863,6 +896,9 @@ def show_plan(name: str, json_output: bool) -> None:
                 )
             attempt = validated_current_plan_attempt(paths, store, borg)
             stored_plan = attempt.result
+            findings = standing_planning_findings(
+                store, borg.id, "tech_review"
+            )
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 
@@ -874,6 +910,10 @@ def show_plan(name: str, json_output: bool) -> None:
             click.echo(json.dumps(stored_plan, sort_keys=True, separators=(",", ":")))
         else:
             click.echo(render_plan_markdown(stored_plan), nl=False)
+            rendered_findings = render_planning_findings_markdown(findings)
+            if rendered_findings:
+                click.echo()
+                click.echo(rendered_findings, nl=False)
 
 
 @cli.group()
@@ -1209,14 +1249,20 @@ def execute_borg(
                     plan = None
                 prd_session = workflow.prd_session
                 prd_path = prd_session.prd_path if prd_session is not None else None
+                unrun_checks = (
+                    _dropped_checks(result.preflight)
+                    if not isinstance(result.preflight, HostPreflightBlock)
+                    else None
+                )
                 _run_execution_follow_up(
                     progress,
                     pull_request_spec,
                     lambda: _open_rollup_pull_request(
-                        paths.root,
+                        paths,
                         name,
                         plan,
                         prd_path,
+                        unrun_checks=unrun_checks,
                         cancel=cancel,
                         command_runner=run_captured,
                         activity=(
@@ -1376,21 +1422,27 @@ def _push_project_base(git: SafeGit, name: str) -> str:
 
 
 def _open_rollup_pull_request(
-    repository_root: Path,
+    paths: RepoPaths,
     name: str,
     plan: dict[str, object] | None,
     prd_path: Path | None,
     *,
+    unrun_checks: str | None = None,
     cancel: CancellationToken | None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]],
     activity: Callable[[AgentActivity], None] | None = None,
 ) -> str:
     """Open one authenticated GitHub PR after completed local execution."""
+    repository_root = paths.root
     branch = f"project/{name}"
     failure_prefix = "Local execution completed, but rollup PR creation failed"
     try:
+        # The session records the PRD by the name it carries inside a
+        # checkout; this repository's tracked directory is what holds it.
         prd_markdown = (
-            read_repository_text(prd_path, root=repository_root)
+            read_repository_text(
+                paths.prds_dir / prd_path.name, root=paths.tracked_root
+            )
             if prd_path is not None
             else None
         )
@@ -1398,6 +1450,7 @@ def _open_rollup_pull_request(
             prd_markdown=prd_markdown,
             plan=plan,
             project_name=name,
+            unrun_checks=unrun_checks,
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise click.ClickException(f"{failure_prefix}: {error}") from error
@@ -1609,7 +1662,7 @@ def _invoke_host_execution(
     if isinstance(validated, HostPreflightBlock):
         return HostExecutionResult(validated)
 
-    execution_trust = _execution_agent_trust_requirement(paths)
+    execution_trust = _managed_worktree_trust_requirement(paths)
     coding_agent = select_agent(
         config,
         AgentStage.CODING,
@@ -1633,7 +1686,6 @@ def _invoke_host_execution(
     )
     git = SafeGit(paths.root, cancel=cancel)
     environment = HostEnvironmentManager(paths.root, cancel=cancel, git=git)
-    compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
@@ -1649,7 +1701,6 @@ def _invoke_host_execution(
     runtime = HostTaskRuntime(
         validated,
         environment_manager=environment,
-        compose_manager=compose,
         coding=HostCodingPhase(
             paths.root,
             coding_agent,
@@ -1691,7 +1742,6 @@ def _invoke_host_execution(
             paths.root,
             validated,
             environment_manager=environment,
-            compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=locked_repository,
             cancel=cancel,
@@ -1703,7 +1753,6 @@ def _invoke_host_execution(
         preflight,
         runtime,
         worktree_manager=worktrees,
-        compose_manager=compose,
         scheduler_config=HostSchedulerConfig(
             jobs=config.execution.jobs,
             review_passes=config.execution.review_passes,
@@ -1748,17 +1797,33 @@ def _finish_execution_preflight(
             progress.fail("preflight", detail)
     elif isinstance(result, HostPreflightBlock):
         progress.fail("preflight", result.reason)
+    elif result is not None:
+        progress.complete("preflight", _dropped_checks(result) or "ready")
     else:
         progress.complete("preflight", "ready")
 
 
-def _execution_agent_trust_requirement(primary_paths: RepoPaths):
-    """Reuse explicit primary-checkout trust for verified managed worktrees."""
+def _managed_worktree_trust_requirement(primary_paths: RepoPaths):
+    """Reuse explicit primary-checkout trust for the worktrees it manages.
 
-    def require_primary_workspace_trust(_run_paths: RepoPaths, **kwargs):
-        return require_workspace_trust(primary_paths, **kwargs)
+    A worktree Betterborg mints during a run carries identifiers no operator
+    could have trusted beforehand, so a run under the repository's managed
+    worktrees directory is held to the primary checkout's trust. Every other
+    path is trusted on its own identity.
 
-    return require_primary_workspace_trust
+    Containment alone is safe here because the run directory has already been
+    bound to the selected repository, which is where a checkout that merely
+    sits under the worktrees directory is rejected for belonging elsewhere.
+    """
+
+    def require_managed_worktree_trust(run_paths: RepoPaths, **kwargs):
+        managed = primary_paths.manages(run_paths.root)
+        return require_workspace_trust(
+            primary_paths if managed else run_paths,
+            **kwargs,
+        )
+
+    return require_managed_worktree_trust
 
 
 def _agent_billing_mode(adapter_name: str) -> BillingMode:
@@ -1767,9 +1832,29 @@ def _agent_billing_mode(adapter_name: str) -> BillingMode:
     return BillingMode.API
 
 
+def _dropped_checks(preflight: HostPreflightPlan) -> str:
+    """Return the dropped-check summary, masked, as every surface reports it.
+
+    The values come from the environment the same way execution takes them,
+    so a secret quoted inside a catalogued command is masked wherever this
+    string is read.
+    """
+    return redacted_dropped_command_summary(
+        preflight,
+        {
+            name: os.environ[name]
+            for name in preflight.required_secret_names
+            if name in os.environ
+        },
+    )
+
+
 def _write_host_execution_result(result: HostExecutionResult) -> None:
     if isinstance(result.preflight, HostPreflightBlock):
         raise click.ClickException(result.preflight.reason)
+    dropped = _dropped_checks(result.preflight)
+    if dropped:
+        click.echo(dropped)
     if result.active_operation_id is not None:
         click.echo(f"Execution already active: {result.active_operation_id}")
         return
@@ -1840,11 +1925,9 @@ def _current_task_publication(
     paths = RepoPaths.discover()
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
@@ -1862,11 +1945,9 @@ def _current_task_runtime(
     """Load runtime rows and guard against a concurrent generation change."""
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(
@@ -1889,7 +1970,7 @@ def _task_listing_item(
         "complexity": record.complexity.value,
         "dependencies": record.task.get("dependencies", []),
         "digest": record.digest,
-        "path": path.relative_to(paths.root).as_posix(),
+        "path": paths.label(path),
         "position": record.position,
         "stage": record.stage,
         "stem": record.stem,
@@ -2001,6 +2082,7 @@ def approve_plan(
 
     try:
         config = load_repository_config(paths)
+        planning_trust = _managed_worktree_trust_requirement(paths)
         workflow = approve_plan_workflow(
             paths,
             config,
@@ -2010,12 +2092,14 @@ def approve_plan(
                 AgentStage.PM,
                 paths,
                 interactive=_stdin_is_interactive(),
+                trust_requirement=planning_trust,
             ),
             supervisor_agent=lambda: select_agent(
                 config,
                 AgentStage.SUPERVISOR,
                 paths,
                 interactive=_stdin_is_interactive(),
+                trust_requirement=planning_trust,
             ),
             on_bound=mark_resumable,
             cancel=cancel,
@@ -2039,7 +2123,7 @@ def approve_plan(
         raise click.ClickException(str(error)) from error
 
     def write_result() -> None:
-        relative_plan = workflow.plan_path.relative_to(paths.root).as_posix()
+        relative_plan = paths.label(workflow.plan_path)
         click.echo(
             f"Approved plan: {relative_plan} ({workflow.approval.plan_digest})"
         )
@@ -2048,9 +2132,9 @@ def approve_plan(
             click.echo("Current tasks:")
             assert workflow.publication is not None
             for item in workflow.publication.files:
-                click.echo(f"  {item.path.relative_to(paths.root).as_posix()}")
+                click.echo(f"  {paths.label(item.path)}")
         else:
-            click.echo(f"Task decomposition blocked for Borg {name!r}.")
+            _stop_blocked(f"Task decomposition blocked for Borg {name!r}.")
 
     _write_after_progress(progress, write_result)
 
@@ -2059,6 +2143,12 @@ def approve_plan(
 @click.option(
     "--note",
     help="Plain-language changes for the Architect to apply.",
+)
+@click.option(
+    "--unattended",
+    "unattended",
+    is_flag=True,
+    help="Revise with nobody to ask: the Architect settles its own questions.",
 )
 @click.option(
     "--yes",
@@ -2072,6 +2162,7 @@ def change_plan(
     cancel: CancellationToken | None,
     name: str,
     note: str | None,
+    unattended: bool,
 ) -> None:
     """Request changes to a plan awaiting human approval."""
     if note is None:
@@ -2080,7 +2171,9 @@ def change_plan(
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
-    borg = _continue_planning(paths, name, change_note=note, cancel=cancel)
+    borg = _continue_planning(
+        paths, name, change_note=note, cancel=cancel, unattended=unattended
+    )
     _write_after_progress(
         _repository_progress(False),
         lambda: _write_planning_gate(name, borg, changed=True),
@@ -2094,6 +2187,7 @@ def _continue_planning(
     change_note: str | None = None,
     io: InteractiveIO | None = None,
     cancel: CancellationToken | None = None,
+    unattended: bool = False,
 ) -> Borg:
     """Load and drain one initial or change-request planning lifecycle."""
     change_requested = change_note is not None
@@ -2101,11 +2195,9 @@ def _continue_planning(
     try:
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(
@@ -2140,17 +2232,20 @@ def _continue_planning(
             }:
                 resumable = True
                 interactive = _stdin_is_interactive()
+                planning_trust = _managed_worktree_trust_requirement(paths)
                 architect_agent = select_agent(
                     config,
                     AgentStage.ARCHITECT,
                     paths,
                     interactive=interactive,
+                    trust_requirement=planning_trust,
                 )
                 tech_lead_agent = select_agent(
                     config,
                     AgentStage.TECH_LEAD,
                     paths,
                     interactive=interactive,
+                    trust_requirement=planning_trust,
                 )
                 planning_io = io or _interactive_io()
                 progress = _repository_progress(False)
@@ -2168,6 +2263,7 @@ def _continue_planning(
                         store,
                         architect_agent,
                         io=planning_io,
+                        unattended=unattended,
                         cancel=cancel,
                         progress=progress,
                     ).run().borg
@@ -2178,6 +2274,8 @@ def _continue_planning(
                     tech_lead_agent,
                     architect_agent=architect_agent,
                     io=planning_io,
+                    unattended=unattended,
+                    review_rounds=config.planning.review_rounds,
                     cancel=cancel,
                     progress=progress,
                 ).run().borg
@@ -2209,18 +2307,30 @@ def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
     )
 
 
+def _stop_blocked(first: str, *rest: str) -> NoReturn:
+    """Report a blocked gate and end the command, exiting non-zero.
+
+    Raising Exit rather than a ClickException puts these lines on stdout with
+    no "Error: " prefix in front of them: a caller learns that the run stopped
+    from the status, and why from what it reads.
+    """
+    for line in (first, *rest):
+        click.echo(line)
+    raise click.exceptions.Exit(1)
+
+
 def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
-    """Report the actionable terminal gate reached by a planning lifecycle."""
+    """Report the terminal gate reached, stopping on any but approval pending."""
     if borg.state is BorgState.PLAN_APPROVAL_PENDING:
         suffix = " after applying the change" if changed else ""
         click.echo(f"Plan approval pending for Borg {name!r}{suffix}.")
         click.echo(f"Review it with: betterborg plan show {name}")
     elif borg.state is BorgState.BLOCKED:
         suffix = " while applying the change" if changed else ""
-        click.echo(f"Planning blocked for Borg {name!r}{suffix}.")
-        click.echo(
+        _stop_blocked(
+            f"Planning blocked for Borg {name!r}{suffix}.",
             f"Review the saved Tech Lead findings with: "
-            f"betterborg plan show {name}"
+            f"betterborg plan show {name}",
         )
     else:
         raise click.ClickException(

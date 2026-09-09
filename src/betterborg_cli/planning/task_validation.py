@@ -12,7 +12,16 @@ from uuid import UUID
 
 from betterborg_cli.store import TaskComplexity, TaskDependency, TaskRecord
 
-_TASK_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+#: The one shape a stage or stem takes, and a task reference built from two of
+#: them. The Project Manager's schema is built from these, so a name that
+#: schema admits is not refused here for its shape. Anchored with \Z rather
+#: than $, because $ also matches before a trailing newline while the check
+#: below matches in full, which divides the two on exactly that input.
+_TASK_NAME_BODY = r"[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*"
+TASK_NAME_PATTERN = rf"^{_TASK_NAME_BODY}\Z"
+TASK_REFERENCE_PATTERN = rf"^{_TASK_NAME_BODY}/{_TASK_NAME_BODY}\Z"
+
+_TASK_NAME = re.compile(TASK_NAME_PATTERN)
 _VALID_COMPLEXITIES = frozenset(complexity.value for complexity in TaskComplexity)
 
 
@@ -72,10 +81,31 @@ class TaskGraphValidationError(ValueError):
 
     def __init__(self, findings: Iterable[TaskGraphFinding]) -> None:
         self.findings = tuple(findings)
-        details = "; ".join(
-            f"{finding.rule}: {finding.message}" for finding in self.findings
-        )
+        details = "; ".join(_finding_detail(finding) for finding in self.findings)
         super().__init__(f"task graph validation failed: {details}")
+
+
+def _finding_detail(finding: TaskGraphFinding) -> str:
+    """Render one defect with the things it is about.
+
+    A finding already knows which plan element or task it is complaining
+    about, and the whoever has to repair it cannot act on the rule alone:
+    "a required element has no owner" asks them to search, while naming the
+    element asks them to assign it. Dropping the references turned every
+    rejection into a hunt and spent the retry budget on guessing.
+    """
+    named = [
+        f"{label} {', '.join(refs)}"
+        for label, refs in (
+            ("plan element", finding.plan_refs),
+            ("task", finding.task_refs),
+            ("dependency", finding.dependency_refs),
+        )
+        if refs
+    ]
+    if not named:
+        return f"{finding.rule}: {finding.message}"
+    return f"{finding.rule}: {finding.message} ({'; '.join(named)})"
 
 
 class NonProgressingTaskRepairError(ValueError):

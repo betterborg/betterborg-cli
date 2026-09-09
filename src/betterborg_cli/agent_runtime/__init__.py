@@ -46,7 +46,10 @@ from betterborg_cli.agent_runtime.base import (
     combine_agent_usage,
 )
 from betterborg_cli.agent_runtime.claude import ClaudeAdapter
-from betterborg_cli.agent_runtime.codex import CodexAdapter
+from betterborg_cli.agent_runtime.codex import (
+    CodexAdapter,
+    SandboxSettingError,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.openai import (
     OPENAI_API_URL,
@@ -61,9 +64,11 @@ from betterborg_cli.agent_runtime.process import (
     run_streamed,
 )
 from betterborg_cli.agent_runtime.retry import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     DEFAULT_TRANSIENT_BACKOFF_SECONDS,
     DEFAULT_TRANSIENT_MAX_ATTEMPTS,
     RetryOutcome,
+    SchemaRetry,
     retry_outcome_to_result,
     run_with_transient_retry,
 )
@@ -97,6 +102,7 @@ def __getattr__(name: str):
     return value
 
 __all__ = [
+    "DEFAULT_SCHEMA_MAX_ATTEMPTS",
     "DEFAULT_TRANSIENT_BACKOFF_SECONDS",
     "DEFAULT_TRANSIENT_MAX_ATTEMPTS",
     "ANTHROPIC_API_URL",
@@ -140,6 +146,8 @@ __all__ = [
     "PathContainmentError",
     "READ_ONLY_API_TOOLS",
     "RetryOutcome",
+    "SandboxSettingError",
+    "SchemaRetry",
     "StructuredResultError",
     "SearchMatch",
     "SelectedAgent",

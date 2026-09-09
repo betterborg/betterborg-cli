@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
@@ -137,6 +138,152 @@ def test_mock_rejects_schema_invalid_payload(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "missing required property 'status'" in (result.error or "")
     assert not (tmp_path / "result.json").exists()
+
+
+def test_mock_retries_schema_miss_with_the_validating_error(
+    tmp_path: Path,
+) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"count": -1}))
+    adapter.queue(MockResponse(payload={"status": "completed"}))
+    spec = _spec(tmp_path)
+
+    result = adapter.run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed"}
+    assert len(adapter.calls) == 2
+    assert adapter.calls[0].user_prompt == spec.user_prompt
+    assert adapter.calls[1].user_prompt.startswith(spec.user_prompt)
+    assert "missing required property 'status'" in adapter.calls[1].user_prompt
+
+
+def test_a_corrected_attempt_receives_the_result_the_last_one_sent(
+    tmp_path: Path,
+) -> None:
+    rejected = {"count": 3}
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload=rejected))
+    adapter.queue(MockResponse(payload={"status": "completed", "count": 3}))
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    # The whole rejected result comes back, so the agent repairs the field the
+    # failure names and keeps the fields it does not.
+    correction = adapter.calls[1].user_prompt
+    assert json.loads(correction.split("```json")[1].split("```")[0]) == rejected
+
+
+@pytest.mark.parametrize(
+    "unrenderable",
+    # json refuses a value two ways. A non-finite number is reachable today,
+    # because json.loads accepts the NaN literal and no native CLI validates
+    # its own output; the others stand for the types the annotation admits.
+    [float("nan"), {1, 2}, b"bytes"],
+)
+def test_a_result_that_is_not_json_still_corrects_without_crashing(
+    tmp_path: Path, unrenderable: object
+) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"status": "completed", "count": unrenderable}))
+    adapter.queue(MockResponse(payload={"status": "completed", "count": 1}))
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.COMPLETED
+    correction = adapter.calls[1].user_prompt
+    assert "```json" not in correction
+    assert "Send a result that satisfies every schema constraint above." in correction
+
+
+def test_a_first_attempt_carries_no_rejected_result(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"count": 3}))
+    adapter.queue(MockResponse(payload={"status": "completed"}))
+    spec = _spec(tmp_path)
+
+    result = adapter.run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert adapter.calls[0].user_prompt == spec.user_prompt
+    assert "Rejected result" not in adapter.calls[0].user_prompt
+
+
+def test_a_rejected_result_reaches_the_prompt_and_not_the_error(
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["status", "summary"],
+        "properties": {
+            "status": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    adapter = MockAdapter()
+    for _attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS):
+        adapter.queue(MockResponse(payload={"summary": "the value it refused"}))
+
+    result = adapter.run(_spec(tmp_path, schema=schema))
+
+    # A validating error reaches logs, exceptions and stored state, so the
+    # rejected result travels in the prompt and nowhere else.
+    assert result.status == AgentStatus.FAILED
+    assert "missing required property 'status'" in (result.error or "")
+    assert "the value it refused" not in (result.error or "")
+    assert all(
+        "the value it refused" in call.user_prompt for call in adapter.calls[1:]
+    )
+
+
+def test_mock_bills_every_attempt_of_a_schema_retried_turn(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    adapter.queue(
+        MockResponse(
+            payload={"count": -1},
+            usage=AgentUsage(tokens_input=2, tokens_output=3),
+        )
+    )
+    adapter.queue(
+        MockResponse(
+            payload={"status": "completed"},
+            usage=AgentUsage(tokens_input=5, tokens_output=7),
+        )
+    )
+
+    result = adapter.run(_spec(tmp_path))
+
+    # The real adapters combine usage across attempts, so a turn that was
+    # retried costs both attempts here too.
+    assert result.status == AgentStatus.COMPLETED
+    assert result.usage is not None
+    assert result.usage.tokens_input == 7
+    assert result.usage.tokens_output == 10
+
+
+def test_mock_schema_miss_fails_after_bounded_attempts(tmp_path: Path) -> None:
+    adapter = MockAdapter()
+    for attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS + 1):
+        adapter.queue(
+            MockResponse(
+                payload={"count": -1},
+                usage=AgentUsage(tokens_input=attempt + 1),
+            )
+        )
+
+    result = adapter.run(_spec(tmp_path))
+
+    assert result.status == AgentStatus.FAILED
+    assert "missing required property 'status'" in (result.error or "")
+    assert len(adapter.calls) == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert len(adapter.responses) == 1
+    # A turn that never conforms is still billed for every attempt it made.
+    assert result.usage is not None
+    assert result.usage.tokens_input == sum(
+        range(1, DEFAULT_SCHEMA_MAX_ATTEMPTS + 1)
+    )
 
 
 def test_mock_honors_preexisting_cancellation_without_consuming_response(
@@ -822,6 +969,247 @@ def test_structured_validation_supports_local_references() -> None:
     validate_structured_result({"items": ["one", "two"]}, schema)
     with pytest.raises(StructuredResultError, match="must be unique"):
         validate_structured_result({"items": ["one", "one"]}, schema)
+
+
+# Every rejection here pairs the constraint the schema states with a payload
+# value that violates it: the message has to report the first and never the
+# second.
+_CONSTRAINT_REJECTIONS = (
+    (
+        {"type": "string", "pattern": "^[0-9]{2}-[a-z0-9-]+$"},
+        "Merge The Acquisition Memo",
+        '"^[0-9]{2}-[a-z0-9-]+$"',
+    ),
+    ({"type": "string", "minLength": 12}, "secret", "at least 12 characters"),
+    (
+        {"type": "string", "maxLength": 4},
+        "customer-credentials",
+        "at most 4 characters",
+    ),
+    ({"type": "array", "minItems": 3}, ["internal-hostname"], "at least 3"),
+    (
+        {"type": "array", "maxItems": 1},
+        ["internal-hostname", "backup-hostname"],
+        "at most 1",
+    ),
+    ({"type": "integer", "minimum": 5}, -8675309, "minimum 5"),
+    ({"type": "integer", "maximum": 5}, 8675309, "maximum 5"),
+    (
+        {"type": "string", "enum": ["approve", "reject"]},
+        "escalate-to-legal",
+        '["approve", "reject"]',
+    ),
+    (
+        {"const": "01-migrate-the-schema"},
+        "Migrate The Schema",
+        '"01-migrate-the-schema"',
+    ),
+    ({"const": None}, "not-the-constant", "null"),
+)
+
+
+def _reject(constraint: dict[str, Any], value: Any) -> str:
+    schema = {
+        "type": "object",
+        "required": ["field"],
+        "properties": {"field": constraint},
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"field": value}, schema)
+    return str(rejection.value)
+
+
+@pytest.mark.parametrize(("constraint", "rejected", "required"), _CONSTRAINT_REJECTIONS)
+def test_a_violated_constraint_reports_the_value_it_required(
+    constraint: dict[str, Any], rejected: Any, required: str
+) -> None:
+    detail = _reject(constraint, rejected)
+
+    assert required in detail
+    assert detail.startswith("$.field: ")
+    assert "\n" not in detail
+
+
+@pytest.mark.parametrize(("constraint", "rejected", "required"), _CONSTRAINT_REJECTIONS)
+def test_a_violated_constraint_never_quotes_the_value_it_refused(
+    constraint: dict[str, Any], rejected: Any, required: str
+) -> None:
+    detail = _reject(constraint, rejected)
+    quoted = rejected if isinstance(rejected, list) else [rejected]
+
+    assert all(str(item) not in detail for item in quoted)
+
+
+def test_a_shortened_list_constraint_stays_bounded_and_counts_the_rest() -> None:
+    members = [f"option-{index:03d}" for index in range(200)]
+
+    detail = _reject({"enum": members}, "unlisted")
+    listed = detail[detail.index("[") + 1 : detail.index("]")].split(", ")
+    remainder = len(members) - len(listed)
+
+    assert all(json.loads(item) in members for item in listed)
+    assert remainder > 0
+    assert detail.endswith(f"] and {remainder} more")
+    assert len(detail.split("expected one of ", 1)[1]) <= 200
+    assert "\n" not in detail
+    assert "unlisted" not in detail
+
+
+def test_a_constraint_with_no_members_to_drop_is_shown_whole() -> None:
+    pattern = "^(" + "|".join(f"task-{index:02d}" for index in range(30)) + ")$"
+
+    detail = _reject({"type": "string", "pattern": pattern}, "nope")
+
+    assert json.loads(detail[detail.index('"') :]) == pattern
+    assert "more" not in detail
+
+
+def test_a_long_mapping_constraint_drops_whole_entries() -> None:
+    entries = {index: "y" * 30 for index in range(15)}
+
+    detail = _reject({"const": entries}, "no")
+    shown = json.loads(detail[detail.index("{") : detail.rindex("}") + 1])
+    expected = {str(key): entries[key] for key in list(entries)[: len(shown)]}
+
+    assert shown == expected
+    assert detail.endswith(f"and {len(entries) - len(shown)} more")
+
+
+def test_a_constraint_cannot_split_a_message_across_lines() -> None:
+    detail = _reject({"enum": ["a\u2028b", "c\u2029d", "e\u0085f"]}, "no")
+
+    assert len(detail.splitlines()) == 1
+
+
+def test_a_constraint_that_left_nothing_out_does_not_claim_a_remainder() -> None:
+    member = "x" * 250
+
+    detail = _reject({"enum": [member]}, "unlisted")
+
+    assert json.loads(detail[detail.index("[") + 1 : detail.rindex("]")]) == member
+    assert "more" not in detail
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        {"const": {"an", "unserialisable", "set"}},
+        {"const": {(1, 2): "a tuple key"}},
+        {"type": "number", "maximum": float("-inf")},
+    ],
+)
+def test_a_constraint_that_is_not_json_is_refused_as_a_broken_schema(
+    constraint: dict[str, Any],
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["field"],
+        "properties": {"field": constraint},
+    }
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"field": 1}, schema)
+
+    assert "must be JSON" in str(rejection.value)
+
+
+@pytest.mark.parametrize(
+    ("constraint", "rejected", "required"),
+    [
+        ({"type": "string", "minLength": 1}, "", "at least 1 character"),
+        ({"type": "string", "minLength": 2}, "a", "at least 2 characters"),
+        ({"type": "string", "maxLength": 1}, "ab", "at most 1 character"),
+        ({"type": "string", "maxLength": 2}, "abc", "at most 2 characters"),
+    ],
+)
+def test_a_counted_bound_agrees_with_its_count(
+    constraint: dict[str, Any], rejected: str, required: str
+) -> None:
+    assert _reject(constraint, rejected).endswith(required)
+
+
+def test_a_subschema_json_cannot_render_still_rejects_cleanly() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"field": {"not": {"properties": {("x", "y"): {}}}}},
+    }
+
+    with pytest.raises(StructuredResultError):
+        validate_structured_result({"field": "any value"}, schema)
+
+
+def test_a_property_name_cannot_split_a_message_across_lines() -> None:
+    schema = {"type": "object", "additionalProperties": {"minLength": 40}}
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"a\nb\u2028c": "short"}, schema)
+
+    assert len(str(rejection.value).splitlines()) == 1
+
+
+def test_a_forbidden_schema_names_what_it_forbids() -> None:
+    schema = {"type": "object", "properties": {"field": {"not": {"type": "string"}}}}
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"field": "a string"}, schema)
+
+    assert '{"type": "string"}' in str(rejection.value)
+    assert "a string" not in str(rejection.value)
+
+
+def test_a_rejected_branch_names_the_alternatives_it_required() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "anyOf": [{"required": ["files"]}, {"required": ["toolchains"]}],
+        "properties": {
+            "files": {"type": "array"},
+            "toolchains": {"type": "array"},
+            "source": {"type": "string"},
+        },
+    }
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"source": "pyproject.toml"}, schema)
+
+    detail = str(rejection.value)
+
+    assert '{"required": ["files"]}' in detail
+    assert '{"required": ["toolchains"]}' in detail
+    assert "pyproject.toml" not in detail
+
+
+def test_a_schema_correction_carries_the_pattern_the_agent_must_match(
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string", "pattern": "^[0-9]{2}-[a-z0-9-]+$"}},
+        "additionalProperties": False,
+    }
+    adapter = MockAdapter()
+    adapter.queue(MockResponse(payload={"name": "Phase One"}))
+    adapter.queue(MockResponse(payload={"name": "01-phase-one"}))
+
+    result = adapter.run(_spec(tmp_path, schema=schema))
+
+    assert result.status == AgentStatus.COMPLETED
+    assert "^[0-9]{2}-[a-z0-9-]+$" in adapter.calls[1].user_prompt
+
+
+def test_a_value_matching_several_exclusive_branches_is_told_so() -> None:
+    schema = {"oneOf": [{"required": ["a"]}, {"required": ["a"]}]}
+
+    with pytest.raises(StructuredResultError) as rejection:
+        validate_structured_result({"a": "chosen-payload"}, schema)
+
+    detail = str(rejection.value)
+
+    assert "satisfies more than one" in detail
+    assert "chosen-payload" not in detail
 
 
 def test_usage_combines_reported_fields_without_inventing_unknowns() -> None:

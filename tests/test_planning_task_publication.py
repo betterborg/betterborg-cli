@@ -153,6 +153,93 @@ def test_publishes_exact_tracked_generation_and_blocks_digest_drift(
             TaskPublisher(repository, store).current_task_files(borg.id)
 
 
+def test_publishes_a_generation_under_a_declared_home_without_touching_the_repository(
+    committed_git_repo: Path,
+    approved_task_generation,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    database = home / "state/task-publication.sqlite3"
+    repository, borg, approval = _publication_context(committed_git_repo, database)
+    with SqliteStore.open(database) as store:
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-publish"),
+            round_number=1,
+        ).generation
+
+        publication = TaskPublisher(repository, store).publish(generation.id)
+
+        expected = (
+            home
+            / "tasks/durable-tasks"
+            / str(generation.id)
+            / "01-foundation/01-publish.md"
+        )
+        assert publication.generation.status is TaskGenerationStatus.CURRENT
+        assert [item.path for item in publication.files] == [expected]
+        assert expected.read_text(encoding="utf-8") == render_task_markdown(
+            _task_body("01-publish")
+        )
+        assert store.get_current_task_generation(borg.id) == publication.generation
+        assert not (committed_git_repo / ".betterborg").exists()
+
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "status",
+            "--short",
+            "--untracked-files=all",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+
+def test_publication_refuses_a_destination_the_store_cannot_reconstruct(
+    committed_git_repo: Path,
+    approved_task_generation,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    database = home / "state/task-publication.sqlite3"
+    repository, borg, approval = _publication_context(committed_git_repo, database)
+    with SqliteStore.open(database) as store:
+        generation = approved_task_generation(
+            store,
+            borg,
+            approval,
+            body=_task_body("01-publish"),
+            round_number=1,
+        ).generation
+        publisher = TaskPublisher(repository, store)
+        destination = publisher._generation_dir(borg, generation)  # noqa: SLF001
+        (destination / "01-foundation").mkdir(parents=True)
+        (destination / "01-foundation/01-publish.md").write_text(
+            render_task_markdown(_task_body("01-publish")), encoding="utf-8"
+        )
+
+        # The Borg name and generation id are what only SQLite knows, so the
+        # store still reconstructs the destination from them.
+        with pytest.raises(ValueError, match="does not match SQLite"):
+            store._promote_published_task_generation(  # noqa: SLF001
+                generation.id,
+                durable_root=destination,
+                tasks_root=home / "tasks-elsewhere",
+                owned_root=home,
+            )
+
+
 def test_constructor_discovery_cancellation_reaps_registered_git_tree(
     committed_git_repo: Path,
     real_process_harness: Any,

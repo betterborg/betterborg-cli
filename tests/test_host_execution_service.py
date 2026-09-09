@@ -20,7 +20,6 @@ from uuid import UUID, uuid4
 import pytest
 from progress_test_support import FailingStringIO, TTYStringIO
 from progress_test_support import FakeClock as ProgressClock
-from test_execution_preflight import FakeComposeRunner
 from test_host_scheduler import FakeClock
 
 from betterborg_cli.agent_runtime import (
@@ -32,18 +31,15 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.host_execution import (
-    ComposeCleanupResult,
-    EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
     HostCommand,
-    HostComposeManager,
     HostEnvironmentManager,
-    HostExecutable,
     HostExecutionService,
     HostMergeConfig,
     HostMergePhase,
     HostMergeResult,
+    HostPreflight,
     HostPreflightBlock,
     HostPreflightFailure,
     HostPreflightPlan,
@@ -53,12 +49,12 @@ from betterborg_cli.host_execution import (
     HostSanityResult,
     HostSchedulerConfig,
     HostSecret,
-    HostService,
     HostTaskRuntime,
     HostWorktreeManager,
     MergeTip,
     SafeGit,
 )
+from betterborg_cli.host_execution import service as host_service
 from betterborg_cli.host_execution.service import _ExecutionActivityBinding
 from betterborg_cli.planning import (
     approved_plan_digest,
@@ -78,7 +74,6 @@ from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.store import (
     Borg,
     BorgState,
-    ComposeResource,
     ExecutionAttemptStatus,
     ExecutionEvent,
     ExecutionRunStatus,
@@ -94,13 +89,29 @@ from betterborg_cli.store import (
     TaskRecord,
     TaskRuntimeStatus,
 )
+from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
 
 def _store_fixture(
     tmp_path: Path, task_count: int = 1
 ) -> tuple[SqliteStore, Borg, TaskGeneration, list[TaskRecord]]:
     repository = Repository(root=tmp_path / "repository")
-    borg = Borg(repository_id=repository.id, name="Integration")
+    store = SqliteStore.open(tmp_path / "execution.sqlite3")
+    store.add_repository(repository)
+    borg, generation, records = _seed_generation(
+        store, repository, "Integration", task_count
+    )
+    return store, borg, generation, records
+
+
+def _seed_generation(
+    store: SqliteStore,
+    repository: Repository,
+    borg_name: str,
+    task_count: int,
+) -> tuple[Borg, TaskGeneration, list[TaskRecord]]:
+    """Publish one Borg's current generation of claimable tasks."""
+    borg = Borg(repository_id=repository.id, name=borg_name)
     approval = PlanApproval(
         borg_id=borg.id,
         plan_digest="sha256:plan",
@@ -142,8 +153,6 @@ def _store_fixture(
     durable_root = (
         repository.root / ".betterborg/tasks" / borg.name / str(generation.id)
     )
-    store = SqliteStore.open(tmp_path / "execution.sqlite3")
-    store.add_repository(repository)
     store.add_borg(borg)
     store.append_plan_approval(approval)
     store.append_task_batch(batch)
@@ -152,8 +161,13 @@ def _store_fixture(
         path = durable_root / record.stage / f"{record.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(record.task_ref, encoding="utf-8")
-    store._promote_published_task_generation(generation.id, durable_root=durable_root)
-    return store, borg, generation, records
+    store._promote_published_task_generation(
+        generation.id,
+        durable_root=durable_root,
+        tasks_root=repository.root / ".betterborg/tasks",
+        owned_root=repository.root,
+    )
+    return borg, generation, records
 
 
 class _Preflight:
@@ -176,24 +190,6 @@ class _Worktrees:
 
     def refresh_unstarted_task_worktree(self, *args, **kwargs) -> bool:
         return False
-
-
-class _Compose:
-    def __init__(self, calls: list[str]) -> None:
-        self.calls = calls
-
-    def cleanup_stale_projects(
-        self, store, resources, **kwargs
-    ) -> tuple[object, ...]:
-        self.calls.append("stale-cleanup")
-        return ()
-
-    def start_claimed_stack(self, *args, **kwargs):
-        self.calls.append("services-start")
-        return SimpleNamespace(environment={"SERVICE_URL": "http://127.0.0.1"})
-
-    def stop_claimed_stack(self, *args, **kwargs) -> None:
-        self.calls.append("services-stop")
 
 
 class _Environment:
@@ -233,10 +229,7 @@ class _Coding:
         expected_environment: dict[str, str] | None = None,
     ) -> None:
         self.calls = calls
-        self.expected_environment = expected_environment or {
-            "CACHE": "prepared",
-            "SERVICE_URL": "http://127.0.0.1",
-        }
+        self.expected_environment = expected_environment or {"CACHE": "prepared"}
 
     def run(
         self,
@@ -269,9 +262,7 @@ class _Review:
         review_environment=None,
         fix_environment=None,
     ) -> TaskRuntimeStatus:
-        if self.expected_environment is None:
-            assert environment["SERVICE_URL"] == "http://127.0.0.1"
-        else:
+        if self.expected_environment is not None:
             assert environment == self.expected_environment
         if self.expected_agent_environment is not None:
             assert review_environment == self.expected_agent_environment
@@ -311,14 +302,8 @@ class _Sanity:
         tip,
         *,
         secret_values=None,
-        existing_stack=None,
     ) -> HostSanityResult:
-        if existing_stack is not None:
-            self.calls.append("services-stop")
-            self.calls.append("services-start")
         self.calls.append("sanity")
-        if existing_stack is not None:
-            self.calls.append("services-stop")
         context.transition(TaskRuntimeStatus.MERGING, TaskRuntimeStatus.DONE)
         return HostSanityResult(TaskRuntimeStatus.DONE, "published", "c")
 
@@ -329,11 +314,7 @@ def _plan(tmp_path: Path) -> HostPreflightPlan:
         commands=(),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(),
-        executables=(),
         required_secret_names=(),
-        compose_files=(),
-        services=(),
     )
 
 
@@ -508,7 +489,6 @@ class _ConcreteHostFixture:
     coding: MockAdapter
     review: MockAdapter
     merge: MockAdapter
-    compose: FakeComposeRunner
     environment: HostEnvironmentManager
     worktrees: HostWorktreeManager
     clock: FakeClock
@@ -526,7 +506,7 @@ def _concrete_host_fixture(
     git_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     environment_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     environment_activity: Callable[[AgentActivity], None] | None = None,
-    compose_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    plan_factory: Callable[[Path], HostPreflightPlan] | None = None,
     sanity_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     activity: Callable[[UUID, AgentActivity], None] | None = None,
 ) -> _ConcreteHostFixture:
@@ -536,11 +516,8 @@ def _concrete_host_fixture(
     _git(repository_root, "config", "user.name", "Betterborg Tests")
     _git(repository_root, "config", "user.email", "tests@betterborg.dev")
     (repository_root / "README.md").write_text("# Fixture\n", encoding="utf-8")
-    (repository_root / "compose.yml").write_text(
-        "services:\n  healthy:\n    image: fixture\n",
-        encoding="utf-8",
-    )
-    ensure_managed_gitignore(RepoPaths.discover(repository_root))
+    paths = RepoPaths.discover(repository_root)
+    ensure_managed_gitignore(paths)
     _git(repository_root, "add", ".")
     _git(repository_root, "commit", "--quiet", "-m", "initial")
 
@@ -662,39 +639,34 @@ def _concrete_host_fixture(
     store.append_plan_approval(approval)
     store.append_task_batch(batch)
     store.add_task_generation(generation, tasks, dependencies)
-    durable_root = (
-        repository_root / ".betterborg/tasks" / borg.name / str(generation.id)
-    )
+    durable_root = paths.tasks_dir / borg.name / str(generation.id)
     for task in tasks:
         path = durable_root / task.stage / f"{task.stem}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render_task_markdown(task.task), encoding="utf-8")
-    store._promote_published_task_generation(generation.id, durable_root=durable_root)
-    _git(repository_root, "add", ".")
-    _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
+    store._promote_published_task_generation(
+        generation.id,
+        durable_root=durable_root,
+        tasks_root=paths.tasks_dir,
+        owned_root=paths.tracked_root,
+    )
+    if paths.tracked_in_repository:
+        _git(repository_root, "add", ".")
+        _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
 
     clock = FakeClock()
-    plan = HostPreflightPlan(
-        repository_root=repository_root,
-        commands=(HostCommand("test", ("git", "status", "--short"), "."),),
-        prepare_commands=(HostCommand("prepare", ("git", "status", "--short"), "."),),
-        materialize_commands=(),
-        environment_files=(repository_root / "README.md",),
-        executables=(HostExecutable("docker", Path("/validated/docker")),),
-        required_secret_names=(),
-        compose_files=(repository_root / "compose.yml",),
-        services=(
-            HostService(
-                name="http-service",
-                kind="compose",
-                evidence="concrete fixture",
-                compose_service="healthy",
-                url_env="SERVICE_URL",
-                port=8080,
-                url_targets=(("SERVICE_URL", 8080, "tcp"),),
+    plan = (
+        plan_factory(repository_root)
+        if plan_factory is not None
+        else HostPreflightPlan(
+            repository_root=repository_root,
+            commands=(HostCommand("test", ("git", "status", "--short"), "."),),
+            prepare_commands=(
+                HostCommand("prepare", ("git", "status", "--short"), "."),
             ),
-        ),
-        compose_networks=("default",),
+            materialize_commands=(),
+            required_secret_names=(),
+        )
     )
     git = SafeGit(
         repository_root,
@@ -708,12 +680,6 @@ def _concrete_host_fixture(
         git=git,
         command_runner=environment_runner,
         activity=environment_activity,
-    )
-    compose_observer = FakeComposeRunner()
-    compose = HostComposeManager(
-        repository_root,
-        command_runner=compose_runner or compose_observer,
-        clock=clock,
     )
     worktrees = HostWorktreeManager(
         repository_root,
@@ -749,7 +715,6 @@ def _concrete_host_fixture(
     runtime = HostTaskRuntime(
         plan,
         environment_manager=environment,
-        compose_manager=compose,
         coding=HostCodingPhase(
             repository_root,
             coding,
@@ -776,7 +741,6 @@ def _concrete_host_fixture(
             repository_root,
             plan,
             environment_manager=environment,
-            compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=lambda: repository_lock,
             command_runner=sanity_runner,
@@ -789,7 +753,6 @@ def _concrete_host_fixture(
         _Preflight(plan, []),
         runtime,
         worktree_manager=worktrees,
-        compose_manager=compose,
         scheduler_config=HostSchedulerConfig(
             jobs=task_count,
             lease_duration=timedelta(minutes=5),
@@ -808,7 +771,6 @@ def _concrete_host_fixture(
         coding,
         review,
         merge,
-        compose_observer,
         environment,
         worktrees,
         clock,
@@ -897,9 +859,9 @@ def test_service_setup_reaps_cancelled_environment_command(
                 "service-environment.child.pid"
             )
             cancel.cancel()
-            with pytest.raises(KeyboardInterrupt):
-                result.result(timeout=5)
+            cancelled = result.result(timeout=5)
 
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
         real_process_harness.assert_tree_absent("service-environment")
         assert observed_tokens == [cancel]
         assert activities == [
@@ -920,11 +882,9 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
     store, borg, generation, records = _store_fixture(tmp_path)
     calls: list[str] = []
     plan = _plan(tmp_path)
-    compose = _Compose(calls)
     runtime = HostTaskRuntime(
         plan,
         environment_manager=_Environment(calls),
-        compose_manager=compose,
         coding=_Coding(calls),
         review_fix=_Review(calls),
         merge=_Merge(calls),
@@ -956,7 +916,6 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             _Preflight(plan, calls),
             runtime,
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
             progress=progress,
         ).run(borg.id, generation.id, {})
@@ -975,14 +934,10 @@ def test_service_runs_the_concrete_task_lifecycle_in_order(tmp_path: Path) -> No
             "preflight",
             "worktrees",
             "environment",
-            "services-start",
             "coding",
             "review",
             "merge",
-            "services-stop",
-            "services-start",
             "sanity",
-            "services-stop",
         ]
     finally:
         store.close()
@@ -1087,18 +1042,12 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             )
         )
 
-    compose = _Compose(calls)
     runtime = HostTaskRuntime(
         plan,
         environment_manager=ActivityEnvironment(calls),
-        compose_manager=compose,
         coding=ActivityCoding(
             calls,
-            {
-                "CACHE": "prepared",
-                "SERVICE_URL": "http://127.0.0.1",
-                "EXECUTION_TOKEN": token,
-            },
+            {"CACHE": "prepared", "EXECUTION_TOKEN": token},
         ),
         review_fix=_Review(calls),
         merge=_Merge(calls),
@@ -1110,7 +1059,6 @@ def test_service_masks_local_and_agent_activity_before_every_reporter_surface(
             _Preflight(plan, calls),
             runtime,
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
             activity=report,
             progress=service_progress,
@@ -1224,18 +1172,12 @@ def test_service_settles_durable_task_before_render_failure_escapes(
         observed.append(activity)
         raise RuntimeError("observer unavailable")
 
-    compose = _Compose(calls)
     runtime = HostTaskRuntime(
         plan,
         environment_manager=_Environment(calls),
-        compose_manager=compose,
         coding=BlockingActivityCoding(
             calls,
-            {
-                "CACHE": "prepared",
-                "SERVICE_URL": "http://127.0.0.1",
-                "EXECUTION_TOKEN": token,
-            },
+            {"CACHE": "prepared", "EXECUTION_TOKEN": token},
         ),
         review_fix=_Review(calls),
         merge=_Merge(calls),
@@ -1249,7 +1191,6 @@ def test_service_settles_durable_task_before_render_failure_escapes(
             _Preflight(plan, calls),
             runtime,
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
             activity=failing_observer,
             progress=progress,
@@ -1293,7 +1234,7 @@ def test_service_settles_durable_task_before_render_failure_escapes(
         store.close()
 
 
-def test_cancellation_during_materialization_does_not_start_services(
+def test_cancellation_during_materialization_does_not_start_coding(
     tmp_path: Path,
 ) -> None:
     store, borg, generation, records = _store_fixture(tmp_path)
@@ -1317,11 +1258,9 @@ def test_cancellation_during_materialization_does_not_start_services(
             )
             return SimpleNamespace(environment={"CACHE": "prepared"})
 
-    compose = _Compose(calls)
     runtime = HostTaskRuntime(
         plan,
         environment_manager=PausingEnvironment(calls),
-        compose_manager=compose,
         coding=_Coding(calls),
         review_fix=_Review(calls),
         merge=_Merge(calls),
@@ -1333,7 +1272,6 @@ def test_cancellation_during_materialization_does_not_start_services(
             _Preflight(plan, calls),
             runtime,
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1352,146 +1290,7 @@ def test_cancellation_during_materialization_does_not_start_services(
         assert store.get_task_runtime(records[0].id).status is (
             TaskRuntimeStatus.PENDING
         )
-        assert "services-start" not in calls
         assert "coding" not in calls
-    finally:
-        store.close()
-
-
-def test_cancellation_during_compose_startup_does_not_start_coding(
-    tmp_path: Path,
-    real_process_harness,
-) -> None:
-    cancel = CancellationToken()
-    fake = FakeComposeRunner()
-    invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
-    activities: list[tuple[UUID, AgentActivity]] = []
-
-    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
-        command = tuple(argv)
-        invocations.append((command, dict(kwargs)))
-        if "up" in command:
-            return run_captured(
-                real_process_harness.resistant_argv("service-compose-startup"),
-                **kwargs,
-            )
-        return fake(argv, **kwargs)
-
-    fixture = _concrete_host_fixture(
-        tmp_path,
-        cancel=cancel,
-        compose_runner=runner,
-        activity=lambda task_id, item: activities.append((task_id, item)),
-    )
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            running = executor.submit(
-                fixture.service.run,
-                fixture.borg.id,
-                fixture.generation.id,
-                {},
-                cancel=cancel,
-            )
-            real_process_harness.wait_for_marker(
-                "service-compose-startup.child.pid"
-            )
-            cancel.cancel()
-            result = running.result(timeout=5)
-
-        real_process_harness.assert_tree_absent("service-compose-startup")
-        up = next(item for item in invocations if "up" in item[0])
-        down = next(item for item in invocations if "down" in item[0])
-        assert result.status is ExecutionRunStatus.CANCELLED
-        assert fixture.coding.calls == []
-        assert up[1]["cancel"] is cancel
-        assert up[1]["terminate_on_cancel"] is True
-        assert down[1]["cancel"] is cancel
-        assert down[1]["terminate_on_cancel"] is False
-        assert down[1]["deadline"] == cancel.force_deadline
-        compose_activities = [
-            item for _task_id, item in activities if " compose " in item.detail
-        ]
-        assert [item.kind for item in compose_activities] == [
-            AgentActivityKind.COMMAND,
-            AgentActivityKind.COMMAND,
-        ]
-        assert " up " in f" {compose_activities[0].detail} "
-        assert " down " in f" {compose_activities[1].detail} "
-        assert fixture.store.list_stale_compose_resources() == []
-        assert result.operation_id is not None
-        events = [
-            event.kind
-            for event in fixture.store.list_execution_events(result.operation_id)
-            if event.kind.startswith("compose.")
-        ]
-        assert set(events) == {
-            "compose.starting",
-            "compose.stopping",
-            "compose.stopped",
-            "compose.cleanup_completed",
-        }
-    finally:
-        fixture.store.close()
-
-
-def test_external_only_service_url_reaches_every_agent_phase(tmp_path: Path) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    registry_url = "https://registry.example.test"
-    plan = replace(
-        _plan(tmp_path),
-        services=(
-            HostService(
-                name="registry",
-                kind="external",
-                evidence="validated external fixture",
-                url_env="REGISTRY_URL",
-                url=registry_url,
-            ),
-        ),
-    )
-    expected_environment = {
-        "CACHE": "prepared",
-        "REGISTRY_URL": registry_url,
-    }
-
-    class ExternalOnlyCompose(_Compose):
-        def start_claimed_stack(self, *args, **kwargs):
-            self.calls.append("services-start")
-            return None
-
-    compose = ExternalOnlyCompose(calls)
-    runtime = HostTaskRuntime(
-        plan,
-        environment_manager=_Environment(calls),
-        compose_manager=compose,
-        coding=_Coding(calls, expected_environment),
-        review_fix=_Review(calls, expected_environment),
-        merge=_Merge(calls, expected_environment),
-        sanity=_Sanity(calls),
-    )
-    try:
-        result = HostExecutionService(
-            store,
-            _Preflight(plan, calls),
-            runtime,
-            worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
-            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
-        ).run(borg.id, generation.id, {})
-
-        assert result.status is ExecutionRunStatus.COMPLETED
-        assert store.get_task_runtime(records[0].id).status is TaskRuntimeStatus.DONE
-        assert calls == [
-            "preflight",
-            "worktrees",
-            "environment",
-            "services-start",
-            "coding",
-            "review",
-            "merge",
-            "sanity",
-        ]
     finally:
         store.close()
 
@@ -1512,16 +1311,11 @@ def test_command_stage_agent_secret_reaches_every_agent_phase(tmp_path: Path) ->
             ),
         ),
     )
-    service_environment = {
-        "CACHE": "prepared",
-        "SERVICE_URL": "http://127.0.0.1",
-    }
+    service_environment = {"CACHE": "prepared"}
     agent_environment = {"AGENT_TOKEN": token}
-    compose = _Compose(calls)
     runtime = HostTaskRuntime(
         plan,
         environment_manager=_Environment(calls),
-        compose_manager=compose,
         coding=_Coding(calls, {**service_environment, **agent_environment}),
         review_fix=_Review(
             calls,
@@ -1537,7 +1331,6 @@ def test_command_stage_agent_secret_reaches_every_agent_phase(tmp_path: Path) ->
             _Preflight(plan, calls),
             runtime,
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
         ).run(
             borg.id,
@@ -1554,17 +1347,127 @@ def test_command_stage_agent_secret_reaches_every_agent_phase(tmp_path: Path) ->
             "preflight",
             "worktrees",
             "environment",
-            "services-start",
             "coding",
             "review",
             "merge",
-            "services-stop",
-            "services-start",
             "sanity",
-            "services-stop",
         ]
     finally:
         store.close()
+
+
+_SERVICE_ANALYSIS: dict[str, object] = {
+    "command_catalog": {
+        "source": "fixture",
+        "commands": [
+            {
+                "stage": "test",
+                "argv": ["git", "status", "--short"],
+                "cwd": ".",
+                "source": "fixture",
+                "uses_services": ["database", "search"],
+            }
+        ],
+    },
+    "environment": {
+        "files": ["README.md"],
+        "prepare_commands": [
+            {"argv": ["git", "status", "--short"], "cwd": ".", "source": "fixture"}
+        ],
+    },
+    "compose": {
+        "file": "compose.yml",
+        "files": [
+            {
+                "path": "compose.yml",
+                "source": "compose.yml",
+                "services": ["healthy"],
+            }
+        ],
+        "source": "compose.yml",
+    },
+    "service_dependencies": [
+        {
+            "name": "database",
+            "compose_service": "healthy",
+            "url_env": "SERVICE_URL",
+            "port": 8080,
+            "source": "compose.yml#services.healthy",
+        },
+        {
+            "name": "search",
+            "url_env": "SEARCH_URL",
+            "source": "fixture#search",
+        },
+    ],
+}
+
+
+def test_a_repository_declaring_services_executes_its_tasks(
+    tmp_path: Path,
+) -> None:
+    """The operator runs their own stack; Betterborg starts nothing.
+
+    The analysis selects a Compose service and an external one, and no
+    ``SEARCH_URL`` is set. Both used to refuse the run before a task was
+    claimed, and the Compose one used to start a stack per task.
+    """
+    observed: list[tuple[str, ...]] = []
+
+    def recorder(argv, **kwargs):  # noqa: ANN001, ANN003
+        observed.append(tuple(argv))
+        return run_captured(argv, **kwargs)
+
+    validated: list[HostPreflightPlan] = []
+
+    def plan_factory(repository_root: Path) -> HostPreflightPlan:
+        (repository_root / "compose.yml").write_text(
+            "services:\n  healthy:\n    image: fixture\n",
+            encoding="utf-8",
+        )
+        _git(repository_root, "add", "compose.yml")
+        _git(repository_root, "commit", "--quiet", "-m", "declare a service stack")
+        trust_store = TrustStore(
+            repository_root.parent / "service-trust" / "trust.json"
+        )
+        require_workspace_trust(
+            RepoPaths.discover(repository_root), store=trust_store, explicit=True
+        )
+        result = HostPreflight(
+            repository_root,
+            trust_store=trust_store,
+            environment={"PATH": os.environ["PATH"]},
+            command_runner=recorder,
+        ).validate(_SERVICE_ANALYSIS)
+        assert isinstance(result, HostPreflightPlan), result
+        validated.append(result)
+        return result
+
+    fixture = _concrete_host_fixture(
+        tmp_path,
+        plan_factory=plan_factory,
+        git_runner=recorder,
+        environment_runner=recorder,
+        sanity_runner=recorder,
+    )
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED, (
+            fixture.store.get_task_runtime(fixture.tasks[0].id).state_reason
+        )
+        assert fixture.store.get_task_runtime(fixture.tasks[0].id).status is (
+            TaskRuntimeStatus.DONE
+        )
+        assert not hasattr(validated[0], "services")
+        assert observed
+        assert not any(
+            "docker" in argument or "compose" in argument
+            for command in observed
+            for argument in command
+        )
+    finally:
+        fixture.store.close()
 
 
 def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
@@ -1585,29 +1488,15 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         )
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 2
-        assert all(
-            call.env["SERVICE_URL"].startswith("http://127.0.0.1:")
-            for call in fixture.coding.calls
-        )
-        assert len(fixture.compose.up_projects) == 4
-        assert sorted(fixture.compose.up_projects) == sorted(
-            fixture.compose.down_projects
-        )
-        assert len(set(fixture.compose.up_projects)) == 4
-        assert fixture.compose.active == set()
-        environment_attempts = [
-            attempt
+        # Each task is prepared once before coding and once at the sanity
+        # gate, which asks for the merged tip whatever reuse would say.
+        assert [
+            [
+                attempt.kind
+                for attempt in fixture.store.list_environment_attempts(task.id)
+            ]
             for task in fixture.tasks
-            for attempt in fixture.store.list_environment_attempts(task.id)
-        ]
-        preparations = [
-            attempt for attempt in environment_attempts if attempt.kind == "prepare"
-        ]
-        assert len(preparations) == 1
-        assert preparations[0].result["prepared_before_dispatch"] is True
-        assert (
-            sum(attempt.kind == "materialize" for attempt in environment_attempts) == 2
-        )
+        ] == [["materialize", "materialize"]] * 2
         project_tip = _git(
             fixture.store.get_repository(fixture.borg.repository_id).root,
             "rev-parse",
@@ -1631,7 +1520,77 @@ def test_concrete_jobs_two_complete_and_resume_without_phase_replay(
         fixture.store.close()
 
 
-def test_predispatch_preparation_failure_is_a_durable_environment_attempt(
+def test_agent_runs_in_the_operator_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An agent's whole job is to build and test the repository.
+
+    Preparing a worktree against the operator's package store and then
+    running its tests against an empty one is the same defect in a new
+    place, so the agent gets the environment the commands got.
+    """
+    monkeypatch.setenv("OPERATOR_TOOLCHAIN", str(tmp_path / "operator-toolchain"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "operator-cache"))
+    fixture = _concrete_host_fixture(tmp_path)
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        spec = fixture.coding.calls[0]
+        assert spec.env["OPERATOR_TOOLCHAIN"] == str(tmp_path / "operator-toolchain")
+        assert spec.env["XDG_CACHE_HOME"] == str(tmp_path / "operator-cache")
+        assert spec.env["HOME"] == os.environ["HOME"]
+        assert "BETTERBORG_ENVIRONMENT_ROOT" not in spec.env
+    finally:
+        fixture.store.close()
+
+
+def test_a_completed_run_under_a_declared_home_leaves_the_repository_untouched(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "betterborg-home"
+    home.mkdir()
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    fixture = _concrete_host_fixture(tmp_path, task_count=2)
+    try:
+        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED, [
+            fixture.store.get_task_runtime(task.id).state_reason
+            for task in fixture.tasks
+        ]
+        assert all(
+            fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
+            for task in fixture.tasks
+        )
+        repository_root = fixture.store.get_repository(
+            fixture.borg.repository_id
+        ).root
+        paths = RepoPaths.discover(repository_root)
+
+        assert paths.tasks_dir.is_relative_to(home)
+        assert list((home / "state/environment-markers").iterdir())
+        assert not (repository_root / ".betterborg").exists()
+        assert not paths.gitignore.exists()
+        assert (
+            _git(
+                repository_root,
+                "status",
+                "--short",
+                "--untracked-files=all",
+            )
+            == ""
+        )
+    finally:
+        fixture.store.close()
+
+
+def test_preparation_failure_is_a_durable_attempt_that_blocks_before_coding(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1647,26 +1606,21 @@ def test_predispatch_preparation_failure_is_a_durable_environment_attempt(
 
     monkeypatch.setattr(fixture.environment, "_run", fail_preparation)
     try:
-        with pytest.raises(
-            EnvironmentMaterializationError,
-            match="dependency setup failed",
-        ):
-            fixture.service.run(fixture.borg.id, fixture.generation.id, {})
+        fixture.service.run(fixture.borg.id, fixture.generation.id, {})
 
         task = fixture.tasks[0]
         attempts = fixture.store.list_environment_attempts(task.id)
         assert len(attempts) == 1
         attempt = attempts[0]
-        assert attempt.claim_id is None
+        assert attempt.claim_id is not None
         assert attempt.status is ExecutionAttemptStatus.FAILED
-        assert attempt.kind == "prepare"
+        assert attempt.kind == "materialize"
         assert attempt.fingerprint.startswith("sha256:")
         assert attempt.commands == [["git", "status", "--short"]]
         assert attempt.error is not None
         assert "dependency setup failed" in attempt.error
-        assert attempt.result is not None
-        assert attempt.result["prepared_before_dispatch"] is True
-        assert fixture.store.list_task_claims(attempt.run_id) == []
+        runtime = fixture.store.get_task_runtime(task.id)
+        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
         assert fixture.coding.calls == []
     finally:
         fixture.store.close()
@@ -1803,72 +1757,6 @@ def test_cancellation_cannot_mask_review_worktree_mutation(
         fixture.store.close()
 
 
-def test_concrete_sanity_restarts_compose_after_merged_descriptor_change(
-    tmp_path: Path,
-) -> None:
-    fixture = _concrete_host_fixture(tmp_path)
-
-    def change_compose_descriptor(spec):  # noqa: ANN001
-        descriptor = spec.cwd / "compose.yml"
-        descriptor.write_text(
-            "services:\n  healthy:\n    image: fixture-after-coding\n",
-            encoding="utf-8",
-        )
-        _git(spec.cwd, "add", descriptor.name)
-        _git(spec.cwd, "commit", "--quiet", "-m", "change service descriptor")
-        return MockResponse(
-            payload={
-                "task_file": ".betterborg-task/task.md",
-                "status": "completed",
-                "summary": "Changed the service descriptor.",
-                "changed_files": [descriptor.name],
-                "tests_run": ["integration"],
-                "follow_ups": [],
-                "blockers": [],
-            }
-        )
-
-    fixture.coding.responses.clear()
-    fixture.coding.queue(MockResponse(dynamic=change_compose_descriptor))
-    try:
-        result = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
-
-        assert result.status is ExecutionRunStatus.COMPLETED
-        assert len(fixture.compose.up_projects) == 2
-        assert fixture.compose.up_projects[0] != fixture.compose.up_projects[1]
-        assert fixture.compose.up_projects[1].endswith("-sanity")
-        lifecycle = [
-            "down" if "down" in command else "up"
-            for command in fixture.compose.commands
-            if "up" in command or "down" in command
-        ]
-        assert lifecycle == ["up", "down", "up", "down"]
-        assert all(
-            "--volumes" in command and command[-2:] == ("--rmi", "all")
-            for command in fixture.compose.down_commands
-        )
-        repository = fixture.store.get_repository(fixture.borg.repository_id)
-        assert repository is not None
-        assert (
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repository.root),
-                    "show",
-                    f"project/{fixture.borg.name}:compose.yml",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            == "services:\n  healthy:\n    image: fixture-after-coding\n"
-        )
-        assert fixture.compose.active == set()
-    finally:
-        fixture.store.close()
-
-
 def test_cancellation_during_concrete_sanity_command_reaps_process_tree(
     tmp_path: Path,
     real_process_harness,
@@ -1927,7 +1815,6 @@ def test_cancellation_during_concrete_sanity_command_reaps_process_tree(
         assert _git(repository.root, "rev-parse", f"project/{fixture.borg.name}") != (
             _git(Path(runtime.worktree_path), "rev-parse", "HEAD")
         )
-        assert fixture.compose.active == set()
     finally:
         fixture.store.close()
 
@@ -1976,7 +1863,7 @@ def test_concrete_dependent_starts_from_published_prerequisite(
         fixture.store.close()
 
 
-def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
+def test_concrete_dependent_with_earlier_position_refreshes_before_coding(
     tmp_path: Path,
 ) -> None:
     fixture = _concrete_host_fixture(
@@ -1995,16 +1882,12 @@ def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
 
         assert dependent.position < prerequisite.position
         assert dependent.stem > prerequisite.stem
-        preparations = [
-            attempt
-            for attempt in fixture.store.list_environment_attempts(dependent.id)
-            if attempt.kind == "prepare"
+        preparations = fixture.store.list_environment_attempts(dependent.id)
+        assert [attempt.kind for attempt in preparations] == [
+            "materialize",
+            "materialize",
         ]
-        assert len(preparations) == 1
-        preparation = preparations[0]
-        assert preparation.claim_id is None
-        assert preparation.result is not None
-        assert preparation.result["prepared_before_dispatch"] is True
+        assert all(attempt.claim_id is not None for attempt in preparations)
         assert result.status is ExecutionRunStatus.COMPLETED, [
             fixture.store.get_task_runtime(task.id).state_reason
             for task in fixture.tasks
@@ -2031,46 +1914,6 @@ def test_concrete_dependent_with_earlier_position_refreshes_after_preparation(
             ).returncode
             == 0
         )
-    finally:
-        fixture.store.close()
-
-
-def test_concrete_agent_stack_teardown_failure_prevents_base_advance(
-    tmp_path: Path,
-) -> None:
-    fixture = _concrete_host_fixture(tmp_path)
-    repository = fixture.store.get_repository(fixture.borg.repository_id)
-    assert repository is not None
-    base_commit = _git(repository.root, "rev-parse", "main")
-    fixture.compose.fail_all_down = True
-    try:
-        result = fixture.service.run(
-            fixture.borg.id,
-            fixture.generation.id,
-            {},
-        )
-
-        runtime = fixture.store.get_task_runtime(fixture.tasks[0].id)
-        assert result.status is ExecutionRunStatus.FAILED
-        assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
-        assert "Compose teardown failed" in runtime.state_reason
-        assert _git(
-            repository.root,
-            "rev-parse",
-            f"project/{fixture.borg.name}",
-        ) == base_commit
-        assert fixture.store.list_task_execution_events(
-            fixture.tasks[0].id,
-            kind="sanity.completed",
-        ) == []
-        assert fixture.store.list_task_execution_events(
-            fixture.tasks[0].id,
-            kind="base.advance_started",
-        ) == []
-        assert set(fixture.compose.down_projects) == set(
-            fixture.compose.up_projects
-        )
-        assert fixture.compose.active == set(fixture.compose.up_projects)
     finally:
         fixture.store.close()
 
@@ -2118,9 +1961,6 @@ def test_concrete_dependency_refresh_contamination_blocks_and_preserves_worktree
         assert blocked.worktree_path is not None
         assert Path(blocked.worktree_path).is_dir()
         assert len(fixture.coding.calls) == 1
-        assert len(fixture.compose.up_projects) == 2
-        assert fixture.compose.up_projects == fixture.compose.down_projects
-        assert fixture.compose.active == set()
 
     finally:
         fixture.store.close()
@@ -2240,6 +2080,8 @@ def test_concrete_retry_exhaustion_stops_and_resumes_coding(
             attempts[0].result["_betterborg"]["outcome_reason"]
         )
 
+        before_resume = len(fixture.store.list_environment_attempts(task.id))
+
         monkeypatch.setattr(MockAdapter, "run", adapter_run)
         fixture.clock.advance(timedelta(seconds=1))
         resumed = fixture.service.run(fixture.borg.id, fixture.generation.id, {})
@@ -2248,6 +2090,13 @@ def test_concrete_retry_exhaustion_stops_and_resumes_coding(
         assert fixture.store.get_task_runtime(task.id).status is TaskRuntimeStatus.DONE
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 1
+        # The re-claim reuses what the cancelled run prepared, so the only
+        # further install is the sanity gate's, which asks for the merged
+        # tip whatever reuse would say.
+        assert (
+            before_resume,
+            len(fixture.store.list_environment_attempts(task.id)),
+        ) == (1, 2)
     finally:
         fixture.store.close()
 
@@ -3121,11 +2970,6 @@ def test_concrete_jobs_two_and_duplicate_callers_share_one_operation(
         assert len(fixture.store.list_task_claims(completed.operation_id)) == 2
         assert len(fixture.coding.calls) == 2
         assert len(fixture.review.calls) == 2
-        assert len(fixture.compose.up_projects) == 4
-        assert sorted(fixture.compose.up_projects) == sorted(
-            fixture.compose.down_projects
-        )
-        assert fixture.compose.active == set()
     finally:
         release.set()
         fixture.store.close()
@@ -3143,7 +2987,6 @@ def test_preflight_block_prevents_run_acquisition(tmp_path: Path) -> None:
             _Preflight(block, calls),
             _ConcurrentRuntime(_plan(tmp_path)),
             worktree_manager=_Worktrees(calls),
-            compose_manager=_Compose(calls),
         ).run(borg.id, generation.id, {})
 
         assert result.preflight is block
@@ -3172,7 +3015,6 @@ def test_cancelled_preflight_propagates_before_run_acquisition(tmp_path: Path) -
                 CancelledPreflight(),
                 _ConcurrentRuntime(_plan(tmp_path)),
                 worktree_manager=_Worktrees(calls),
-                compose_manager=_Compose(calls),
             ).run(borg.id, generation.id, {}, cancel=cancel)
 
         assert store.list_execution_runs(borg.id) == []
@@ -3181,7 +3023,7 @@ def test_cancelled_preflight_propagates_before_run_acquisition(tmp_path: Path) -
         store.close()
 
 
-def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
+def test_concrete_blocked_task_preserves_its_worktree(
     tmp_path: Path,
 ) -> None:
     fixture = _concrete_host_fixture(tmp_path)
@@ -3223,9 +3065,6 @@ def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
         assert len(fixture.store.list_task_claims(result.operation_id)) == 1
         assert len(fixture.coding.calls) == 1
         assert fixture.review.calls == []
-        assert len(fixture.compose.up_projects) == 1
-        assert fixture.compose.up_projects == fixture.compose.down_projects
-        assert fixture.compose.active == set()
 
         resumed = fixture.service.run(
             fixture.borg.id,
@@ -3236,7 +3075,6 @@ def test_concrete_blocked_task_cleans_services_and_preserves_worktree(
         assert resumed.status is ExecutionRunStatus.FAILED
         assert fixture.store.get_task_runtime(fixture.tasks[0].id) == blocked
         assert len(fixture.coding.calls) == 1
-        assert len(fixture.compose.up_projects) == 1
         assert fixture.store.list_task_claims(resumed.operation_id) == []
     finally:
         fixture.store.close()
@@ -3260,7 +3098,6 @@ def test_setup_heartbeats_keep_the_execution_lease_owned(tmp_path: Path) -> None
             _Preflight(plan, calls),
             _ConcurrentRuntime(plan),
             worktree_manager=SlowWorktrees(calls),
-            compose_manager=_Compose(calls),
             scheduler_config=HostSchedulerConfig(
                 lease_duration=timedelta(seconds=10),
                 heartbeat_interval=timedelta(seconds=2),
@@ -3274,10 +3111,11 @@ def test_setup_heartbeats_keep_the_execution_lease_owned(tmp_path: Path) -> None
         store.close()
 
 
-def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
+def test_an_expired_prior_claim_is_released_before_new_task_dispatch(
     tmp_path: Path,
 ) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
+    """No claim from an expired prior run survives into this run's dispatch."""
+    store, borg, generation, _records = _store_fixture(tmp_path)
     calls: list[str] = []
     plan = _plan(tmp_path)
     start = datetime(2026, 8, 26, 12, tzinfo=UTC)
@@ -3292,112 +3130,210 @@ def test_acquisition_expiry_cleanup_precedes_new_task_dispatch(
     previous_claim = store.claim_dependency_ready_task(
         previous.run_id,
         previous.owner_token,
-        lease_duration=timedelta(seconds=1),
+        lease_duration=timedelta(minutes=30),
         now=start,
     )
     assert previous_claim is not None
-    resource = ComposeResource(
-        run_id=previous.run_id,
-        claim_id=previous_claim.id,
-        task_id=records[0].id,
-        project_name="expired-between-reconcile-and-acquire",
-        resource_type="project",
-        resource_name="expired-between-reconcile-and-acquire",
-        created_at=start,
+
+    observed_at_dispatch: list[tuple[ExecutionRunStatus, datetime | None]] = []
+
+    class ObservingWorktrees(_Worktrees):
+        def prepare_current_task_worktrees(self, *args, **kwargs):
+            observed_at_dispatch.append(
+                (
+                    store.get_execution_run(previous.run_id).status,
+                    store.list_task_claims(previous.run_id)[0].released_at,
+                )
+            )
+            return super().prepare_current_task_worktrees(*args, **kwargs)
+
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            _ConcurrentRuntime(plan),
+            worktree_manager=ObservingWorktrees(calls),
+            clock=lambda: expired_at,
+        ).run(borg.id, generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert observed_at_dispatch == [
+            (ExecutionRunStatus.CANCELLED, expired_at)
+        ]
+    finally:
+        store.close()
+
+
+def test_an_expired_run_on_a_borg_nobody_acquires_is_still_swept(
+    tmp_path: Path,
+) -> None:
+    """Acquisition expires only the Borg being acquired.
+
+    One repository can hold several Borgs, so the sweep is the only thing
+    that reaches an expired run left behind by any of the others.
+    """
+    store, borg, generation, _records = _store_fixture(tmp_path)
+    repository = store.get_repository(borg.repository_id)
+    assert repository is not None
+    other_borg, other_generation, _other_records = _seed_generation(
+        store, repository, "Abandoned", 1
     )
-    store.add_compose_resource(
-        resource,
-        previous.owner_token,
-        previous_claim.claim_token,
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    start = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    abandoned = store.acquire_execution_run(
+        other_borg.id,
+        other_generation.id,
+        lease_duration=timedelta(seconds=1),
         now=start,
     )
+    assert abandoned.owner_token is not None
+    abandoned_claim = store.claim_dependency_ready_task(
+        abandoned.run_id,
+        abandoned.owner_token,
+        lease_duration=timedelta(minutes=30),
+        now=start,
+    )
+    assert abandoned_claim is not None
 
-    class ExpiryRaceClock:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def __call__(self) -> datetime:
-            self.calls += 1
-            return start if self.calls == 1 else expired_at
-
-    class CleanupCompose(_Compose):
-        def cleanup_stale_projects(self, cleanup_store, resources, **kwargs):
-            self.calls.append("stale-cleanup")
-            for stale in resources:
-                cleanup_store.confirm_compose_project_cleanup(
-                    stale.run_id,
-                    stale.task_id,
-                    stale.project_name,
-                    now=expired_at,
-                )
-            return ()
-
-    clock = ExpiryRaceClock()
-    compose = CleanupCompose(calls)
     try:
         result = HostExecutionService(
             store,
             _Preflight(plan, calls),
             _ConcurrentRuntime(plan),
             worktree_manager=_Worktrees(calls),
-            compose_manager=compose,
-            clock=clock,
+            clock=lambda: start + timedelta(seconds=30),
         ).run(borg.id, generation.id, {})
 
         assert result.status is ExecutionRunStatus.COMPLETED
-        assert calls.index("stale-cleanup") < calls.index("worktrees")
-        assert store.list_stale_compose_resources(previous.run_id) == []
-        assert store.list_task_claims(previous.run_id)[0].released_at == expired_at
+        swept = store.get_execution_run(abandoned.run_id)
+        assert swept is not None
+        assert swept.status is ExecutionRunStatus.CANCELLED
+        assert store.list_task_claims(abandoned.run_id)[0].released_at == (
+            start + timedelta(seconds=30)
+        )
     finally:
         store.close()
 
 
-def test_reusable_cache_preparation_precedes_task_dispatch(tmp_path: Path) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    worktree = tmp_path / "prepared-worktree"
-    worktree.mkdir()
-    plan = HostPreflightPlan(
-        repository_root=tmp_path / "repository",
-        commands=(),
-        prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
-        materialize_commands=(),
-        environment_files=(),
-        executables=(),
-        required_secret_names=(),
-        compose_files=(),
-        services=(),
+class _ExpiryRaceClock:
+    """Hold the clock before a prior lease expires until acquisition."""
+
+    def __init__(self, start: datetime, expired_at: datetime) -> None:
+        self._start = start
+        self._expired_at = expired_at
+        self.acquired = False
+
+    def __call__(self) -> datetime:
+        return self._expired_at if self.acquired else self._start
+
+
+def test_a_run_expiring_during_acquisition_is_swept_before_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A lease can expire after the sweep that precedes acquisition.
+
+    Reading the clock before the abandoned lease runs out leaves that first
+    sweep nothing to find, so only the sweep taken while the new lease is
+    heartbeating can release the claim before any worktree is prepared.
+    """
+    store, borg, generation, _records = _store_fixture(tmp_path)
+    repository = store.get_repository(borg.repository_id)
+    assert repository is not None
+    other_borg, other_generation, _other = _seed_generation(
+        store, repository, "Abandoned", 1
     )
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    start = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    expired_at = start + timedelta(seconds=30)
+    abandoned = store.acquire_execution_run(
+        other_borg.id,
+        other_generation.id,
+        lease_duration=timedelta(seconds=1),
+        now=start,
+    )
+    assert abandoned.owner_token is not None
+    abandoned_claim = store.claim_dependency_ready_task(
+        abandoned.run_id,
+        abandoned.owner_token,
+        lease_duration=timedelta(minutes=30),
+        now=start,
+    )
+    assert abandoned_claim is not None
 
-    class PreparedWorktrees(_Worktrees):
-        def prepare_current_task_worktrees(self, *args, **kwargs):
-            super().prepare_current_task_worktrees(*args, **kwargs)
-            return [SimpleNamespace(task_id=records[0].id, path=worktree)]
+    clock = _ExpiryRaceClock(start, expired_at)
+    acquire = store.acquire_execution_run
+    observed: list[ExecutionRunStatus] = []
 
-    @dataclass
-    class PreparedRuntime(_ConcurrentRuntime):
-        def prepare_reusable_caches(
-            self, store, run_id, owner_token, worktrees, *, secret_values
-        ):
-            assert tuple(worktrees) == ((records[0].id, worktree),)
-            calls.append("cache")
-            return ("fingerprint",)
+    def acquire_then_expire(*arguments, **keywords):  # noqa: ANN002, ANN003
+        acquired = acquire(*arguments, **keywords)
+        clock.acquired = True
+        return acquired
 
-        def __call__(self, context) -> TaskRuntimeStatus:
-            calls.append("dispatch")
-            return super().__call__(context)
+    class _ObservingWorktrees(_Worktrees):
+        """Read the abandoned run at the moment worktrees are prepared."""
 
+        def prepare_current_task_worktrees(self, *arguments, **keywords):  # noqa: ANN002, ANN003, ANN201
+            abandoned_run = store.get_execution_run(abandoned.run_id)
+            assert abandoned_run is not None
+            observed.append(abandoned_run.status)
+            return super().prepare_current_task_worktrees(*arguments, **keywords)
+
+    monkeypatch.setattr(store, "acquire_execution_run", acquire_then_expire)
     try:
         result = HostExecutionService(
             store,
             _Preflight(plan, calls),
-            PreparedRuntime(plan),
-            worktree_manager=PreparedWorktrees(calls),
-            compose_manager=_Compose(calls),
+            _ConcurrentRuntime(plan),
+            worktree_manager=_ObservingWorktrees(calls),
+            clock=clock,
         ).run(borg.id, generation.id, {})
 
         assert result.status is ExecutionRunStatus.COMPLETED
-        assert calls[:4] == ["preflight", "worktrees", "cache", "dispatch"]
+        assert observed == [ExecutionRunStatus.CANCELLED]
+        assert store.list_task_claims(abandoned.run_id)[0].released_at == expired_at
+    finally:
+        store.close()
+
+
+def test_the_scheduler_is_given_the_sweep_it_calls_on_cancellation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The scheduler sweeps through a callable the service has to supply.
+
+    Its own tests inject one, so nothing else notices if the assembly stops
+    handing over the real sweep and every fence the scheduler raises then
+    reconciles nothing.
+    """
+    store, borg, generation, _records = _store_fixture(tmp_path)
+    calls: list[str] = []
+    plan = _plan(tmp_path)
+    captured: list[object] = []
+    real_scheduler = host_service.HostTaskScheduler
+
+    def capture(*arguments, **keywords):  # noqa: ANN002, ANN003
+        captured.append(keywords.get("expired_run_sweep"))
+        return real_scheduler(*arguments, **keywords)
+
+    monkeypatch.setattr(host_service, "HostTaskScheduler", capture)
+    try:
+        result = HostExecutionService(
+            store,
+            _Preflight(plan, calls),
+            _ConcurrentRuntime(plan),
+            worktree_manager=_Worktrees(calls),
+        ).run(borg.id, generation.id, {})
+
+        assert result.status is ExecutionRunStatus.COMPLETED
+        assert captured
+        assert all(
+            getattr(sweep, "__func__", None)
+            is HostExecutionService._sweep_expired_runs
+            for sweep in captured
+        )
     finally:
         store.close()
 
@@ -3434,7 +3370,6 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             _Preflight(plan, calls),
             CancellingRuntime(plan),
             worktree_manager=_Worktrees(calls),
-            compose_manager=_Compose(calls),
             scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
             progress=first_progress,
         )
@@ -3478,7 +3413,6 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
             _Preflight(plan, calls),
             ResumeRuntime(plan),
             worktree_manager=_Worktrees(calls),
-            compose_manager=_Compose(calls),
             progress=resumed_progress,
         ).run(borg.id, generation.id, {})
 
@@ -3492,139 +3426,5 @@ def test_cancelled_service_resumes_only_unfinished_tasks(tmp_path: Path) -> None
         assert retained.started_at is None
         assert resumed_stage.retained is False
         assert resumed_stage.started_at is not None
-    finally:
-        store.close()
-
-
-@pytest.mark.parametrize("cleanup_succeeds", [True, False])
-def test_cancelled_service_reconciles_compose_cleanup_before_result(
-    tmp_path: Path,
-    cleanup_succeeds: bool,
-) -> None:
-    store, borg, generation, records = _store_fixture(tmp_path)
-    calls: list[str] = []
-    plan = _plan(tmp_path)
-    cancel = CancellationToken()
-    started = threading.Event()
-    clock = FakeClock()
-    progress = RunProgress(stream=StringIO(), enabled=False)
-
-    @dataclass
-    class ComposeRuntime:
-        plan: HostPreflightPlan
-
-        def with_secret_values(self, secret_values):  # noqa: ANN001
-            return self
-
-        def __call__(self, context) -> TaskRuntimeStatus:  # noqa: ANN001
-            store.add_compose_resource(
-                ComposeResource(
-                    run_id=context.claim.run_id,
-                    claim_id=context.claim.id,
-                    task_id=context.claim.task_id,
-                    project_name="cancelled-task",
-                    resource_type="project",
-                    resource_name="cancelled-task",
-                    created_at=clock(),
-                ),
-                context.owner_token,
-                context.claim.claim_token,
-                now=clock(),
-            )
-            started.set()
-            assert context.cancel.wait(timeout=2)
-            return TaskRuntimeStatus.DONE
-
-    class CleanupCompose(_Compose):
-        def cleanup_stale_projects(  # noqa: ANN001
-            self, cleanup_store, resources, **kwargs
-        ):
-            self.calls.append("stale-cleanup")
-            assert resources
-            assert progress.stages[str(records[0].id)].state is StageState.RUNNING
-            outcomes = []
-            for resource in resources:
-                command = ("docker", "compose", "down")
-                if cleanup_succeeds:
-                    cleanup_store.confirm_compose_project_cleanup(
-                        resource.run_id,
-                        resource.task_id,
-                        resource.project_name,
-                        command=command,
-                        now=clock(),
-                    )
-                    outcomes.append(
-                        ComposeCleanupResult(
-                            resource.run_id,
-                            resource.task_id,
-                            resource.project_name,
-                            command,
-                            True,
-                        )
-                    )
-                else:
-                    error = "cleanup command failed"
-                    assert cleanup_store.record_compose_cleanup_failure(
-                        resource.run_id,
-                        resource.task_id,
-                        resource.project_name,
-                        command=command,
-                        error=error,
-                        now=clock(),
-                    )
-                    outcomes.append(
-                        ComposeCleanupResult(
-                            resource.run_id,
-                            resource.task_id,
-                            resource.project_name,
-                            command,
-                            False,
-                            error,
-                        )
-                    )
-            return tuple(outcomes)
-
-    try:
-        service = HostExecutionService(
-            store,
-            _Preflight(plan, calls),
-            ComposeRuntime(plan),
-            worktree_manager=_Worktrees(calls),
-            compose_manager=CleanupCompose(calls),
-            scheduler_config=HostSchedulerConfig(poll_interval_seconds=0.005),
-            clock=clock,
-            progress=progress,
-        )
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            running = executor.submit(
-                service.run,
-                borg.id,
-                generation.id,
-                {},
-                cancel=cancel,
-            )
-            assert started.wait(timeout=2)
-            cancel.cancel()
-            result = running.result(timeout=2)
-
-        runtime = store.get_task_runtime(records[0].id)
-        assert runtime is not None
-        assert result.status is ExecutionRunStatus.CANCELLED
-        assert len(result.cleanup) == 1
-        assert calls.count("stale-cleanup") == 1
-        stage = progress.stages[str(records[0].id)]
-        if cleanup_succeeds:
-            assert runtime.status is TaskRuntimeStatus.PENDING
-            assert result.scheduler is not None
-            assert result.scheduler.pending == 1
-            assert result.scheduler.blocked == 0
-            assert stage.state is StageState.STOPPED
-        else:
-            assert runtime.status is TaskRuntimeStatus.BLOCKED
-            assert result.scheduler is not None
-            assert result.scheduler.pending == 0
-            assert result.scheduler.blocked == 1
-            assert stage.state is StageState.FAILED
-            assert runtime.state_reason in str(stage.result)
     finally:
         store.close()

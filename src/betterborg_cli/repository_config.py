@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -11,9 +12,17 @@ from typing import Any
 from uuid import UUID
 
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_files import (
+    RepositoryPathError,
+    publish_repository_text,
+    read_repository_text,
+)
+from betterborg_cli.store.models import Repository
 
 CONFIG_FILENAME = "config.toml"
 CONFIG_VERSION = 1
+BINDING_FILENAME = "repository.json"
+BINDING_VERSION = 1
 
 _SECRET_KEY_PARTS = {
     "credential",
@@ -92,6 +101,14 @@ class ExecutionLimits:
 
 
 @dataclass(frozen=True)
+class PlanningLimits:
+    """Repository defaults that bound repeated planning review."""
+
+    review_rounds: int = 3
+    decomposition_rounds: int = 3
+
+
+@dataclass(frozen=True)
 class RepositoryConfig:
     """Validated contents of tracked ``.betterborg/config.toml``."""
 
@@ -100,6 +117,86 @@ class RepositoryConfig:
     default_branch: str
     agents: AgentChoices = field(default_factory=AgentChoices)
     execution: ExecutionLimits = field(default_factory=ExecutionLimits)
+    planning: PlanningLimits = field(default_factory=PlanningLimits)
+
+
+def require_registered_repository(
+    paths: RepoPaths, repository: Repository | None
+) -> Repository:
+    """Return the repository ``paths`` serves, refusing another's directory.
+
+    One tracked directory serves one repository. Configuration carries the
+    identity it was written for, so a directory whose configuration names a
+    repository registered at another root is refused rather than quietly
+    serving both from one set of files.
+    """
+    if repository is None:
+        raise RepositoryConfigError(
+            "repository is not initialized; run 'betterborg init' first"
+        )
+    _require_served_repository(paths, repository.root)
+    return repository
+
+
+def bind_tracked_directory(paths: RepoPaths) -> None:
+    """Bind a relocated tracked directory to the one repository it serves.
+
+    ``require_registered_repository`` can only speak while SQLite still holds
+    the repository row, and ``state/`` is the one thing Betterborg treats as
+    disposable. A tracked directory inside the repository names the repository
+    it serves by where it sits; a relocated one has no such tie, so the
+    binding is recorded durably beside the configuration whose identity it
+    protects.
+    """
+    if paths.tracked_in_repository:
+        return
+    path = paths.tracked_dir / BINDING_FILENAME
+    body = (
+        json.dumps(
+            {"repository_root": str(paths.root), "version": BINDING_VERSION},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    try:
+        publish_repository_text(
+            path, body, root=paths.tracked_root, overwrite=False
+        )
+        return
+    except FileExistsError:
+        # Another repository, or an earlier run of this one, claimed the
+        # directory first; whichever it was decides who it serves.
+        pass
+    except (OSError, RepositoryPathError) as error:
+        raise RepositoryConfigError(
+            f"unable to bind tracked directory {paths.tracked_dir}: {error}"
+        ) from error
+    _require_served_repository(paths, _bound_repository_root(paths, path))
+
+
+def _bound_repository_root(paths: RepoPaths, path: Path) -> Path:
+    try:
+        document = json.loads(read_repository_text(path, root=paths.tracked_root))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RepositoryConfigError(
+            f"unreadable tracked directory binding {path}: {error}"
+        ) from error
+    if (
+        not isinstance(document, dict)
+        or document.get("version") != BINDING_VERSION
+        or not isinstance(document.get("repository_root"), str)
+    ):
+        raise RepositoryConfigError(f"unsupported tracked directory binding: {path}")
+    return Path(document["repository_root"])
+
+
+def _require_served_repository(paths: RepoPaths, root: Path) -> None:
+    if root != paths.root:
+        raise RepositoryConfigError(
+            f"{paths.tracked_dir} holds configuration for {root}, "
+            f"not {paths.root}; one directory serves one repository"
+        )
 
 
 def load_repository_config(paths: RepoPaths) -> RepositoryConfig:
@@ -122,7 +219,9 @@ def load_repository_config(paths: RepoPaths) -> RepositoryConfig:
 
 
 def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
-    _require_only_keys(document, {"version", "repository", "agents", "execution"})
+    _require_only_keys(
+        document, {"version", "repository", "agents", "execution", "planning"}
+    )
 
     version = _require_int(document, "version")
     if version != CONFIG_VERSION:
@@ -172,12 +271,35 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
 
+    planning_document = _optional_table(document, "planning")
+    _require_only_keys(
+        planning_document,
+        {"review_rounds", "decomposition_rounds"},
+        section="planning",
+    )
+    review_rounds = _optional_int(
+        planning_document, "review_rounds", default=3, section="planning"
+    )
+    if review_rounds < 1:
+        raise RepositoryConfigError("planning.review_rounds must be at least 1")
+    decomposition_rounds = _optional_int(
+        planning_document, "decomposition_rounds", default=3, section="planning"
+    )
+    if decomposition_rounds < 1:
+        raise RepositoryConfigError(
+            "planning.decomposition_rounds must be at least 1"
+        )
+
     return RepositoryConfig(
         version=version,
         repository_id=repository_id,
         default_branch=default_branch,
         agents=AgentChoices(**agent_choices),
         execution=ExecutionLimits(jobs=jobs, review_passes=review_passes),
+        planning=PlanningLimits(
+            review_rounds=review_rounds,
+            decomposition_rounds=decomposition_rounds,
+        ),
     )
 
 

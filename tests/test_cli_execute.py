@@ -40,6 +40,7 @@ from betterborg_cli.agent_runtime import (
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import (
     HostCommand,
+    HostDroppedCommand,
     HostExecutionResult,
     HostPreflightPlan,
     HostSchedulerConfig,
@@ -158,6 +159,8 @@ def _seed_executable_generation(
 
 def _execution_result(
     status: ExecutionRunStatus = ExecutionRunStatus.COMPLETED,
+    dropped_commands: tuple[HostDroppedCommand, ...] = (),
+    required_secret_names: tuple[str, ...] = (),
 ):
     return SimpleNamespace(
         preflight=HostPreflightPlan(
@@ -165,11 +168,8 @@ def _execution_result(
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
-            required_secret_names=(),
-            compose_files=(),
-            services=(),
+            required_secret_names=required_secret_names,
+            dropped_commands=dropped_commands,
         ),
         active_operation_id=None,
         operation_id=uuid4(),
@@ -983,11 +983,7 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         commands=(),
         prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
         materialize_commands=(),
-        environment_files=(),
-        executables=(),
         required_secret_names=(),
-        compose_files=(),
-        services=(),
     )
 
     class ObservedPreflight:
@@ -1028,13 +1024,6 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
             return False
 
-    class ObservedCompose:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
-            return ()
-
     active_lock = threading.Lock()
     active_started = 0
     target_active = min(2, task_count - completed_count)
@@ -1047,10 +1036,6 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
 
         def with_secret_values(self, _secret_values):
             return self
-
-        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
-            assert_setup_projection("cache-preparation")
-            return ("prepared",)
 
         def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
             nonlocal active_started
@@ -1142,7 +1127,6 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     monkeypatch.setattr(
         cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
     )
-    monkeypatch.setattr(cli_module, "HostComposeManager", ObservedCompose)
     monkeypatch.setattr(cli_module, "HostWorktreeManager", ObservedWorktrees)
     monkeypatch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
     monkeypatch.setattr(cli_module, "HostReviewFixPhase", lambda *_a, **_k: object())
@@ -1272,7 +1256,6 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         "run-acquisition",
         "stale-cleanup-2",
         "worktree-preparation",
-        "cache-preparation",
     ]
     assert stale_checks == 2
     assert len(progress.stages) == expected_summary_count
@@ -1330,11 +1313,7 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
         commands=(),
         prepare_commands=(HostCommand("prepare", ("prepare",), "."),),
         materialize_commands=(),
-        environment_files=(),
-        executables=(),
         required_secret_names=(),
-        compose_files=(),
-        services=(),
     )
 
     def progress_factory(**kwargs) -> RunProgress:
@@ -1366,22 +1345,12 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
         def refresh_unstarted_task_worktree(self, *_args, **_kwargs) -> bool:
             return False
 
-    class CleanCompose:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        def cleanup_stale_projects(self, *_args, **_kwargs) -> tuple[object, ...]:
-            return ()
-
     class DeterministicRuntime:
         def __init__(self, runtime_plan, **_kwargs) -> None:
             self.plan = runtime_plan
 
         def with_secret_values(self, _secret_values):
             return self
-
-        def prepare_reusable_caches(self, *_args, **_kwargs) -> tuple[str, ...]:
-            return ("prepared",)
 
         def __call__(self, context: ScheduledTaskContext) -> TaskRuntimeStatus:
             progress = progress_ref["progress"]
@@ -1420,7 +1389,6 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
         run_patch.setattr(
             cli_module, "HostEnvironmentManager", lambda *_a, **_k: object()
         )
-        run_patch.setattr(cli_module, "HostComposeManager", CleanCompose)
         run_patch.setattr(cli_module, "HostWorktreeManager", PreparedWorktrees)
         run_patch.setattr(cli_module, "HostCodingPhase", lambda *_a, **_k: object())
         run_patch.setattr(
@@ -1899,11 +1867,7 @@ preflight = HostPreflightPlan(
     commands=(),
     prepare_commands=(),
     materialize_commands=(),
-    environment_files=(),
-    executables=(),
     required_secret_names=(),
-    compose_files=(),
-    services=(),
 )
 cli_module.RunProgress = FastProgress
 cli_module.SafeGit = safe_git
@@ -2173,6 +2137,141 @@ def test_pr_option_opens_rollup_with_prd_and_rendered_plan(
     assert _remote_project_sha(remote, name) == local_sha
 
 
+def test_the_rollup_pull_request_names_a_check_this_host_could_not_run(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drop has to travel from preflight into the artifact, not just be
+    formattable into it.
+
+    Testing the body builder proves the section can be written. What decides
+    whether a reviewer ever sees it is whether execute hands it the drop, and
+    that wire is the thing a green suite must not survive losing.
+    """
+    name = "pr-dropped"
+    _seed_executable_generation(
+        committed_git_repo,
+        planning_cli_repository,
+        approved_task_generation,
+        name=name,
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "push",
+            str(remote),
+            f"refs/heads/project/{name}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    dropped = (
+        HostDroppedCommand(
+            command=HostCommand(
+                stage="test",
+                argv=("missing-runtime", "-m", "pytest"),
+                cwd=".",
+                evidence="pyproject.toml",
+            ),
+            reason="host executable is not available: missing-runtime",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(dropped_commands=dropped),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 0, result.output
+    body = body_path.read_text(encoding="utf-8")
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime" in body
+    assert local_sha == _project_branch_sha(committed_git_repo, name)
+
+
+def test_the_pushed_pull_request_masks_a_secret_a_dropped_check_quoted(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The summary quotes a catalogued command, and this body leaves the host.
+
+    A repository that spells a token into a script has it in the analysis, and
+    a run that could not invoke that script says so on every surface. The one
+    that is pushed to GitHub is the one that cannot be taken back.
+    """
+    name = "masked-pr"
+    _repository, _paths, _borg, _approval, _fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name=name,
+        )
+    )
+    local_sha = _create_project_branch(committed_git_repo, name)
+    remote = _add_bare_origin(committed_git_repo, name)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(committed_git_repo),
+            "push",
+            str(remote),
+            f"refs/heads/project/{name}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _configure_github_origin(committed_git_repo, remote, "acme/widgets")
+    _args_path, body_path = _install_fake_gh(committed_git_repo, monkeypatch)
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
+    dropped = (
+        HostDroppedCommand(
+            command=HostCommand(
+                stage="test",
+                argv=("missing-runtime", "--token", "s3cr3t-value"),
+                cwd=".",
+                evidence="pyproject.toml",
+            ),
+            reason="host executable is not available: missing-runtime",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_invoke_host_execution",
+        lambda *_args, **_kwargs: _execution_result(
+            dropped_commands=dropped,
+            required_secret_names=("PACKAGE_TOKEN",),
+        ),
+    )
+
+    result = cli_runner.invoke(cli, ["execute", name, "--auto-execute", "--pr"])
+
+    assert result.exit_code == 0, result.output
+    body = body_path.read_text(encoding="utf-8")
+    assert body.startswith("## Checks not run on this host")
+    assert "missing-runtime" in body
+    assert "s3cr3t-value" not in body
+    assert "s3cr3t-value" not in result.output
+    assert local_sha == _project_branch_sha(committed_git_repo, name)
+
+
 def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2198,7 +2297,7 @@ def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
     monkeypatch.setattr(cli_module.shutil, "which", lambda _name: gh)
 
     result = cli_module._open_rollup_pull_request(
-        committed_git_repo,
+        cli_module.RepoPaths.discover(committed_git_repo),
         "runner-contract",
         {"title": "Runner contract"},
         None,
@@ -2256,6 +2355,51 @@ def test_rollup_pr_commands_keep_runner_contract_and_report_activity(
     assert [activity.detail for activity in activities] == [
         shlex.join(call[0]) for call in calls
     ]
+
+
+def test_rollup_pr_reads_the_prd_from_a_declared_home(
+    committed_git_repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path_factory.mktemp("betterborg-home")
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    (home / "prds").mkdir()
+    (home / "prds/relocated.md").write_text(
+        "# Relocated PRD\n", encoding="utf-8"
+    )
+    bodies: list[str] = []
+
+    def runner(command, **kwargs):
+        argv = tuple(command)
+        if argv[0] == "git":
+            stdout = "https://github.com/acme/widgets.git\n"
+        elif argv[1:3] == ("repo", "view"):
+            stdout = "main\n"
+        elif argv[1:3] == ("pr", "create"):
+            bodies.append(kwargs["input"])
+            stdout = "https://github.com/acme/widgets/pull/7\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: "/test/bin/gh")
+
+    result = cli_module._open_rollup_pull_request(
+        cli_module.RepoPaths.discover(committed_git_repo),
+        "relocated",
+        {"title": "Relocated"},
+        # The session records the PRD by the name it carries inside a
+        # checkout, which is no file of this repository's.
+        Path(".betterborg/prds/relocated.md"),
+        cancel=None,
+        command_runner=runner,
+    )
+
+    assert result.endswith(": https://github.com/acme/widgets/pull/7")
+    assert len(bodies) == 1
+    assert "# Relocated PRD" in bodies[0]
+    assert not (committed_git_repo / ".betterborg").exists()
 
 
 def test_combined_push_and_pr_publishes_branch_before_opening_rollup(
@@ -2412,11 +2556,7 @@ preflight = HostPreflightPlan(
     commands=(),
     prepare_commands=(),
     materialize_commands=(),
-    environment_files=(),
-    executables=(),
     required_secret_names=(),
-    compose_files=(),
-    services=(),
 )
 cli_module.RunProgress = FastProgress
 cli_module.run_captured = runner
@@ -2947,3 +3087,71 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     assert isinstance(
         observed_kwargs["validated_preflight"], HostPreflightPlan
     )
+
+
+def test_preflight_and_execution_output_name_every_dropped_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dropped = HostDroppedCommand(
+        HostCommand("test", ("missing-runtime", "-m", "pytest"), "."),
+        "host executable is not available: missing-runtime "
+        "(evidence: pyproject.toml)",
+    )
+    result = _execution_result()
+    result.preflight = replace(
+        result.preflight, dropped_commands=(dropped,)
+    )
+    summary = (
+        "1 sanity command dropped: missing-runtime -m pytest: host "
+        "executable is not available: missing-runtime "
+        "(evidence: pyproject.toml)"
+    )
+    progress = RunProgress(enabled=False)
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
+
+    cli_module._finish_execution_preflight(
+        progress, cancel=None, result=result.preflight
+    )
+    cli_module._write_host_execution_result(result)
+
+    assert progress.stages["preflight"].state is StageState.COMPLETED
+    assert progress.stages["preflight"].result == summary
+    assert summary in capsys.readouterr().out
+
+
+def test_the_preflight_progress_line_masks_a_secret_a_dropped_check_quoted(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The progress line is a surface that reports the run, and it is durable.
+
+    It is the worked example in the published documentation, and it quotes a
+    catalogued command's argv, so it is masked like the terminal line and the
+    pull request body beside it.
+    """
+    progress = RunProgress(stream=StringIO())
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
+    plan = _execution_result(
+        dropped_commands=(
+            HostDroppedCommand(
+                command=HostCommand(
+                    stage="test",
+                    argv=("missing-runtime", "--token", "s3cr3t-value"),
+                    cwd=".",
+                    evidence="pyproject.toml",
+                ),
+                reason="host executable is not available: missing-runtime",
+            ),
+        ),
+        required_secret_names=("PACKAGE_TOKEN",),
+    ).preflight
+
+    cli_module._finish_execution_preflight(progress, cancel=None, result=plan)
+
+    reported = progress.stages["preflight"].result
+    assert reported is not None
+    assert "missing-runtime" in reported
+    assert "s3cr3t-value" not in reported

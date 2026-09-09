@@ -16,17 +16,31 @@ from test_adapter_harness import (
     write_native_output,
 )
 
+import betterborg_cli.agent_runtime.retry as agent_retry
 from betterborg_cli.agent_runtime import (
+    DEFAULT_SCHEMA_MAX_ATTEMPTS,
+    READ_ONLY_API_TOOLS,
     AgentActivity,
     AgentActivityKind,
     AgentArtifact,
+    AgentResult,
+    AgentRunSpec,
     AgentStatus,
     AgentUsage,
     ApiAgentRole,
     BillingMode,
     CancellationToken,
     CodexAdapter,
+    SandboxSettingError,
 )
+from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import (
+    CONFIG_FILENAME,
+    RepositoryConfigError,
+    load_repository_config,
+)
+
+_READ_ONLY_TOOL_SET = tuple(READ_ONLY_API_TOOLS)
 
 
 def _usage_event(
@@ -410,7 +424,8 @@ def test_native_command_validates_and_persists_result_metadata(
     assert json.loads(spec.result_path.read_text(encoding="utf-8")) == result.payload
 
 
-def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None:
+def _launched_sandbox(tmp_path: Path, **changes: Any) -> str:
+    """Return the sandbox one completed Codex invocation was launched with."""
     captured_command: list[str] = []
 
     def runner(
@@ -429,20 +444,455 @@ def test_read_only_tool_allowlist_uses_read_only_sandbox(tmp_path: Path) -> None
         )
         return 0
 
-    spec = codex_spec(
-        tmp_path,
-        allowed_tools=("list_files", "read_file", "search_text"),
-    )
-
+    spec = codex_spec(tmp_path, **changes)
     result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
 
     assert result.status == AgentStatus.COMPLETED
-    assert captured_command[captured_command.index("-s") + 1] == "read-only"
+    return captured_command[captured_command.index("-s") + 1]
 
 
-def test_schema_invalid_result_fails_without_persisting_result(
+@pytest.mark.parametrize(
+    ("allowed_tools", "expected"),
+    (
+        (_READ_ONLY_TOOL_SET, "read-only"),
+        ((), "danger-full-access"),
+    ),
+)
+def test_undeclared_sandbox_follows_the_tool_set(
+    tmp_path: Path, allowed_tools: tuple[str, ...], expected: str
+) -> None:
+    assert _launched_sandbox(tmp_path, allowed_tools=allowed_tools) == expected
+
+
+@pytest.mark.parametrize("declaration", ("auto", " AUTO ", "", "   "))
+def test_auto_declaration_follows_the_tool_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declaration: str
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", declaration)
+
+    sandbox = _launched_sandbox(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    assert sandbox == "read-only"
+
+
+@pytest.mark.parametrize("declaration", ("host", " HOST "))
+@pytest.mark.parametrize("allowed_tools", (_READ_ONLY_TOOL_SET, ()))
+def test_isolated_environment_declaration_drops_the_read_only_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    declaration: str,
+    allowed_tools: tuple[str, ...],
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", declaration)
+
+    sandbox = _launched_sandbox(tmp_path, allowed_tools=allowed_tools)
+
+    assert sandbox == "danger-full-access"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "rejection"),
+    (
+        ('sandbox = "host"\n[repository]', "unknown root configuration key"),
+        ('[repository]', "unknown agents.defaults configuration key"),
+    ),
+)
+def test_tracked_configuration_cannot_declare_the_environment_isolated(
+    git_repo: Path, declaration: str, rejection: str
+) -> None:
+    """Pin that ``sandbox`` is not, and cannot become, a tracked config key.
+
+    The repository being worked on is the party a sandbox defends against, so
+    the declaration must be refused wherever a reader might expect to place it.
+    """
+    paths = RepoPaths.discover(git_repo)
+    paths.tracked_dir.mkdir()
+    (paths.tracked_dir / CONFIG_FILENAME).write_text(
+        f"""
+version = 1
+{declaration}
+id = "bd3b21f9-693b-4c58-b7cf-a90417809e1f"
+default_branch = "main"
+[agents.defaults]
+sandbox = "host"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RepositoryConfigError, match=rejection):
+        load_repository_config(paths)
+
+
+def _never_launched(*_args: object, **_kwargs: object) -> int:
+    raise AssertionError("Codex launched under a declaration it should refuse")
+
+
+def test_declaration_is_resolved_again_when_the_command_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adapter outlives its construction, so the launch path revalidates.
+
+    A long-lived process builds an adapter once and runs it per request, so
+    the declaration validated at construction is not necessarily the one in
+    force at launch.
+    """
+    adapter = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=_never_launched)
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "sealed")
+
+    with pytest.raises(SandboxSettingError, match="accepted values are auto, host"):
+        adapter.run(codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET))
+
+
+def test_run_environment_cannot_declare_the_environment_isolated(
     tmp_path: Path,
 ) -> None:
+    """The run spec's environment is repository-authored and must not decide.
+
+    It is built from the analyzer plan and merged over ours for the Codex
+    child. No read-only phase passes one today; this keeps a future one from
+    letting the repository under test choose its own sandbox.
+    """
+    sandbox = _launched_sandbox(
+        tmp_path,
+        allowed_tools=_READ_ONLY_TOOL_SET,
+        env={"BETTERBORG_SANDBOX": "host"},
+    )
+
+    assert sandbox == "read-only"
+
+
+def test_unrecognised_declaration_is_refused_when_the_adapter_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One refusal at selection, not one per command after preflight ran."""
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "hsot")
+
+    with pytest.raises(SandboxSettingError, match="accepted values are auto, host"):
+        CodexAdapter(ApiAgentRole.PLANNING)
+
+
+def test_unrecognised_sandbox_declaration_names_the_accepted_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "sealed")
+
+    with pytest.raises(SandboxSettingError) as error:
+        _launched_sandbox(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    assert "BETTERBORG_SANDBOX='sealed'" in str(error.value)
+    assert "accepted values are auto, host" in str(error.value)
+
+
+# Captured verbatim from codex-cli 0.151.0 launched with ``-s read-only``
+# inside a container whose seccomp profile denies unprivileged user
+# namespaces. Bubblewrap refuses every command, Codex exits zero, and its
+# answer is composed without the repository it could never read.
+_BWRAP_NAMESPACE_REFUSAL = (
+    "bwrap: No permissions to create a new namespace, likely because the "
+    "kernel does not allow non-privileged user namespaces. On e.g. debian "
+    "this can be enabled with 'sysctl kernel.unprivileged_userns_clone=1'.\n"
+)
+_SANDBOX_COMMAND = "/bin/bash -lc 'ls /app | head -3'"
+_SANDBOX_FAILURE_LOG = native_event_stream(
+    {"type": "thread.started", "thread_id": "01a06ffe-340c-7a42-9cf6"},
+    {"type": "turn.started"},
+    _item_event(
+        "item.completed",
+        "agent_message",
+        id="item_0",
+        text="I will run that exact pipeline and report its output verbatim.",
+    ),
+    _item_event(
+        "item.started",
+        "command_execution",
+        id="item_1",
+        command=_SANDBOX_COMMAND,
+        aggregated_output="",
+        exit_code=None,
+        status="in_progress",
+    ),
+    _item_event(
+        "item.completed",
+        "command_execution",
+        id="item_1",
+        command=_SANDBOX_COMMAND,
+        aggregated_output=_BWRAP_NAMESPACE_REFUSAL,
+        exit_code=1,
+        status="failed",
+    ),
+    _item_event(
+        "item.completed",
+        "agent_message",
+        id="item_2",
+        text=_BWRAP_NAMESPACE_REFUSAL.strip(),
+    ),
+    _usage_event(25238, 22912, 124),
+)
+
+
+def _run_with_log(spec: AgentRunSpec, transcript: str) -> tuple[AgentResult, int]:
+    """Run Codex over a fixed log while a valid result is always produced."""
+    calls = 0
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        write_native_output(log_path, transcript, on_line)
+        _write_invocation_result(
+            command, {"status": "completed", "version": "1.2.3"}
+        )
+        return 0
+
+    result = CodexAdapter(
+        ApiAgentRole.PLANNING,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+    ).run(spec)
+    return result, calls
+
+
+def test_sandbox_that_never_started_fails_a_zero_exit_run(tmp_path: Path) -> None:
+    spec = codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET)
+
+    result, calls = _run_with_log(spec, _SANDBOX_FAILURE_LOG)
+
+    assert result.status == AgentStatus.FAILED
+    assert result.exit_code == 0
+    assert result.payload is None
+    assert not spec.result_path.exists()
+    assert calls == 1
+
+
+def test_sandbox_failure_names_the_sandbox_and_the_setting(tmp_path: Path) -> None:
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+    error = result.error or ""
+
+    assert "Codex sandbox never started" in error
+    assert "bubblewrap could not create its namespace" in error
+    assert "BETTERBORG_SANDBOX=host" in error
+
+
+def test_sandbox_failure_is_not_retried(tmp_path: Path) -> None:
+    result, calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert not result.retryable
+    assert result.attempts == 1
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    (
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="/bin/bash -lc 'ls /nope'",
+                    aggregated_output=(
+                        "ls: cannot access '/nope': No such file or directory\n"
+                    ),
+                    exit_code=2,
+                    status="failed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="ordinary-nonzero-exit",
+        ),
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="cat tests/test_codex_adapter.py",
+                    aggregated_output=_BWRAP_NAMESPACE_REFUSAL,
+                    exit_code=0,
+                    status="completed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="launcher-text-read-by-a-command-that-succeeded",
+        ),
+        pytest.param(
+            native_event_stream(
+                _item_event(
+                    "item.completed",
+                    "command_execution",
+                    command="python -m pytest tests/test_codex_adapter.py",
+                    aggregated_output=(
+                        "FAILED tests/test_codex_adapter.py::test_sandbox\n"
+                        f"E   assert {_BWRAP_NAMESPACE_REFUSAL}"
+                    ),
+                    exit_code=1,
+                    status="failed",
+                ),
+                _usage_event(10, 4, 3),
+            ),
+            id="launcher-text-quoted-by-a-command-that-failed",
+        ),
+        pytest.param(
+            native_event_stream({"type": "turn.started"}, _usage_event(10, 4, 3)),
+            id="no-command-output-at-all",
+        ),
+    ),
+)
+def test_logs_without_a_launcher_failure_still_complete(
+    tmp_path: Path, transcript: str
+) -> None:
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET), transcript
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.payload == {"status": "completed", "version": "1.2.3"}
+    assert result.error is None
+
+
+def test_isolated_declaration_leaves_no_sandbox_to_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared-isolated run is not judged by a sandbox it never asked for."""
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "host")
+
+    result, _calls = _run_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.error is None
+
+
+def _run_failing_with_log(
+    spec: AgentRunSpec, transcript: str, *, attempts: int = 3
+) -> tuple[AgentResult, int]:
+    """Run Codex over a fixed log with a non-zero exit and no result file."""
+    calls = 0
+
+    def runner(
+        _command: Sequence[str],
+        _cwd: Path,
+        _stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        on_line: Callable[[str], None] | None,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        write_native_output(log_path, transcript, on_line)
+        return 1
+
+    result = CodexAdapter(
+        ApiAgentRole.PLANNING,
+        proc_runner=runner,
+        transient_backoff_seconds=0,
+        transient_max_attempts=attempts,
+    ).run(spec)
+    return result, calls
+
+
+def test_sandbox_failure_names_the_sandbox_on_a_non_zero_exit(
+    tmp_path: Path,
+) -> None:
+    """The cause is named however Codex exited, not only when it exited zero."""
+    result, calls = _run_failing_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET),
+        _SANDBOX_FAILURE_LOG,
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert "Codex sandbox never started" in (result.error or "")
+    assert "BETTERBORG_SANDBOX=host" in (result.error or "")
+    assert calls == 1
+
+
+def test_sandbox_failure_beside_a_transient_marker_is_still_terminal(
+    tmp_path: Path,
+) -> None:
+    """A dead sandbox is not a network blip, however the log also reads.
+
+    Retrying spends the whole backoff to fail identically and then reports
+    the transient marker as the cause.
+    """
+    transcript = "\n".join(
+        (
+            _SANDBOX_FAILURE_LOG,
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "stream disconnected before completion",
+                }
+            ),
+        )
+    )
+
+    result, calls = _run_failing_with_log(
+        codex_spec(tmp_path, allowed_tools=_READ_ONLY_TOOL_SET), transcript
+    )
+
+    assert result.status == AgentStatus.FAILED
+    assert not result.retryable
+    assert "Codex sandbox never started" in (result.error or "")
+    assert calls == 1
+
+
+def test_unsandboxed_run_still_retries_a_transient_failure(
+    tmp_path: Path,
+) -> None:
+    """Silencing retries is scoped to the sandbox, not to transients."""
+    transcript = "\n".join(
+        (
+            _SANDBOX_FAILURE_LOG,
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "stream disconnected before completion",
+                }
+            ),
+        )
+    )
+
+    result, calls = _run_failing_with_log(codex_spec(tmp_path), transcript)
+
+    assert calls == 3
+    assert "Codex network transport failed" in (result.error or "")
+
+
+def test_unsandboxed_run_is_not_judged_by_a_sandbox_it_never_asked_for(
+    tmp_path: Path,
+) -> None:
+    """A phase Codex runs unsandboxed cannot have had a launcher fail.
+
+    Its commands run on the host, so launcher text in a failed command's
+    output was printed by that command rather than by a boundary of ours.
+    """
+    result, _calls = _run_with_log(codex_spec(tmp_path), _SANDBOX_FAILURE_LOG)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.error is None
+
+
+def test_schema_invalid_result_fails_after_bounded_attempts(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
     def runner(
         command: Sequence[str],
         _cwd: Path,
@@ -452,6 +902,8 @@ def test_schema_invalid_result_fails_without_persisting_result(
         _env: Mapping[str, str] | None,
         _on_line: Callable[[str], None] | None,
     ) -> int:
+        nonlocal calls
+        calls += 1
         log_path.write_text("{}\n", encoding="utf-8")
         _write_invocation_result(command, {"status": "completed"})
         return 0
@@ -462,6 +914,89 @@ def test_schema_invalid_result_fails_without_persisting_result(
     assert result.status == AgentStatus.FAILED
     assert "missing required property 'version'" in (result.error or "")
     assert not spec.result_path.exists()
+    assert calls == DEFAULT_SCHEMA_MAX_ATTEMPTS
+    assert result.attempts == DEFAULT_SCHEMA_MAX_ATTEMPTS
+
+
+def test_schema_miss_is_retried_with_the_validating_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr(agent_retry.time, "sleep", waits.append)
+    prompts: list[str] = []
+    payloads: list[dict[str, str]] = [
+        {"status": "completed"},
+        {"status": "completed", "version": "corrected"},
+    ]
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
+    ) -> int:
+        prompts.append(stdin_text)
+        log_path.write_text(_usage_event(10, 0, 5), encoding="utf-8")
+        _write_invocation_result(command, payloads.pop(0))
+        return 0
+
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert result.attempts == 2
+    assert result.payload == {"status": "completed", "version": "corrected"}
+    assert spec.user_prompt in prompts[0]
+    assert prompts[1].startswith(prompts[0])
+    assert "missing required property 'version'" in prompts[1]
+    assert not waits
+    assert json.loads(
+        spec.result_path.read_text(encoding="utf-8")
+    ) == result.payload
+
+
+def test_a_rejected_result_is_corrected_over_stdin_and_not_through_the_log(
+    tmp_path: Path,
+) -> None:
+    logged: list[str] = []
+    prompts: list[str] = []
+    payloads: list[dict[str, str]] = [
+        {"version": "written-by-the-first-attempt"},
+        {"status": "completed", "version": "corrected"},
+    ]
+
+    def runner(
+        command: Sequence[str],
+        _cwd: Path,
+        stdin_text: str,
+        log_path: Path,
+        _cancel: CancellationToken | None,
+        _env: Mapping[str, str] | None,
+        _on_line: Callable[[str], None] | None,
+    ) -> int:
+        prompts.append(stdin_text)
+        # The real runner truncates the log when it starts a process, so this
+        # reads before writing to capture what each attempt found.
+        logged.append(
+            log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        )
+        log_path.write_text(_usage_event(10, 0, 5), encoding="utf-8")
+        _write_invocation_result(command, payloads.pop(0))
+        return 0
+
+    spec = codex_spec(tmp_path)
+    result = CodexAdapter(ApiAgentRole.PLANNING, proc_runner=runner).run(spec)
+
+    assert result.status == AgentStatus.COMPLETED
+    assert "written-by-the-first-attempt" in prompts[1]
+    # The correction travels over stdin, and the log holds what the process
+    # wrote and nothing the adapter added to it.
+    assert spec.log_path.read_text(encoding="utf-8") == _usage_event(10, 0, 5)
+    assert logged == ["", _usage_event(10, 0, 5)]
 
 
 def test_cancellation_is_forwarded_and_preserves_artifacts(tmp_path: Path) -> None:

@@ -5,20 +5,11 @@ from betterborg_cli.host_execution.coding import (
     HostCodingConfig,
     HostCodingPhase,
 )
-from betterborg_cli.host_execution.compose import (
-    ComposeCleanupResult,
-    ComposeStack,
-    ComposeStackError,
-    HostComposeManager,
-    compose_project_name,
-    service_url_environment,
-)
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterialization,
     EnvironmentMaterializationError,
     HostEnvironmentManager,
-    environment_fingerprint,
-    package_manager_cache_environment,
+    redacted_dropped_command_summary,
 )
 from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError
 from betterborg_cli.host_execution.guard import (
@@ -35,14 +26,13 @@ from betterborg_cli.host_execution.merge import (
 )
 from betterborg_cli.host_execution.preflight import (
     HostCommand,
-    HostExecutable,
+    HostDroppedCommand,
     HostPreflight,
     HostPreflightBlock,
     HostPreflightFailure,
     HostPreflightPlan,
     HostPreflightResult,
     HostSecret,
-    HostService,
 )
 from betterborg_cli.host_execution.review import (
     REVIEW_RESULT_SCHEMA,
@@ -79,9 +69,6 @@ from betterborg_cli.host_execution.worktrees import (
 
 __all__ = [
     "ActivitySink",
-    "ComposeCleanupResult",
-    "ComposeStack",
-    "ComposeStackError",
     "CodingPhaseError",
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
@@ -92,12 +79,11 @@ __all__ = [
     "HostMergeConfig",
     "HostMergePhase",
     "HostMergeResult",
-    "HostComposeManager",
     "HostCodingConfig",
     "HostCodingPhase",
     "HostWorktreeManager",
     "HostCommand",
-    "HostExecutable",
+    "HostDroppedCommand",
     "HostPreflight",
     "HostPreflightBlock",
     "HostPreflightFailure",
@@ -110,7 +96,6 @@ __all__ = [
     "HostSanityPhase",
     "HostSanityResult",
     "HostSecret",
-    "HostService",
     "HostTaskBehavior",
     "HostTaskRuntime",
     "HostTaskScheduler",
@@ -129,8 +114,5 @@ __all__ = [
     "UnsafeGitError",
     "WorktreeError",
     "WorktreeSpec",
-    "environment_fingerprint",
-    "compose_project_name",
-    "package_manager_cache_environment",
-    "service_url_environment",
+    "redacted_dropped_command_summary",
 ]

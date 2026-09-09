@@ -23,6 +23,8 @@ from betterborg_cli.planning.task_render import (
     task_markdown_digest,
 )
 from betterborg_cli.planning.task_validation import (
+    TASK_NAME_PATTERN,
+    TASK_REFERENCE_PATTERN,
     TaskGraphValidationError,
     build_plan_element_catalog,
     validate_task_graph,
@@ -92,14 +94,12 @@ PROJECT_MANAGER_TASKS_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "stage": {
                         "type": "string",
-                        "pattern": "^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$",
-                        "minLength": 4,
+                        "pattern": TASK_NAME_PATTERN,
                         "maxLength": 32,
                     },
                     "stem": {
                         "type": "string",
-                        "pattern": "^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$",
-                        "minLength": 4,
+                        "pattern": TASK_NAME_PATTERN,
                         "maxLength": 32,
                     },
                     "repository": _NONBLANK_STRING,
@@ -117,10 +117,7 @@ PROJECT_MANAGER_TASKS_SCHEMA: dict[str, Any] = {
                         "uniqueItems": True,
                         "items": {
                             "type": "string",
-                            "pattern": (
-                                "^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*/"
-                                "[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$"
-                            ),
+                            "pattern": TASK_REFERENCE_PATTERN,
                         },
                     },
                     "out_of_scope": _NONBLANK_STRINGS,
@@ -145,7 +142,12 @@ shippable coding tasks. Do not modify files. Every task must stand alone with a
 specific rationale, scope, notes, acceptance criteria, tests, dependencies,
 exclusions, plan references, and S/M/L complexity. Assign every required plan
 reference to exactly one task and use only dependency task identities present
-in this batch. Return only the required JSON object.
+in this batch. Within one stage, a task may depend only on a task whose stem
+sorts before its own, so number the stems of a stage in the order they must
+run. Betterborg performs the delivery around your tasks: branching, worktrees,
+commits, review, merge, and the repository's own checks. Never write a task for
+any of that. Every task changes the repository, and one with nothing to commit
+is not a task. Return only the required JSON object.
 """
 
 

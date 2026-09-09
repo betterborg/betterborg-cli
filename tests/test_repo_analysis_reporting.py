@@ -48,6 +48,42 @@ def _rubric(score: float) -> dict[str, dict[str, object]]:
     }
 
 
+def _commit_cited_evidence(git_repo: Path) -> None:
+    """Commit the small evidence set the citation-shape tests analyze."""
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    (git_repo / "Makefile").write_text(
+        "test:\n\tpython -m pytest\n", encoding="utf-8"
+    )
+    (git_repo / "package.json").write_text(
+        '{"scripts":{"test":"python -m pytest"}}\n', encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(git_repo), "add", "--all"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+
+
+def _catalog_payload(catalog: dict[str, object]) -> dict[str, object]:
+    """Wrap one command catalog in the smallest valid analyzer payload."""
+    return {
+        "summary": "A small Python command-line application.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": catalog,
+    }
+
+
 @pytest.fixture
 def analysis() -> RepositoryAnalysis:
     return RepositoryAnalysis(
@@ -68,7 +104,9 @@ def analysis() -> RepositoryAnalysis:
             ],
             "command_catalog": {
                 "source": "Makefile",
-                "commands": [{"stage": "test", "argv": ["make", "test"]}],
+                "commands": [
+                    {"stage": "test", "argv": ["make", "test"], "verifies": True}
+                ],
             },
             "required_secrets": [
                 {
@@ -223,6 +261,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "package.json#scripts",
                     "uses_services": ["postgres"],
@@ -309,6 +348,7 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     }
     impact = report["harness_impact"]
     assert impact["commands"]["commands"] == payload["command_catalog"]["commands"]
+    assert impact["environment"]["files"] == payload["environment"]["files"]
     assert impact["environment"]["toolchains"] == payload["environment"][
         "toolchains"
     ]
@@ -342,6 +382,8 @@ def test_analyzer_persists_harness_inputs_consumed_by_report(
     assert "PACKAGE_TOKEN" in terminal
     assert r"PACKAGE\_TOKEN" in markdown
     for rendered in (terminal, markdown):
+        assert "Environment file: pyproject.toml" in rendered
+        assert "Environment file: .python-version" in rendered
         assert "python 3.11" in rendered
         assert "java 21" in rendered
         assert "postgres" in rendered
@@ -375,6 +417,7 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
             "commands": [
                 {
                     "stage": "test",
+                    "verifies": True,
                     "argv": ["make", "test"],
                     "source": "command.missing.yml#jobs",
                 }
@@ -430,6 +473,109 @@ def test_analyzer_rejects_harness_evidence_outside_discovery_manifest(
             "port.missing.yml",
         )
     )
+
+
+def test_single_anchored_and_directory_relative_citations_stay_accepted(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "verifies": True,
+                    "argv": ["make", "test"],
+                    "source": "package.json#scripts",
+                },
+                {
+                    "stage": "lint",
+                    "verifies": True,
+                    "argv": ["make", "lint"],
+                    "source": "package.json/scripts",
+                },
+            ],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+
+        assert len(store.list_analyses(repository.id)) == 1
+
+
+def test_a_citation_naming_several_manifest_files_is_accepted(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile; package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "verifies": True,
+                    "argv": ["make", "test"],
+                    "source": "package.json#scripts; Makefile",
+                }
+            ],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository,
+            store,
+            adapter,
+            artifact_dir=git_repo / "artifacts",
+        )
+
+        analyses = store.list_analyses(repository.id)
+        assert len(analyses) == 1
+        catalog = analyses[0].analysis_json["command_catalog"]
+        assert catalog["source"] == "Makefile; package.json"
+
+
+def test_a_citation_naming_several_files_reports_only_the_absent_one(
+    git_repo: Path,
+) -> None:
+    _commit_cited_evidence(git_repo)
+    payload = _catalog_payload(
+        {
+            "source": "Makefile; not-discovered.yml",
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}],
+        }
+    )
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+
+        with pytest.raises(AnalyzerError, match="absent from manifest") as error:
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+
+        assert store.list_analyses(repository.id) == []
+
+    assert "not-discovered.yml" in str(error.value)
+    assert "Makefile" not in str(error.value)
 
 
 def test_materialize_command_alone_is_a_valid_environment_input(
@@ -569,7 +715,7 @@ def test_analyzer_rejects_uncited_harness_detections(git_repo: Path) -> None:
         "recommendations": [],
         "themes": [],
         "command_catalog": {
-            "commands": [{"stage": "test", "argv": ["make", "test"]}]
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}]
         },
         "environment": {
             "toolchains": [{"name": "python"}],
@@ -730,6 +876,7 @@ def test_human_reports_sanitize_control_characters_and_escape_markdown(
         "commands": [
             {
                 "stage": "test\n## Command\x1b[31m",
+                "verifies": True,
                 "argv": ["make", "bad\n## Arg"],
             }
         ]
@@ -840,7 +987,7 @@ def test_analyzer_treats_the_workspace_index_as_no_harness_evidence(
         "themes": [],
         "command_catalog": {
             "source": ANALYSIS_INPUT_FILENAME,
-            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+            "commands": [{"stage": "test", "argv": ["make", "test"], "verifies": True}],
         },
     }
     repository = Repository(root=git_repo)
@@ -858,3 +1005,247 @@ def test_analyzer_treats_the_workspace_index_as_no_harness_evidence(
         assert store.list_analyses(repository.id) == []
 
     assert ANALYSIS_INPUT_FILENAME not in str(error.value)
+
+
+def test_a_catalogued_command_must_say_whether_it_verifies(
+    git_repo: Path,
+) -> None:
+    """The gate runs this list, so each entry answers what running it settles.
+
+    Left to infer it, a gate cannot: a docs watch server and a docs build are
+    one word apart in the same manifest.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "A small application whose catalogue declines the question.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [{"stage": "test", "argv": ["make", "test"]}],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="verifies"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []
+
+
+def test_a_command_directory_must_belong_to_the_repository(
+    git_repo: Path,
+) -> None:
+    """A Dockerfile's WORKDIR reads like a directory and is one, elsewhere.
+
+    Betterborg runs commands in the checkout, so the only directory it can act
+    on is one relative to the repository root. An absolute path taken off an
+    image build refuses at preflight, after analysis and planning have already
+    been paid for.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose prepare step cites an image WORKDIR.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {"stage": "test", "argv": ["make", "test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "files": ["Dockerfile"],
+            "prepare_commands": [
+                {
+                    "argv": ["go", "mod", "vendor"],
+                    "cwd": "/abs",
+                    "source": "Dockerfile",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="cwd"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []
+
+
+def test_a_catalogued_command_directory_must_belong_to_the_repository(
+    git_repo: Path,
+) -> None:
+    """The rule holds for the catalog as well as for environment commands."""
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose catalogued check cites an image path.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["go", "test", "./..."],
+                    "verifies": True,
+                    "cwd": "/abs",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        with pytest.raises(AnalyzerError, match="cwd"):
+            run_analyzer(
+                repository,
+                store,
+                adapter,
+                artifact_dir=git_repo / "artifacts",
+            )
+        assert store.list_analyses(repository.id) == []
+
+
+def test_the_analyzer_is_told_what_decides_whether_a_command_verifies() -> None:
+    """The schema forces a boolean; only this sentence decides which one.
+
+    Nothing downstream can recover the answer, so the rule living in one long
+    prompt string is the whole contract. Trimmed or reformatted away, analysis
+    still succeeds and the gate starts running watch servers again.
+    """
+    from betterborg_cli.repo_analysis.analyzer import _SYSTEM_PROMPT
+
+    prompt = " ".join(_SYSTEM_PROMPT.split())
+    assert "verifies is true only for a command that exits on its own" in prompt
+    assert "leaves git status clean after it" in prompt
+    # The admitted kinds, and the closing default that decides everything else.
+    for admitted in ("a test run", "a linter", "a type checker", "a build"):
+        assert admitted in prompt
+    assert "It is false for everything else" in prompt
+    for refused in ("serves", "watches", "publishes", "waits for input"):
+        assert refused in prompt
+    assert "where you cannot tell, verifies is false" in prompt
+    # And the evidence the question depends on.
+    assert ".gitignore" in prompt
+
+
+@pytest.mark.parametrize(
+    "cwd", [".", "package", "services/api", "Backend", "./package"]
+)
+def test_a_repository_relative_command_directory_is_accepted(
+    git_repo: Path,
+    cwd: str,
+) -> None:
+    """The rule refuses paths that leave the repository, and nothing else.
+
+    Narrowing it further refuses a monorepo's whole analysis at the
+    persistence edge, over a directory that was always fine.
+    """
+    (git_repo / "README.md").write_text("# Example\n", encoding="utf-8")
+    (git_repo / "Makefile").write_text("test:\n\tgo test ./...\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    payload = {
+        "summary": "An application whose check runs in a repository directory.",
+        "primary_language": "go",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "go",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["go", "test", "./..."],
+                    "verifies": True,
+                    "cwd": cwd,
+                    "source": "Makefile",
+                }
+            ],
+        },
+    }
+    repository = Repository(root=git_repo)
+    adapter = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+
+    with SqliteStore.open(git_repo / "state.sqlite3") as store:
+        store.add_repository(repository)
+        run_analyzer(
+            repository, store, adapter, artifact_dir=git_repo / "artifacts"
+        )
+        stored = store.list_analyses(repository.id)
+
+    assert len(stored) == 1
+    assert stored[0].analysis_json["command_catalog"]["commands"][0]["cwd"] == cwd

@@ -13,6 +13,7 @@ from planning_progress_test_support import BoundaryInterruptProgress
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
+    TECH_REVIEW_ROUND_CAP,
     ArchitectCancelled,
     ArchitectError,
     ArchitectLoop,
@@ -26,10 +27,12 @@ from betterborg_cli.progress import (
     StageRecord,
     StageState,
 )
+from betterborg_cli.repository_config import PlanningLimits
 from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
+    PlanningFinding,
     SqliteStore,
 )
 
@@ -436,6 +439,398 @@ def test_recovers_completed_provider_review_without_duplicate_turn(
         assert len(reviewer.calls) == 1
 
 
+def test_unattended_revision_assumes_the_questions_it_raises(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A revision the Tech Lead asked for must not stop on its own question.
+
+    Later question rounds arise here rather than in the first Architect pass,
+    and this loop builds the Architect that answers them, so an unattended run
+    that does not reach this one dies after the review it already paid for.
+    """
+    initial_plan = planning_plan_response()
+    ambiguous_plan = planning_plan_response(
+        summary="Choose a concrete rollback strategy."
+    )
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = planning_plan_response(
+        summary="Use retries before rolling back the release."
+    )
+    # The plan names the decision the run made for it, which is what
+    # the unattended directive asks of a real one.
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+    database = committed_git_repo.parent / "tech-lead-unattended.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-unattended"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=ambiguous_plan))
+        architect.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": "Retry twice, then roll back."}
+                    ]
+                }
+            )
+        )
+        architect.queue(MockResponse(payload=revised_plan))
+
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+
+
+def test_an_assumption_survives_the_revision_that_does_not_revisit_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A revision addresses a finding; it does not re-argue settled ground.
+
+    The Architect names an assumption once, in the plan that made it. Nothing
+    obliges the revision that answers an unrelated finding to restate it, and
+    a plan that quietly stops carrying one leaves a decision nobody took
+    reading like a requirement somebody gave.
+    """
+    initial_plan = planning_plan_response()
+    initial_plan["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+    # The revision addresses the finding and says nothing about assumptions,
+    # which is what a schema making the field optional invites.
+    revised_plan = planning_plan_response(
+        summary="Define the rollback behavior the review asked for."
+    )
+    assert "assumptions" not in revised_plan
+
+    database = committed_git_repo.parent / "tech-lead-carried.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-carried"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+        assert handoff.plan["assumptions"] == initial_plan["assumptions"]
+
+        architect.queue(MockResponse(payload=revised_plan))
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root, beside the README.",
+        }
+    ]
+
+
+def test_a_revision_that_names_its_assumptions_replaces_them_rather_than_adding(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The plan names the set it rests on, not every wording it has used.
+
+    A revision restating an assumption in different words is the same
+    decision, and keeping both wordings turns the section into a history of
+    the review. After a few rounds that buries the decisions it exists to
+    surface, and a reviewer reads the duplication as the defect it is.
+    """
+    initial_plan = planning_plan_response()
+    initial_plan["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    revised_plan = planning_plan_response(summary="Define the rollback behavior.")
+    # The same decision asked in different words, which is what defeats a
+    # merge that can only tell two entries apart by their question text.
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which directory holds the changelog?",
+            "assumption": "The repository root, beside the README.",
+        }
+    ]
+
+    database = committed_git_repo.parent / "tech-lead-restated.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-restated"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=revised_plan))
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert resumed.plan["assumptions"] == [
+        {
+            "question": "Which directory holds the changelog?",
+            "assumption": "The repository root, beside the README.",
+        }
+    ]
+
+
+def test_two_question_raising_revisions_strand_no_decision(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """A stored plan's assumptions key does not say who wrote it.
+
+    Every payload passes through the merge before it is stored, so a plan that
+    named nothing still holds what it inherited. Reading that as having spoken
+    would let each question-raising revision close the window over the answer
+    the one before it produced, and those decisions would reach neither the
+    correction nor the published plan.
+    """
+    initial = planning_plan_response()
+    initial["assumptions"] = [
+        {
+            "question": "Where does the changelog live?",
+            "assumption": "At the repository root.",
+        }
+    ]
+    first_questions = planning_plan_response(summary="Stage the rollout.")
+    first_questions["open_questions"] = ["Which rollback strategy should be used?"]
+    second_questions = planning_plan_response(summary="Stage it again.")
+    second_questions["open_questions"] = ["Which changelog format is required?"]
+    silent = planning_plan_response(summary="Address the finding.")
+    assert "assumptions" not in silent
+
+    database = committed_git_repo.parent / "tech-lead-two-question-plans.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "two-question-plans"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=first_questions))
+        architect.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": "Retry twice, then roll back."}
+                    ]
+                }
+            )
+        )
+        architect.queue(MockResponse(payload=second_questions))
+        architect.queue(
+            MockResponse(
+                payload={"answers": [{"q_id": "q1", "answer": "Keep a Changelog."}]}
+            )
+        )
+        architect.queue(MockResponse(payload=silent))
+        architect.queue(MockResponse(payload=silent))
+
+        resumed = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    published = {
+        item["assumption"] for item in resumed.plan.get("assumptions", [])
+    }
+    assert "Retry twice, then roll back." in published
+    assert "Keep a Changelog." in published
+
+
+def test_a_question_raised_by_a_plan_is_answered_against_that_plan(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The turn deciding a plan's open question needs the plan that raised it.
+
+    It is a fresh agent holding none of the reasoning that produced the
+    question. Given a workspace whose manifest says no plan exists, it answers
+    from the PRD alone, and that answer is recorded as a decision the plan
+    rests on.
+    """
+    initial_plan = planning_plan_response()
+    ambiguous_plan = planning_plan_response(
+        summary="Choose a concrete rollback strategy."
+    )
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = planning_plan_response(
+        summary="Use retries before rolling back the release."
+    )
+    revised_plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+    seen: dict[str, object] = {}
+
+    def answer_against_the_plan(spec):
+        manifest = json.loads(
+            (
+                spec.cwd / ".betterborg/state/planning/context/manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        seen["current_plan"] = manifest.get("current_plan")
+        seen["plan_text"] = (spec.cwd / str(manifest["current_plan"])).read_text(
+            encoding="utf-8"
+        )
+        seen["user_prompt"] = spec.user_prompt
+        return {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]}
+
+    database = committed_git_repo.parent / "tech-lead-plan-context.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=initial_plan))
+    reviewer = MockAdapter(name="openai")
+    reviewer.queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-plan-context"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        architect.queue(MockResponse(payload=ambiguous_plan))
+        architect.queue(MockResponse(dynamic=answer_against_the_plan))
+        architect.queue(MockResponse(payload=revised_plan))
+
+        TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            unattended=True,
+        ).run()
+
+    assert seen["current_plan"] is not None
+    assert "Choose a concrete rollback strategy." in str(seen["plan_text"])
+    assert "a question a plan raises is a question about that plan" in str(
+        seen["user_prompt"]
+    )
+
+
 def test_resumes_committed_change_request_through_architect_pause(
     committed_git_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -587,6 +982,192 @@ def test_third_change_request_blocks_with_durable_resumable_history(
         ]
         assert loop.run() == result
         assert len(reviewer.calls) == 3
+
+
+def test_unconfigured_repository_keeps_the_default_review_round_budget() -> None:
+    assert PlanningLimits().review_rounds == TECH_REVIEW_ROUND_CAP
+
+
+def test_raised_review_budget_approves_on_a_round_the_default_denies(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+) -> None:
+    database = committed_git_repo.parent / "tech-lead-raised-budget.sqlite3"
+    plans = [
+        planning_plan_response(),
+        planning_plan_response(summary="Revision one."),
+        planning_plan_response(summary="Revision two."),
+        planning_plan_response(summary="Revision three."),
+    ]
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    for plan in plans:
+        architect.queue(MockResponse(payload=plan))
+    reviewer = MockAdapter(name="openai")
+    for round_number in range(1, 4):
+        reviewer.queue(
+            MockResponse(
+                payload=tech_lead_change_request_response(
+                    f"Finding round {round_number}."
+                )
+            )
+        )
+    reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-raised-budget"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=4,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert result.plan == plans[-1]
+        assert len(reviewer.calls) == 4
+        assert "review round 1 of 4" in reviewer.calls[0].user_prompt
+        assert "review round 4 of 4" in reviewer.calls[-1].user_prompt
+        assert [item.round for item in store.list_planning_findings(borg.id)] == [
+            1,
+            2,
+            3,
+        ]
+
+
+def test_lowering_the_budget_does_not_strand_a_revision_already_under_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    tech_lead_approval_response,
+) -> None:
+    """The budget bounds what happens next, never what already happened.
+
+    A run interrupted mid-revision is resumable, and the CLI says so. Reading
+    the record through a budget lowered since would hide the rejection the
+    revision belongs to, and the advertised resume could never succeed: the
+    only way back would be restoring a number nothing names.
+    """
+    database = committed_git_repo.parent / "tech-lead-lowered-midflight.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-lowered-midflight"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        # The review asks for a revision, then the run dies before the
+        # Architect can answer it.
+        with pytest.raises((TechLeadError, ArchitectError)):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+                review_rounds=3,
+            ).run()
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.ARCHITECT_WORKING
+
+        # The operator lowers the budget below the round already spent, then
+        # resumes as the CLI told them to.
+        architect.queue(MockResponse(payload=planning_plan_response()))
+        reviewer.queue(MockResponse(payload=tech_lead_approval_response()))
+        resumed = TechLeadLoop(
+            repository,
+            interrupted,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+        ).run()
+
+        assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        # The round the stranded revision leads to is the last one, and saying
+        # so is the only description of it that is true. "Round 2 of 1" hands
+        # the reviewer a number it cannot use.
+        assert "review round 1 of 3." in reviewer.calls[0].user_prompt
+        assert (
+            "review round 2, the final round." in reviewer.calls[-1].user_prompt
+        )
+        assert "of 1" not in reviewer.calls[-1].user_prompt
+
+
+def test_lowered_review_budget_blocks_after_its_only_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    database = committed_git_repo.parent / "tech-lead-lowered-budget.sqlite3"
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    architect.queue(MockResponse(payload=planning_plan_response()))
+    reviewer = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Define rollback behavior.")
+        )
+    )
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-lowered-budget"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        loop = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+        )
+
+        result = loop.run()
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert "review round 1 of 1" in reviewer.calls[0].user_prompt
+        assert len(reviewer.calls) == 1
+        assert len(architect.calls) == 2
+        assert [
+            (item.round, item.message)
+            for item in store.list_planning_findings(borg.id)
+        ] == [(1, "Define rollback behavior.")]
+        assert loop.run() == result
+        assert len(reviewer.calls) == 1
 
 
 def test_two_revision_children_reconstruct_once_from_durable_attempt_ids(
@@ -841,6 +1422,129 @@ def _assert_prior_finding_count(spec, expected: int) -> None:
     assert len(_findings(spec)) == expected
 
 
+def _blocked_by_three_rejections(
+    store,
+    repository,
+    borg,
+    planning_plan_response,
+    tech_lead_change_request_response,
+):
+    """Drive a Borg to BLOCKED on the default budget and return its adapters."""
+    architect = MockAdapter(name="openai").queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    for index in range(4):
+        architect.queue(
+            MockResponse(payload=planning_plan_response(summary=f"Revision {index}."))
+        )
+    reviewer = MockAdapter(name="openai")
+    for index in range(3):
+        reviewer.queue(
+            MockResponse(payload=tech_lead_change_request_response(f"Fix {index}."))
+        )
+    handoff = ArchitectLoop(repository, borg, store, architect, io=_io()).run()
+    result = TechLeadLoop(
+        repository,
+        handoff.borg,
+        store,
+        reviewer,
+        architect_agent=architect,
+        io=_io(),
+    ).run()
+    assert result.borg.state is BorgState.BLOCKED
+    return architect, reviewer, result
+
+
+def test_a_blocked_plan_reconstructs_its_progress_without_a_stranded_child(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    """The rejection that blocked never revises, so it declares no revision.
+
+    A child declared for it stays pending, and a pending child refuses to let
+    its parent be seeded, so re-entering the record raises instead of
+    reporting what it holds.
+    """
+    database = committed_git_repo.parent / "tech-lead-blocked-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-blocked-progress"
+        )
+        architect, reviewer, first = _blocked_by_three_rejections(
+            store,
+            repository,
+            borg,
+            planning_plan_response,
+            tech_lead_change_request_response,
+        )
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        progress = RunProgress(stream=StringIO())
+
+        again = TechLeadLoop(
+            repository,
+            blocked,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            progress=progress,
+        ).run()
+
+        assert again.borg.state is BorgState.BLOCKED
+        assert again == first
+        children = progress.stages["tech-lead"].children
+        assert [child.state for child in children.values()] == [
+            StageState.COMPLETED,
+            StageState.COMPLETED,
+        ]
+
+
+def test_a_blocked_plan_stays_blocked_when_the_budget_is_raised_afterwards(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+) -> None:
+    """Whether a rejection blocked was settled when it completed.
+
+    The budget bounds a run from its start. Counting the record against a
+    number raised since would deny the plainly terminal record, and the caller
+    would get an error naming a state rather than the result it asked for.
+    """
+    database = committed_git_repo.parent / "tech-lead-blocked-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "review-blocked-raised"
+        )
+        architect, reviewer, first = _blocked_by_three_rejections(
+            store,
+            repository,
+            borg,
+            planning_plan_response,
+            tech_lead_change_request_response,
+        )
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        reviews_before = len(reviewer.calls)
+
+        again = TechLeadLoop(
+            repository,
+            blocked,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=5,
+        ).run()
+
+        assert again == first
+        assert again.borg.state is BorgState.BLOCKED
+        assert len(reviewer.calls) == reviews_before
+
+
 def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
     supplied_answers = answers or iter(())
     return InteractiveIO(
@@ -848,3 +1552,107 @@ def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
         confirm=lambda _message, _default: False,
         write=lambda _message: None,
     )
+
+
+def _seed_review(store, borg, phase: str, decision: str, message: str) -> None:
+    """Put one completed review, and the finding it wrote, on the record."""
+    attempt = PlanningAttempt(
+        borg_id=borg.id,
+        phase=phase,
+        round=len(
+            [
+                item
+                for item in store.list_planning_attempts(borg.id)
+                if item.phase == phase
+            ]
+        )
+        + 1,
+        adapter="mock",
+        model="test-model",
+    )
+    store.append_planning_attempt(attempt)
+    store.complete_planning_attempt(
+        attempt.id,
+        status=PlanningAttemptStatus.COMPLETED,
+        result={"decision": decision},
+        summary=message,
+    )
+    if decision == "request_changes":
+        store.append_planning_finding(
+            PlanningFinding(
+                borg_id=borg.id,
+                attempt_id=attempt.id,
+                round=1,
+                severity="major",
+                message=message,
+            )
+        )
+
+
+def test_only_the_findings_the_current_plan_must_answer_still_stand(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Three filters, and the record alone satisfies none of them.
+
+    A finding belongs to the round that wrote it. An approval answers the
+    finding that asked for it. A change request closes the cycle that held it.
+    And a Supervisor's finding is not a Tech Lead's, however alike they read.
+    """
+    from betterborg_cli.planning.turns import standing_planning_findings
+    from betterborg_cli.store import PlanChangeRequest
+
+    database = committed_git_repo.parent / "standing-findings.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "standing-findings"
+        )
+        assert repository is not None
+
+        # A rejection the reviewer then approved: answered, so it stands no more.
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-1 round-1")
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-1 round-1"]
+        _seed_review(store, borg, "tech_review", "approve", "cycle-1 approved")
+        assert standing_planning_findings(store, borg.id, "tech_review") == []
+
+        # A change request closes that cycle; the next one blocks.
+        store.append_plan_change_request(
+            PlanChangeRequest(borg_id=borg.id, round=1, note="Stage the rollout.")
+        )
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-1")
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-2")
+
+        standing = standing_planning_findings(store, borg.id, "tech_review")
+        assert [finding.message for finding in standing] == [
+            "cycle-2 round-1",
+            "cycle-2 round-2",
+        ]
+        assert "cycle-1 round-1" not in [finding.message for finding in standing]
+
+        # A second change request moves the boundary again.
+        store.append_plan_change_request(
+            PlanChangeRequest(borg_id=borg.id, round=2, note="Name the checks.")
+        )
+        _seed_review(store, borg, "tech_review", "request_changes", "cycle-3 round-1")
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-3 round-1"]
+
+        # A Supervisor finding is not a Tech Lead one.
+        _seed_review(
+            store, borg, "supervisor_review", "request_changes", "batch objection"
+        )
+        assert [
+            finding.message
+            for finding in standing_planning_findings(store, borg.id, "tech_review")
+        ] == ["cycle-3 round-1"]
+        assert [
+            finding.message
+            for finding in standing_planning_findings(
+                store, borg.id, "supervisor_review"
+            )
+        ] == ["batch objection"]

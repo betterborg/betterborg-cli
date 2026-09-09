@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,57 +24,16 @@ from test_host_merge import (
 from betterborg_cli.agent_runtime import CancellationToken, MockAdapter, run_captured
 from betterborg_cli.host_execution import (
     HostCommand,
-    HostComposeManager,
+    HostDroppedCommand,
     HostEnvironmentManager,
-    HostExecutable,
     HostPreflightPlan,
     HostSanityPhase,
     HostSecret,
-    HostService,
     HostWorktreeManager,
     SafeGit,
     WorktreeError,
 )
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
-
-
-@dataclass
-class _FakeStack:
-    environment: dict[str, str]
-
-
-class _RecordingCompose:
-    def __init__(self, repository_lock: RecordingLock, *, with_stack: bool) -> None:
-        self.repository_lock = repository_lock
-        self.with_stack = with_stack
-        self.stack = (
-            _FakeStack({"HEALTHY_URL": "http://127.0.0.1:39123"})
-            if with_stack
-            else None
-        )
-        self.started: list[object] = []
-        self.stopped: list[object] = []
-
-    def start_claimed_stack(  # noqa: ANN001
-        self, store, plan, claim, owner_token, **kwargs
-    ):
-        assert self.repository_lock.locked()
-        self.started.append(claim)
-        return self.stack
-
-    def start_claimed_sanity_stack(  # noqa: ANN001
-        self, store, plan, claim, owner_token, **kwargs
-    ):
-        return self.start_claimed_stack(
-            store, plan, claim, owner_token, **kwargs
-        )
-
-    def stop_claimed_stack(  # noqa: ANN001
-        self, store, stack, claim, owner_token, **kwargs
-    ) -> None:
-        assert self.repository_lock.locked()
-        assert stack is not None
-        self.stopped.append(stack)
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -114,20 +73,7 @@ def _plan(fixture) -> HostPreflightPlan:  # noqa: ANN001
         ),
         prepare_commands=(),
         materialize_commands=(),
-        environment_files=(fixture.repository / "README.md",),
-        executables=(),
         required_secret_names=("BUILD_TOKEN", "AGENT_TOKEN"),
-        compose_files=(),
-        services=(
-            HostService(
-                name="registry",
-                kind="external",
-                evidence="fixture",
-                url_env="REGISTRY_URL",
-                url="https://registry.example.test",
-            ),
-        ),
-        package_managers=("cargo", "go", "pnpm"),
         secret_requirements=(
             HostSecret("BUILD_TOKEN", "build", ("install",), "fixture"),
             HostSecret("AGENT_TOKEN", "agent", ("install", "test"), "fixture"),
@@ -139,7 +85,6 @@ def _sanity_phase(
     fixture,  # noqa: ANN001
     plan: HostPreflightPlan,
     repository_lock: RecordingLock,
-    compose,  # noqa: ANN001
     runner,  # noqa: ANN001
     *,
     cancel: CancellationToken | None = None,
@@ -152,12 +97,16 @@ def _sanity_phase(
             fixture.repository,
             environment={
                 "PATH": os.environ["PATH"],
+                "HOME": str(fixture.repository.parent),
+                "XDG_CACHE_HOME": str(fixture.repository.parent / "cache"),
                 "UNDECLARED_HOST": "no",
+                "REGISTRY_URL": "https://registry.example.test",
+                "BUILD_TOKEN": "operator-shell-value",
+                "AGENT_TOKEN": "operator-shell-value",
             },
             cancel=cancel,
             git=git,
         ),
-        compose_manager=compose,
         worktree_manager=HostWorktreeManager(
             fixture.repository,
             fixture.repository.parent / "worktrees",
@@ -178,7 +127,6 @@ def test_sanity_attestation_reuses_bound_git_and_reaps_cancelled_probe(
 ) -> None:
     fixture, tip, repository_lock = _merged_fixture(tmp_path)
     plan = _plan(fixture)
-    compose = _RecordingCompose(repository_lock, with_stack=False)
     cancel = CancellationToken()
     resistant = real_process_harness.resistant_argv("sanity-attestation-git")
     observed_tokens: list[CancellationToken | None] = []
@@ -213,7 +161,6 @@ def test_sanity_attestation_reuses_bound_git_and_reaps_cancelled_probe(
             fixture,
             plan,
             repository_lock,
-            compose,
             command_runner,
             cancel=cancel,
             git=git,
@@ -260,7 +207,6 @@ def test_sanity_catalog_command_reports_redacted_activity_and_reaps_cancellation
             original_plan.commands[1],
         ),
     )
-    compose = _RecordingCompose(repository_lock, with_stack=False)
     cancel = CancellationToken()
     resistant = real_process_harness.resistant_argv("sanity-catalog-command")
     invocations: list[tuple[tuple[str, ...], dict[str, object]]] = []
@@ -275,7 +221,6 @@ def test_sanity_catalog_command_reports_redacted_activity_and_reaps_cancellation
             fixture,
             plan,
             repository_lock,
-            compose,
             runner,
             cancel=cancel,
         )
@@ -327,7 +272,6 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
             original_plan.commands[1],
         ),
     )
-    compose = _RecordingCompose(repository_lock, with_stack=False)
     calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
 
     def runner(argv, *, cwd, env, **kwargs):  # noqa: ANN001, ANN003
@@ -338,7 +282,7 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
 
     with SqliteStore.open(fixture.database) as store:
         before_attempts = store.list_environment_attempts(fixture.task.id)
-        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
             fixture.context(store),
             tip,
             secret_values={
@@ -376,26 +320,16 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert "BUILD_TOKEN" not in test_env
     assert "AGENT_TOKEN" not in install_env | test_env
     assert "UNDECLARED_TOKEN" not in install_env | test_env
-    assert "UNDECLARED_HOST" not in install_env | test_env
+    assert install_env["UNDECLARED_HOST"] == "no"
+    assert test_env["UNDECLARED_HOST"] == "no"
     assert install_env["REGISTRY_URL"] == "https://registry.example.test"
-    assert install_env["HOME"] == test_env["HOME"]
-    assert install_env["XDG_CACHE_HOME"] == test_env["XDG_CACHE_HOME"]
-    assert install_env["CARGO_HOME"] == test_env["CARGO_HOME"]
-    assert install_env["GOCACHE"] == test_env["GOCACHE"]
-    assert install_env["PNPM_STORE_DIR"] == test_env["PNPM_STORE_DIR"]
+    assert install_env["HOME"] == str(fixture.repository.parent)
+    assert test_env["HOME"] == str(fixture.repository.parent)
+    assert install_env["XDG_CACHE_HOME"] == str(fixture.repository.parent / "cache")
+    assert test_env["XDG_CACHE_HOME"] == str(fixture.repository.parent / "cache")
     assert len(attempts) == len(before_attempts) + 1
     assert attempts[-1].kind == "materialize"
-    cache_path = Path(attempts[-1].result["cache_path"])
-    assert all(
-        Path(value).is_relative_to(cache_path)
-        for value in (
-            install_env["HOME"],
-            install_env["XDG_CACHE_HOME"],
-            install_env["CARGO_HOME"],
-            install_env["GOCACHE"],
-            install_env["PNPM_STORE_DIR"],
-        )
-    )
+    assert sanity_events[-1].payload["preparation_key"] == attempts[-1].fingerprint
     assert result.commands[0].command.argv == ("catalog-install", "[REDACTED]")
     assert secret not in repr(result)
     persisted = json.dumps(sanity_events[-1].payload)
@@ -403,16 +337,80 @@ def test_sanity_rematerializes_runs_catalog_and_advances_before_cleanup(
     assert json.dumps(secret)[1:-1] not in persisted
     assert quote(secret, safe="") not in persisted
     assert persisted.count("[REDACTED]") == 7
-    assert len(compose.started) == 1
-    assert compose.stopped == []
 
 
-def test_sanity_failure_stops_exact_stack_and_never_advances(
+def test_sanity_judges_the_catalog_on_the_merged_dependencies(
+    tmp_path: Path,
+) -> None:
+    """The gate prepares the merged tip whatever the reuse rule would say.
+
+    The worktree was prepared before the merge, and a digest of the declared
+    commands cannot tell a merged tree from the tree it replaced, so the
+    catalog would otherwise judge the dependencies of the tree the merge
+    already replaced.
+    """
+    fixture = _approved_merge_fixture(tmp_path)
+    subdir = fixture.repository / "package"
+    subdir.mkdir()
+    (subdir / ".keep").write_text("package\n", encoding="utf-8")
+    _git(fixture.repository, "add", "package/.keep")
+    _git(fixture.repository, "commit", "--quiet", "-m", "add package directory")
+
+    installer = tmp_path / "install-dependencies"
+    installer.write_text(
+        '#!/bin/sh\nset -eu\ncat README.md > "$1"\n', encoding="utf-8"
+    )
+    installer.chmod(0o755)
+    installed = tmp_path / "installed-dependencies"
+    original_plan = _plan(fixture)
+    plan = replace(
+        original_plan,
+        materialize_commands=(
+            HostCommand("environment", (str(installer), str(installed)), "."),
+        ),
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        HostEnvironmentManager(
+            fixture.repository,
+            environment={"PATH": os.environ["PATH"]},
+        ).materialize_claimed_task(
+            store, plan, fixture.claim, fixture.owner_token
+        )
+    before_merge = installed.read_text(encoding="utf-8")
+
+    merged_readme = "# Fixture\n\nbase descriptor changed\n"
+    _advance_project_base(fixture, "README.md", merged_readme)
+    repository_lock = RecordingLock()
+    with SqliteStore.open(fixture.database) as store:
+        merged = merge_phase(fixture, MockAdapter(), repository_lock).run(
+            fixture.context(store)
+        )
+    assert merged.tip is not None
+
+    judged: list[str] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        judged.append(installed.read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
+            fixture.context(store),
+            merged.tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert before_merge != merged_readme
+    assert judged == [merged_readme, merged_readme]
+
+
+def test_sanity_failure_blocks_and_never_advances(
     tmp_path: Path,
 ) -> None:
     fixture, tip, repository_lock = _merged_fixture(tmp_path)
     plan = _plan(fixture)
-    compose = _RecordingCompose(repository_lock, with_stack=True)
     calls: list[tuple[str, ...]] = []
     secret = "sanity-build-secret"
 
@@ -427,7 +425,7 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
         )
 
     with SqliteStore.open(fixture.database) as store:
-        result = _sanity_phase(fixture, plan, repository_lock, compose, runner).run(
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
             fixture.context(store),
             tip,
             secret_values={"BUILD_TOKEN": secret, "AGENT_TOKEN": "agent"},
@@ -448,63 +446,10 @@ def test_sanity_failure_stops_exact_stack_and_never_advances(
     assert failed_command.returncode == 7
     assert failed_command.stdout == "failed with [REDACTED]"
     assert failed_command.stderr == ""
-    assert len(compose.started) == 1
-    assert compose.stopped == [compose.stack]
     assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
         tip.base_commit
     )
     assert Path(runtime.worktree_path).is_dir()
-
-
-def test_compose_file_drift_durably_blocks_before_base_advancement(
-    tmp_path: Path,
-) -> None:
-    fixture, tip, repository_lock = _merged_fixture(tmp_path)
-    missing_compose_file = fixture.repository / "compose.yml"
-    plan = replace(
-        _plan(fixture),
-        executables=(HostExecutable("docker", Path("/validated/docker"), "fixture"),),
-        compose_files=(missing_compose_file,),
-        services=(
-            HostService(
-                name="database",
-                kind="compose",
-                evidence="fixture",
-                compose_service="database",
-            ),
-        ),
-    )
-    compose = HostComposeManager(
-        fixture.repository,
-        environment={"PATH": os.environ["PATH"]},
-        command_runner=lambda *args, **kwargs: pytest.fail(
-            "Compose must not run after validated file drift"
-        ),
-    )
-
-    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    with SqliteStore.open(fixture.database) as store:
-        result = _sanity_phase(
-            fixture, plan, repository_lock, compose, runner
-        ).run(
-            fixture.context(store),
-            tip,
-            secret_values={
-                "BUILD_TOKEN": "build-secret",
-                "AGENT_TOKEN": "agent-secret",
-            },
-        )
-        runtime = store.get_task_runtime(fixture.task.id)
-
-    assert result.status is TaskRuntimeStatus.BLOCKED
-    assert "validated Compose file is missing" in result.reason
-    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
-    assert Path(runtime.worktree_path).is_dir()
-    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
-        tip.base_commit
-    )
 
 
 def test_cleanup_failure_blocks_before_completion_while_locked(
@@ -513,13 +458,12 @@ def test_cleanup_failure_blocks_before_completion_while_locked(
 ) -> None:
     fixture, tip, repository_lock = _merged_fixture(tmp_path)
     plan = _plan(fixture)
-    compose = _RecordingCompose(repository_lock, with_stack=False)
 
     def runner(argv, **kwargs):  # noqa: ANN001, ANN003
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     with SqliteStore.open(fixture.database) as store:
-        phase = _sanity_phase(fixture, plan, repository_lock, compose, runner)
+        phase = _sanity_phase(fixture, plan, repository_lock, runner)
 
         def fail_cleanup(runtime):  # noqa: ANN001
             assert repository_lock.locked()
@@ -557,7 +501,6 @@ def test_resume_after_fast_forward_uses_durable_attestation(
 ) -> None:
     fixture, tip, repository_lock = _merged_fixture(tmp_path)
     plan = _plan(fixture)
-    compose = _RecordingCompose(repository_lock, with_stack=False)
     calls: list[tuple[str, ...]] = []
 
     def runner(argv, **kwargs):  # noqa: ANN001, ANN003
@@ -565,7 +508,7 @@ def test_resume_after_fast_forward_uses_durable_attestation(
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     with SqliteStore.open(fixture.database) as store:
-        phase = _sanity_phase(fixture, plan, repository_lock, compose, runner)
+        phase = _sanity_phase(fixture, plan, repository_lock, runner)
         original_transition = store.transition_task_runtime
 
         def interrupt_transition(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -598,3 +541,155 @@ def test_resume_after_fast_forward_uses_durable_attestation(
     assert runtime is not None and runtime.status is TaskRuntimeStatus.DONE
     assert not Path(runtime.worktree_path).exists()
     assert calls == [("catalog-install",), ("catalog-test",)]
+
+
+def _dropped_catalog_plan(fixture) -> HostPreflightPlan:  # noqa: ANN001
+    """Return the plan a host without ``catalog-test``'s program produces."""
+    original = _plan(fixture)
+    return replace(
+        original,
+        commands=(original.commands[0],),
+        dropped_commands=(
+            HostDroppedCommand(
+                original.commands[1],
+                "host executable is not available: catalog-test "
+                "(evidence: analyzer command catalog)",
+            ),
+        ),
+    )
+
+
+_DROPPED_SUMMARY = (
+    "1 sanity command dropped: catalog-test: host executable is not "
+    "available: catalog-test (evidence: analyzer command catalog)"
+)
+
+
+def test_published_task_names_the_command_the_host_could_not_run(
+    tmp_path: Path,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _dropped_catalog_plan(fixture)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert calls == [("catalog-install",)]
+    assert _DROPPED_SUMMARY in result.reason
+    assert runtime is not None
+    assert _DROPPED_SUMMARY in runtime.state_reason
+
+
+def test_surviving_command_still_fails_the_task_and_names_the_drop(
+    tmp_path: Path,
+) -> None:
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = _dropped_catalog_plan(fixture)
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 3, stdout="broken", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "sanity command failed with exit code 3" in result.reason
+    assert _DROPPED_SUMMARY in result.reason
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.base_commit
+    )
+
+
+def test_the_dropped_summary_is_masked_like_every_other_quotation(
+    tmp_path: Path,
+) -> None:
+    """This reason is durable, and the summary quotes the analysis verbatim.
+
+    It is stored as the task's state reason, listed back, and carried into the
+    pull request body that is pushed. Everything else this phase quotes from
+    the analysis is masked, and a catalogued argv is no safer than the argv of
+    a command that ran.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    original = _plan(fixture)
+    leaking = replace(
+        original.commands[1],
+        argv=(*original.commands[1].argv, "--token", "build"),
+    )
+    plan = replace(
+        original,
+        commands=(original.commands[0],),
+        dropped_commands=(
+            HostDroppedCommand(
+                leaking, "host executable is not available: catalog-test"
+            ),
+        ),
+    )
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert "--token build" not in result.reason
+    assert "catalog-test" in result.reason
+    assert runtime is not None
+    assert "--token build" not in runtime.state_reason
+
+
+def test_a_task_with_no_check_to_run_blocks_rather_than_publishing(
+    tmp_path: Path,
+) -> None:
+    """The gate's last backstop, behind preflight's refusal.
+
+    Preflight refuses a run holding no check, so reaching here means something
+    upstream let one through. Publishing the task anyway would advance the
+    project base on a change nothing verified, and say nothing about it.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = replace(_plan(fixture), commands=())
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(fixture, plan, repository_lock, runner).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.BLOCKED
+    assert "sanity command catalog is empty" in result.reason
+    assert calls == []
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.base_commit
+    )

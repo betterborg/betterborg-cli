@@ -69,17 +69,24 @@ _ROLE_REQUIREMENTS = {
     "coding": """The coding prompt must cover mission, runtime inputs, concrete
 source and test layout, exact build/lint/test commands, reuse and locality,
 meaningful tests using established fixtures, commit conventions, completion,
-and the coding agent's final result contract.""",
+and the coding agent's final result contract. It must state that an existing
+assertion is never weakened, deleted, or reversed to make a change pass, that
+such a conflict is reported instead, and that changing an assertion the task
+requires to change is reported with its reason.""",
     "review": """The review prompt must cover mission, runtime inputs, review
 method by file class, duplication/over-abstraction/orphaned-code lenses, test
 value and established test infrastructure, verification commands, sensitive
 paths, blocker/major/minor severity, approval criteria, and the review result
-contract. It must instruct the reviewer to inspect rather than edit.""",
+contract. It must instruct the reviewer to inspect rather than edit, and to
+treat an existing assertion the change weakens, deletes, or reverses as a
+blocker unless the task required that behaviour to change.""",
     "merge": """The merge prompt must cover mission, rebase inputs, conflict
 resolution using surrounding code, append-only migrations when present,
 regeneration of generated code and lock files using discovered commands, Git
 rules, post-merge verification, fail-loud criteria, and the merge result
-contract.""",
+contract. It must state that a conflict is resolved in the code and never by
+weakening an assertion either side made, and that a genuine disagreement about
+asserted behaviour fails the merge rather than picking a side.""",
 }
 
 
@@ -164,6 +171,7 @@ def generate_role_prompts(
                 agent=agent,
                 artifact_dir=artifact_dir,
                 prompt_path=prompt_path,
+                tracked_root=paths.tracked_root,
                 prior_prompt=prior_prompts.get(role),
                 model=model,
                 effort=resolved_config.effort,
@@ -182,6 +190,7 @@ def generate_role_prompts(
                 store,
                 role=role,
                 path=prompt_path,
+                root=paths.tracked_root,
                 analysis_id=analysis.id,
             )
             if retained is not None:
@@ -208,6 +217,7 @@ def generate_role_prompts(
                 store,
                 role=role,
                 path=prompt_path,
+                root=paths.tracked_root,
                 analysis_id=analysis.id,
             )
             if outcome.ok
@@ -278,6 +288,7 @@ def _generate_one_role(
     agent: AgentAdapter | SelectedAgent,
     artifact_dir: Path,
     prompt_path: Path,
+    tracked_root: Path,
     prior_prompt: GeneratedPrompt | None,
     model: str,
     effort: str | None,
@@ -326,7 +337,7 @@ def _generate_one_role(
         with _stable_prompt_publication(
             prompt_path,
             body_md,
-            repository.root,
+            tracked_root,
         ) as publish:
             with store.transaction():
                 _raise_if_cancelled(cancel)
@@ -360,6 +371,7 @@ def get_durable_role_prompt(
     *,
     role: str,
     path: Path,
+    root: Path,
     analysis_id: UUID | None = None,
 ) -> GeneratedPrompt | None:
     """Return the latest prompt only when its stable file matches metadata."""
@@ -369,7 +381,7 @@ def get_durable_role_prompt(
     ):
         return None
     try:
-        body = read_repository_text(path, root=repository.root)
+        body = read_repository_text(path, root=root)
     except (OSError, UnicodeError, RepositoryPathError):
         return None
     return prompt if body == prompt.body_md else None
@@ -525,13 +537,13 @@ def _validate_roles(roles: Iterable[str] | None) -> tuple[str, ...]:
 def _prepare_stable_prompt_directory(paths: RepoPaths) -> None:
     prompt_directory = paths.prompts_dir
     resolved = prompt_directory.resolve()
-    if not resolved.is_relative_to(paths.root):
+    if not resolved.is_relative_to(paths.tracked_root):
         raise ValueError(
             f"stable prompt directory escapes repository: {prompt_directory}"
         )
     prompt_directory.mkdir(parents=True, exist_ok=True)
     resolved = prompt_directory.resolve(strict=True)
-    if not resolved.is_relative_to(paths.root):
+    if not resolved.is_relative_to(paths.tracked_root):
         raise ValueError(
             f"stable prompt directory escapes repository: {prompt_directory}"
         )
@@ -541,10 +553,10 @@ def _prepare_stable_prompt_directory(paths: RepoPaths) -> None:
 def _stable_prompt_publication(
     path: Path,
     body_md: str,
-    repository_root: Path,
+    tracked_root: Path,
 ) -> Iterator[Callable[[], None]]:
     resolved_directory = path.parent.resolve(strict=True)
-    if not resolved_directory.is_relative_to(repository_root):
+    if not resolved_directory.is_relative_to(tracked_root):
         raise ValueError(f"stable prompt path escapes repository: {path}")
     path = resolved_directory / path.name
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")

@@ -126,7 +126,10 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
             repository, borg, first_generation, [foundation, consumer]
         )
         first_current = store._promote_published_task_generation(
-            first_generation.id, durable_root=first_root
+            first_generation.id,
+            durable_root=first_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
         assert first_current.status is TaskGenerationStatus.CURRENT
         assert first_current.current_at is not None
@@ -159,7 +162,10 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
             repository, borg, second_generation, [replacement]
         )
         second_current = store._promote_published_task_generation(
-            second_generation.id, durable_root=second_root
+            second_generation.id,
+            durable_root=second_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
         generations = store.list_task_generations(borg.id)
         first_superseded = generations[0]
@@ -170,7 +176,7 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         assert store.get_current_task_generation(borg.id) == second_current
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 12))
+        assert reopened.applied_migrations() == tuple(range(1, 13))
         assert reopened.list_plan_approvals(borg.id) == [approval]
         assert reopened.list_task_batches(borg.id) == [first_batch, second_batch]
         assert reopened.list_task_findings(borg.id) == [finding]
@@ -236,13 +242,19 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
         )
         with pytest.raises(ValueError, match="tree is missing"):
             store._promote_published_task_generation(
-                generation.id, durable_root=missing_root
+                generation.id,
+                durable_root=missing_root,
+                tasks_root=repository.root / ".betterborg/tasks",
+                owned_root=repository.root,
             )
         durable_root = _write_durable_tree(
             repository, borg, generation, [first, second]
         )
         current = store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
 
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -285,7 +297,10 @@ def test_generation_rows_and_current_visibility_are_database_enforced(
                 )
         with pytest.raises(ValueError, match="only a preparing"):
             store._promote_published_task_generation(
-                generation.id, durable_root=durable_root
+                generation.id,
+                durable_root=durable_root,
+                tasks_root=repository.root / ".betterborg/tasks",
+                owned_root=repository.root,
             )
 
         next_batch = TaskBatch(

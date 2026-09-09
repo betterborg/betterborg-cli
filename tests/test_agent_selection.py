@@ -30,6 +30,7 @@ from betterborg_cli.agent_runtime import (
     MockAdapter,
     MockResponse,
     OpenAIAdapter,
+    SandboxSettingError,
     SelectedAgent,
     run_captured,
     select_agent,
@@ -610,6 +611,32 @@ def test_untrusted_native_selection_never_spawns(git_repo: Path) -> None:
         selected.run(_spec(git_repo))
 
     assert not spawned
+
+
+def test_unrecognised_sandbox_declaration_stops_agent_selection(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting Codex refuses a malformed declaration, as a ValueError.
+
+    The base class is load-bearing rather than incidental: every CLI command
+    that selects an agent catches ``(OSError, RuntimeError, ValueError)``, so
+    it is what turns this into a message naming the accepted values instead of
+    a traceback.
+    """
+    monkeypatch.setenv("BETTERBORG_SANDBOX", "hsot")
+
+    with pytest.raises(ValueError, match="accepted values are auto, host") as error:
+        select_agent(
+            _config(coding=AgentChoice(adapter="codex")),
+            AgentStage.CODING,
+            RepoPaths.discover(git_repo),
+            interactive=True,
+            credentials={},
+            executable_lookup=lambda _binary: "/bin/codex",
+        )
+
+    assert isinstance(error.value, SandboxSettingError)
+    assert "BETTERBORG_SANDBOX='hsot'" in str(error.value)
 
 
 def _selected_codex(git_repo: Path, **changes: Any) -> SelectedAgent:

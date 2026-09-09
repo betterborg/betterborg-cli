@@ -87,6 +87,61 @@ Provider credentials are environment-only. Keep `ANTHROPIC_API_KEY` and
 valid tracked configuration and `betterborg init` never writes them to this
 file.
 
+Codex runs a read-only phase under a read-only sandbox and every other phase
+with sandboxing off. Inside a container that is already the boundary, the
+read-only sandbox usually cannot start, because it is built from an
+unprivileged user namespace that such a container is normally refused. Set
+`BETTERBORG_SANDBOX=host` to declare the environment already isolated, and
+Codex then runs without a sandbox in every phase.
+
+Weigh what that gives up. Every read-only phase under Codex is held to reading
+by this sandbox alone, creating a Borg and generating prompts as much as
+analysis and planning, and what the sandbox denies is writing anywhere and
+reaching the network. It does not confine reads: under either setting Codex can
+read outside the workspace it was given. Set `host` only where something around
+Betterborg is genuinely the boundary. Claude is unaffected either way, because
+it is held to reading by a tool allowlist rather than by a sandbox.
+
+The variable accepts `auto` and `host`, in any case and with surrounding
+spaces. Unset is the default and an empty value is read the same way; any other
+value fails any run that would launch Codex. Like a credential it belongs to
+whoever starts Betterborg, so it is environment-only and not valid tracked
+Betterborg configuration.
+
+## Betterborg's own files
+
+Betterborg keeps its configuration, prompts, PRDs, plans, published tasks and
+score in `.betterborg` inside the repository, and adds a managed block to the
+repository's `.gitignore` so its state directory stays out of Git. For a team
+that owns the repository this is the point: the configuration is reviewed and
+shared like any other checked-in file.
+
+Working on a repository you are only passing through, set `BETTERBORG_HOME` to
+an absolute path outside it:
+
+```console
+BETTERBORG_HOME=~/.betterborg/acme betterborg init --yes
+```
+
+Configuration, prompts, PRDs, plans, tasks, score, state and artifacts all
+move there together, and the repository's working tree and `.gitignore` are
+left exactly as Betterborg found them: with nothing of Betterborg's inside the
+repository there is nothing to ignore, so no managed block is written. The
+task worktrees Betterborg mints are unaffected; they are siblings of the
+repository under `.betterborg-worktrees`, and are not the operator's to place.
+
+Unset is the default and an empty value is read the same way. A path that
+resolves inside the repository fails the run, because it would reintroduce
+exactly what the variable exists to keep out; so does a path that contains the
+repository, which would put the whole working tree inside what Betterborg
+owns, and so does a relative path. One directory serves one repository: a
+directory already holding another repository's configuration is refused rather
+than serving both, and it goes on refusing after its state directory is
+deleted, because a relocated directory records the repository it serves beside
+that configuration. Like the sandbox declaration it belongs to whoever starts
+Betterborg, so it is environment-only and not valid tracked Betterborg
+configuration.
+
 ## Host integrations
 
 ```console
@@ -108,6 +163,140 @@ Once initialization completes, use `betterborg create`, `betterborg plan`, `bett
 and `betterborg execute` as shown by `betterborg COMMAND --help`. Before executing a
 published task generation, `betterborg task estimate NAME` shows its P50/P80 work and
 billing-mode estimate.
+
+## Run on a host that has less than the repository names
+
+`betterborg execute` requires what the run will use, not everything the
+repository has ever been able to do. The toolchains and package managers the
+analysis lists are an inventory written for a person to read, so a host with no
+program by one of those names is not refused; every command that runs already
+requires the program it invokes.
+
+The catalog lists what a repository can do, and only part of it settles
+whether a change broke anything. Each catalogued command says whether running
+it verifies the repository: a test run, a linter, a type checker or other
+static analysis, a formatter in a check mode that reports rather than rewrites,
+or a build whose output the repository ignores. Everything else does not,
+including a command that serves, watches, publishes, waits for input, measures
+rather than checks, or writes anything the repository tracks or would report as
+untracked. `.gitignore` decides which outputs count, and where it cannot be
+told, the command is not a check. A run whose catalog declares no check at all is refused
+before any task is coded, because nothing in it could prove a change safe.
+The sanity gate runs the ones that do. An analysis recorded before the question
+was asked says nothing, and every command in it still runs.
+
+A catalog command whose program is missing is dropped from the run rather than
+refusing it, and never silently. The Preflight stage names each dropped
+command, and so does the result of every task that would have run it:
+
+```text
+completed Preflight — 1 sanity command dropped: cargo test: host executable is
+not available: cargo (evidence: Cargo.toml)
+```
+
+A dropped check cannot fail, so a task that skipped one is not the same as a
+task that passed it. The checks the host can run still run, and a host that can
+run none of them is refused rather than spending the run. Commands that build
+the run itself are never dropped: a worktree is prepared by the analysis's
+materialize commands when it declares any and by its prepare commands
+otherwise, and a host that cannot run a program that list names is refused.
+
+Secrets follow the commands. One that nothing left in the run consumes does not
+block, and a secret the analysis names twice blocks only when the two records
+disagree, in which case the refusal says what they disagree on.
+
+## Adopt an existing PRD
+
+When the PRD is already written and authoritative, `--adopt` publishes it as
+the Borg's confirmed PRD unchanged, including whether it ends in a newline.
+Line endings are read the way every other PRD source is read, so a CRLF file
+is published with newlines:
+
+```console
+betterborg create my-feature --prd spec.md --adopt --yes
+```
+
+Adoption holds no requirements interview, so it selects no agent, needs no
+provider credential, reports no progress stages, and does not require an
+interactive terminal. It still requires a trusted workspace, which is what
+`--yes` grants above. `--adopt` requires `--prd`, because a PRD that has yet to
+be brainstormed is not one that can be adopted. The Borg it creates is the one
+an interview would have confirmed, so continue with `betterborg plan start
+NAME` as usual.
+
+## Plan without a terminal
+
+The Architect asks when the requirements do not settle something it needs, and
+with a terminal the operator answers. `--unattended` supplies the missing
+party: the Architect is told nobody can be asked, so it settles each
+uncertainty itself, on the reading the evidence it already read best supports.
+
+```console
+betterborg plan start my-feature --yes --unattended
+```
+
+The plan names those decisions itself, and `betterborg plan show` renders them
+under `## Assumptions`, so the gaps a run closed on its own stay in front of
+whoever reads it. A plan that says nothing about them is asked once,
+shown what it decided, and told to say what it still rests on; if it says
+nothing again the recorded decisions are published in its place. A revision
+that no longer rests on anything assumed says so with an empty list, which
+retires what it would otherwise inherit. An Architect that asks a question anyway
+is answered the same way instead of ending the run, and that answer is stored
+beside its question, marked as assumed rather than answered.
+
+`betterborg plan change NAME --note ... --unattended` revises the same way, so
+a Borg planned without a terminal can be changed without one.
+
+Without `--unattended` planning still prompts, and a prompt that returns
+nothing still stops the run for a person to resume. A plan written that way
+claims no assumptions of its own, because every requirement there was given; it
+keeps the ones the plan it revises already carried, minus any over a question
+the operator has since answered.
+
+An unattended run's questions are bounded per planning cycle, so a Borg that
+spent its budget planning can still be revised. An Architect that keeps asking
+past that budget ends the run with its unanswered round preserved, so
+`betterborg plan start NAME` resumes it with a person answering.
+
+A run that blocks says so and exits non-zero, so a script driving Betterborg
+with nobody watching stops on it rather than carrying on. A plan waiting for
+approval is the ordinary end of `betterborg plan start NAME` and exits zero,
+because it is what an unattended plan is meant to reach.
+
+## Choose how many revisions a plan gets
+
+The Tech Lead reviews the Architect's plan, and where it finds something wrong
+the Architect revises and it reviews again. Three rounds is what a plan gets,
+and one the Tech Lead still will not approve then blocks with its findings
+kept, so `betterborg plan show NAME` says what stood in the way.
+
+A repository that wants more or fewer attempts at agreement sets its own
+budget in `.betterborg/config.toml`:
+
+```toml
+[planning]
+review_rounds = 5
+```
+
+Decomposition has the same shape and the same knob. The Supervisor reviews the
+Project Manager's task batch, sends it back where it finds something wrong, and
+after its rounds a batch it still will not approve blocks with its findings
+kept. `decomposition_rounds` sets how many it gets:
+
+```toml
+[planning]
+decomposition_rounds = 5
+```
+
+Both are read when a run starts and govern that run. A plan or a batch that has
+already blocked stays blocked whatever the setting becomes afterwards.
+
+The value is a whole number of at least one, and anything else is refused when
+the configuration is read rather than part-way through a review. Each review
+is told the round it is on and the budget it has. Raising the budget buys
+further rounds, never approval: a plan that spends the larger budget
+unapproved blocks exactly as one that spends the default does.
 
 ## Progress output
 

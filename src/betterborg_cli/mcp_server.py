@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import threading
 import time
@@ -20,15 +21,25 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.selection import select_agent
-from betterborg_cli.host_execution import HostPreflightBlock
+from betterborg_cli.host_execution import (
+    HostPreflightBlock,
+    HostPreflightPlan,
+    redacted_dropped_command_summary,
+)
 from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
+from betterborg_cli.planning.turns import standing_planning_findings
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import AgentStage, load_repository_config
+from betterborg_cli.repository_config import (
+    AgentStage,
+    load_repository_config,
+    require_registered_repository,
+)
 from betterborg_cli.repository_service import RepositoryService
 from betterborg_cli.run_control import RunControl
 from betterborg_cli.store import (
+    Borg,
     BorgState,
     ExecutionEvent,
     ExecutionRunStatus,
@@ -200,6 +211,11 @@ class PlanCodePointer(ProtocolModel):
     why: str
 
 
+class PlanAssumption(ProtocolModel):
+    question: str
+    assumption: str
+
+
 class PlanDocument(ProtocolModel):
     title: str
     repositories: tuple[PlanRepository, ...] = ()
@@ -207,6 +223,7 @@ class PlanDocument(ProtocolModel):
     overall_approach: str
     phases: tuple[PlanPhase, ...]
     code_pointers: tuple[PlanCodePointer, ...] = ()
+    assumptions: tuple[PlanAssumption, ...] = ()
     risks: tuple[str, ...] = ()
     open_questions: tuple[str, ...] = ()
 
@@ -216,9 +233,17 @@ class PlanProgressData(ProtocolModel):
     questions: tuple[PlanningQuestionData, ...]
 
 
+class PlanFindingData(ProtocolModel):
+    round: int
+    severity: str
+    message: str
+    suggestion: str | None = None
+
+
 class PlanShowData(ProtocolModel):
     borg: str
     plan: PlanDocument
+    findings: tuple[PlanFindingData, ...] = ()
 
 
 class PlanApprovalData(ProtocolModel):
@@ -732,7 +757,6 @@ def _progress_phase(
     namespace = event.kind.partition(".")[0]
     return {
         "base": "merging",
-        "compose": "environment",
         "environment": "environment",
         "merge": "merging",
         "run": "execution",
@@ -1067,7 +1091,7 @@ def _cli_command(*arguments: str) -> str:
 
 
 def _relative(paths: RepoPaths, path: Path) -> str:
-    return path.resolve().relative_to(paths.root).as_posix()
+    return paths.label(path)
 
 
 def _analysis_artifacts(
@@ -1135,6 +1159,7 @@ def _initialize(
                 cancel=cancel,
             )
             onboarding = OnboardingDispatcher(
+                paths,
                 result.repository,
                 store,
                 io,
@@ -1238,11 +1263,9 @@ def _create(
     if source_path is not None and not source_path.is_absolute():
         source_path = paths.root / source_path
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         result = CreateService(
             repository,
             store,
@@ -1308,11 +1331,9 @@ async def create(
 def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, Any]]]:
     config = load_repository_config(paths)
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = store.get_repository(config.repository_id)
-        if repository is None:
-            raise ValueError(
-                "repository is not initialized; run 'betterborg init' first"
-            )
+        repository = require_registered_repository(
+            paths, store.get_repository(config.repository_id)
+        )
         borg = store.get_borg_by_name(repository.id, name)
         if borg is None:
             raise ValueError(f"Borg {name!r} does not exist")
@@ -1328,9 +1349,52 @@ def _planning_state(paths: RepoPaths, name: str) -> tuple[Any, list[dict[str, An
     return borg, questions
 
 
+def _dropped_checks(preflight: HostPreflightPlan) -> str:
+    """Return the dropped-check summary, masked, as every surface reports it."""
+    return redacted_dropped_command_summary(
+        preflight,
+        {
+            name: os.environ[name]
+            for name in preflight.required_secret_names
+            if name in os.environ
+        },
+    )
+
+
+def _plan_findings(
+    store: SqliteStore, borg: Borg
+) -> tuple[PlanFindingData, ...]:
+    """Return the Tech Lead findings standing against this Borg's plan.
+
+    A blocked plan keeps them, and a headless caller has no terminal to read
+    them in, so they travel in the payload the way the drop summary does.
+    """
+
+    return tuple(
+        PlanFindingData(
+            round=finding.round,
+            severity=finding.severity,
+            message=finding.message,
+            suggestion=finding.suggestion,
+        )
+        for finding in standing_planning_findings(
+            store, borg.id, "tech_review"
+        )
+    )
+
+
 def _plan_actions(
     name: str, state: BorgState
 ) -> tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]:
+    if state is BorgState.BLOCKED:
+        # Blocked is where the findings matter most, and the terminal names a
+        # command to read them with. The headless caller gets the same one.
+        return (
+            PlanNextAction(
+                tool="plan",
+                arguments=PlanActionArguments(name=name, action="show"),
+            ),
+        )
     if state is BorgState.PLAN_APPROVAL_PENDING:
         return (
             PlanNextAction(
@@ -1362,16 +1426,27 @@ def _approve_plan(
     *,
     cancel: CancellationToken | None = None,
 ) -> tuple[Any, Any, Path, Any]:
+    from betterborg_cli import cli as cli_module
+
     config = load_repository_config(paths)
+    planning_trust = cli_module._managed_worktree_trust_requirement(paths)
     result = approve_plan_workflow(
         paths,
         config,
         name,
         pm_agent=lambda: select_agent(
-            config, AgentStage.PM, paths, interactive=False
+            config,
+            AgentStage.PM,
+            paths,
+            interactive=False,
+            trust_requirement=planning_trust,
         ),
         supervisor_agent=lambda: select_agent(
-            config, AgentStage.SUPERVISOR, paths, interactive=False
+            config,
+            AgentStage.SUPERVISOR,
+            paths,
+            interactive=False,
+            trust_requirement=planning_trust,
         ),
         cancel=cancel,
     )
@@ -1394,6 +1469,7 @@ def _plan(
         borg, _questions = _planning_state(paths, name)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
             attempt = validated_current_plan_attempt(paths, store, borg)
+            approval_findings = _plan_findings(store, borg)
         plan_document = PlanDocument.model_validate(attempt.result)
         io.write(json.dumps(attempt.result, indent=2, sort_keys=True))
         if not io.confirm(
@@ -1403,7 +1479,11 @@ def _plan(
             return PlanResult(
                 status=borg.state,
                 next_actions=_plan_actions(name, borg.state),
-                data=PlanShowData(borg=name, plan=plan_document),
+                data=PlanShowData(
+                    borg=name,
+                    plan=plan_document,
+                    findings=approval_findings,
+                ),
             )
         borg, approval, plan_path, publication = _approve_plan(
             paths,
@@ -1431,21 +1511,21 @@ def _plan(
     if action == "show":
         config = load_repository_config(paths)
         with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-            repository = store.get_repository(config.repository_id)
-            if repository is None:
-                raise ValueError(
-                    "repository is not initialized; run 'betterborg init' first"
-                )
+            repository = require_registered_repository(
+                paths, store.get_repository(config.repository_id)
+            )
             borg = store.get_borg_by_name(repository.id, name)
             if borg is None:
                 raise ValueError(f"Borg {name!r} does not exist")
             attempt = validated_current_plan_attempt(paths, store, borg)
+            findings = _plan_findings(store, borg)
         return PlanResult(
             status=borg.state,
             next_actions=_plan_actions(name, borg.state),
             data=PlanShowData(
                 borg=name,
                 plan=PlanDocument.model_validate(attempt.result),
+                findings=findings,
             ),
         )
 
@@ -1627,14 +1707,16 @@ def _execute(
         status = "active"
         operation_id = None
         active_operation_id = str(result.active_operation_id)
-        reason = None
+        # A headless caller has no progress stream, so the checks this host
+        # could not run have to travel with the result itself.
+        reason = _dropped_checks(result.preflight) or None
     else:
         if result.operation_id is None or result.status is None:
             raise RuntimeError("host execution returned no operation")
         status = result.status.value
         operation_id = str(result.operation_id)
         active_operation_id = None
-        reason = None
+        reason = _dropped_checks(result.preflight) or None
     actions = ()
     if result.status not in {ExecutionRunStatus.COMPLETED}:
         actions = (

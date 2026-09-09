@@ -167,7 +167,10 @@ class TaskPublisher:
         self._raise_if_cancelled()
         try:
             generation = self.store._promote_published_task_generation(
-                generation.id, durable_root=destination
+                generation.id,
+                durable_root=destination,
+                tasks_root=self.paths.tasks_dir,
+                owned_root=self.paths.tracked_root,
             )
         except (KeyError, ValueError) as error:
             raise TaskPublicationError(str(error)) from error
@@ -416,6 +419,10 @@ class TaskPublisher:
     def _require_git_trackable(
         self, files: tuple[PublishedTaskFile, ...]
     ) -> None:
+        # Published tasks outside the repository are nothing Git tracks, so
+        # no ignore rule can swallow them.
+        if not self.paths.tracked_in_repository:
+            return
         for published in files:
             try:
                 require_git_trackable(
@@ -446,20 +453,21 @@ class TaskPublisher:
             _fsync_directory(directory.parent)
 
     def _require_safe_directory_lineage(self, path: Path) -> None:
+        owned_root = self.paths.tracked_root
         try:
-            relative = path.relative_to(self.paths.root)
+            relative = path.relative_to(owned_root)
         except ValueError as error:
             raise TaskPublicationError(
                 "task publication directory escapes repository"
             ) from error
-        candidate = self.paths.root
+        candidate = owned_root
         for component in relative.parts:
             candidate /= component
             if candidate.is_symlink():
                 raise TaskPublicationError(
                     f"task publication directory is a symlink: {candidate}"
                 )
-        if not path.resolve().is_relative_to(self.paths.root):
+        if not path.resolve().is_relative_to(owned_root):
             raise TaskPublicationError("task publication directory escapes repository")
 
     def _remove_tree(self, path: Path) -> None:

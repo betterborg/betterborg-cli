@@ -12,6 +12,7 @@ from betterborg_cli.agent_runtime.api_adapter import (
     AbortableApiRequest,
     ApiCredentialRedactor,
     ApiRunContext,
+    SchemaCorrection,
 )
 from betterborg_cli.agent_runtime.api_http import (
     MultiprocessUrlRequest,
@@ -334,7 +335,24 @@ class OpenAIAdapter:
                     payload = _tool_arguments(submissions[0])
                 except OpenAIApiError as error:
                     return runtime.result(AgentStatus.FAILED, error=str(error))
-                return runtime.complete(payload)
+                submitted = runtime.complete(payload)
+                if not isinstance(submitted, SchemaCorrection):
+                    return submitted
+                call_id = submissions[0].get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    return runtime.result(
+                        AgentStatus.FAILED,
+                        error="OpenAI tool call is missing a call_id",
+                    )
+                input_items = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": submitted.message,
+                    }
+                ]
+                previous_response_id = response_id
+                continue
 
             if not calls:
                 return runtime.result(

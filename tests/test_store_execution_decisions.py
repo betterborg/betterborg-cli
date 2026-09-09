@@ -181,7 +181,7 @@ def test_decisions_are_complete_unique_and_current_generation_bound(
                 )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 12))
+        assert reopened.applied_migrations() == tuple(range(1, 13))
         assert reopened.get_execution_decision(borg.id, first_generation.id) == first
         assert reopened.get_current_execution_decision(borg.id) == second
         with reopened.locked_connection() as connection:

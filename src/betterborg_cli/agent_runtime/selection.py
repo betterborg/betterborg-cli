@@ -84,7 +84,9 @@ def require_read_only_agent(
     """Reject an adapter that cannot enforce a read-only execution boundary.
 
     An adapter qualifies by confining tool access to an allowlist, or by
-    running its provider CLI in a read-only sandbox. A host-capable adapter
+    running its provider CLI in a read-only sandbox. An operator who has
+    declared the environment already isolated satisfies the second without a
+    sandbox actually in force; see ``codex._sandbox_setting``. A host-capable adapter
     additionally has to arrive wrapped, because ``SelectedAgent`` is what
     holds it to a read-only tool set and to workspace trust.
     """
@@ -167,11 +169,13 @@ class SelectedAgent:
         resolve every path beneath the run directory. It reaches nothing else
         on the host and therefore needs no repository trust.
 
-        A native CLI is only held to reading. Its read-only tool set stops it
-        writing or editing, but neither provider confines reads to the working
-        directory, so it can still reach the repository the workspace was
-        sampled from. For a native CLI the workspace is therefore a bound on
-        cost and on the evidence the prompt cites, not a containment boundary.
+        A native CLI is held to reading by whatever its provider offers:
+        Claude by a read-only tool set, Codex by a sandbox an operator can
+        decline, after which Codex can write. Neither provider confines reads
+        to the working directory, so either can still reach the repository the
+        workspace was sampled from. For a native CLI the workspace is
+        therefore a bound on cost and on the evidence the prompt cites, not a
+        containment boundary.
 
         Trust is required for that host access, but every current caller
         already trusts the workspace before selecting an agent, so this is
@@ -236,7 +240,7 @@ class SelectedAgent:
 
         same_workspace = run_paths.root == self.paths.root
         managed_worktree = (
-            run_paths.root.is_relative_to(self.paths.worktrees_dir.resolve())
+            self.paths.manages(run_paths.root)
             and run_identity.git_common_dir == selected_identity.git_common_dir
         )
         if not same_workspace and not managed_worktree:

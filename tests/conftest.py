@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -584,6 +584,26 @@ except RuntimeError as error:
         return len(fields) < 3 or fields[2] != "Z"
 
 
+@pytest.fixture(autouse=True)
+def undeclared_sandbox(monkeypatch: MonkeyPatch) -> None:
+    """Hold every test to the sandbox declaration it sets for itself.
+
+    The declaration is an operator's environment variable, so a machine that
+    genuinely sets it would otherwise change what unrelated tests assert.
+    """
+    monkeypatch.delenv("BETTERBORG_SANDBOX", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def undeclared_home(monkeypatch: MonkeyPatch) -> None:
+    """Hold every test to the tracked directory it declares for itself.
+
+    The declaration is an operator's environment variable, so a machine that
+    genuinely sets it would otherwise move every path unrelated tests assert.
+    """
+    monkeypatch.delenv("BETTERBORG_HOME", raising=False)
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """Return Click's isolated command-line test runner."""
@@ -749,6 +769,18 @@ def configure_interactive_cli(monkeypatch: MonkeyPatch):
     return configure
 
 
+@pytest.fixture
+def host_capable_adapter():
+    """Return a factory for a mock whose host access requires workspace trust."""
+    return _host_capable_adapter
+
+
+def _host_capable_adapter() -> MockAdapter:
+    adapter = MockAdapter(name="openai")
+    adapter.capabilities = replace(adapter.capabilities, host_capable=True)
+    return adapter
+
+
 def _write_repository_config(root: Path, repository: Repository) -> None:
     (root / ".betterborg").mkdir()
     (root / ".betterborg/config.toml").write_text(
@@ -880,7 +912,20 @@ def _persist_repository_analysis(
         analysis_json={
             "packages": [{"path": "."}],
             "themes": [],
-            "command_catalog": {"commands": []},
+            # A repository with a check: a run holding none is refused
+            # before any task is coded, which is not what these fixtures are
+            # about.
+            "command_catalog": {
+                "source": "README.md",
+                "commands": [
+                    {
+                        "stage": "test",
+                        "argv": ["git", "status", "--short"],
+                        "verifies": True,
+                        "source": "README.md",
+                    }
+                ],
+            },
             "environment": {"files": []},
             "required_secrets": [],
             "service_dependencies": [],

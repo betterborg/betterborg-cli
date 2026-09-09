@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
@@ -21,6 +22,7 @@ from betterborg_cli.agent_runtime import (
     CancellationToken,
 )
 from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_MERGE_RULE,
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
@@ -49,12 +51,16 @@ from betterborg_cli.store import (
 
 MERGE_RESULT_SCHEMA: dict[str, Any] = CODING_RESULT_SCHEMA
 
-_MERGE_IDENTITY = {
-    "GIT_AUTHOR_NAME": "Betterborg",
-    "GIT_AUTHOR_EMAIL": "betterborg@example.invalid",
-    "GIT_COMMITTER_NAME": "Betterborg",
-    "GIT_COMMITTER_EMAIL": "betterborg@example.invalid",
-}
+#: Probed committer first, matching the order ``git merge`` itself reports a
+#: missing identity in.
+_COMMIT_IDENTITY_VARIABLES = ("GIT_COMMITTER_IDENT", "GIT_AUTHOR_IDENT")
+_RESOLVED_IDENTITY = re.compile(r"\A(?P<name>.*) <(?P<email>.*)> [0-9]+ [-+][0-9]{4}\Z")
+_MISSING_IDENTITY_MESSAGE = (
+    "Git could not resolve a commit identity for this merge; set user.name "
+    "and user.email in this repository or in your global Git configuration, "
+    "and check GIT_AUTHOR_* and GIT_COMMITTER_* in the environment, which "
+    "override both"
+)
 _MERGE_STARTED_EVENT = "merge.started"
 _MERGE_COMPLETED_EVENT = "merge.completed"
 
@@ -172,13 +178,13 @@ class HostMergePhase:
         """Produce an attested merge tip without advancing the project base."""
         try:
             runtime, worktree = require_ready_worktree(
-                self.repository_root,
+                self._paths,
                 self._primary_git,
                 context,
                 expected_statuses={TaskRuntimeStatus.MERGING},
             )
             inputs = verified_task_inputs(
-                self.repository_root,
+                self._paths,
                 context,
                 worktree,
                 prompt_role="merge",
@@ -278,6 +284,10 @@ class HostMergePhase:
                     raise MergePhaseError(
                         "active merge lacks a durable host attestation"
                     )
+            # The agent commits its own resolution, so a resumed merge needs an
+            # identity as much as the merge that opened it. Refuse here rather
+            # than let the agent meet Git's error and invent one to get past it.
+            self._require_commit_identity(git)
             return self._invoke_agent(
                 context,
                 runtime,
@@ -345,12 +355,21 @@ class HostMergePhase:
                     )
                 return outcome
             merge_date = f"@{int(context.clock().timestamp())} +0000"
-            expected_commit = self._expected_clean_merge_commit(
-                git,
-                starting_commit=current,
-                base_commit=base_commit,
-                merge_date=merge_date,
-            )
+            if git.is_ancestor(current, base_commit):
+                # Merging only moves the branch pointer, so Git writes no
+                # commit and needs no identity, and the tip to attest to is
+                # the base itself rather than one Git has yet to build.
+                identity: dict[str, str] = {}
+                expected_commit: str | None = base_commit
+            else:
+                identity = self._require_commit_identity(git)
+                expected_commit = self._expected_clean_merge_commit(
+                    git,
+                    starting_commit=current,
+                    base_commit=base_commit,
+                    merge_date=merge_date,
+                    identity=identity,
+                )
             self._record_merge_event(
                 context,
                 kind=_MERGE_STARTED_EVENT,
@@ -363,6 +382,7 @@ class HostMergePhase:
                 merge_date=merge_date,
             )
             merge_environment = self._merge_environment()
+            merge_environment.update(identity)
             merge_environment.update(
                 {
                     "GIT_AUTHOR_DATE": merge_date,
@@ -372,6 +392,10 @@ class HostMergePhase:
             merged = git.run(
                 [
                     "merge",
+                    # Betterborg decides whether this merge writes a commit;
+                    # the sha pre-attested just above assumes that decision,
+                    # and merge.ff would otherwise take it instead.
+                    "--ff",
                     "--no-edit",
                     "-m",
                     self._clean_merge_message(base_commit),
@@ -867,10 +891,9 @@ class HostMergePhase:
         starting_commit: str,
         base_commit: str,
         merge_date: str,
+        identity: Mapping[str, str],
     ) -> str | None:
         """Create the exact clean merge object before its branch can move."""
-        if git.is_ancestor(starting_commit, base_commit):
-            return base_commit
         merged_tree = git.run(
             ["merge-tree", "--write-tree", starting_commit, base_commit],
             check=False,
@@ -884,6 +907,7 @@ class HostMergePhase:
                 "Git could not prepare the clean merge attestation: " + detail
             )
         environment = self._merge_environment()
+        environment.update(identity)
         environment.update(
             {
                 "GIT_AUTHOR_DATE": merge_date,
@@ -1070,11 +1094,76 @@ class HostMergePhase:
         commit_sha = result.stdout.strip()
         return commit_sha if result.returncode == 0 and commit_sha else None
 
+    def _require_commit_identity(self, git: SafeGit) -> dict[str, str]:
+        """Pin the ambient identity the commits Betterborg makes carry.
+
+        Git resolves an identity per process from configuration on disk, so the
+        pre-attested commit and the merge that has to reproduce its sha are
+        otherwise free to disagree whenever that configuration changes between
+        them. Reading it once and handing it to both makes the sha an argument
+        rather than a race, and refusing here reports what to configure instead
+        of letting Git's own error surface from whichever call runs first.
+
+        Which identities Git will accept is Git's own question, asked with
+        Git's own strictness, so one Git auto-detects is admitted here exactly
+        as it would be by the commit this stands in for. On top of that this
+        refuses two Git would take: an identity whose bytes do not decode, and
+        one whose shape it cannot read, because neither can be reproduced
+        faithfully in the two commits that have to match. A caller that only
+        needs the refusal, because the commit is the merge agent's rather than
+        Betterborg's, discards the result.
+        """
+        environment = self._merge_environment()
+        # Git parses these when it resolves an identity, and an unparseable one
+        # would be reported here as a missing identity. The commits themselves
+        # set their own dates.
+        for variable in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+            environment.pop(variable, None)
+        identity: dict[str, str] = {}
+        for variable in _COMMIT_IDENTITY_VARIABLES:
+            role = variable.removesuffix("_IDENT")
+            role_word = role.removeprefix("GIT_").lower()
+            try:
+                probe = git.run(["var", variable], check=False, env=environment)
+            except UnicodeDecodeError as error:
+                # Git writes configured bytes back verbatim, and this is the
+                # first place Betterborg reads them. A phase that raises here
+                # never reaches its own reporting.
+                raise MergePhaseError(
+                    f"Git reported a {role_word} Betterborg cannot decode: "
+                    "its bytes are not text in this process's encoding"
+                ) from error
+            if probe.returncode != 0:
+                raise MergePhaseError(
+                    f"{_MISSING_IDENTITY_MESSAGE}; Git resolves no {role_word}: "
+                    + self._identity_fault(probe)
+                )
+            resolved = _RESOLVED_IDENTITY.match(probe.stdout.strip())
+            if resolved is None:
+                raise MergePhaseError(
+                    f"Git reported a {role_word} Betterborg cannot read: "
+                    + probe.stdout.strip()[:200]
+                )
+            identity[f"{role}_NAME"] = resolved["name"]
+            identity[f"{role}_EMAIL"] = resolved["email"]
+        return identity
+
+    @staticmethod
+    def _identity_fault(probe: subprocess.CompletedProcess[str]) -> str:
+        """Reduce Git's identity banner to the line stating the fault.
+
+        The banner repeats advice the message this is appended to already
+        gives, and a status reason is no place for it. Git writes the hint
+        first and the verdict last, and it translates the ``fatal:`` prefix,
+        so the last line is the one to keep and its text is no way to find it.
+        """
+        text = (probe.stderr or probe.stdout).strip()
+        lines = [line for line in text.splitlines() if line.strip()]
+        return lines[-1][:200] if lines else ""
+
     def _merge_environment(self) -> dict[str, str]:
         environment = dict(os.environ)
         environment.update(self._config.environment)
-        for name, value in _MERGE_IDENTITY.items():
-            environment.setdefault(name, value)
         return environment
 
     def _transition(
@@ -1121,6 +1210,8 @@ def _render_merge_prompt(
         "base. Resolve every conflicted path, stage the resolutions, and create "
         "the merge commit before returning completed. Do not abort the merge, "
         "switch branches, or modify the primary checkout.",
+        "",
+        EXISTING_TEST_MERGE_RULE,
         "",
         f"Task branch: {task_branch}",
         f"Project branch: {project_branch}",

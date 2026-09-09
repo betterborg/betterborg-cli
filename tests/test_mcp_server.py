@@ -10,7 +10,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -54,7 +55,7 @@ from betterborg_cli.host_execution import (
 )
 from betterborg_cli.planning import TaskPublisher, build_plan_element_catalog
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import AgentStage
+from betterborg_cli.repository_config import AgentStage, RepositoryConfigError
 from betterborg_cli.run_control import DEFAULT_FORCE_GRACE_SECONDS
 from betterborg_cli.store import (
     AgentAttempt,
@@ -1028,11 +1029,7 @@ def test_cancelled_execute_is_durable_before_request_returns(
                 commands=(),
                 prepare_commands=(),
                 materialize_commands=(),
-                environment_files=(),
-                executables=(),
                 required_secret_names=(),
-                compose_files=(),
-                services=(),
             ),
             scheduler=scheduler,
         )
@@ -1182,6 +1179,38 @@ def _pm_tasks(plan: dict) -> dict:
             }
         ],
     }
+
+
+def _seed_plan_awaiting_approval(
+    paths: RepoPaths,
+    repository,
+    name: str,
+    plan: dict,
+) -> None:
+    """Persist one completed architect plan and gate its Borg on approval."""
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, name)
+        assert borg is not None
+        attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_plan",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=plan,
+            summary="Ready for approval.",
+        )
+        store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.PLAN_APPROVAL_PENDING,
+        )
 
 
 def _published_runtime(
@@ -1633,6 +1662,56 @@ def test_create_and_plan_approval_are_service_backed_and_typed(
     ]
 
 
+def test_mcp_tools_refuse_a_directory_that_serves_another_repository(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch,
+) -> None:
+    _repository, paths = planning_cli_repository(committed_git_repo, "mcp-served")
+    second = tmp_path_factory.mktemp("second-repository")
+    subprocess.run(["git", "init", "--quiet", str(second)], check=True)
+    # The configuration belongs to the first repository whichever one the
+    # operator has the server standing in.
+    foreign = replace(paths, root=second)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: foreign,
+    )
+
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._create("new-borg", None, None)
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._planning_state(foreign, "mcp-served")
+    with pytest.raises(RepositoryConfigError, match="one directory serves one"):
+        mcp_server._plan("mcp-served", "show", None, None)
+
+
+def test_plan_show_carries_an_assumption_the_architect_made(
+    planning_plan_response,
+) -> None:
+    """An unattended plan must survive the surface a person approves it on.
+
+    The plan document is closed to unknown fields, so an assumption that the
+    Architect schema allows but this model does not know is not merely dropped
+    here: it makes the plan unreadable, and unapprovable, over MCP.
+    """
+    plan = planning_plan_response()
+    plan["assumptions"] = [
+        {"question": "Which platforms are required?", "assumption": "Linux only."}
+    ]
+
+    document = mcp_server.PlanDocument.model_validate(plan)
+
+    assert document.assumptions[0].question == "Which platforms are required?"
+    assert document.assumptions[0].assumption == "Linux only."
+    shown = mcp_server.PlanShowData(borg="unattended", plan=document).model_dump()
+    assert shown["plan"]["assumptions"] == (
+        {"question": "Which platforms are required?", "assumption": "Linux only."},
+    )
+
+
 def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
     committed_git_repo: Path,
     planning_cli_repository,
@@ -1789,6 +1868,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
     assert invalid.isError is True
     assert "plan change note must not be empty" in invalid.content[0].text
 
+    # A change opens a new planning cycle, and a cycle starts by asking.
+    architect.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     architect.queue(MockResponse(payload=revised))
     tech_lead.queue(MockResponse(payload=tech_lead_approval_response()))
     changed = _structured(
@@ -1816,7 +1897,8 @@ def test_plan_change_validates_note_and_preserves_service_history(
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
     ]
-    assert len(architect.calls) == 3
+    # Two turns per cycle: the cycle asks, then plans.
+    assert len(architect.calls) == 4
     assert len(tech_lead.calls) == 2
     assert shown["data"]["plan"]["summary"] == "Revised MCP plan."
     assert shown["data"]["plan"]["code_pointers"] == revised["code_pointers"]
@@ -1841,29 +1923,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
 ) -> None:
     plan = planning_plan_response()
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-plan")
-    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        borg = store.get_borg_by_name(repository.id, "mcp-plan")
-        assert borg is not None
-        attempt = PlanningAttempt(
-            borg_id=borg.id,
-            phase="architect_plan",
-            round=1,
-            adapter="mock",
-            model="test-model",
-        )
-        store.append_planning_attempt(attempt)
-        store.complete_planning_attempt(
-            attempt.id,
-            status=PlanningAttemptStatus.COMPLETED,
-            result=plan,
-            summary="Ready for approval.",
-        )
-        store.compare_and_set_borg_state(
-            borg.id,
-            expected_state=borg.state,
-            expected_version=borg.state_version,
-            new_state=BorgState.PLAN_APPROVAL_PENDING,
-        )
+    _seed_plan_awaiting_approval(paths, repository, "mcp-plan", plan)
 
     project_manager = MockAdapter(name="openai").queue(
         MockResponse(payload=_pm_tasks(plan))
@@ -1929,6 +1989,74 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     assert "Approve the current plan" in requests[0].message
     assert not hasattr(mcp_server, "approve_task")
     assert not hasattr(mcp_server, "decompose")
+
+
+def test_plan_approval_reuses_repository_trust_for_its_managed_worktree(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    host_capable_adapter,
+    monkeypatch,
+) -> None:
+    plan = planning_plan_response()
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-trust")
+    _seed_plan_awaiting_approval(paths, repository, "mcp-trust", plan)
+    state_home = committed_git_repo.parent / "mcp-machine-state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    TrustStore().trust(WorkspaceIdentity.discover(paths))
+
+    project_manager = host_capable_adapter().queue(
+        MockResponse(payload=_pm_tasks(plan))
+    )
+    supervisor = host_capable_adapter().queue(
+        MockResponse(
+            payload={
+                "decision": "approve",
+                "summary": "The task is ready.",
+                "findings": [],
+            }
+        )
+    )
+    adapters = {
+        AgentStage.PM: project_manager,
+        AgentStage.SUPERVISOR: supervisor,
+    }
+
+    def select(_config, stage, selected_paths, **policy):
+        return SelectedAgent(
+            role=ApiAgentRole.PLANNING,
+            adapter=adapters[stage],
+            paths=selected_paths,
+            **policy,
+        )
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server,
+        "_paths",
+        lambda *, trusted, io=None, cancel=None: paths,
+    )
+    monkeypatch.setattr(mcp_server, "select_agent", select)
+
+    result = _structured(
+        _call_tool("plan", {"name": "mcp-trust", "action": "approve"})
+    )
+
+    assert result["status"] == BorgState.READY_TO_EXECUTE.value
+    planning_root = paths.worktrees_dir / "planning"
+    worktrees = [
+        call.cwd for call in (*project_manager.calls, *supervisor.calls)
+    ]
+    assert len(worktrees) == 2
+    assert all(worktree.is_relative_to(planning_root) for worktree in worktrees)
+    trusted = json.loads(
+        (state_home / "betterborg" / "trusted-workspaces.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        entry["repository_path"] for entry in trusted["workspaces"].values()
+    ] == [str(paths.root)]
 
 
 def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
@@ -2019,11 +2147,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
             required_secret_names=(),
-            compose_files=(),
-            services=(),
         ),
     )
 
@@ -2654,3 +2778,234 @@ mcp_server.run_stdio_server()
     assert responses[-1]["result"]["structuredContent"]["status"] == "completed"
     assert "Processing request" not in "\n".join(map(json.dumps, responses))
     assert "Processing request" in stderr
+
+
+@pytest.mark.parametrize(
+    ("acquired", "run_status", "payload_status"),
+    [
+        (1, ExecutionRunStatus.COMPLETED, "completed"),
+        (0, ExecutionRunStatus.RUNNING, "active"),
+    ],
+    ids=["this-caller-ran-it", "another-caller-is-already-running-it"],
+)
+def test_execute_payload_names_the_checks_this_host_could_not_run(
+    acquired: int,
+    run_status: ExecutionRunStatus,
+    payload_status: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A headless caller has no terminal, so the drop travels in the result.
+
+    Stage 13 lets a run continue without a check its host cannot run, and the
+    whole trade rests on nobody mistaking that for a run where the check
+    passed. Over MCP this field is the only place it is said.
+    """
+    from types import SimpleNamespace
+
+    from betterborg_cli.agent_runtime import BillingMode
+    from betterborg_cli.execution_estimate import PhaseBilling, estimate_generation
+    from betterborg_cli.host_execution import HostCommand, HostPreflightPlan
+    from betterborg_cli.host_execution.preflight import HostDroppedCommand
+    from betterborg_cli.host_execution.service import (
+        HostExecutionResult,
+        HostSchedulerResult,
+    )
+    from betterborg_cli.store import (
+        TaskComplexity,
+        TaskGeneration,
+        TaskGenerationStatus,
+    )
+
+    preflight = HostPreflightPlan(
+        repository_root=tmp_path,
+        commands=(),
+        prepare_commands=(),
+        materialize_commands=(),
+        required_secret_names=("PACKAGE_TOKEN",),
+        dropped_commands=(
+            HostDroppedCommand(
+                command=HostCommand(
+                    stage="test",
+                    argv=("missing-runtime", "--token", "s3cr3t-value"),
+                    cwd=".",
+                    evidence="pyproject.toml",
+                ),
+                reason="host executable is not available: missing-runtime",
+            ),
+        ),
+    )
+    generation = TaskGeneration(
+        borg_id=uuid4(),
+        plan_approval_id=uuid4(),
+        batch_id=uuid4(),
+        digest="sha256:deadbeef",
+        manifest={},
+        status=TaskGenerationStatus.CURRENT,
+        current_at=datetime.now(UTC),
+    )
+    workflow = SimpleNamespace(
+        publication=SimpleNamespace(generation=generation, files=()),
+        estimate=estimate_generation(
+            generation.id,
+            [TaskComplexity.SMALL],
+            [],
+            (
+                PhaseBilling("coding", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+                PhaseBilling("review", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+                PhaseBilling("merge", BillingMode.SUBSCRIPTION, None, "gpt-5"),
+            ),
+            priors={},
+        ),
+        host_result=HostExecutionResult(
+            preflight,
+            scheduler=HostSchedulerResult(
+                operation_id=uuid4(),
+                status=run_status,
+                acquired=acquired,
+                total=1,
+                done=1,
+                failed=0,
+                blocked=0,
+                pending=0,
+            ),
+        ),
+    )
+
+    # The value execution would supply, so the payload has something to mask.
+    monkeypatch.setenv("PACKAGE_TOKEN", "s3cr3t-value")
+    monkeypatch.setattr(mcp_server, "_paths", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        mcp_server, "load_repository_config", lambda _paths: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        mcp_server, "execute_workflow", lambda *_args, **_kwargs: workflow
+    )
+
+    result = mcp_server._execute(
+        "borg", mcp_server.McpInteractiveIO(SimpleNamespace())
+    )
+
+    # Both branches of the payload carry it: a caller told another operation
+    # is already running is told about the drop by this field too.
+    assert result.status == payload_status
+    assert result.data.reason is not None
+    assert "missing-runtime" in result.data.reason
+    # This payload is what a caller with no terminal reads, so it is masked
+    # like the terminal line and the pull request body beside it.
+    assert "s3cr3t-value" not in result.data.reason
+
+
+def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    monkeypatch,
+) -> None:
+    """Blocked is where the findings matter, and MCP has no terminal to print to.
+
+    A caller told only that its plan is blocked, with nothing said and nothing
+    to call, is in exactly the state keeping the findings exists to prevent.
+    """
+    repository, paths = planning_cli_repository(committed_git_repo, "mcp-blocked")
+    architect = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(),
+        planning_plan_response(summary="Clarify rollback behavior."),
+        planning_plan_response(summary="Name the rollback checks."),
+    ):
+        architect.queue(MockResponse(payload=payload))
+    tech_lead = MockAdapter(name="openai")
+    for message in (
+        "Clarify rollback behavior.",
+        "Name the rollback checks.",
+        "Cover a partial rollback.",
+    ):
+        tech_lead.queue(MockResponse(payload=tech_lead_change_request_response(message)))
+
+    def select(_config, stage, _paths, **_kwargs):
+        return {AgentStage.ARCHITECT: architect, AgentStage.TECH_LEAD: tech_lead}[stage]
+
+    monkeypatch.chdir(committed_git_repo)
+    monkeypatch.setattr(
+        mcp_server, "_paths", lambda *, trusted, io=None, cancel=None: paths
+    )
+    monkeypatch.setattr(cli_module, "select_agent", select)
+
+    started = _structured(
+        _call_tool("plan", {"name": "mcp-blocked", "action": "start"})
+    )
+    shown = _structured(
+        _call_tool("plan", {"name": "mcp-blocked", "action": "show"})
+    )
+
+    assert started["status"] == BorgState.BLOCKED.value
+    assert shown["status"] == BorgState.BLOCKED.value
+    assert [
+        finding["message"] for finding in shown["data"]["findings"]
+    ] == [
+        "Clarify rollback behavior.",
+        "Name the rollback checks.",
+        "Cover a partial rollback.",
+    ]
+    assert [finding["round"] for finding in shown["data"]["findings"]] == [1, 2, 3]
+    # And the caller is told which call reaches them.
+    assert [
+        action["arguments"]["action"] for action in started["next_actions"]
+    ] == ["show"]
+
+
+def test_the_headless_findings_are_narrowed_to_what_still_stands(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The payload carries the same account the terminal renders.
+
+    The store keeps every finding a Borg collected, and round numbers restart
+    each planning cycle. Handed whole to a caller with no terminal, it reads as
+    a page of outstanding objections with repeating rounds, including ones the
+    reviewer already answered by approving the revision that asked for them.
+    """
+    from betterborg_cli.store import PlanningFinding
+
+    def seed(store, borg, decision: str, message: str) -> None:
+        attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="tech_review",
+            round=len(store.list_planning_attempts(borg.id)) + 1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(attempt)
+        store.complete_planning_attempt(
+            attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result={"decision": decision},
+            summary=message,
+        )
+        if decision == "request_changes":
+            store.append_planning_finding(
+                PlanningFinding(
+                    borg_id=borg.id,
+                    attempt_id=attempt.id,
+                    round=1,
+                    severity="major",
+                    message=message,
+                )
+            )
+
+    database = committed_git_repo.parent / "mcp-standing.sqlite3"
+    with SqliteStore.open(database) as store:
+        _repository, borg = persist_planning_context(
+            committed_git_repo, store, "mcp-standing"
+        )
+        seed(store, borg, "request_changes", "answered by the revision")
+        seed(store, borg, "approve", "approved")
+        assert len(store.list_planning_findings(borg.id)) == 1
+
+        # The store holds it; the plan the caller is being handed does not
+        # rest on it any more, because the reviewer approved the revision that
+        # answered it.
+        assert mcp_server._plan_findings(store, borg) == ()

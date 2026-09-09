@@ -859,11 +859,7 @@ class TaskClaim:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentAttempt:
-    """Immutable record of one environment preparation or materialization.
-
-    Reusable preparation may be owned by the execution run before a task is
-    claimed. Checkout-local materialization always remains claim-owned.
-    """
+    """Immutable record of preparing one claimed task's checkout."""
 
     run_id: UUID
     claim_id: UUID | None
@@ -1001,33 +997,4 @@ class ExecutionEvent:
             raise ValueError("execution event kind must not be empty")
         if not isinstance(self.payload, dict):
             raise TypeError("execution event payload must be a dictionary")
-        _validate_utc(self.created_at)
-
-
-@dataclass(frozen=True, slots=True)
-class ComposeResource:
-    """Durable identity for a Compose resource owned by one claimed task."""
-
-    run_id: UUID
-    claim_id: UUID
-    task_id: UUID
-    project_name: str
-    resource_type: str
-    resource_name: str
-    labels: dict[str, str] = field(default_factory=dict)
-    id: UUID = field(default_factory=uuid4)
-    created_at: datetime = field(default_factory=utcnow)
-
-    def __post_init__(self) -> None:
-        for name in ("id", "run_id", "claim_id", "task_id"):
-            if not isinstance(getattr(self, name), UUID):
-                raise TypeError(f"Compose resource {name} must be a UUID")
-        for name in ("project_name", "resource_type", "resource_name"):
-            if not getattr(self, name).strip():
-                raise ValueError(f"Compose resource {name} must not be empty")
-        if not isinstance(self.labels, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in self.labels.items()
-        ):
-            raise TypeError("Compose resource labels must map strings to strings")
         _validate_utc(self.created_at)

@@ -101,10 +101,13 @@ SUPERVISOR_REVIEW_SCHEMA: dict[str, Any] = {
 _SUPERVISOR_SYSTEM_PROMPT = """You are the Supervisor reviewing a complete,
 deterministically valid Project Manager task batch for an approved plan. Judge
 plan coverage, task coherence, foundation ownership, reuse instead of
-duplication, dependency ordering, meaningful tests, delivery scope, and
-simplicity. Approve only a complete batch that is ready for publication. Do not
-modify files or redesign the batch; return actionable findings for the Project
-Manager. Return only the required JSON object.
+duplication, dependency ordering, meaningful tests, and simplicity. Approve
+only a complete batch that is ready for publication. Betterborg performs the
+delivery around the batch: branching, worktrees, commits, review, merge, and
+the repository's own checks. Every task changes the repository, so never hold
+the batch to work Betterborg already does, and reject a task that has nothing
+to commit. Do not modify files or redesign the batch; return actionable
+findings for the Project Manager. Return only the required JSON object.
 """
 
 
@@ -131,6 +134,18 @@ class SupervisorResult:
     publication: TaskPublication | None
 
 
+def _review_round_phrase(review_round: int, budget: int) -> str:
+    """State the round without contradicting itself.
+
+    A revision already under way outlives a budget lowered beneath it, and the
+    round that follows it is the last one.
+    """
+
+    if review_round > budget:
+        return f"in round {review_round}, the final round."
+    return f"in round {review_round} of {budget}."
+
+
 class SupervisorLoop:
     """Review valid PM batches and request no more than three PM cycles."""
 
@@ -151,9 +166,15 @@ class SupervisorLoop:
         progress: RunProgress | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
+        review_rounds: int = SUPERVISOR_ROUND_CAP,
     ) -> None:
         if cancel is not None and cancel.is_set():
             raise SupervisorCancelled("Supervisor run cancelled")
+        if not isinstance(review_rounds, int) or review_rounds < 1:
+            raise SupervisorError(
+                "Supervisor review rounds must be a whole number of at least 1"
+            )
+        self.review_rounds = review_rounds
         project_manager = pm_agent or agent
         require_read_only_agent(
             agent, role="Supervisor", error_factory=SupervisorError
@@ -329,11 +350,13 @@ class SupervisorLoop:
                 ) from error
             self._require_revision_progress(batch, approval)
 
+            # No refusal here. A revision already under way outlives a budget
+            # lowered beneath it: the round it leads to runs, is told it is the
+            # last one, and blocks after it. Refusing instead would strand the
+            # revision with no way back but restoring the old number. The loop
+            # is still bounded, because a round at or past the budget blocks
+            # rather than asking for another revision.
             review_round = len(self._completed_reviews(approval)) + 1
-            if review_round > SUPERVISOR_ROUND_CAP:
-                raise SupervisorError(
-                    "Supervisor review round cap was already exhausted"
-                )
             attempt, payload = self._turns.run(
                 phase=_SUPERVISOR_PHASE,
                 round_number=self._turns.next_round(_SUPERVISOR_PHASE),
@@ -343,8 +366,8 @@ class SupervisorLoop:
                     "Read the complete approved plan and task-review context from "
                     ".betterborg/state/planning/context/manifest.json. "
                     "Review task batch "
-                    f"{batch.id} in round {review_round} of "
-                    f"{SUPERVISOR_ROUND_CAP}."
+                    f"{batch.id} "
+                    + _review_round_phrase(review_round, self.review_rounds)
                 ),
                 current_plan=json.dumps(
                     self._review_context(plan, batch, tasks),
@@ -375,7 +398,7 @@ class SupervisorLoop:
             decision = payload["decision"]
             if decision == "approve":
                 next_state = BorgState.READY_TO_EXECUTE
-            elif review_round < SUPERVISOR_ROUND_CAP:
+            elif review_round < self.review_rounds:
                 next_state = BorgState.PM_WORKING
             else:
                 next_state = BorgState.BLOCKED
@@ -606,10 +629,14 @@ class SupervisorLoop:
         )
 
     def _revision_reviews(self, approval: PlanApproval) -> list[PlanningAttempt]:
+        # No cap: whether a rejection revised or blocked was settled when it
+        # completed and is held in the Borg's state, so filtering the record
+        # by today's budget would strand a run whose budget has since been
+        # lowered, with no way back but restoring the old number.
         return planning_request_change_attempts(
             self._completed_reviews(approval),
             _SUPERVISOR_PHASE,
-            round_cap=SUPERVISOR_ROUND_CAP,
+            round_cap=None,
         )
 
     @staticmethod
@@ -636,10 +663,29 @@ class SupervisorLoop:
                 return self._revision_key(review)
         return None
 
+    def _revisions_with_work(self, approval: PlanApproval) -> set[str]:
+        """Identify the rejections a revision belongs to, run or under way.
+
+        The rejection that blocked is followed by neither, and a child
+        declared for it would stay pending forever, refusing to let its parent
+        be seeded when the record is read back.
+        """
+        reviews = self._revision_reviews(approval)
+        revising = self._turns.current_borg().state is BorgState.PM_WORKING
+        return {
+            review.id
+            for index, review in enumerate(reviews)
+            if self._revision_attempt(approval, review) is not None
+            or (revising and index == len(reviews) - 1)
+        }
+
     def _declare_revision_progress(self, approval: PlanApproval) -> None:
         if self.progress is None:
             return
+        with_work = self._revisions_with_work(approval)
         for number, review in enumerate(self._revision_reviews(approval), start=1):
+            if review.id not in with_work:
+                continue
             key = self._revision_key(review)
             if key not in self.progress.stages["supervisor"].children:
                 self.progress.declare_child(
@@ -878,11 +924,6 @@ class SupervisorLoop:
         }:
             return None
         completed_reviews = self._completed_reviews(approval)
-        if (
-            borg.state is BorgState.BLOCKED
-            and len(completed_reviews) < SUPERVISOR_ROUND_CAP
-        ):
-            return None
         attempt = next(
             (
                 item

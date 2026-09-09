@@ -19,6 +19,7 @@ from betterborg_cli.prd_session import (
 from betterborg_cli.progress import RunProgress
 from betterborg_cli.repo_analysis import ImprovementPrd
 from betterborg_cli.repo_analysis.text_rendering import terminal_text
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import Repository, SqliteStore
 
 
@@ -77,6 +78,7 @@ class OnboardingDispatcher:
 
     def __init__(
         self,
+        paths: RepoPaths,
         repository: Repository,
         store: SqliteStore,
         io: InteractiveIO,
@@ -86,6 +88,7 @@ class OnboardingDispatcher:
         cancel: CancellationToken | None = None,
         progress: RunProgress | None = None,
     ) -> None:
+        self.paths = paths
         self.repository = repository
         self.store = store
         self.io = io
@@ -186,7 +189,7 @@ class OnboardingDispatcher:
             except ValueError as error:
                 self.io.write(f"Invalid Borg name: {error}")
                 continue
-            destination = self.repository.root / ".betterborg" / "prds" / f"{name}.md"
+            destination = self.paths.prds_dir / f"{name}.md"
             if (
                 self.store.get_borg_by_name(self.repository.id, name) is not None
                 or destination.exists()
@@ -234,7 +237,7 @@ class OnboardingDispatcher:
 
 
 def create_commands(
-    repository_root: Path, improvement_prds: Sequence[ImprovementPrd]
+    paths: RepoPaths, improvement_prds: Sequence[ImprovementPrd]
 ) -> tuple[tuple[str, ...], ...]:
     """Return one shell-free create argv for each ranked generated theme."""
     return tuple(
@@ -243,7 +246,7 @@ def create_commands(
             "create",
             document.suggested_borg_name,
             "--prd",
-            document.path.relative_to(repository_root).as_posix(),
+            paths.label(document.path),
         )
         for document in improvement_prds
     )

@@ -41,6 +41,7 @@ from betterborg_cli.store import (
     SqliteStore,
 )
 
+#: Review rounds a plan gets where its repository configures no budget.
 TECH_REVIEW_ROUND_CAP = 3
 _TECH_REVIEW_PHASE = "tech_review"
 _ARCHITECT_PLAN_PHASE = "architect_plan"
@@ -79,8 +80,13 @@ _TECH_LEAD_SYSTEM_PROMPT = """You are the Tech Lead reviewing an Architect plan.
 Inspect the materialized repository, confirmed PRD, current plan, and complete
 finding history. Verify the plan against the actual code and return approve only
 when it is ready for human approval. Otherwise return concise, actionable
-findings for the Architect. Do not modify files. Return only the required JSON
-object.
+findings for the Architect. Betterborg performs the delivery around the plan:
+branching, worktrees, commits, review, merge, and the repository's own checks.
+The plan covers the product change only, so never hold it to work Betterborg
+already does. A phase name is two digits then lowercase words of letters and
+digits, all joined by single hyphens and at most 32 characters, as in
+01-schema-migration, so never ask for a name the Architect cannot use. Do not
+modify files. Return only the required JSON object.
 """
 
 
@@ -101,8 +107,21 @@ class TechLeadResult:
     attempt: PlanningAttempt
 
 
+def _review_round_sentence(review_round: int, budget: int) -> str:
+    """State the round without contradicting itself.
+
+    A revision already under way outlives a budget lowered beneath it, and the
+    round that follows it is the last one. Calling that "round 2 of 1" hands
+    the reviewer a number it cannot use on the one turn the number matters.
+    """
+
+    if review_round > budget:
+        return f"This is Tech Lead review round {review_round}, the final round."
+    return f"This is Tech Lead review round {review_round} of {budget}."
+
+
 class TechLeadLoop:
-    """Review a validated plan, revising it at most twice before blocking."""
+    """Review a validated plan, revising it within its round budget."""
 
     def __init__(
         self,
@@ -113,6 +132,8 @@ class TechLeadLoop:
         *,
         architect_agent: AgentAdapter | SelectedAgent | None = None,
         io: InteractiveIO,
+        unattended: bool = False,
+        review_rounds: int = TECH_REVIEW_ROUND_CAP,
         artifact_dir: Path | None = None,
         model: str | None = None,
         architect_model: str | None = None,
@@ -147,6 +168,8 @@ class TechLeadLoop:
         self.agent = agent
         self.architect_agent = architect
         self.io = io
+        self.unattended = unattended
+        self.review_rounds = review_rounds
         self.artifact_dir = Path(
             artifact_dir or paths.artifacts_dir / "planning" / str(borg.id)
         ).resolve()
@@ -229,6 +252,7 @@ class TechLeadLoop:
                     self.store,
                     self.architect_agent,
                     io=self.io,
+                    unattended=self.unattended,
                     artifact_dir=self.artifact_dir,
                     model=self.architect_model,
                     cancel=self.cancel,
@@ -272,7 +296,7 @@ class TechLeadLoop:
             decision = payload["decision"]
             if decision == "approve":
                 next_state = BorgState.PLAN_APPROVAL_PENDING
-            elif review_round < TECH_REVIEW_ROUND_CAP:
+            elif review_round < self.review_rounds:
                 next_state = BorgState.ARCHITECT_WORKING
             else:
                 next_state = BorgState.BLOCKED
@@ -308,8 +332,7 @@ class TechLeadLoop:
             user_prompt=(
                 "Read .betterborg/state/planning/context/manifest.json and all "
                 "referenced evidence. Review the complete current plan. "
-                f"This is Tech Lead review round {review_round} of "
-                f"{TECH_REVIEW_ROUND_CAP}."
+                + _review_round_sentence(review_round, self.review_rounds)
             ),
             current_plan=json.dumps(plan, indent=2, sort_keys=True),
             turn_name="review",
@@ -406,13 +429,7 @@ class TechLeadLoop:
         if (
             borg.state is BorgState.PLAN_APPROVAL_PENDING
             and decision != "approve"
-        ) or (
-            borg.state is BorgState.BLOCKED
-            and (
-                decision != "request_changes"
-                or len(self._completed_reviews()) < TECH_REVIEW_ROUND_CAP
-            )
-        ):
+        ) or (borg.state is BorgState.BLOCKED and decision != "request_changes"):
             return None
         plan_attempt = next(
             (
@@ -456,10 +473,16 @@ class TechLeadLoop:
         )
 
     def _revision_reviews(self) -> list[PlanningAttempt]:
+        # No cap: this reads which rejection a revision belongs to, and it is
+        # only ever asked while one is under way. Whether a rejection revised
+        # or blocked was decided when it completed and is held in the Borg's
+        # state, so filtering the record by today's budget would strand a run
+        # whose budget has since been lowered, with no way back but restoring
+        # the old number.
         return planning_request_change_attempts(
             self._cycle_attempts(),
             _TECH_REVIEW_PHASE,
-            round_cap=TECH_REVIEW_ROUND_CAP,
+            round_cap=None,
         )
 
     @staticmethod
@@ -489,10 +512,34 @@ class TechLeadLoop:
                 return self._revision_key(review)
         return None
 
+    def _revisions_with_work(self) -> set[str]:
+        """Identify the rejections a revision belongs to, run or under way.
+
+        The rejection that blocked is followed by neither, and only the Borg's
+        state tells it apart from one whose revision has not finished. A child
+        declared for it would stay pending forever, and a pending child refuses
+        to let its parent be seeded, so reconstructing a blocked plan would
+        raise instead of reporting what the record holds.
+        """
+        reviews = self._revision_reviews()
+        revising = self._turns.current_borg().state in {
+            BorgState.ARCHITECT_WORKING,
+            BorgState.ARCHITECT_AWAITING_ANSWERS,
+        }
+        return {
+            review.id
+            for index, review in enumerate(reviews)
+            if self._revision_plan(review) is not None
+            or (revising and index == len(reviews) - 1)
+        }
+
     def _declare_revision_progress(self) -> None:
         if self.progress is None:
             return
+        with_work = self._revisions_with_work()
         for number, review in enumerate(self._revision_reviews(), start=1):
+            if review.id not in with_work:
+                continue
             key = self._revision_key(review)
             if key not in self.progress.stages["tech-lead"].children:
                 self.progress.declare_child(

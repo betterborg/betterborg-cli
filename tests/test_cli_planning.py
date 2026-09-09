@@ -4,6 +4,8 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import click
 import pytest
@@ -11,14 +13,20 @@ from click.testing import CliRunner
 from pytest import MonkeyPatch
 
 from betterborg_cli import cli as cli_module
-from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime import (
+    ApiAgentRole,
+    CancellationToken,
+    SelectedAgent,
+)
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
+    Borg,
     BorgState,
     PlanChangeRequest,
     PlanningAttempt,
@@ -86,8 +94,10 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
     assert result.exit_code == 0, result.output
     assert prompts == ["Which platforms are required?"]
     assert outputs == ["Why this matters: This controls the test matrix."]
-    assert "Plan approval pending" in result.output
-    assert "betterborg plan show inline-plan" in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Plan approval pending for Borg 'inline-plan'.",
+        "Review it with: betterborg plan show inline-plan",
+    ]
     assert result.output.count("none failed or stopped.") == 1
     assert result.output.index("none failed or stopped.") < result.output.index(
         "Plan approval pending"
@@ -103,6 +113,108 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
         assert store.list_planning_questions(borg.id)[0].answers == [
             {"q_id": "q1", "answer": "Linux and macOS."}
         ]
+
+
+def _rollback_plan(planning_plan_response) -> dict[str, object]:
+    """A revision that names the decision its own question produced."""
+    plan = planning_plan_response(summary="Retry, then roll back.")
+    plan["assumptions"] = [
+        {
+            "question": "Which rollback strategy should be used?",
+            "assumption": "Retry twice, then roll back.",
+        }
+    ]
+    return plan
+
+
+def test_plan_start_unattended_assumes_answers_and_shows_them_in_the_plan(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = MockAdapter(name="openai")
+    tech_lead_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(
+        MockResponse(
+            payload={
+                "decision": "ask_more",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Which platforms are required?",
+                        "why": "This controls the test matrix.",
+                    }
+                ],
+            }
+        )
+    )
+    architect_adapter.queue(
+        MockResponse(
+            payload={
+                "answers": [{"q_id": "q1", "answer": "Linux and macOS."}]
+            }
+        )
+    )
+    architect_adapter.queue(
+        MockResponse(payload={"decision": "ready_to_plan"})
+    )
+    plan = planning_plan_response()
+    plan["assumptions"] = [
+        {
+            "question": "Which platforms are required?",
+            "assumption": "Linux and macOS.",
+        }
+    ]
+    architect_adapter.queue(MockResponse(payload=plan))
+    tech_lead_adapter.queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    prompts: list[str] = []
+
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-plan"
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-plan", "--yes", "--unattended"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert prompts == []
+    assert "Plan approval pending" in result.output
+    assert len(architect_adapter.calls) == 4
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-plan")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert store.list_planning_questions(borg.id)[0].answers == [
+            {"q_id": "q1", "answer": "Linux and macOS.", "assumed": True}
+        ]
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "unattended-plan"])
+
+    assert shown.exit_code == 0, shown.output
+    assert "## Assumptions" in shown.output
+    assert "**Which platforms are required?** Linux and macOS." in shown.output
 
 
 def test_plan_start_interruption_preserves_question_and_same_command_resumes(
@@ -258,6 +370,7 @@ def test_plan_start_resumes_directly_with_tech_lead_agent(
 
 def test_plan_start_reports_review_cap_as_blocked(
     cli_runner: CliRunner,
+    capsys: pytest.CaptureFixture[str],
     committed_git_repo: Path,
     planning_cli_repository,
     planning_plan_response,
@@ -299,9 +412,16 @@ def test_plan_start_reports_review_cap_as_blocked(
 
     result = cli_runner.invoke(cli, ["plan", "start", "blocked-plan", "--yes"])
 
-    assert result.exit_code == 0, result.output
-    assert "Planning blocked" in result.output
-    assert "betterborg plan show blocked-plan" in result.output
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Planning blocked for Borg 'blocked-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show blocked-plan",
+    ]
     assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
     assert len(architect_adapter.calls) == 4
     assert len(tech_lead_adapter.calls) == 3
@@ -318,6 +438,95 @@ def test_plan_start_reports_review_cap_as_blocked(
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
         assert len(store.list_planning_findings(borg.id)) == 3
+
+    # The runner above exits through Click's standalone branch; the binary
+    # takes the other one, and a blocked Borg reports the same gate on resume.
+    capsys.readouterr()
+    assert cli_module.main(["plan", "start", "blocked-plan", "--yes"]) == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "Planning blocked for Borg 'blocked-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show blocked-plan",
+    ]
+
+    # Keeping the findings is worth something only where the run said to read
+    # them, so the command it named shows every one of them.
+    shown = cli_runner.invoke(cli, ["plan", "show", "blocked-plan"])
+
+    assert shown.exit_code == 0, shown.output
+    assert "## Tech Lead findings" in shown.output
+    for round_number, message in enumerate(
+        (
+            "Clarify rollback behavior.",
+            "Name the rollback checks.",
+            "Cover a partial rollback.",
+        ),
+        start=1,
+    ):
+        assert f"- Round {round_number} " in shown.output
+        assert message in shown.output
+
+
+def test_plan_start_honors_the_repository_review_round_budget(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = MockAdapter(name="openai")
+    for payload in ({"decision": "ready_to_plan"}, planning_plan_response()):
+        architect_adapter.queue(MockResponse(payload=payload))
+    tech_lead_adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload=tech_lead_change_request_response("Clarify rollback behavior.")
+        )
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "budgeted-plan")
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\nreview_rounds = 1\n",
+        encoding="utf-8",
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "budgeted-plan", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    # `.stdout` is the merged stream on the locked Click and the
+    # separated one on newer releases, so pin the absence either way.
+    assert "Error:" not in result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "Planning blocked for Borg 'budgeted-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show budgeted-plan",
+    ]
+    assert len(architect_adapter.calls) == 2
+    assert len(tech_lead_adapter.calls) == 1
+    assert "review round 1 of 1" in tech_lead_adapter.calls[0].user_prompt
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "budgeted-plan")
+        assert borg is not None
+        assert borg.state is BorgState.BLOCKED
+        assert len(store.list_planning_findings(borg.id)) == 1
 
 
 def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
@@ -414,7 +623,13 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     )
 
     assert markdown_result.exit_code == 0, markdown_result.output
-    assert markdown_result.output == render_plan_markdown(plan)
+    assert markdown_result.output.startswith(render_plan_markdown(plan))
+    # The finding belongs to the cycle a change request closed, so it no longer
+    # stands. Showing it would put a page of answered objections under a
+    # heading that says they are outstanding, with round numbers that repeat
+    # because each cycle counts its own from one.
+    assert "## Tech Lead findings" not in markdown_result.output
+    assert "Name the supported platforms." not in markdown_result.output
     assert markdown_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
@@ -514,6 +729,8 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         ]
         return requested_plan
 
+    # A change opens a new planning cycle, and a cycle starts by asking.
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     adapter.queue(MockResponse(dynamic=requested_revision))
     for payload in (
         tech_lead_change_request_response("Add rollback verification."),
@@ -578,6 +795,157 @@ def test_plan_change_preserves_history_and_drains_revision_loop_to_gate(
         assert store.list_planning_attempts(borg.id) == attempts
         assert store.list_planning_findings(borg.id) == findings
         assert store.list_plan_change_requests(borg.id) == requests
+
+
+def test_plan_start_unattended_assumes_the_questions_a_review_revision_raises(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    tech_lead_change_request_response,
+    configure_interactive_cli,
+) -> None:
+    """The Tech Lead's revision runs the Architect the command did not build.
+
+    A first plan that satisfies the Architect can still be sent back, and the
+    revision is where it meets a requirement the first pass never needed. That
+    Architect is constructed inside the review loop, so the run's own mode has
+    to reach it or the review is paid for and then thrown away at a prompt.
+    """
+    ambiguous_plan = planning_plan_response(summary="Stage the rollout.")
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(summary="Original plan."),
+        tech_lead_change_request_response("Define rollback behavior."),
+        ambiguous_plan,
+        {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
+        _rollback_plan(planning_plan_response),
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    prompts: list[str] = []
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-review"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+
+    started = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-review", "--yes", "--unattended"]
+    )
+
+    assert started.exit_code == 0, started.output
+    assert prompts == []
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-review")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert store.list_planning_questions(borg.id)[-1].answers == [
+            {
+                "q_id": "q1",
+                "answer": "Retry twice, then roll back.",
+                "assumed": True,
+            }
+        ]
+
+
+def test_plan_change_unattended_assumes_the_questions_the_revision_raises(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+) -> None:
+    """A Borg planned without a terminal must be revisable without one.
+
+    `plan start` and `plan change` are the same lifecycle, and a revision is
+    where the Architect meets the requirement it did not need for the first
+    plan. Stopping there costs the review that has already been paid for.
+    """
+    original_plan = planning_plan_response(summary="Original plan.")
+    ambiguous_plan = planning_plan_response(summary="Stage the rollout.")
+    ambiguous_plan["open_questions"] = ["Which rollback strategy should be used?"]
+    revised_plan = _rollback_plan(planning_plan_response)
+    adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        original_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+    prompts: list[str] = []
+    repository, paths = planning_cli_repository(
+        committed_git_repo, "unattended-change"
+    )
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda message: prompts.append(message) or "Never asked.",
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+
+    started = cli_runner.invoke(
+        cli, ["plan", "start", "unattended-change", "--yes", "--unattended"]
+    )
+    assert started.exit_code == 0, started.output
+
+    for payload in (
+        {"decision": "ready_to_plan"},
+        ambiguous_plan,
+        {"answers": [{"q_id": "q1", "answer": "Retry twice, then roll back."}]},
+        revised_plan,
+        tech_lead_approval_response(),
+    ):
+        adapter.queue(MockResponse(payload=payload))
+
+    changed = cli_runner.invoke(
+        cli,
+        [
+            "plan",
+            "change",
+            "unattended-change",
+            "--note",
+            "Stage the rollout.",
+            "--yes",
+            "--unattended",
+        ],
+    )
+
+    assert changed.exit_code == 0, changed.output
+    assert prompts == []
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "unattended-change")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+        questions = store.list_planning_questions(borg.id)
+        assert questions[-1].answers == [
+            {
+                "q_id": "q1",
+                "answer": "Retry twice, then roll back.",
+                "assumed": True,
+            }
+        ]
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "unattended-change"])
+    assert shown.exit_code == 0, shown.output
+    assert "## Assumptions" in shown.output
+    assert "Retry twice, then roll back." in shown.output
 
 
 def test_plan_change_rejects_empty_note_without_mutating_gate(
@@ -701,7 +1069,8 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
     captured = capsys.readouterr()
     expected_error = (
         "Error: Plan change for Borg 'resume-change' could not continue "
-        "(Architect architect_plan turn crashed: planning provider unavailable). "
+        "(Architect architect_questions turn crashed: planning provider "
+        "unavailable). "
         "Run 'betterborg plan start "
         "resume-change' to resume.\n"
     )
@@ -725,6 +1094,7 @@ def test_plan_change_runtime_failure_is_actionably_resumable(
         ] == ["Add rollback verification."]
 
     monkeypatch.setattr(cli_module, "RunProgress", original_progress)
+    adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
     adapter.queue(
         MockResponse(payload=planning_plan_response(summary="Revised plan."))
     )
@@ -823,6 +1193,173 @@ def test_plan_start_primary_error_survives_root_progress_close_failure(
     assert progress.stages["architect"].state is StageState.FAILED
 
 
+def test_plan_start_proceeds_from_an_adopted_borg(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, paths = planning_cli_repository(committed_git_repo, "seeded-plan")
+    state_home = repository.root.parent / f".{repository.root.name}-state"
+    source = repository.root / "authoritative.md"
+    source.write_text(
+        "# Adopted PRD\n\nPublish releases unattended.\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setattr(
+        cli_module,
+        "select_agent",
+        lambda *_args, **_kwargs: pytest.fail("adoption must not select an agent"),
+    )
+
+    adopted = cli_runner.invoke(
+        cli,
+        ["create", "adopted-plan", "--prd", str(source), "--adopt", "--yes"],
+    )
+
+    assert adopted.exit_code == 0, adopted.output
+
+    architect_adapter = MockAdapter(name="openai")
+    architect_adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter = MockAdapter(name="openai").queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: pytest.fail("the adopted PRD needs no answers"),
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=state_home,
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "adopted-plan", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan approval pending" in result.output
+    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "adopted-plan")
+        assert borg is not None
+        assert borg.state is BorgState.PLAN_APPROVAL_PENDING
+
+
+def test_plan_start_reuses_repository_trust_for_its_managed_worktree(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    host_capable_adapter,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    architect_adapter = host_capable_adapter()
+    architect_adapter.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    architect_adapter.queue(MockResponse(payload=planning_plan_response()))
+    tech_lead_adapter = host_capable_adapter().queue(
+        MockResponse(payload=tech_lead_approval_response())
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "managed-trust")
+    state_home = repository.root.parent / f".{repository.root.name}-state"
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: pytest.fail("the seeded PRD needs no answers"),
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=state_home,
+    )
+    _select_trust_bound_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "managed-trust", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan approval pending" in result.output
+    planning_root = paths.worktrees_dir / "planning"
+    worktrees = [
+        call.cwd
+        for call in (*architect_adapter.calls, *tech_lead_adapter.calls)
+    ]
+    assert len(worktrees) == 3
+    assert all(worktree.is_relative_to(planning_root) for worktree in worktrees)
+    trusted = json.loads(
+        (state_home / "betterborg" / "trusted-workspaces.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        entry["repository_path"] for entry in trusted["workspaces"].values()
+    ] == [str(paths.root)]
+
+
+def test_plan_start_still_refuses_an_untrusted_repository(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository, _paths = planning_cli_repository(committed_git_repo, "untrusted-plan")
+    monkeypatch.chdir(repository.root)
+    monkeypatch.setenv(
+        "XDG_STATE_HOME", str(repository.root.parent / "untrusted-state")
+    )
+    monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(
+        cli_module,
+        "select_agent",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an untrusted repository must not select an agent"
+        ),
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "untrusted-plan"])
+
+    assert result.exit_code == 1
+    assert "workspace is not trusted on this machine" in result.output
+    assert str(repository.root) in result.output
+
+
+def test_managed_worktree_trust_is_confined_to_the_worktrees_directory(
+    committed_git_repo: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    paths = RepoPaths.discover(committed_git_repo)
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        cli_module,
+        "require_workspace_trust",
+        lambda run_paths, **_kwargs: observed.append(run_paths.root),
+    )
+    requirement = cli_module._managed_worktree_trust_requirement(paths)
+    managed = paths.worktrees_dir / "planning" / "borg-run"
+    adjacent = paths.worktrees_dir.parent / f"{paths.worktrees_dir.name}-elsewhere"
+    unrelated = paths.root.parent / "other-checkout"
+
+    for candidate in (managed, adjacent, unrelated):
+        requirement(SimpleNamespace(root=candidate))
+
+    assert observed == [paths.root, adjacent, unrelated]
+
+
 def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> None:
     result = cli_runner.invoke(cli, ["plan", "--help"])
 
@@ -832,6 +1369,97 @@ def test_plan_exposes_start_show_and_change_commands(cli_runner: CliRunner) -> N
     assert "change" in result.output
     assert "question" not in result.output
     assert "answer" not in result.output
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_planning_gate_exits_non_zero_when_blocked_and_zero_when_pending(
+    capsys: pytest.CaptureFixture[str],
+    changed: bool,
+) -> None:
+    """Blocked is the failure a script has to see; pending is a finished start.
+
+    Both `plan start` and `plan change` report through this gate, so the change
+    a run made to a plan does not change which gate is an error.
+    """
+    repository_id = uuid4()
+
+    cli_module._write_planning_gate(
+        "gate-borg",
+        Borg(
+            repository_id=repository_id,
+            name="gate-borg",
+            state=BorgState.PLAN_APPROVAL_PENDING,
+        ),
+        changed=changed,
+    )
+
+    pending_suffix = " after applying the change" if changed else ""
+    assert capsys.readouterr().out.splitlines() == [
+        f"Plan approval pending for Borg 'gate-borg'{pending_suffix}.",
+        "Review it with: betterborg plan show gate-borg",
+    ]
+
+    with pytest.raises(click.exceptions.Exit) as blocked:
+        cli_module._write_planning_gate(
+            "gate-borg",
+            Borg(
+                repository_id=repository_id,
+                name="gate-borg",
+                state=BorgState.BLOCKED,
+            ),
+            changed=changed,
+        )
+
+    assert blocked.value.exit_code == 1
+    blocked_suffix = " while applying the change" if changed else ""
+    assert capsys.readouterr().out.splitlines() == [
+        f"Planning blocked for Borg 'gate-borg'{blocked_suffix}.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show gate-borg",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code", "first_line"),
+    [
+        (BorgState.BLOCKED, 1, "Planning blocked for Borg 'gate-borg'."),
+        (
+            BorgState.PLAN_APPROVAL_PENDING,
+            0,
+            "Plan approval pending for Borg 'gate-borg'.",
+        ),
+    ],
+)
+def test_main_returns_the_planning_gate_exit_code(
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: BorgState,
+    expected_code: int,
+    first_line: str,
+) -> None:
+    """A shell sees the gate through `main`, which Click does not exit for.
+
+    Every other test here runs Click in standalone mode, where Click calls
+    sys.exit itself; `main` asks it not to and returns what it is handed back.
+    """
+    borg = Borg(
+        repository_id=uuid4(),
+        name="gate-borg",
+        state=state,
+    )
+
+    @click.group()
+    def command() -> None:
+        pass
+
+    @command.command(name="gate")
+    def gate() -> None:
+        cli_module._write_planning_gate("gate-borg", borg, changed=False)
+
+    monkeypatch.setattr(cli_module, "cli", command)
+
+    assert cli_module.main(["gate"], prog_name="betterborg") == expected_code
+    assert capsys.readouterr().out.splitlines()[0] == first_line
 
 
 def _planning_snapshot(store: SqliteStore, borg_id):
@@ -866,10 +1494,34 @@ def _select_planning_agents(
         AgentStage.TECH_LEAD: tech_lead,
     }
 
-    def select(_config, stage, _paths, *, interactive):
+    def select(_config, stage, _paths, *, interactive, trust_requirement):
         assert interactive is True
+        assert trust_requirement is not None
         selected_stages.append(stage)
         return adapters[stage]
 
     monkeypatch.setattr(cli_module, "select_agent", select)
     return selected_stages
+
+
+def _select_trust_bound_planning_agents(
+    monkeypatch: MonkeyPatch,
+    *,
+    architect: MockAdapter,
+    tech_lead: MockAdapter,
+) -> None:
+    """Wrap planning adapters in the trust policy the CLI selects them under."""
+    adapters = {
+        AgentStage.ARCHITECT: architect,
+        AgentStage.TECH_LEAD: tech_lead,
+    }
+
+    def select(_config, stage, selected_paths, **policy):
+        return SelectedAgent(
+            role=ApiAgentRole.PLANNING,
+            adapter=adapters[stage],
+            paths=selected_paths,
+            **policy,
+        )
+
+    monkeypatch.setattr(cli_module, "select_agent", select)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import tempfile
 from collections.abc import Iterator, Mapping
@@ -38,6 +39,27 @@ from betterborg_cli.progress import AgentActivity, AgentActivityKind
 
 _PROVIDER = "codex"
 _COMMAND_DETAIL_LIMIT = 160
+_SANDBOX_VARIABLE = "BETTERBORG_SANDBOX"
+_SANDBOX_AUTO = "auto"
+_SANDBOX_HOST = "host"
+_SANDBOX_SETTINGS = (_SANDBOX_AUTO, _SANDBOX_HOST)
+_READ_ONLY_SANDBOX = "read-only"
+_UNSANDBOXED = "danger-full-access"
+# Launcher errors proving Codex's own sandbox never started, as opposed to a
+# command the sandbox refused or a command that failed on its own merits. The
+# bubblewrap refusal is measured. The rest were read out of the Codex binary
+# as strings for the same class of failure and never observed in output, so
+# they widen the net on a path already narrowed to sandboxed runs.
+_SANDBOX_LAUNCHER_FAILURES = (
+    ("bwrap:", "bubblewrap could not create its namespace"),
+    ("error calling `seccomp`", "the seccomp filter could not be installed"),
+    ("linux sandbox restrictions", "the Linux restrictions could not be applied"),
+    ("failed to prepare process sandbox", "the process sandbox could not be built"),
+    (
+        "failed to verify linux sandbox capabilities",
+        "the Linux sandbox capabilities could not be verified",
+    ),
+)
 _READ_COMMANDS = frozenset({"cat", "head", "sed", "tail"})
 _SEARCH_COMMANDS = frozenset({"fd", "find", "grep", "ls", "rg", "tree"})
 _SHELL_COMMANDS = frozenset({"bash", "dash", "sh", "zsh"})
@@ -75,6 +97,10 @@ _OPENAI_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
 )
 
 
+class SandboxSettingError(ValueError):
+    """Raised when the operator declares a sandbox Betterborg cannot honour."""
+
+
 class _PromptSchemaFallback(ValueError):
     """The caller schema needs prompt-constrained output and local validation."""
 
@@ -98,6 +124,10 @@ class CodexAdapter(NativeCliAdapter):
             streaming=True,
             resumable=True,
             host_capable=True,
+            # True of the sandbox Codex is asked for, which an operator can
+            # decline: see _sandbox_setting. No gate may read this as proof a
+            # boundary is in force; require_read_only_agent deliberately does
+            # not.
             read_only_sandbox=True,
         ),
         init=False,
@@ -105,6 +135,9 @@ class CodexAdapter(NativeCliAdapter):
 
     def __post_init__(self) -> None:
         self._validate_native_configuration()
+        # Refuse a malformed declaration when the adapter is built, rather
+        # than at its first invocation.
+        _sandbox_setting()
 
     @contextmanager
     def _prepare_invocation(
@@ -122,11 +155,13 @@ class CodexAdapter(NativeCliAdapter):
                 schema_path.write_text(
                     json.dumps(transport_schema, sort_keys=True), encoding="utf-8"
                 )
+            sandbox = _sandbox_for(spec)
             yield NativeInvocation(
                 command=self._command(
                     spec,
                     schema_path if transport_schema is not None else None,
                     invocation_result_path,
+                    sandbox,
                 ),
                 stdin_text=_stdin_prompt(
                     spec, include_output_schema=transport_schema is None
@@ -136,6 +171,7 @@ class CodexAdapter(NativeCliAdapter):
                     spec.log_path,
                     spec.schema,
                     strip_optional_nulls=transport_schema is not None,
+                    sandboxed=sandbox == _READ_ONLY_SANDBOX,
                 ),
                 before_attempt=lambda: invocation_result_path.unlink(
                     missing_ok=True
@@ -149,6 +185,7 @@ class CodexAdapter(NativeCliAdapter):
         spec: AgentRunSpec,
         schema_path: Path | None,
         invocation_result_path: Path,
+        sandbox: str,
     ) -> list[str]:
         command = [
             self.binary,
@@ -159,7 +196,7 @@ class CodexAdapter(NativeCliAdapter):
             "-m",
             spec.model,
             "-s",
-            _sandbox_for(spec),
+            sandbox,
             "--skip-git-repo-check",
             "--ignore-user-config",
             "--ephemeral",
@@ -179,7 +216,17 @@ class CodexAdapter(NativeCliAdapter):
         schema: Mapping[str, Any],
         *,
         strip_optional_nulls: bool,
+        sandboxed: bool,
     ) -> NativePayload:
+        # A sandbox that never started denies every command Codex runs, yet
+        # Codex still exits zero with an answer composed without the
+        # repository, so refuse the result however well formed it is. Only a
+        # run that asked for a sandbox can have had one fail: on an
+        # unsandboxed run the same text is something a command printed.
+        if sandboxed:
+            sandbox_failure = _sandbox_launcher_failure(log_path)
+            if sandbox_failure is not None:
+                return NativePayload(error=sandbox_failure)
         payload = _load_payload(invocation_result_path)
         if payload is None:
             return NativePayload(error=_terminal_error(log_path, 0))
@@ -191,20 +238,75 @@ class CodexAdapter(NativeCliAdapter):
         return _extract_usage(log_path)
 
     def _classify_transient_error(
-        self, log_path: Path, exit_code: int
+        self, spec: AgentRunSpec, exit_code: int
     ) -> str | None:
         if exit_code == 0:
             return None
-        return _classify_transient_error(log_path)
+        # A sandbox that cannot start will not start on the next attempt, so
+        # a transient marker beside it is describing a different symptom of
+        # the same dead run. Retrying spends the whole backoff to fail
+        # identically and then blames the network.
+        if self._sandbox_failure(spec) is not None:
+            return None
+        return _classify_transient_error(spec.log_path)
 
-    def _terminal_error(self, log_path: Path, exit_code: int) -> str:
-        return _terminal_error(log_path, exit_code)
+    def _terminal_error(self, spec: AgentRunSpec, exit_code: int) -> str:
+        return self._sandbox_failure(spec) or _terminal_error(
+            spec.log_path, exit_code
+        )
+
+    def _sandbox_failure(self, spec: AgentRunSpec) -> str | None:
+        """Return the launcher failure for a run that asked for a sandbox."""
+        # Re-derived rather than carried from the launch: these hooks see
+        # only the spec, and one adapter serves concurrent runs, so it can
+        # hold no per-run state. The declaration was valid when this run
+        # launched, so an invalid one now is a later edit rather than
+        # anything this run did, and it is not this run's failure to report.
+        try:
+            sandboxed = _sandbox_for(spec) == _READ_ONLY_SANDBOX
+        except SandboxSettingError:
+            return None
+        if not sandboxed:
+            return None
+        return _sandbox_launcher_failure(spec.log_path)
 
 
 def _sandbox_for(spec: AgentRunSpec) -> str:
+    """Choose the sandbox Codex enforces for one run."""
+    # An operator who has declared the environment already isolated gets no
+    # second boundary: Codex builds its read-only sandbox from an unprivileged
+    # user namespace, which a sealed container is usually refused.
+    if _sandbox_setting() == _SANDBOX_HOST:
+        return _UNSANDBOXED
     if is_read_only_tool_set(spec.allowed_tools):
-        return "read-only"
-    return "danger-full-access"
+        return _READ_ONLY_SANDBOX
+    return _UNSANDBOXED
+
+
+def _sandbox_setting() -> str:
+    """Read the operator's sandbox declaration from the process environment.
+
+    The declaration belongs to whoever started Betterborg, never to the
+    repository being worked on, so it arrives by environment variable rather
+    than as tracked configuration.
+
+    This reads the Betterborg process environment and deliberately not the
+    run spec's, which ``native_cli`` merges over ours for the child process. A
+    spec's environment is shaped by the analyzer plan, which the repository
+    under test drives, so reading ours keeps the sandbox choice out of its
+    reach however that environment is populated later.
+    """
+    declared = os.environ.get(_SANDBOX_VARIABLE, "")
+    setting = declared.strip().lower()
+    if not setting:
+        return _SANDBOX_AUTO
+    if setting not in _SANDBOX_SETTINGS:
+        accepted = ", ".join(_SANDBOX_SETTINGS)
+        raise SandboxSettingError(
+            f"{_SANDBOX_VARIABLE}={declared!r} is not a sandbox setting; "
+            f"accepted values are {accepted}"
+        )
+    return setting
 
 
 def _translate_event(event: Mapping[str, Any]) -> AgentActivity | None:
@@ -326,6 +428,65 @@ def _load_payload(result_path: Path) -> dict[str, Any] | None:
     except (OSError, StructuredResultError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _sandbox_launcher_failure(log_path: Path) -> str | None:
+    """Return why Codex's sandbox never started, read from its event log.
+
+    A launcher that cannot build its boundary denies every sandboxed command
+    identically, and Codex reports each denial as failed command output rather
+    than as a run error, so one occurrence settles it. Only the first line of
+    that output can carry the signature, because the launcher writes before
+    the command it denied produced anything: the same text further down
+    belongs to the command, which merely read or printed it.
+    """
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return None
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, Mapping):
+            continue
+        item = event.get("item")
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("type") != "command_execution" or not _command_failed(item):
+            continue
+        reported = _first_output_line(item.get("aggregated_output"))
+        if reported is None:
+            continue
+        lowered = reported.lower()
+        for marker, description in _SANDBOX_LAUNCHER_FAILURES:
+            if marker in lowered:
+                return (
+                    f"Codex sandbox never started: {description} "
+                    f"({reported[:300]}). Every sandboxed command failed the "
+                    "same way, so any result was composed without the "
+                    f"repository. Set {_SANDBOX_VARIABLE}={_SANDBOX_HOST} when "
+                    "the environment is already isolated."
+                )
+    return None
+
+
+def _command_failed(item: Mapping[str, Any]) -> bool:
+    if item.get("status") == "failed":
+        return True
+    exit_code = item.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        return False
+    return exit_code != 0
+
+
+def _first_output_line(output: Any) -> str | None:
+    if not isinstance(output, str):
+        return None
+    for line in output.splitlines():
+        reported = line.strip()
+        if reported:
+            return reported
+    return None
 
 
 def _classify_transient_error(log_path: Path) -> str | None:

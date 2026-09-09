@@ -217,6 +217,27 @@ def test_safe_git_preserves_files_when_output_option_is_requested(
     assert protected.read_bytes() == original
 
 
+def test_safe_git_reads_only_the_identity_variables(
+    committed_git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git parses these while resolving an identity and refuses the command
+    # outright when it cannot; the production caller drops them for that reason.
+    for variable in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.delenv(variable, raising=False)
+    resolved = SafeGit(committed_git_repo).run(["var", "GIT_COMMITTER_IDENT"])
+
+    assert resolved.stdout.strip()
+    # ``git var -l`` would dump resolved configuration into captured output.
+    for arguments in (
+        ["var", "-l"],
+        ["var", "GIT_EDITOR"],
+        ["var"],
+        ["var", "GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"],
+    ):
+        with pytest.raises(UnsafeGitError, match="reads exactly one of"):
+            SafeGit(committed_git_repo).run(arguments)
+
+
 def test_safe_git_rejects_parent_discovery_from_nested_path(
     committed_git_repo: Path,
 ) -> None:
@@ -456,7 +477,10 @@ def test_allocates_persists_reuses_and_cleans_task_worktree(
         task_path.parent.mkdir(parents=True)
         task_path.write_text(render_task_markdown(body), encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=committed_git_repo / ".betterborg/tasks",
+            owned_root=committed_git_repo,
         )
 
     _git(committed_git_repo, "add", ".betterborg")

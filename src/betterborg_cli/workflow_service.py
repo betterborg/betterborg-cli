@@ -27,7 +27,10 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.repository_config import RepositoryConfig
+from betterborg_cli.repository_config import (
+    RepositoryConfig,
+    require_registered_repository,
+)
 from betterborg_cli.repository_files import (
     publish_repository_text,
     require_git_trackable,
@@ -110,7 +113,7 @@ def approve_plan_workflow(
 ) -> PlanApprovalWorkflowResult:
     """Bind, decompose, reconcile, and validate one plan approval."""
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = _repository(store, config)
+        repository = _repository(paths, store, config)
         borg = _borg(store, repository, name)
         approval, plan_path = bind_plan_approval(
             paths,
@@ -138,6 +141,7 @@ def approve_plan_workflow(
                 plan_approval=approval,
                 cancel=cancel,
                 progress=progress,
+                review_rounds=config.planning.decomposition_rounds,
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication
@@ -178,7 +182,7 @@ def execute_workflow(
 ) -> ExecutionWorkflowResult:
     """Verify, estimate, persist the gate, and invoke the sole host service."""
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
-        repository = _repository(store, config)
+        repository = _repository(paths, store, config)
         borg = _borg(store, repository, name)
         if borg.state is not BorgState.READY_TO_EXECUTE:
             raise ValueError(f"Borg {name!r} is not ready to execute")
@@ -340,8 +344,8 @@ def bind_plan_approval(
     digest = approved_plan_digest(current_plan)
     body = render_plan_markdown(current_plan)
     body_digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-    relative_path = Path(".betterborg/plans") / f"{borg.name}.md"
-    plan_path = paths.root / relative_path
+    plan_path = paths.plans_dir / f"{borg.name}.md"
+    relative_path = paths.in_checkout(plan_path)
 
     approvals = store.list_plan_approvals(borg.id)
     if approvals:
@@ -362,11 +366,13 @@ def bind_plan_approval(
         try:
             existing = plan_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
+            publish_repository_text(
+                plan_path, body, root=paths.tracked_root, overwrite=True
+            )
         else:
             if existing != body:
                 raise ValueError(f"approved plan Markdown drifted: {relative_path}")
-        require_git_trackable(relative_path, root=paths.root, cancel=cancel)
+        _require_plan_trackable(paths, relative_path, cancel)
         return approval, plan_path
 
     if borg.state is not BorgState.PLAN_APPROVAL_PENDING:
@@ -374,8 +380,8 @@ def bind_plan_approval(
             f"Borg {borg.name!r} cannot approve a plan from state "
             f"{borg.state.value!r}; a plan must be awaiting approval"
         )
-    publish_repository_text(plan_path, body, root=paths.root, overwrite=True)
-    require_git_trackable(relative_path, root=paths.root, cancel=cancel)
+    publish_repository_text(plan_path, body, root=paths.tracked_root, overwrite=True)
+    _require_plan_trackable(paths, relative_path, cancel)
     approval = PlanApproval(
         borg_id=borg.id,
         attempt_id=plan_attempt.id,
@@ -423,11 +429,25 @@ def validated_current_plan_attempt(
     return attempt
 
 
-def _repository(store: SqliteStore, config: RepositoryConfig) -> Repository:
-    repository = store.get_repository(config.repository_id)
-    if repository is None:
-        raise ValueError("repository is not initialized; run 'betterborg init' first")
-    return repository
+def _require_plan_trackable(
+    paths: RepoPaths, relative_path: Path, cancel: CancellationToken | None
+) -> None:
+    """Require Git to see an approved plan that lives in the repository.
+
+    A plan written outside the repository is nothing Git tracks, so no
+    ignore rule can swallow it.
+    """
+    if not paths.tracked_in_repository:
+        return
+    require_git_trackable(relative_path, root=paths.root, cancel=cancel)
+
+
+def _repository(
+    paths: RepoPaths, store: SqliteStore, config: RepositoryConfig
+) -> Repository:
+    return require_registered_repository(
+        paths, store.get_repository(config.repository_id)
+    )
 
 
 def _borg(store: SqliteStore, repository: Repository, name: str) -> Borg:

@@ -138,7 +138,10 @@ def _scheduler_fixture(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(record.task_ref, encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=repository.root / ".betterborg/tasks",
+            owned_root=repository.root,
         )
     return database, borg, generation, records
 
@@ -1437,6 +1440,93 @@ def test_scheduler_cancels_inflight_behavior_when_run_lease_expires(
         runtime = store.get_task_runtime(records["task"].id)
         assert runtime is not None
         assert runtime.status is TaskRuntimeStatus.PENDING
+
+
+def test_scheduler_sweeps_expired_runs_inside_its_cancellation_fence(
+    tmp_path: Path,
+) -> None:
+    """Cancellation reaches the sweep, and only after the run is interrupted."""
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    cancel = CancellationToken()
+    started = threading.Event()
+    observed: list[ExecutionRunStatus] = []
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            assert context.cancel.wait(timeout=2)
+            return TaskRuntimeStatus.DONE
+
+        def sweep() -> None:
+            observed.append(store.list_execution_runs(borg.id)[0].status)
+
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(jobs=1, poll_interval_seconds=0.005),
+            clock=FakeClock(),
+            expired_run_sweep=sweep,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                scheduler.run, borg.id, generation.id, cancel=cancel
+            )
+            assert started.wait(timeout=2)
+            cancel.cancel()
+            cancelled = running.result(timeout=2)
+
+        assert cancelled.status is ExecutionRunStatus.CANCELLED
+        assert observed == [ExecutionRunStatus.CANCELLED]
+
+
+def test_scheduler_sweeps_expired_runs_when_it_loses_ownership(
+    tmp_path: Path,
+) -> None:
+    """A lost lease reaches the sweep before the ownership error escapes."""
+    database, borg, generation, _records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    clock = FakeClock()
+    started = threading.Event()
+    sweeps = 0
+
+    with SqliteStore.open(database) as store:
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            started.set()
+            context.cancel.wait(timeout=2)
+            return TaskRuntimeStatus.DONE
+
+        def sweep() -> None:
+            nonlocal sweeps
+            sweeps += 1
+
+        scheduler = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(
+                lease_duration=timedelta(seconds=10),
+                heartbeat_interval=timedelta(seconds=2),
+                poll_interval_seconds=0.005,
+            ),
+            clock=clock,
+            expired_run_sweep=sweep,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(scheduler.run, borg.id, generation.id)
+            assert started.wait(timeout=2)
+            clock.advance(timedelta(seconds=11))
+            with pytest.raises(ExecutionOwnershipError, match="lease expired"):
+                running.result(timeout=2)
+
+        assert sweeps == 1
 
 
 def test_scheduler_isolates_task_failure_and_finishes_run(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ import pytest
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
+from betterborg_cli.agent_runtime.retry import DEFAULT_SCHEMA_MAX_ATTEMPTS
 from betterborg_cli.planning import (
     NonProgressingTaskRepairError,
     ProjectManagerError,
@@ -141,7 +142,7 @@ def _valid_graph() -> tuple[dict, list[TaskRecord], list[TaskDependency]]:
     return plan, [foundation, consumer], [dependency]
 
 
-def _pm_payload(plan: dict) -> dict:
+def _pm_payload(plan: dict, *, revision: str = "") -> dict:
     def task(
         stage: str,
         stem: str,
@@ -154,7 +155,7 @@ def _pm_payload(plan: dict) -> dict:
             "stage": stage,
             "stem": stem,
             "repository": "repo",
-            "title": f"Build {stage}",
+            "title": f"Build {stage}{revision}",
             "why": "This task owns one independently testable plan slice.",
             "scope": [f"Implement the concrete {stage} deliverable."],
             "implementation_notes": [],
@@ -246,6 +247,46 @@ def _rules(findings: Iterable[TaskGraphFinding]) -> set[str]:
     return {finding.rule for finding in findings}
 
 
+def test_a_validation_failure_names_what_it_is_about() -> None:
+    """A rule alone asks the reader to search; the reference asks them to act.
+
+    The Project Manager repairs its own rejected batch from this text and
+    nothing else, so a finding that keeps the element to itself spends the
+    retry budget on guessing which one it meant.
+    """
+    error = TaskGraphValidationError(
+        [
+            TaskGraphFinding(
+                rule="task.traceability.unowned",
+                message="required approved-plan element has no valid task owner",
+                plan_refs=("phase/02-loader/deliverable/1",),
+            ),
+            TaskGraphFinding(
+                rule="task.dependency.same_stage_order",
+                message="same-stage dependency must point to a lexically earlier stem",
+                task_refs=("02-loader/01-cache",),
+                dependency_refs=("02-loader/09-reset",),
+            ),
+        ]
+    )
+
+    detail = str(error)
+
+    assert "phase/02-loader/deliverable/1" in detail
+    assert "02-loader/01-cache" in detail
+    assert "02-loader/09-reset" in detail
+
+
+def test_a_validation_failure_without_references_reads_as_before() -> None:
+    error = TaskGraphValidationError(
+        [TaskGraphFinding(rule="task.batch.empty", message="batch has no tasks")]
+    )
+
+    assert str(error) == (
+        "task graph validation failed: task.batch.empty: batch has no tasks"
+    )
+
+
 def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
     committed_git_repo: Path,
     persist_planning_context,
@@ -271,6 +312,14 @@ def test_pm_generates_complete_digest_bound_batch_and_persists_attempt(
             *payload["tasks"][0]["plan_refs"],
             *payload["tasks"][1]["plan_refs"],
         }
+        # The same-stage ordering rule is enforced on the output, so the PM is
+        # told it before writing rather than discovering it by rejection: it
+        # constrains how stems are named, which is not recoverable by editing
+        # one dependency.
+        instruction = " ".join(spec.system_prompt.split())
+        assert "a task may depend only on a task whose stem sorts before" in (
+            instruction
+        )
         return payload
 
     adapter = MockAdapter(name="openai").queue(MockResponse(dynamic=complete_batch))
@@ -354,7 +403,8 @@ def test_pm_retries_malformed_output_with_persisted_feedback(
         return _pm_payload(plan)
 
     adapter = MockAdapter(name="openai")
-    adapter.queue(MockResponse(payload=malformed))
+    for _attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS):
+        adapter.queue(MockResponse(payload=malformed))
     adapter.queue(MockResponse(dynamic=repaired_batch))
     database = committed_git_repo.parent / "pm-retry.sqlite3"
     with SqliteStore.open(database) as store:
@@ -372,7 +422,7 @@ def test_pm_retries_malformed_output_with_persisted_feedback(
         ).run()
 
         assert result.borg.state is BorgState.SUPERVISOR_WORKING
-        assert len(adapter.calls) == 2
+        assert len(adapter.calls) == DEFAULT_SCHEMA_MAX_ATTEMPTS + 1
         attempts = store.list_planning_attempts(borg.id)
         assert [item.status for item in attempts] == [
             PlanningAttemptStatus.FAILED,
@@ -2161,3 +2211,371 @@ def test_moving_duplicate_dependency_to_another_edge_is_not_progress() -> None:
     ]
     with pytest.raises(NonProgressingTaskRepairError):
         validate_task_repair_progress(previous, repaired)
+
+
+def test_a_lowered_decomposition_budget_blocks_on_its_only_round(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Three rounds is a default, not the only answer a project may give."""
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-lowered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-lowered"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm_result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+
+        result = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=1,
+        ).run()
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert len(supervisor.calls) == 1
+        assert "in round 1 of 1." in supervisor.calls[0].user_prompt
+        assert store.list_task_findings(borg.id)
+
+
+def test_a_blocked_decomposition_reports_its_record_under_any_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Whether a rejection revised or blocked was settled when it completed.
+
+    Counting the record against a number raised since would deny the plainly
+    terminal record and answer with an error naming a state.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-blocked-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-blocked-raised"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm_result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+        supervisor = MockAdapter(name="openai").queue(
+            MockResponse(dynamic=_review_response("request_changes"))
+        )
+        first = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=1,
+        ).run()
+        assert first.borg.state is BorgState.BLOCKED
+
+        blocked = store.get_borg(borg.id)
+        assert blocked is not None
+        again = SupervisorLoop(
+            repository,
+            blocked,
+            store,
+            supervisor,
+            approved_plan=plan,
+            review_rounds=5,
+            progress=RunProgress(stream=StringIO()),
+        ).run()
+
+        assert again.borg.state is BorgState.BLOCKED
+        assert len(supervisor.calls) == 1
+
+
+def test_a_decomposition_budget_below_one_is_refused_at_construction(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-zero-budget.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-zero-budget"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(SupervisorError, match="at least 1"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                review_rounds=0,
+            )
+
+
+def test_lowering_the_decomposition_budget_does_not_strand_a_revision_under_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The budget bounds what happens next, never what already happened.
+
+    A run interrupted mid-revision is resumable, and the CLI says so. Refusing
+    the round that revision leads to would make the advertised resume
+    impossible, with no way back but restoring a number nothing names.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-strand.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-strand"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        pm_result = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+
+        # Two rejections spent, and the run dies before the third revision.
+        supervisor = MockAdapter(name="openai")
+        for _ in range(2):
+            supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        with pytest.raises((SupervisorError, RuntimeError)):
+            SupervisorLoop(
+                repository,
+                pm_result.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+                review_rounds=3,
+            ).run()
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.PM_WORKING
+
+        # The operator lowers the budget below the rounds already spent, then
+        # resumes as the run told them to.
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" Two.")))
+        supervisor.queue(MockResponse(dynamic=_review_response("request_changes")))
+        resumed = SupervisorLoop(
+            repository,
+            interrupted,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=2,
+        ).run()
+
+        assert resumed.borg.state is BorgState.BLOCKED
+        assert "the final round." in supervisor.calls[-1].user_prompt
+        assert "of 2." not in supervisor.calls[-1].user_prompt
+
+
+def test_a_raised_budget_reconstructs_every_revision_it_paid_for(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """History is history, however the budget has moved since.
+
+    Read back through a bound the record outgrew, the revisions past that
+    bound disappear from the account of the run, and the reader is shown a
+    decomposition that took fewer attempts than it did.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-raised.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-raised"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        pm_result = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+
+        # Three rejections, each answered by a revision, then an approval:
+        # more rounds than the default budget allows.
+        supervisor = MockAdapter(name="openai")
+        for index in range(3):
+            supervisor.queue(
+                MockResponse(dynamic=_review_response("request_changes"))
+            )
+            pm.queue(
+                MockResponse(payload=_pm_payload(plan, revision=f" R{index}."))
+            )
+        supervisor.queue(MockResponse(dynamic=_review_response("approve")))
+
+        first = SupervisorLoop(
+            repository,
+            pm_result.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=5,
+        ).run()
+        assert first.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(supervisor.calls) == 4
+
+        finished = store.get_borg(borg.id)
+        assert finished is not None
+        progress = RunProgress(stream=StringIO())
+        again = SupervisorLoop(
+            repository,
+            finished,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=5,
+            progress=progress,
+        ).run()
+
+        assert again == first
+        assert len(supervisor.calls) == 4
+        children = progress.stages["supervisor"].children
+        assert len(children) == 3
+        assert all(
+            child.state is StageState.COMPLETED for child in children.values()
+        )
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5])
+def test_a_decomposition_budget_that_is_not_a_whole_number_above_zero_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+    budget: object,
+) -> None:
+    """The loop is handed this directly as well as through configuration."""
+    plan = _plan()
+    database = committed_git_repo.parent / f"supervisor-budget-{budget}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"supervisor-budget-{str(budget).strip('-.')}"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(SupervisorError, match="whole number"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                review_rounds=budget,
+            )
+
+
+def test_no_stem_clears_the_schema_and_fails_the_graph_check_after_it() -> None:
+    """The Project Manager's schema and the graph check agree on every stem.
+
+    Both read the same constant, but the schema searches while the check
+    matches in full, so an anchor generous about a trailing newline divides
+    them on that one input and costs a decomposition round to discover.
+    """
+
+    from betterborg_cli.agent_runtime.structured import (
+        StructuredResultError,
+        validate_structured_result,
+    )
+    from betterborg_cli.planning.pm import PROJECT_MANAGER_TASKS_SCHEMA
+    from betterborg_cli.planning.task_validation import _TASK_NAME
+
+    schema = {
+        "type": "object",
+        "required": ["stem"],
+        "properties": {
+            "stem": PROJECT_MANAGER_TASKS_SCHEMA["properties"]["tasks"]["items"][
+                "properties"
+            ]["stem"]
+        },
+    }
+
+    for stem in ("01-setup", "01-abc\n", "01-abc\r\n", "01--bad", "01-bad-"):
+        try:
+            validate_structured_result({"stem": stem}, schema)
+        except StructuredResultError:
+            continue
+        assert _TASK_NAME.fullmatch(stem) is not None, (
+            f"{stem!r} cleared the schema and is refused by the graph check"
+        )
+
+
+def test_every_role_that_writes_a_phase_name_is_told_its_shape() -> None:
+    """The Tech Lead writes phase names as surely as the Architect does.
+
+    Its findings are not only a verdict: the revision turn is told to address
+    every persisted finding, so a suggestion that renames a phase becomes the
+    name. A Tech Lead that has not been told the shape can ask for one the
+    Architect is then refused for using, and a finding that cannot be
+    satisfied blocks the run once the rounds run out.
+    """
+    from betterborg_cli.planning.architect import _PLAN_SYSTEM_PROMPT
+    from betterborg_cli.planning.tech_lead import _TECH_LEAD_SYSTEM_PROMPT
+
+    shape = (
+        "A phase name is two digits then lowercase words of letters and "
+        "digits, all joined by single hyphens and at most 32 characters"
+    )
+    for prompt in (_PLAN_SYSTEM_PROMPT, _TECH_LEAD_SYSTEM_PROMPT):
+        assert shape in " ".join(prompt.split())
+
+
+def test_every_planning_role_is_told_what_betterborg_performs() -> None:
+    """A role that does not know the harness holds the plan to the harness.
+
+    Betterborg creates the branch and worktree, commits, reviews, merges and
+    runs the checks. Told to none of them, a plan grows a delivery-preflight
+    phase and the batch grows a task whose whole scope is verifying a baseline
+    and creating a branch, which has nothing to commit. Told only to the two
+    that write, the two that judge reject the plan for the omission, which is
+    the same run lost at the other end.
+    """
+    from betterborg_cli.planning.architect import _PLAN_SYSTEM_PROMPT
+    from betterborg_cli.planning.pm import _PROJECT_MANAGER_SYSTEM_PROMPT
+    from betterborg_cli.planning.supervisor import _SUPERVISOR_SYSTEM_PROMPT
+    from betterborg_cli.planning.tech_lead import _TECH_LEAD_SYSTEM_PROMPT
+
+    boundary = "branching, worktrees, commits, review, merge"
+    for prompt in (
+        _PLAN_SYSTEM_PROMPT,
+        _PROJECT_MANAGER_SYSTEM_PROMPT,
+        _TECH_LEAD_SYSTEM_PROMPT,
+        _SUPERVISOR_SYSTEM_PROMPT,
+    ):
+        flattened = " ".join(prompt.split())
+        assert "Betterborg performs the delivery" in flattened
+        assert boundary in flattened
+
+    plan_prompt = " ".join(_PLAN_SYSTEM_PROMPT.split())
+    assert "Plan the product change only" in plan_prompt
+
+    pm_prompt = " ".join(_PROJECT_MANAGER_SYSTEM_PROMPT.split())
+    assert "Never write a task for any of that" in pm_prompt
+    assert "one with nothing to commit is not a task" in pm_prompt
+
+    # The two that judge are told not to require what the two that write were
+    # told to leave out.
+    for prompt in (_TECH_LEAD_SYSTEM_PROMPT, _SUPERVISOR_SYSTEM_PROMPT):
+        assert "never hold" in " ".join(prompt.split())

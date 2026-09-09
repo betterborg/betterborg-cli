@@ -15,6 +15,10 @@ class StructuredResultError(ValueError):
 
 
 _FENCE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+_CONSTRAINT_DETAIL_LIMIT = 200
+_LINE_SEPARATORS = str.maketrans(
+    {"\u0085": "\\u0085", "\u2028": "\\u2028", "\u2029": "\\u2029"}
+)
 
 
 def extract_json(text: str) -> dict[str, Any] | list[Any]:
@@ -173,6 +177,9 @@ def _validate_schema_shape(schema: Mapping[str, Any], *, path: str) -> None:
         not isinstance(enum, Sequence) or isinstance(enum, str | bytes)
     ):
         raise StructuredResultError(f"{path}.enum must be an array")
+    for keyword in ("const", "enum", "minimum", "maximum"):
+        if keyword in schema:
+            _require_json_value(schema[keyword], path=f"{path}.{keyword}")
     pattern = schema.get("pattern")
     if pattern is not None and not isinstance(pattern, str):
         raise StructuredResultError(f"{path}.pattern must be a string")
@@ -243,14 +250,20 @@ def _validate_value(
     _validate_choices(value, schema, "anyOf", path=path, root=root, exactly_one=False)
     _validate_choices(value, schema, "oneOf", path=path, root=root, exactly_one=True)
     if "not" in schema and _matches(value, schema["not"], path=path, root=root):
-        raise StructuredResultError(f"{path}: value matches forbidden schema")
+        raise StructuredResultError(
+            f"{path}: value matches forbidden schema {_constraint(schema['not'])}"
+        )
 
     if "const" in schema and not _json_equal(value, schema["const"]):
-        raise StructuredResultError(f"{path}: expected constant {schema['const']!r}")
+        raise StructuredResultError(
+            f"{path}: expected constant {_constraint(schema['const'])}"
+        )
     if "enum" in schema and not any(
         _json_equal(value, candidate) for candidate in schema["enum"]
     ):
-        raise StructuredResultError(f"{path}: value is not in enum")
+        raise StructuredResultError(
+            f"{path}: expected one of {_constraint(list(schema['enum']))}"
+        )
 
     expected = schema.get("type")
     if expected is not None:
@@ -284,14 +297,22 @@ def _validate_object(value, schema, *, path, root) -> None:
         elif additional is False:
             raise StructuredResultError(f"{path}: unexpected property {name!r}")
         elif isinstance(additional, Mapping):
-            _validate_value(child, additional, path=f"{path}.{name}", root=root)
+            _validate_value(
+                child, additional, path=f"{path}.{_segment(name)}", root=root
+            )
 
 
 def _validate_array(value, schema, *, path, root) -> None:
-    if len(value) < schema.get("minItems", 0):
-        raise StructuredResultError(f"{path}: array has too few items")
+    minimum = schema.get("minItems", 0)
+    if len(value) < minimum:
+        raise StructuredResultError(
+            f"{path}: array has too few items, expected at least {_constraint(minimum)}"
+        )
     if "maxItems" in schema and len(value) > schema["maxItems"]:
-        raise StructuredResultError(f"{path}: array has too many items")
+        raise StructuredResultError(
+            f"{path}: array has too many items, "
+            f"expected at most {_constraint(schema['maxItems'])}"
+        )
     if schema.get("uniqueItems") and any(
         _json_equal(left, right)
         for index, left in enumerate(value)
@@ -304,21 +325,34 @@ def _validate_array(value, schema, *, path, root) -> None:
 
 
 def _validate_string(value, schema, *, path) -> None:
-    if len(value) < schema.get("minLength", 0):
-        raise StructuredResultError(f"{path}: string is too short")
+    minimum = schema.get("minLength", 0)
+    if len(value) < minimum:
+        raise StructuredResultError(
+            f"{path}: string is too short, "
+            f"expected at least {_quantity(minimum, 'character')}"
+        )
     if "maxLength" in schema and len(value) > schema["maxLength"]:
-        raise StructuredResultError(f"{path}: string is too long")
+        raise StructuredResultError(
+            f"{path}: string is too long, "
+            f"expected at most {_quantity(schema['maxLength'], 'character')}"
+        )
     if "pattern" in schema and re.search(schema["pattern"], value) is None:
-        raise StructuredResultError(f"{path}: string does not match pattern")
+        raise StructuredResultError(
+            f"{path}: string does not match pattern {_constraint(schema['pattern'])}"
+        )
 
 
 def _validate_number(value, schema, *, path) -> None:
     if not math.isfinite(value):
         raise StructuredResultError(f"{path}: number must be finite")
     if "minimum" in schema and value < schema["minimum"]:
-        raise StructuredResultError(f"{path}: number is below minimum")
+        raise StructuredResultError(
+            f"{path}: number is below minimum {_constraint(schema['minimum'])}"
+        )
     if "maximum" in schema and value > schema["maximum"]:
-        raise StructuredResultError(f"{path}: number is above maximum")
+        raise StructuredResultError(
+            f"{path}: number is above maximum {_constraint(schema['maximum'])}"
+        )
 
 
 def _validate_choices(value, schema, keyword, *, path, root, exactly_one) -> None:
@@ -326,8 +360,15 @@ def _validate_choices(value, schema, keyword, *, path, root, exactly_one) -> Non
     if choices is None:
         return
     matches = sum(_matches(value, choice, path=path, root=root) for choice in choices)
-    if matches == 0 or (exactly_one and matches != 1):
-        raise StructuredResultError(f"{path}: value does not satisfy {keyword}")
+    if matches == 0:
+        raise StructuredResultError(
+            f"{path}: value does not satisfy {keyword} {_constraint(list(choices))}"
+        )
+    if exactly_one and matches != 1:
+        raise StructuredResultError(
+            f"{path}: value satisfies more than one {keyword} branch "
+            f"{_constraint(list(choices))}"
+        )
 
 
 def _matches(value, schema, *, path, root) -> bool:
@@ -377,6 +418,96 @@ def _type_name(value: Any) -> str:
         if _is_json_type(value, name):
             return name
     return type(value).__name__
+
+
+def _constraint(value: Any) -> str:
+    """Render a schema constraint for the agent asked to satisfy it.
+
+    Only values the schema itself carries reach here, never a rejected payload
+    value. The rendering is JSON because JSON is what the agent has to send
+    back: a Python repr would offer it ``True`` and ``None``, neither of which
+    it can use.
+
+    A constraint carries no length bound of its own, so a long one is
+    shortened by dropping whole members and saying how many were dropped. A
+    value with no members to drop is shown whole however long it runs, because
+    a string cut part way through reads as a shorter string the schema would
+    reject just as surely, and an abbreviated pattern is not even a pattern.
+    That would leave the message worse than the silence it replaced.
+    """
+    detail = _json_literal(value)
+    if len(detail) <= _CONSTRAINT_DETAIL_LIMIT:
+        return detail
+    if isinstance(value, Mapping):
+        entries = [
+            f"{_json_literal(str(key))}: {_constraint(item)}"
+            for key, item in value.items()
+        ]
+        return _elided(entries, len(value), "{", "}")
+    if isinstance(value, list | tuple):
+        members = [_constraint(member) for member in value]
+        return _elided(members, len(value), "[", "]")
+    return detail
+
+
+def _elided(items: Sequence[str], total: int, opener: str, closer: str) -> str:
+    """Keep whole items while they fit, then say how many were left out."""
+    suffix = f" and {total} more"
+    budget = _CONSTRAINT_DETAIL_LIMIT - len(opener) - len(closer) - len(suffix)
+    kept: list[str] = []
+    for item in items:
+        if kept and len(item) + 2 > budget:
+            break
+        kept.append(item)
+        budget -= len(item) + 2
+    remainder = total - len(kept)
+    body = f"{opener}{', '.join(kept)}{closer}"
+    return body if remainder == 0 else f"{body} and {remainder} more"
+
+
+def _quantity(count: Any, noun: str) -> str:
+    """Render a counted noun that agrees with its count."""
+    suffix = "" if count == 1 else "s"
+    return f"{_constraint(count)} {noun}{suffix}"
+
+
+def _segment(name: str) -> str:
+    """Render a payload property name so it cannot break the message apart.
+
+    ``repr`` escapes every unprintable character, the line separators included,
+    which is what the neighbouring ``unexpected property`` message already
+    relies on.
+    """
+    return repr(name)[1:-1] if name.isprintable() else repr(name)
+
+
+def _require_json_value(value: Any, *, path: str) -> None:
+    """Reject a schema value that cannot be stated to the agent as JSON.
+
+    A constraint the agent is asked to satisfy has to be expressible in what it
+    sends back. A set, a tuple-keyed mapping or an infinity is a broken schema,
+    and saying so here is better than rendering Python syntax into a correction
+    or letting ``json`` raise from inside a rejection it cannot recover from.
+    """
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise StructuredResultError(f"{path} must be JSON: {error}") from error
+
+
+def _json_literal(value: Any) -> str:
+    """Render a schema value the way the agent must send it back.
+
+    Constraint values are checked for renderability when the schema is
+    validated, so ``default`` covers only what that check does not reach, and
+    covers it without raising from inside a rejection. The separators Python
+    leaves raw are escaped so a message stays one line.
+    """
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = json.dumps(repr(value), ensure_ascii=False)
+    return rendered.translate(_LINE_SEPARATORS)
 
 
 def _json_equal(left: Any, right: Any) -> bool:

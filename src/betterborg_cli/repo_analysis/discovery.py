@@ -143,6 +143,10 @@ _DOC_SUFFIXES = {"", ".md", ".mdx", ".rst", ".txt"}
 
 _CONFIG_BASENAMES = {
     ".editorconfig",
+    # A catalogued command has to say whether running it leaves the working
+    # tree unchanged, and the gate enforces that against git's own answer. The
+    # file that decides which of a command's outputs count has to be evidence.
+    ".gitignore",
     ".env.example",
     ".env.sample",
     ".flake8",

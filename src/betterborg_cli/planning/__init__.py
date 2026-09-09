@@ -1,6 +1,8 @@
 """Repository-aware planning lifecycle and workspace primitives."""
 
 from betterborg_cli.planning.architect import (
+    ARCHITECT_ANSWERS_SCHEMA,
+    ARCHITECT_PLAN_CONTRACT_ROUND_CAP,
     ARCHITECT_PLAN_SCHEMA,
     ARCHITECT_QUESTION_ROUND_CAP,
     ARCHITECT_QUESTIONS_SCHEMA,
@@ -13,6 +15,7 @@ from betterborg_cli.planning.plan_contracts import (
     PlanValidationError,
     build_project_pr_body,
     render_plan_markdown,
+    render_planning_findings_markdown,
     validate_plan,
     validate_plan_json,
 )
@@ -70,6 +73,8 @@ from betterborg_cli.planning.worktree import (
 )
 
 __all__ = [
+    "ARCHITECT_ANSWERS_SCHEMA",
+    "ARCHITECT_PLAN_CONTRACT_ROUND_CAP",
     "ARCHITECT_PLAN_SCHEMA",
     "ARCHITECT_QUESTION_ROUND_CAP",
     "ARCHITECT_QUESTIONS_SCHEMA",
@@ -113,6 +118,7 @@ __all__ = [
     "task_batch_semantic_digest",
     "materialize_planning_worktree",
     "render_plan_markdown",
+    "render_planning_findings_markdown",
     "render_task_markdown",
     "task_graph_findings",
     "task_markdown_digest",

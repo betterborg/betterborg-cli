@@ -22,7 +22,14 @@ class PlanValidationError(ValueError):
     """Raised when an Architect plan cannot safely enter Tech Lead review."""
 
 
-_PHASE_NAME = re.compile(r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+#: The one shape a phase name takes. The Architect's schema is built from this
+#: pattern, so a name that schema admits cannot be refused here for its shape.
+#: Anchored with \Z rather than $, because $ also matches before a trailing
+#: newline and the schema searches while this check is a full match, which is
+#: precisely the disagreement the shared pattern exists to end.
+PHASE_NAME_PATTERN = r"^[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*\Z"
+
+_PHASE_NAME = re.compile(PHASE_NAME_PATTERN)
 _GITHUB_PR_BODY_LIMIT = 65_536
 _TRUNCATION_MARKER = (
     "\n\n---\n\n_(Body truncated to fit GitHub's 65,536-character limit; "
@@ -183,6 +190,11 @@ def _validate_completeness(plan: Mapping[str, Any]) -> None:
     _require_nonblank_items(plan.get("risks", []), "risks")
     _require_nonblank_items(plan.get("open_questions", []), "open_questions")
 
+    for index, assumption in enumerate(plan.get("assumptions", [])):
+        prefix = f"assumptions[{index}]"
+        _require_nonblank(assumption["question"], f"{prefix}.question")
+        _require_nonblank(assumption["assumption"], f"{prefix}.assumption")
+
     for index, repository in enumerate(plan.get("repositories", [])):
         _require_nonblank(repository["id"], f"repositories[{index}].id")
 
@@ -342,11 +354,32 @@ def _validate_planned_path(
 
 
 def _validate_existing_path(root: Path, raw_path: str, *, field: str) -> None:
-    candidate = _repository_path(root, raw_path, field=field)
-    if not candidate.exists():
+    if _grounded_path(root, raw_path, field=field) is None:
         raise PlanValidationError(
             f"{field} {raw_path!r} is not grounded in the repository"
         )
+
+
+def _grounded_path(root: Path, raw_path: str, *, field: str) -> Path | None:
+    """Return the repository file a pointer names, or None if it names none.
+
+    A pointer at a line is written the way every editor and reviewer writes
+    one, ``path:line``, and the schema asks only for a string. Read as a
+    filename that names nothing, so a plan pointing accurately at real code
+    was rejected for citing it precisely. The file is what has to exist: the
+    line is a position within it and grounds nothing on its own.
+    """
+    candidate = _repository_path(root, raw_path, field=field)
+    if candidate.exists():
+        return candidate
+
+    located, marker, position = raw_path.rpartition(":")
+    while marker and position.isdigit():
+        candidate = _repository_path(root, located, field=field)
+        if candidate.exists():
+            return candidate
+        located, marker, position = located.rpartition(":")
+    return None
 
 
 def _repository_path(root: Path, raw_path: str, *, field: str) -> Path:
@@ -370,6 +403,27 @@ def _validate_relative_path(raw_path: str, *, field: str) -> PurePosixPath:
     return path
 
 
+def render_planning_findings_markdown(findings: Sequence[Any]) -> str:
+    """Render the Tech Lead findings a blocked plan left behind.
+
+    A plan blocks with its findings kept, and keeping them is only worth
+    something if the reader can see them.
+    """
+
+    if not findings:
+        return ""
+    lines = ["## Tech Lead findings", ""]
+    for finding in findings:
+        lines.append(
+            f"- Round {finding.round} ({markdown_text(finding.severity)}): "
+            f"{markdown_text(finding.message)}"
+        )
+        if finding.suggestion:
+            lines.append(f"  - Suggestion: {markdown_text(finding.suggestion)}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
     """Render a plan as portable GFM, tolerating partial legacy input."""
     if not plan or not isinstance(plan, Mapping):
@@ -391,6 +445,24 @@ def render_plan_markdown(plan: Mapping[str, Any] | None) -> str:
     if approach:
         add("## Overall approach")
         add(markdown_text(approach))
+
+    assumption_lines: list[str] = []
+    assumptions = plan.get("assumptions")
+    if isinstance(assumptions, list):
+        for assumption in assumptions:
+            if not isinstance(assumption, Mapping):
+                continue
+            question = _string(assumption.get("question"))
+            decision = _string(assumption.get("assumption"))
+            if not question or not decision:
+                continue
+            assumption_lines.append(
+                f"- **{markdown_text(question)}** {markdown_text(decision)}"
+            )
+    if assumption_lines:
+        add("## Assumptions")
+        add("The Architect decided these itself; nobody confirmed them.")
+        add("\n".join(assumption_lines))
 
     repository_lines: list[str] = []
     repositories = plan.get("repositories")
@@ -444,9 +516,20 @@ def build_project_pr_body(
     prd_markdown: str | None,
     plan: Mapping[str, Any] | None,
     project_name: str,
+    unrun_checks: str | None = None,
 ) -> str:
-    """Build the bounded rollup PR body from repository-owned planning data."""
+    """Build the bounded rollup PR body from repository-owned planning data.
+
+    Checks the host could not run are named first and never truncated away.
+    The terminal that started the run reports them, but the pull request is
+    what leaves the machine and what the decision is made on, and a rollup
+    that reads as a green delivery while its tests never ran once is the one
+    way a dropped check can still mislead somebody.
+    """
     sections: list[str] = []
+    unrun = (unrun_checks or "").strip()
+    if unrun:
+        sections.append(f"## Checks not run on this host\n\n{unrun}")
     prd = (prd_markdown or "").strip()
     if prd:
         sections.append(prd)
@@ -578,6 +661,7 @@ def _nonempty_strings(value: Any) -> list[str]:
 
 
 __all__ = [
+    "PHASE_NAME_PATTERN",
     "PlanValidationError",
     "build_project_pr_body",
     "render_plan_markdown",

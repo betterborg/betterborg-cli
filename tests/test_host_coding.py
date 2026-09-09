@@ -23,6 +23,7 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.host_execution import (
+    EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
     HostEnvironmentManager,
@@ -32,6 +33,18 @@ from betterborg_cli.host_execution import (
     HostWorktreeManager,
     SafeGit,
     ScheduledTaskContext,
+)
+from betterborg_cli.host_execution._agent_phase import (
+    EXISTING_TEST_MERGE_RULE,
+    EXISTING_TEST_REVIEW_RULE,
+    EXISTING_TEST_RULE,
+    VerifiedTaskInputs,
+)
+from betterborg_cli.host_execution.coding import _render_user_prompt
+from betterborg_cli.host_execution.merge import _render_merge_prompt
+from betterborg_cli.host_execution.review import (
+    _render_fix_prompt,
+    _render_review_prompt,
 )
 from betterborg_cli.planning import (
     approved_plan_digest,
@@ -147,7 +160,8 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
     _git(repository_root, "config", "user.name", "Betterborg Tests")
     _git(repository_root, "config", "user.email", "tests@betterborg.dev")
     (repository_root / "README.md").write_text("# Fixture\n", encoding="utf-8")
-    ensure_managed_gitignore(RepoPaths.discover(repository_root))
+    paths = RepoPaths.discover(repository_root)
+    ensure_managed_gitignore(paths)
     _git(repository_root, "add", ".")
     _git(repository_root, "commit", "--quiet", "-m", "initial")
 
@@ -240,9 +254,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
         rubric={},
         overall_score=4,
     )
-    durable_root = (
-        repository_root / ".betterborg/tasks" / borg.name / str(generation.id)
-    )
+    durable_root = paths.tasks_dir / borg.name / str(generation.id)
 
     with SqliteStore.open(database) as store:
         store.add_repository(repository)
@@ -262,11 +274,15 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(render_task_markdown(record.task), encoding="utf-8")
         store._promote_published_task_generation(
-            generation.id, durable_root=durable_root
+            generation.id,
+            durable_root=durable_root,
+            tasks_root=paths.tasks_dir,
+            owned_root=paths.tracked_root,
         )
 
-    _git(repository_root, "add", ".")
-    _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
+    if paths.tracked_in_repository:
+        _git(repository_root, "add", ".")
+        _git(repository_root, "commit", "--quiet", "-m", "publish tasks")
     with SqliteStore.open(database) as store:
         acquisition = store.acquire_execution_run(
             borg.id, generation.id, lease_duration=timedelta(hours=1)
@@ -308,11 +324,7 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
             commands=(),
             prepare_commands=(),
             materialize_commands=(),
-            environment_files=(),
-            executables=(),
             required_secret_names=(),
-            compose_files=(),
-            services=(),
         )
         HostEnvironmentManager(repository_root).materialize_claimed_task(
             store, plan, claim, acquisition.owner_token
@@ -615,6 +627,196 @@ def test_missing_materialization_marker_blocks_before_invocation(
             / ".betterborg/state/environment-materialization"
         )
         marker.unlink()
+        adapter = MockAdapter().queue(_committing_response(fixture.task))
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        blocked = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert blocked is not None and "marker is missing" in blocked.state_reason
+    assert adapter.calls == []
+
+
+def test_a_drifted_materialization_marker_blocks_before_invocation(
+    tmp_path: Path,
+) -> None:
+    """The stored attempt and the checkout's marker have to agree.
+
+    A completed attempt outlives the dependencies it installed, so an agent
+    is only let into a checkout whose marker still names what the store
+    recorded for it.
+    """
+    fixture = _coding_fixture(tmp_path)
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+        assert runtime is not None and runtime.worktree_path is not None
+        marker = (
+            Path(runtime.worktree_path)
+            / ".betterborg/state/environment-materialization"
+        )
+        marker.write_text("sha256:another-preparation\n", encoding="utf-8")
+        adapter = MockAdapter().queue(_committing_response(fixture.task))
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        blocked = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert blocked is not None and "marker has drifted" in blocked.state_reason
+    assert adapter.calls == []
+
+
+def _relocated_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, CodingFixture]:
+    home = tmp_path / "betterborg-home"
+    home.mkdir()
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+    return home, _coding_fixture(tmp_path)
+
+
+def _status(root: Path) -> str:
+    return _git(root, "status", "--short", "--untracked-files=all")
+
+
+def test_coding_under_a_declared_home_leaves_every_checkout_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, fixture = _relocated_home(tmp_path, monkeypatch)
+    paths = RepoPaths.discover(fixture.repository)
+
+    def commit(spec):
+        (spec.cwd / "feature.txt").write_text("implemented\n", encoding="utf-8")
+        _git(spec.cwd, "add", "feature.txt")
+        _git(spec.cwd, "commit", "--quiet", "-m", "add feature")
+        return MockResponse(
+            payload=_completed_payload(fixture.task),
+            billing_mode=spec.billing_mode,
+        )
+
+    adapter = MockAdapter().queue(MockResponse(dynamic=commit))
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+        assert runtime is not None and runtime.worktree_path is not None
+        worktree = Path(runtime.worktree_path)
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+
+    assert status is TaskRuntimeStatus.REVIEW
+    # The task the agent read is published outside every checkout, so its
+    # absolute path is the only name it has.
+    prompt = adapter.calls[0].user_prompt
+    published = (
+        paths.tasks_dir
+        / fixture.borg.name
+        / str(fixture.generation.id)
+        / fixture.task.stage
+        / f"{fixture.task.stem}.md"
+    )
+    assert f"Task file: {published.as_posix()}" in prompt
+    assert f"Implement {fixture.task.stem}" in prompt
+    assert f"Implement {fixture.dependency.stem}" in prompt
+
+    # The marker recording what this checkout materialized lives with the
+    # rest of Betterborg's state, keyed by the checkout it speaks for.
+    markers = list((home / "state/environment-markers").iterdir())
+    assert len(markers) == 1 and markers[0].is_file()
+    assert not (worktree / ".betterborg").exists()
+    assert not (fixture.repository / ".betterborg").exists()
+    assert not paths.gitignore.exists()
+    assert _status(fixture.repository) == ""
+    assert _status(worktree) == ""
+
+
+def test_missing_relocated_materialization_marker_blocks_before_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, fixture = _relocated_home(tmp_path, monkeypatch)
+    adapter = MockAdapter().queue(_committing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        markers = list((home / "state/environment-markers").iterdir())
+        assert len(markers) == 1
+        markers[0].unlink()
+        status = HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(model="test-model"),
+        ).run(fixture.context(store))
+        blocked = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert blocked is not None and "marker is missing" in blocked.state_reason
+    assert adapter.calls == []
+
+
+def test_a_marker_directory_outside_the_tracked_one_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The marker still has to sit somewhere Betterborg owns.
+
+    Outside every checkout, no ignore rule of the repository's governs it, so
+    the ignore guard no longer applies. What remains is that the directory
+    holding it must not lead somewhere else, which is how it would end up
+    back in the working tree the relocation exists to keep empty.
+    """
+    home = tmp_path / "betterborg-home"
+    (home / "state").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (home / "state/environment-markers").symlink_to(
+        elsewhere, target_is_directory=True
+    )
+    monkeypatch.setenv("BETTERBORG_HOME", str(home))
+
+    with pytest.raises(
+        EnvironmentMaterializationError, match="escapes the tracked directory"
+    ):
+        _coding_fixture(tmp_path)
+
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_fresh_worktree_does_not_inherit_the_marker_it_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, fixture = _relocated_home(tmp_path, monkeypatch)
+    markers = home / "state/environment-markers"
+
+    with SqliteStore.open(fixture.database) as store:
+        runtime = store.get_task_runtime(fixture.task.id)
+        assert runtime is not None and runtime.worktree_path is not None
+        worktree = Path(runtime.worktree_path)
+        assert len(list(markers.iterdir())) == 1
+
+        # A checkout-local marker leaves with its checkout; one kept outside
+        # every checkout has to be discarded deliberately.
+        _git(fixture.repository, "worktree", "remove", "--force", str(worktree))
+        HostWorktreeManager(
+            fixture.repository,
+            tmp_path / "worktrees",
+            source_branch="main",
+        ).prepare_current_task_worktrees(
+            store,
+            run_id=fixture.run_id,
+            owner_token=fixture.owner_token,
+            generation_id=fixture.generation.id,
+            project_name=fixture.borg.name,
+        )
+
+        assert list(markers.iterdir()) == []
         adapter = MockAdapter().queue(_committing_response(fixture.task))
         status = HostCodingPhase(
             fixture.repository,
@@ -980,3 +1182,66 @@ def test_completed_review_resumes_transition_without_replaying_agent(
             attempt.phase
             for attempt in reopened.list_agent_attempts(fixture.task.id)
         ] == ["coding", "review"]
+
+
+def test_every_phase_is_told_not_to_weaken_an_existing_assertion() -> None:
+    """A rule the generated role prompt omits is a rule nobody in a run states.
+
+    A run changed what an omitted slice start means and, rather than fail the
+    repository's existing parser test, edited that test to assert the opposite.
+    Coding, review and the fix round all accepted it, and the fix round is where
+    the move is most tempting, because a finding is already asking for a change.
+    Betterborg renders these three prompts itself, so the rule arrives whatever
+    the model that writes the role prompts produced.
+    """
+    borg = Borg(repository_id=uuid4(), name="prompt-rules")
+    task = _record(
+        uuid4(), borg, position=1, stem="09-run-coding-agent", dependencies=[]
+    )
+    inputs = VerifiedTaskInputs(
+        task=task,
+        task_path=Path(f"{task.stem}.md"),
+        task_markdown=render_task_markdown(task.task),
+        dependencies=(),
+        system_prompt="You are the generated coding agent.\n",
+    )
+
+    assert EXISTING_TEST_RULE in _render_user_prompt(inputs)
+    assert EXISTING_TEST_RULE in _render_fix_prompt(
+        inputs,
+        findings=("the parser must keep the documented omitted-start value",),
+        review_round=1,
+    )
+    assert EXISTING_TEST_REVIEW_RULE in _render_review_prompt(
+        inputs,
+        branch="betterborg/09-run-coding-agent",
+        base_commit="a" * 40,
+        current_commit="b" * 40,
+        review_round=0,
+    )
+    assert EXISTING_TEST_MERGE_RULE in _render_merge_prompt(
+        inputs,
+        task_branch="betterborg/09-run-coding-agent",
+        project_branch="project/demo",
+        approved_commit="b" * 40,
+        base_commit="a" * 40,
+        unresolved=("evaluator/evaluator_test.go",),
+    )
+
+
+def test_the_rules_keep_an_honest_assertion_change_possible() -> None:
+    """A flat prohibition would trade one defect for a worse one.
+
+    Asserting only that a constant appears in a prompt holds for any value of
+    that constant, so the half that forbids the dishonest edit is guarded and
+    the half that permits the honest one is not. A coding agent left with no
+    legal path abandons the finding or defies the rule; a reviewer told to
+    judge only the base commit cannot see an assertion an earlier round of the
+    same task wrote.
+    """
+    assert "When the task or a review finding requires" in EXISTING_TEST_RULE
+    assert "return status blocked" in EXISTING_TEST_RULE
+    assert "unless the assigned task required" in EXISTING_TEST_REVIEW_RULE
+    assert "an earlier round of this task" in EXISTING_TEST_REVIEW_RULE
+    assert "resolve the code" in EXISTING_TEST_MERGE_RULE
+    assert "fail rather than choose one" in EXISTING_TEST_MERGE_RULE

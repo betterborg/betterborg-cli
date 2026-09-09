@@ -13,18 +13,17 @@ from uuid import uuid4
 import pytest
 
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
-from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
+    HostCommand,
     HostExecutionService,
     HostPreflight,
     HostPreflightBlock,
     HostPreflightPlan,
-    service_url_environment,
+    HostSecret,
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
-from betterborg_cli.repo_analysis import DIMENSIONS, run_analyzer
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.store import Repository, SqliteStore
+from betterborg_cli.store import SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
 
@@ -49,27 +48,6 @@ def _executable(directory: Path, name: str, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(0o755)
     return path
-
-
-def _compose_executable(
-    directory: Path,
-    *,
-    version: str = "2.30.0",
-    model: dict[str, object] | None = None,
-) -> Path:
-    resolved_model = model or {
-        "services": {"postgres": {}},
-        "networks": {"default": {}},
-    }
-    return _executable(
-        directory,
-        "docker",
-        (
-            "if test \"$1 $2\" = 'compose version'; then "
-            f"echo 'Docker Compose v{version}'; exit 0; fi\n"
-            f"printf '%s\\n' {shlex.quote(json.dumps(resolved_model))}"
-        ),
-    )
 
 
 def _base_plan() -> dict[str, object]:
@@ -138,29 +116,19 @@ def _base_plan() -> dict[str, object]:
 
 
 def _complete_probe_plan(repository: Path) -> dict[str, object]:
-    """Prepare one plan that reaches every direct preflight probe."""
+    """Prepare one plan that reaches both direct preflight probes."""
     (repository / "package").mkdir(exist_ok=True)
     (repository / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
-    (repository / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
     return _base_plan()
 
 
 def _probe_name(command: list[str] | tuple[str, ...]) -> str | None:
-    """Identify the five ordered direct probes covered by cancellation tests."""
+    """Identify the two ordered direct probes covered by cancellation tests."""
     argv = tuple(command)
     if argv[-1:] == ("--show-toplevel",):
         return "root"
     if argv[-1:] == ("--git-common-dir",):
         return "identity"
-    if argv[-2:] == ("compose", "version"):
-        return "compose-version"
-    if argv[-3:] == ("config", "--format", "json"):
-        return "topology"
-    if argv[-1:] == ("--version",):
-        return "executable-version"
     return None
 
 
@@ -170,7 +138,6 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
     binary_dir = committed_git_repo.parent / "all-probe-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -194,21 +161,17 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
     ).validate(
         plan,
         available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
     assert isinstance(result, HostPreflightPlan)
     assert [_probe_name(command) for command, _token in calls] == [
         "root",
         "identity",
-        "executable-version",
-        "compose-version",
-        "topology",
     ]
     assert all(observed is cancel for _command, observed in calls)
     assert [activity.kind for activity in activities] == [
         AgentActivityKind.COMMAND
-    ] * 5
+    ] * 2
     assert [activity.detail for activity in activities] == [
         shlex.join(command) for command, _token in calls
     ]
@@ -216,7 +179,7 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
     committed_git_repo: Path,
@@ -226,7 +189,6 @@ def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
     binary_dir = committed_git_repo.parent / f"{target}-cancel-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -288,7 +250,6 @@ try:
         ).validate(
             _base_plan(),
             available_secret_names={"PACKAGE_TOKEN"},
-            external_urls={"SEARCH_URL": "https://search.example.test/api"},
         )
 except KeyboardInterrupt:
     (marker_root / f"{target}.interrupted").write_text("yes", encoding="utf-8")
@@ -312,13 +273,7 @@ finally:
     assert real_process_harness.wait_for_exit(process) == 130
     real_process_harness.assert_tree_absent(target)
     probes = real_process_harness.wait_for_marker(f"{target}.probes").splitlines()
-    assert probes == [
-        "root",
-        "identity",
-        "executable-version",
-        "compose-version",
-        "topology",
-    ][: probes.index(target) + 1]
+    assert probes == ["root", "identity"][: probes.index(target) + 1]
     activities = real_process_harness.wait_for_marker(
         f"{target}.activities"
     ).splitlines()
@@ -327,7 +282,7 @@ finally:
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_cancelled_probe_result_propagates_interruption(
     committed_git_repo: Path,
@@ -336,7 +291,6 @@ def test_cancelled_probe_result_propagates_interruption(
     binary_dir = committed_git_repo.parent / f"{target}-interrupt-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -364,7 +318,6 @@ def test_cancelled_probe_result_propagates_interruption(
         ).validate(
             plan,
             available_secret_names={"PACKAGE_TOKEN"},
-            external_urls={"SEARCH_URL": "https://search.example.test/api"},
         )
 
     assert probes[-1] == target
@@ -372,7 +325,7 @@ def test_cancelled_probe_result_propagates_interruption(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "executable-version", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_each_concrete_probe_cancels_before_run_or_claim_creation(
     committed_git_repo: Path,
@@ -381,7 +334,6 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
     binary_dir = committed_git_repo.parent / f"{target}-boundary-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     trust_store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -413,15 +365,11 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
                 preflight,
                 SimpleNamespace(plan=None),
                 worktree_manager=SimpleNamespace(),
-                compose_manager=SimpleNamespace(),
             ).run(
                 borg_id,
                 generation_id,
                 plan,
                 secret_values={"PACKAGE_TOKEN": "available"},
-                external_urls={
-                    "SEARCH_URL": "https://search.example.test/api"
-                },
                 cancel=cancel,
             )
 
@@ -431,53 +379,6 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
                 "SELECT COUNT(*) FROM task_claims"
             ).fetchone()[0]
         assert claim_count == 0
-
-
-@pytest.mark.parametrize("outcome", ["timeout", "nonzero"])
-def test_ordinary_probe_failures_remain_host_blocks(
-    committed_git_repo: Path,
-    outcome: str,
-) -> None:
-    binary_dir = committed_git_repo.parent / f"ordinary-{outcome}-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
-    store = _trust_store(committed_git_repo)
-    require_workspace_trust(
-        RepoPaths.discover(committed_git_repo), store=store, explicit=True
-    )
-
-    def runner(command, **kwargs):
-        if _probe_name(command) == "executable-version":
-            if outcome == "timeout":
-                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-            return subprocess.CompletedProcess(command, 7, "", "probe failed")
-        return run_captured(command, **kwargs)
-
-    result = HostPreflight(
-        committed_git_repo,
-        trust_store=store,
-        environment={"PATH": str(binary_dir)},
-        command_runner=runner,
-    ).validate(
-        {
-            "environment": {
-                "files": ["runtime.version"],
-                "toolchains": [
-                    {
-                        "name": "example-runtime",
-                        "version": "3.11.9",
-                        "source": "runtime.version",
-                    }
-                ],
-            }
-        }
-    )
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "host executable 'example-runtime' must satisfy" in result.reason
 
 
 def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
@@ -503,73 +404,49 @@ def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
     assert "betterborg trust --yes" in result.reason
 
 
-def test_validates_complete_plan_and_ignores_unselected_service(
+def test_declared_inventory_and_services_leave_the_plan(
     committed_git_repo: Path,
 ) -> None:
+    """The analysis still names all of it; the validated plan names none of it.
+
+    Declared files, package managers, toolchains and services are evidence a
+    person reads. Nothing on this host can run Docker, the declared package
+    manager or the second toolchain, and the run is accepted anyway.
+    """
     binary_dir = committed_git_repo.parent / "host-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    docker = _compose_executable(
-        binary_dir,
-        model={
-            "services": {
-                "postgres": {
-                    "build": {"context": "."},
-                    "image": "betterborg/shared-postgres:dev",
-                }
-            },
-            "networks": {"backend": {}},
-            "volumes": {"database": {}},
-        },
-    )
     (committed_git_repo / "package").mkdir()
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     (committed_git_repo / "compose.yml").write_text(
         "services:\n  postgres:\n    image: postgres:16\n",
         encoding="utf-8",
     )
+    plan = _base_plan()
+    plan["environment"]["package_managers"] = ["absent-manager"]
+    plan["environment"]["toolchains"].append({"name": "absent-toolchain"})
 
     result = _preflight(
         committed_git_repo,
         environment={"PATH": str(binary_dir)},
     ).validate(
-        lambda: _base_plan(),
+        lambda: plan,
         available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
     assert isinstance(result, HostPreflightPlan)
     assert result.commands[0].cwd == "package"
-    assert result.environment_files == (committed_git_repo / "runtime.version",)
-    assert {tool.name for tool in result.executables} == {
-        "docker",
-        "example-runtime",
-    }
-    assert next(tool.path for tool in result.executables if tool.name == "docker") == (
-        docker
-    )
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
-    assert result.package_managers == ()
     assert [secret.scope for secret in result.secret_requirements] == ["build"]
-    assert result.compose_files == (committed_git_repo / "compose.yml",)
-    assert result.compose_networks == ("backend",)
-    assert result.compose_volumes == ("database",)
-    assert result.compose_build_services == ("postgres",)
-    assert [(service.name, service.kind) for service in result.services] == [
-        ("database", "compose"),
-        ("search", "external"),
-    ]
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "tcp"),)
-    assert result.services[1].url == "https://search.example.test/api"
-    assert service_url_environment(result.services) == {
-        "SEARCH_URL": "https://search.example.test/api",
-    }
-    assert service_url_environment(
-        result.services, published_ports={("postgres", 5432, "tcp"): 49152}
-    ) == {
-        "DATABASE_URL": "postgres://127.0.0.1:49152/postgres",
-        "SEARCH_URL": "https://search.example.test/api",
-    }
+    assert not hasattr(result, "environment_files")
+    assert not hasattr(result, "package_managers")
+    assert not hasattr(result, "executables")
+    assert not hasattr(result, "services")
+    assert not hasattr(result, "compose_files")
+    assert not hasattr(result, "compose_profiles")
+    assert not hasattr(result, "compose_networks")
+    assert not hasattr(result, "compose_volumes")
+    assert not hasattr(result, "compose_build_services")
 
 
 def test_preserves_prepare_and_materialize_command_phases(
@@ -579,11 +456,20 @@ def test_preserves_prepare_and_materialize_command_phases(
     binary_dir.mkdir()
     _executable(binary_dir, "prepare-environment", "exit 0")
     _executable(binary_dir, "materialize-environment", "exit 0")
+    _executable(binary_dir, "example-test", "exit 0")
     plan = {
+        # A check, so the subject here stays the phases rather than the
+        # refusal a run with no check would take.
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
         "environment": {
             "prepare_commands": [{"argv": ["prepare-environment"]}],
             "materialize_commands": [{"argv": ["materialize-environment"]}],
-        }
+        },
     }
 
     result = _preflight(
@@ -591,7 +477,7 @@ def test_preserves_prepare_and_materialize_command_phases(
     ).validate(plan)
 
     assert isinstance(result, HostPreflightPlan)
-    assert result.commands == ()
+    assert [command.argv for command in result.commands] == [("example-test",)]
     assert [command.argv for command in result.prepare_commands] == [
         ("prepare-environment",)
     ]
@@ -600,32 +486,77 @@ def test_preserves_prepare_and_materialize_command_phases(
     ]
 
 
-def test_aggregates_missing_files_cwd_runtime_and_secret_with_evidence(
+def test_aggregates_cwd_runtime_and_secret_failures_with_evidence(
     committed_git_repo: Path,
 ) -> None:
     plan = _base_plan()
     plan["command_catalog"]["commands"][0]["cwd"] = "../outside"
     plan["command_catalog"]["commands"][0]["uses_services"] = []
+    plan["environment"]["prepare_commands"] = [
+        {"argv": ["example-runtime", "-m", "build"], "source": "pyproject.toml"}
+    ]
+    plan["required_secrets"][0]["used_by"] = ["environment"]
 
     result = _preflight(committed_git_repo).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 4
+    assert len(result.failures) == 3
     assert "repo-relative directory" in result.reason
-    assert "runtime.version" in result.reason
+    # The catalogue named a check; it was refused for its own shape, and that
+    # refusal is the reason. A second one saying none was named would be false.
+    assert "declares no command that verifies" not in result.reason
+    assert "referenced environment file must exist" not in result.reason
     assert "host executable is required: example-runtime" in result.reason
     assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
     assert "Betterborg will not install runtimes" in result.reason
     assert "pyproject.toml" in result.reason
 
 
-def test_toolchain_version_must_match_repository_evidence_and_host(
+def test_a_declared_environment_file_that_is_not_there_runs_anyway(
     committed_git_repo: Path,
 ) -> None:
+    """A lockfile the checkout gitignores is still a file the analysis names."""
+    binary_dir = committed_git_repo.parent / "declared-file-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "verifies": True,
+                }
+            ],
+        },
+        "environment": {"files": ["package-lock.json"]},
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
+
+
+def test_a_toolchain_version_the_host_does_not_satisfy_runs_anyway(
+    committed_git_repo: Path,
+) -> None:
+    """Every guard the comparison sat behind is cleared and it still runs.
+
+    The pinned file is here, it cites the pinned version, the toolchain's
+    program resolves, and a validated command invokes it, so the host's own
+    version is the only thing left that could refuse this run.
+    """
     binary_dir = committed_git_repo.parent / "version-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.12.1'")
-    (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
+    cited = committed_git_repo / "runtime.version"
+    cited.write_text("3.11.9\n", encoding="utf-8")
     plan = _base_plan()
     plan["command_catalog"]["commands"][0]["cwd"] = "."
     plan["command_catalog"]["commands"][0]["uses_services"] = []
@@ -636,152 +567,31 @@ def test_toolchain_version_must_match_repository_evidence_and_host(
         committed_git_repo, environment={"PATH": str(binary_dir)}
     ).validate(plan)
 
-    assert isinstance(result, HostPreflightBlock)
-    assert "must satisfy analyzer version '3.11.9'" in result.reason
-    assert "observed: example 3.12.1" in result.reason
-
-
-def test_version_probe_preserves_shim_dispatch_path(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "shim-bin"
-    binary_dir.mkdir()
-    dispatcher = _executable(
-        binary_dir,
-        "runtime-manager",
-        (
-            "test \"${0##*/} $1\" = 'python3 --version' "
-            "&& echo 'Python 3.13.7'"
-        ),
-    )
-    shim = binary_dir / "python3"
-    shim.symlink_to(dispatcher.name)
-    (committed_git_repo / ".python-version").write_text(
-        "3.13.7\n", encoding="utf-8"
-    )
-    plan = {
-        "environment": {
-            "files": [".python-version"],
-            "toolchains": [
-                {
-                    "name": "python3",
-                    "version": "3.13.7",
-                    "source": ".python-version",
-                }
-            ],
-        }
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
     assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].path == shim
-    assert result.executables[0].path.is_symlink()
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
 
 
-def test_go_version_probe_uses_supported_command_and_output(
+def test_a_toolchain_citing_a_file_that_is_not_there_runs_anyway(
     committed_git_repo: Path,
 ) -> None:
-    binary_dir = committed_git_repo.parent / "go-bin"
-    binary_dir.mkdir()
-    _executable(
-        binary_dir,
-        "go",
-        "test \"$1\" = version && echo 'go version go1.24.2 linux/amd64'",
-    )
-    (committed_git_repo / "go.mod").write_text(
-        "module example.test/project\n\ngo 1.24.2\n", encoding="utf-8"
-    )
-    plan = {
-        "environment": {
-            "files": ["go.mod"],
-            "toolchains": [
-                {"name": "go", "version": "1.24.2", "source": "go.mod"}
-            ],
-        }
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].version == "1.24.2"
-
-
-@pytest.mark.parametrize(
-    "optional_version",
-    [{}, {"version": None}],
-    ids=["omitted", "null"],
-)
-def test_unpinned_toolchain_only_requires_available_executable(
-    committed_git_repo: Path,
-    optional_version: dict[str, None],
-) -> None:
-    binary_dir = committed_git_repo.parent / f"{committed_git_repo.name}-unpinned-bin"
-    binary_dir.mkdir()
-    executable = _executable(binary_dir, "python", "exit 7")
-    plan = {
-        "environment": {
-            "toolchains": [{"name": "python", **optional_version}],
-        }
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].name == "python"
-    assert result.executables[0].path == executable
-    assert result.executables[0].version is None
-
-
-def test_rust_toolchain_resolves_and_probes_rustc(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "rust-bin"
-    binary_dir.mkdir()
-    rustc = _executable(
-        binary_dir,
-        "rustc",
-        "test \"$1\" = --version && echo 'rustc 1.88.0 (example)'",
-    )
-    (committed_git_repo / "rust-toolchain.toml").write_text(
-        '[toolchain]\nchannel = "1.88.0"\n', encoding="utf-8"
-    )
-    plan = {
-        "environment": {
-            "toolchains": [
-                {
-                    "name": "rust",
-                    "version": "1.88.0",
-                    "source": "rust-toolchain.toml",
-                }
-            ],
-        }
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.executables[0].name == "rustc"
-    assert result.executables[0].path == rustc
-    assert result.executables[0].version == "1.88.0"
-
-
-def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
-    committed_git_repo: Path,
-) -> None:
+    """A cited version source is evidence a person reads, not a requirement."""
     binary_dir = committed_git_repo.parent / "cited-version-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "verifies": True,
+                }
+            ],
+        },
         "environment": {
             "files": ["runtime.version"],
             "toolchains": [
@@ -791,251 +601,234 @@ def test_missing_cited_toolchain_file_is_not_masked_by_environment_files(
                     "source": "missing.version",
                 }
             ],
-        }
+        },
     }
 
     result = _preflight(
         committed_git_repo, environment={"PATH": str(binary_dir)}
     ).validate(plan)
 
-    assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert "version evidence file must exist" in result.reason
-    assert "missing.version" in result.reason
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-runtime", "-m", "pytest")
+    ]
 
 
 def test_command_derived_failures_retain_exact_source_evidence(
     committed_git_repo: Path,
 ) -> None:
     source = "pyproject.toml#tool.pytest.ini_options"
+    binary_dir = committed_git_repo.parent / "evidence-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "exit 0")
     plan = {
         "command_catalog": {
             "commands": [
                 {
                     "stage": "test",
-                    "argv": ["missing-runtime", "-m", "pytest"],
+                    "argv": ["example-runtime", "-m", "pytest"],
                     "source": source,
                     "required_secrets": ["PACKAGE_TOKEN"],
                     "uses_services": ["database"],
                 }
             ]
+        },
+        "environment": {
+            "prepare_commands": [{"argv": ["missing-runtime"], "source": source}]
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    # The command names a service no dependency declares, which is no longer
+    # anything to refuse.
+    assert len(result.failures) == 2
+    assert all(failure.evidence == source for failure in result.failures)
+    assert "host executable is required: missing-runtime" in result.reason
+    assert "undeclared required secret: PACKAGE_TOKEN" in result.reason
+    assert "database" not in result.reason
+
+
+def test_person_readable_toolchain_inventory_does_not_block_a_run(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "inventory-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "exit 0")
+    plan = {
+        "command_catalog": {
+            "commands": [{"stage": "test", "argv": ["example-runtime"]}]
+        },
+        "environment": {
+            "package_managers": ["Go modules"],
+            "toolchains": [{"name": "Node.js"}, {"name": "Go modules"}],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.dropped_commands == ()
+    assert [command.argv for command in result.commands] == [("example-runtime",)]
+
+
+def test_command_with_no_host_program_is_dropped_and_named(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "partial-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint", "--all"]},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime", "-m", "pytest"],
+                    "source": "pyproject.toml#test",
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-lint", "--all")
+    ]
+    assert [dropped.command.argv for dropped in result.dropped_commands] == [
+        ("missing-runtime", "-m", "pytest")
+    ]
+    assert result.dropped_command_summary == (
+        "1 sanity command dropped: missing-runtime -m pytest: host executable "
+        "is not available: missing-runtime (evidence: pyproject.toml#test)"
+    )
+
+
+def test_environment_command_program_is_still_required(
+    committed_git_repo: Path,
+) -> None:
+    plan = {
+        "environment": {
+            "prepare_commands": [{"argv": ["missing-runtime", "install"]}]
         }
     }
 
     result = _preflight(committed_git_repo).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 3
-    assert all(failure.evidence == source for failure in result.failures)
     assert "host executable is required: missing-runtime" in result.reason
-    assert "undeclared required secret: PACKAGE_TOKEN" in result.reason
-    assert "exactly one analyzer dependency: database" in result.reason
 
 
-@pytest.mark.parametrize(
-    ("service", "external_urls", "expected"),
-    [
-        (
-            {"name": "dependency", "source": "app.toml#dependency"},
-            {},
-            "ambiguous or inferred",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://exa mple.test/api"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://example.test:not-a-port/api"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "localhost:9000"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://["},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-    ],
-)
-def test_selected_service_must_be_explicit_and_external_url_supplied(
+def test_the_preparation_command_that_runs_must_be_runnable(
     committed_git_repo: Path,
-    service: dict[str, object],
-    external_urls: dict[str, str],
-    expected: str,
 ) -> None:
-    binary_dir = committed_git_repo.parent / f"{committed_git_repo.name}-service-bin"
+    """Both lists are declared, so the materialize list prepares the worktree.
+
+    A host that cannot run its program fails every task individually instead
+    of refusing the run once, so the refusal belongs here and names it.
+    """
+    binary_dir = committed_git_repo.parent / "selected-preparation-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "prepare-environment", "exit 0")
     plan = {
         "command_catalog": {
+            "source": "pyproject.toml",
             "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["dependency"],
-                }
-            ]
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
         },
-        "service_dependencies": [service],
+        "environment": {
+            "prepare_commands": [{"argv": ["prepare-environment"]}],
+            "materialize_commands": [{"argv": ["absent-materializer", "sync"]}],
+        },
     }
 
     result = _preflight(
         committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan, external_urls=external_urls)
+    ).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert expected in result.reason
-    assert "app.toml#dependency" in result.reason
-
-
-def test_compose_url_environment_requires_an_exact_service_port(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-url-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _compose_executable(binary_dir)
-    (committed_git_repo / "package").mkdir()
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
-    plan = _base_plan()
-    del plan["service_dependencies"][0]["port"]
-
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "DATABASE_URL requires an exact port" in result.reason
-
-def test_compose_url_environment_does_not_infer_a_multi_port_target(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _compose_executable(binary_dir)
-    (committed_git_repo / "package").mkdir()
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
-    plan = _base_plan()
-    dependencies = plan["service_dependencies"]
-    assert isinstance(dependencies, list)
-    database = dependencies[0]
-    assert isinstance(database, dict)
-    del database["port"]
-    database["ports"] = [
-        {"port": 5432, "protocol": "udp", "env": "POSTGRES_PORT"},
-        {"port": 9187, "protocol": "tcp", "env": "METRICS_URL"},
+    assert [failure.requirement for failure in result.failures] == [
+        "host executable is required: absent-materializer"
     ]
 
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
 
-    assert isinstance(result, HostPreflightBlock)
-    assert "DATABASE_URL requires an exact port" in result.reason
-
-    database["port"] = 5432
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
-    assert result.services[0].port_targets == (
-        ("POSTGRES_PORT", 5432, "udp"),
-        ("METRICS_URL", 9187, "tcp"),
-    )
-    assert service_url_environment(
-        result.services,
-        published_ports={
-            ("postgres", 5432, "udp"): 49152,
-            ("postgres", 9187, "tcp"): 49153,
-        },
-    )["POSTGRES_PORT"] == "49152"
-
-
-def test_missing_compose_metadata_and_plugin_block_before_claim(
+def test_the_preparation_command_that_will_not_run_needs_no_program(
     committed_git_repo: Path,
 ) -> None:
-    binary_dir = committed_git_repo.parent / "compose-bin"
+    """A program nothing will invoke is not a program this host needs.
+
+    The materialize list prepares the worktree, so the prepare list never
+    runs and its program is neither required nor dropped.
+    """
+    binary_dir = committed_git_repo.parent / "unselected-preparation-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _executable(binary_dir, "docker", "exit 1")
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "materialize-environment", "exit 0")
     plan = {
         "command_catalog": {
+            "source": "pyproject.toml",
             "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
         },
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#postgres",
-            }
-        ],
+        "environment": {
+            "prepare_commands": [{"argv": ["absent-preparer", "install"]}],
+            "materialize_commands": [{"argv": ["materialize-environment"]}],
+        },
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.dropped_commands == ()
+
+
+def test_both_declared_preparation_lists_are_shape_checked(
+    committed_git_repo: Path,
+) -> None:
+    """A malformed command is a malformed analysis whichever list is selected.
+
+    Only runnability follows the selection, so both halves of the shape check
+    refuse the analysis in either list: an argument list that is not one, and
+    a working directory that is not in this checkout. The prepare list here
+    never runs and is checked anyway; the materialize list is checked before
+    anything has selected it.
+    """
+    binary_dir = committed_git_repo.parent / "unselected-shape-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "materialize-environment", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "prepare_commands": [
+                {"argv": []},
+                {"argv": ["prepare-environment"], "cwd": "absent-directory"},
+            ],
+            "materialize_commands": [
+                {"argv": ["materialize-environment"]},
+                {"argv": ["materialize-environment"], "cwd": "absent-directory"},
+            ],
+        },
     }
 
     result = _preflight(
@@ -1043,284 +836,1011 @@ def test_missing_compose_metadata_and_plugin_block_before_claim(
     ).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert "Compose metadata is required" in result.reason
-    assert "Docker Compose plugin must be available" in result.reason
-    assert "compose.yml#postgres" in result.reason
+    assert [failure.requirement for failure in result.failures] == [
+        "prepare command 1 must have a non-empty argv",
+        "prepare command cwd must be an existing repo-relative directory: "
+        "'absent-directory'",
+        "materialize command cwd must be an existing repo-relative directory: "
+        "'absent-directory'",
+    ]
+
+
+def test_secret_named_only_by_a_dropped_command_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "secret-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"]},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                },
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            },
+            {
+                "name": "DEPLOY_TOKEN",
+                "used_by": ["deploy"],
+                "scope": "build",
+                "source": ".github/workflows/deploy.yml",
+            },
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("DEPLOY_TOKEN", "PACKAGE_TOKEN")
+
+
+def test_a_secret_a_surviving_command_consumes_still_blocks(
+    committed_git_repo: Path,
+) -> None:
+    """Following the commands must not become excusing every secret.
+
+    The surviving half of the rule is the load-bearing one: a command that
+    will run and needs a secret still cannot run without it, and finding that
+    out at preflight is the whole point of asking.
+    """
+    binary_dir = committed_git_repo.parent / "surviving-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "PACKAGE_TOKEN" in result.reason
+
+
+def test_agent_scoped_secret_blocks_because_the_agents_always_run(
+    committed_git_repo: Path,
+) -> None:
+    plan = {
+        "required_secrets": [
+            {
+                "name": "AGENT_TOKEN",
+                "used_by": ["coding"],
+                "scope": "agent",
+                "source": "AGENTS.md",
+            }
+        ]
+    }
+
+    result = _preflight(committed_git_repo).validate(
+        plan, available_secret_names=set()
+    )
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: AGENT_TOKEN" in result.reason
+
+
+def test_identically_repeated_secret_records_are_accepted(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "repeated-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["build", "test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            },
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test", "build"],
+                "scope": "build",
+                "source": ".github/workflows/release.yml",
+            },
+        ]
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(
+        plan, available_secret_names={"PACKAGE_TOKEN"}
+    )
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.secret_requirements == (
+        HostSecret(
+            "PACKAGE_TOKEN",
+            "build",
+            ("build", "test"),
+            ".github/workflows/ci.yml",
+        ),
+    )
 
 
 @pytest.mark.parametrize(
-    ("compose_version", "supported"),
-    [("2.24.3", False), ("2.24.4", True)],
+    ("repeated", "expected"),
+    [
+        (
+            {"used_by": ["test"], "scope": "agent"},
+            "disagree on scope 'build' and 'agent'",
+        ),
+    ],
+    ids=["scope"],
 )
-def test_compose_plugin_must_support_runtime_overrides(
+def test_conflicting_repeated_secret_records_say_what_disagrees(
     committed_git_repo: Path,
-    compose_version: str,
-    supported: bool,
+    repeated: dict[str, object],
+    expected: str,
 ) -> None:
-    binary_dir = (
-        committed_git_repo.parent / f"{committed_git_repo.name}-compose-version-bin"
-    )
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir, version=compose_version)
-    compose_file = committed_git_repo / "compose.yml"
-    compose_file.write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
     plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
+        "required_secrets": [
             {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    if supported:
-        assert isinstance(result, HostPreflightPlan)
-        return
-    assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert "Docker Compose 2.24.4 or newer is required" in result.reason
-    assert f"Docker Compose v{compose_version}" in result.reason
-    assert "Upgrade the Docker Compose plugin" in result.reason
-
-
-def test_compose_topology_is_validated_before_a_plan_is_returned(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-topology-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(
-        binary_dir,
-        model={
-            "services": {
-                "postgres": {
-                    "volumes": [
-                        {
-                            "type": "bind",
-                            "source": "/var/lib/example",
-                            "target": "/data",
-                        }
-                    ]
-                }
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
             },
-            "networks": {"backend": {}},
-            "volumes": {"database": {}},
-        },
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
             {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
+                "name": "PACKAGE_TOKEN",
+                "source": ".github/workflows/release.yml",
+                **repeated,
+            },
+        ]
     }
 
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
+    result = _preflight(committed_git_repo).validate(
+        plan, available_secret_names={"PACKAGE_TOKEN"}
+    )
 
     assert isinstance(result, HostPreflightBlock)
-    assert "selected Compose service topology must be isolated" in result.reason
-    assert "writable bind mounts cannot be isolated" in result.reason
-    assert "postgres.volumes[0]" in result.reason
+    assert "required secret name must be unambiguous: PACKAGE_TOKEN" in (
+        result.reason
+    )
+    assert expected in result.reason
+    assert ".github/workflows/ci.yml, .github/workflows/release.yml" in (
+        result.reason
+    )
 
 
-def test_preserves_ordered_compose_stack_and_active_profiles(
+def test_repeated_secret_records_accumulate_the_purposes_they_name(
     committed_git_repo: Path,
 ) -> None:
-    binary_dir = committed_git_repo.parent / "compose-stack-bin"
+    """Two workflows needing one secret is not a disagreement about it.
+
+    Scope decides how a value is supplied and cannot be two things at once.
+    What each workflow wants the secret for accumulates, and refusing the run
+    over that stops it for a secret nothing disagrees about, while keeping
+    only the first record would leave it unrequired for the stage the second
+    is the sole evidence for.
+    """
+    binary_dir = committed_git_repo.parent / "merged-secret-bin"
     binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir)
-    for name in ("compose.yml", "compose.test.yml", "compose.fragment.yml"):
-        (committed_git_repo / name).write_text(
-            "services:\n  postgres:\n    image: postgres:16\n",
-            encoding="utf-8",
-        )
-    analyzer_payload = {
-        "summary": "A repository with a multi-file Compose service stack.",
-        "primary_language": "python",
-        "is_monorepo": False,
-        "packages": [
-            {
-                "path": ".",
-                "name": "root",
-                "primary_language": "python",
-                "rubric": {
-                    dimension: {
-                        "score": 3,
-                        "evidence": f"README.md describes {dimension}",
-                    }
-                    for dimension in DIMENSIONS
-                },
-            }
-        ],
-        "recommendations": [],
-        "themes": [],
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                    "source": "README.md#test",
-                }
-            ],
-            "source": "README.md",
-        },
-        "compose": {
-            "file": "compose.yml",
-            "files": [
-                {
-                    "path": "compose.yml",
-                    "services": ["postgres"],
-                    "source": "compose.yml",
-                },
-                {
-                    "path": "compose.test.yml",
-                    "profiles": ["test"],
-                    "services": ["postgres"],
-                    "source": "compose.test.yml",
-                },
-                {
-                    "path": "compose.fragment.yml",
-                    "source": "compose.fragment.yml",
-                },
-            ],
-            "profiles": ["test", "integration"],
-            "source": "compose.yml",
-        },
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    repository = Repository(root=committed_git_repo)
-    adapter = MockAdapter(name="openai").queue(
-        MockResponse(payload=analyzer_payload)
-    )
-    with SqliteStore.open(committed_git_repo / "state.sqlite3") as store:
-        store.add_repository(repository)
-        analysis = run_analyzer(
-            repository,
-            store,
-            adapter,
-            artifact_dir=committed_git_repo / "artifacts",
-        )
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(analysis.analysis_json)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.compose_files == (
-        committed_git_repo / "compose.yml",
-        committed_git_repo / "compose.test.yml",
-        committed_git_repo / "compose.fragment.yml",
-    )
-    assert result.compose_profiles == ("test", "integration")
-
-
-def test_accepts_singular_compose_file_without_service_index(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "single-compose-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir)
-    compose_file = committed_git_repo / "compose.yml"
-    compose_file.write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
+    _executable(binary_dir, "example-test", "exit 0")
+    _executable(binary_dir, "example-release", "exit 0")
     plan = {
         "command_catalog": {
+            "source": "pyproject.toml",
             "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
+                {"stage": "test", "argv": ["example-test"]},
+                {"stage": "release", "argv": ["example-release"]},
+            ],
         },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
+        "required_secrets": [
             {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.compose_files == (compose_file,)
-
-
-def test_unused_service_does_not_require_docker_or_external_url(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "unused-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    plan = {
-        "command_catalog": {
-            "commands": [{"stage": "build", "argv": ["available-command"]}]
-        },
-        "service_dependencies": [
-            {"name": "ambiguous", "source": "example.env"},
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            },
             {
-                "name": "external",
-                "url_env": "UNSUPPLIED_URL",
-                "source": "app.toml",
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["release"],
+                "scope": "build",
+                "source": ".github/workflows/release.yml",
             },
         ],
     }
 
     result = _preflight(
         committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("PACKAGE_TOKEN",)
+    secret = next(
+        item
+        for item in result.secret_requirements
+        if item.name == "PACKAGE_TOKEN"
+    )
+    assert set(secret.used_by) == {"test", "release"}
+
+
+def test_host_that_satisfies_everything_produces_the_unchanged_plan(
+    committed_git_repo: Path,
+) -> None:
+    binary_dir = committed_git_repo.parent / "complete-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
+    _executable(binary_dir, "npm", "exit 0")
+    (committed_git_repo / "runtime.version").write_text(
+        "3.11.9\n", encoding="utf-8"
+    )
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-runtime", "-m", "pytest"],
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "environment": {
+            "files": ["runtime.version"],
+            "package_managers": ["npm"],
+            "toolchains": [
+                {
+                    "name": "example-runtime",
+                    "version": "3.11.9",
+                    "source": "runtime.version",
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["test"],
+                "scope": "build",
+                "source": "pyproject.toml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert result == HostPreflightPlan(
+        repository_root=committed_git_repo.resolve(),
+        commands=(
+            HostCommand(
+                "test",
+                ("example-runtime", "-m", "pytest"),
+                ".",
+                "pyproject.toml",
+            ),
+        ),
+        prepare_commands=(),
+        materialize_commands=(),
+        required_secret_names=("PACKAGE_TOKEN",),
+        secret_requirements=(
+            HostSecret("PACKAGE_TOKEN", "build", ("test",), "pyproject.toml"),
+        ),
+    )
+
+
+def test_the_gate_runs_only_the_commands_that_declare_they_verify(
+    committed_git_repo: Path,
+) -> None:
+    """The catalogue lists what a repository can do; the gate proves a change.
+
+    A docs watch server and a test target are one word apart in a package
+    manifest, so the entry says which of them settles whether a change broke
+    the repository, and only that one runs.
+    """
+    binary_dir = committed_git_repo.parent / "verifies-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "run", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "docs-development",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
     ).validate(plan)
 
     assert isinstance(result, HostPreflightPlan)
-    assert result.services == ()
-    assert result.compose_files == ()
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "run", "test")
+    ]
+    assert result.dropped_commands == ()
+
+
+def test_a_catalogue_that_declares_nothing_runs_every_command(
+    committed_git_repo: Path,
+) -> None:
+    """An analysis recorded before the question was asked answers it by silence.
+
+    Treating that silence as "not a check" would quietly stop running a
+    repository's tests, and the run would look exactly like one that passed
+    them.
+    """
+    binary_dir = committed_git_repo.parent / "silent-catalogue-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {"stage": "test", "argv": ["example-npm", "run", "test"]},
+                {"stage": "build", "argv": ["example-npm", "run", "build"]},
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "run", "test"),
+        ("example-npm", "run", "build"),
+    ]
+
+
+def test_a_secret_only_a_non_verifying_command_names_does_not_block(
+    committed_git_repo: Path,
+) -> None:
+    """A command the gate will not run states no requirement for the run."""
+    binary_dir = committed_git_repo.parent / "publish-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "run", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                    "required_secrets": ["NPM_PUBLISH_TOKEN"],
+                },
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "NPM_PUBLISH_TOKEN",
+                "used_by": ["release"],
+                "scope": "build",
+                "source": "package.json#release",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("NPM_PUBLISH_TOKEN",)
+
+
+def test_a_surviving_command_makes_the_secret_it_names_this_runs_requirement(
+    committed_git_repo: Path,
+) -> None:
+    """The command that names the secret says it needs it.
+
+    Nothing in the analyzer contract makes a secret's used_by spell a catalog
+    stage; a workflow-derived record plausibly names the job instead. Matching
+    only on that string lets a secret a running command declared slip through
+    preflight and fail the command at sanity, after coding, review and merge
+    have been paid for.
+    """
+    binary_dir = committed_git_repo.parent / "named-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["ci"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: PACKAGE_TOKEN" in result.reason
+
+
+def test_a_host_that_can_run_no_catalogued_check_is_refused_before_the_spend(
+    committed_git_repo: Path,
+) -> None:
+    """Dropping is a trade, and it stops paying when nothing survives.
+
+    A run with no check left cannot publish anything: every task would be
+    coded, reviewed and merged, and every one would then block. The refusal
+    the stage removed was worth keeping for exactly this case, where the
+    alternative is not a stricter run but the same no run, after the spend.
+    """
+    plan = {
+        "command_catalog": {
+            "source": "Cargo.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["absent-cargo", "test"],
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "no catalogued check can run on this host" in result.reason
+    # The program, not the command: a refusal reason is never redacted, and a
+    # catalogued argv can carry a secret the repository spelled into a script.
+    assert "absent-cargo" in result.reason
+    assert "absent-cargo test" not in result.reason
+
+
+def test_a_catalogue_declaring_no_check_is_refused_before_the_spend(
+    committed_git_repo: Path,
+) -> None:
+    """A catalogue of servers and deploys leaves the same run as a dropped one.
+
+    Nothing left could prove a change safe, so every task would be coded,
+    reviewed and merged and every one would then block. The refusal belongs
+    where the other empty gate is refused, and the reason has to name the
+    declaration that emptied it.
+    """
+    binary_dir = committed_git_repo.parent / "no-check-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "docs-development",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                },
+                {
+                    "stage": "release",
+                    "argv": ["example-npm", "run", "release"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "declares no command that verifies the repository" in result.reason
+    assert "package.json" in result.reason
+
+
+def test_a_non_verifying_command_requires_no_program_and_is_not_a_drop(
+    committed_git_repo: Path,
+) -> None:
+    """A command the gate will not run states no requirement of the host.
+
+    Nor is it a dropped check: nothing was given up, so naming it beside the
+    checks this host could not run would report a loss the run did not take.
+    """
+    binary_dir = committed_git_repo.parent / "non-verifying-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "deploy",
+                    "argv": ["absent-deployer", "ship"],
+                    "verifies": False,
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [("example-test",)]
+    assert result.dropped_commands == ()
+    assert result.dropped_command_summary == ""
+
+
+def test_the_secret_a_command_named_reaches_the_command_that_named_it(
+    committed_git_repo: Path,
+) -> None:
+    """Requiring a secret and delivering it must answer the same question.
+
+    Preflight makes the operator configure a secret because a command said it
+    needs one. If the phase that runs the command answers "which commands ask"
+    differently, the command runs without it and fails after coding, review
+    and merge have been paid for: the whole failure preflight exists to move
+    forward in time, moved back again.
+    """
+    from betterborg_cli.host_execution.environment import (
+        command_secret_environment,
+    )
+
+    binary_dir = committed_git_repo.parent / "delivered-secret-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                # The workflow job, not the catalog stage.
+                "used_by": ["ci"],
+                "scope": "build",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ("PACKAGE_TOKEN",)
+    environment = command_secret_environment(
+        result, result.commands[0].stage, {}, {"PACKAGE_TOKEN": "s3cr3t"}
+    )
+    assert environment == {"PACKAGE_TOKEN": "s3cr3t"}
+
+
+def test_a_materialize_command_the_host_cannot_run_still_refuses_the_run(
+    committed_git_repo: Path,
+) -> None:
+    """Materialize builds the run itself, so it is never dropped."""
+    plan = {
+        "environment": {
+            "materialize_commands": [{"argv": ["missing-runtime", "sync"]}]
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "host executable is required: missing-runtime" in result.reason
+
+
+def test_a_scope_all_secret_blocks_whatever_the_commands_name(
+    committed_git_repo: Path,
+) -> None:
+    """Scope 'all' reaches every phase, so no command has to ask for it."""
+    binary_dir = committed_git_repo.parent / "scope-all-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "SHARED_TOKEN",
+                "used_by": ["deploy"],
+                "scope": "all",
+                "source": ".env.example",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "required secret is not configured: SHARED_TOKEN" in result.reason
+
+
+def test_a_program_named_by_path_is_resolved_against_its_own_directory(
+    committed_git_repo: Path,
+) -> None:
+    """A bare name is found on PATH; a path is found where the command runs."""
+    tools = committed_git_repo / "tools"
+    tools.mkdir()
+    _executable(tools, "check.sh", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["./check.sh"],
+                    "cwd": "tools",
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo, environment={"PATH": ""}).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [("./check.sh",)]
+    assert result.dropped_commands == ()
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [None, {"source": "Makefile"}, {"source": "Makefile", "commands": []}],
+    ids=["no-catalog", "no-commands-key", "empty-commands"],
+)
+def test_an_analysis_naming_no_check_at_all_is_refused(
+    committed_git_repo: Path,
+    catalog: dict[str, object] | None,
+) -> None:
+    """The commonest way to hold no check is to have catalogued nothing.
+
+    The command catalog is optional, and the analyzer is told to omit a
+    category it has no evidence for, so this is a state the producer is
+    instructed to reach. It leaves the same run as a catalog of servers: every
+    task coded, reviewed and merged, and every one blocked at the end.
+    """
+    plan: dict[str, object] = {}
+    if catalog is not None:
+        plan["command_catalog"] = catalog
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "declares no command that verifies the repository" in result.reason
+
+
+def test_a_secret_declared_without_a_valid_scope_is_refused(
+    committed_git_repo: Path,
+) -> None:
+    """A declaration the operator can fix is refused, not silently skipped.
+
+    Dropping the record instead would let a command reference a secret the
+    run never resolves, turning an analysis the operator could correct into
+    a failure inside a task.
+    """
+    binary_dir = committed_git_repo.parent / "invalid-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {"name": "PACKAGE_TOKEN", "scope": "everywhere", "used_by": ["test"]}
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightBlock)
+    assert [failure.requirement for failure in result.failures] == [
+        "required secret 'PACKAGE_TOKEN' must declare a valid scope "
+        "and non-empty used_by stages"
+    ]
+
+
+def test_a_command_naming_an_agent_scoped_secret_is_refused(
+    committed_git_repo: Path,
+) -> None:
+    """Requiring and delivering must be able to agree, or the run cannot work.
+
+    An agent-scoped secret reaches the agent phases and no command. Accepting
+    a command that names one makes the operator configure a value nothing will
+    hand to that command, and the command fails at sanity after coding, review
+    and merge have been paid for.
+    """
+    binary_dir = committed_git_repo.parent / "agent-scope-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "required_secrets": ["PACKAGE_TOKEN"],
+                }
+            ],
+        },
+        "required_secrets": [
+            {
+                "name": "PACKAGE_TOKEN",
+                "used_by": ["ci"],
+                "scope": "agent",
+                "source": ".github/workflows/ci.yml",
+            }
+        ],
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names={"PACKAGE_TOKEN"})
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "scoped to the agents but named by a command that runs" in result.reason
+    assert "PACKAGE_TOKEN" in result.reason
+    assert "test" in result.reason
+
+
+def test_a_secret_only_a_dropped_command_names_is_not_required_to_be_declared(
+    committed_git_repo: Path,
+) -> None:
+    """Following the commands covers the undeclared case as well as the named one.
+
+    A dropped command's requirements are not this run's, so a secret only it
+    names is not one the analysis had to declare either.
+    """
+    binary_dir = committed_git_repo.parent / "undeclared-drop-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-lint", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "lint", "argv": ["example-lint"], "verifies": True},
+                {
+                    "stage": "test",
+                    "argv": ["missing-runtime"],
+                    "verifies": True,
+                    "required_secrets": ["GHOST_TOKEN"],
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan, available_secret_names=set())
+
+    assert isinstance(result, HostPreflightPlan)
+    assert result.required_secret_names == ()
+    assert [dropped.command.argv[0] for dropped in result.dropped_commands] == [
+        "missing-runtime"
+    ]
+
+
+def test_a_non_verifying_command_needs_no_directory_of_this_host(
+    committed_git_repo: Path,
+) -> None:
+    """Whether a directory is here is a fact about this checkout.
+
+    A command the gate will never enter does not need it: an uninitialised
+    docs submodule would otherwise refuse the whole run over a directory
+    nothing opens. The shape of the path is still the analysis's to get right.
+    """
+    binary_dir = committed_git_repo.parent / "absent-dir-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "test"],
+                    "verifies": True,
+                },
+                {
+                    "stage": "docs",
+                    "argv": ["example-npm", "run", "dev"],
+                    "verifies": False,
+                    "cwd": "website",
+                },
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightPlan)
+    assert [command.argv for command in result.commands] == [
+        ("example-npm", "test")
+    ]
+
+
+def test_a_verifying_command_still_needs_its_directory_to_exist(
+    committed_git_repo: Path,
+) -> None:
+    """The gate will enter this one, so the directory has to be there."""
+    binary_dir = committed_git_repo.parent / "present-dir-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-npm", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "package.json",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-npm", "test"],
+                    "verifies": True,
+                    "cwd": "website",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "repo-relative directory" in result.reason
+
+
+def test_the_refusal_does_not_quote_a_catalogued_command_verbatim(
+    committed_git_repo: Path,
+) -> None:
+    """A block reason is never redacted, so it must quote nothing secret.
+
+    It reaches the terminal and the headless payload, and a repository that
+    spells a token into a script has it in the analysis.
+    """
+    plan = {
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["absent-runner", "--token", "s3cr3t-value"],
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "absent-runner" in result.reason
+    assert "s3cr3t-value" not in result.reason
+
+
+def test_a_catalogue_refused_for_its_own_shape_is_not_reported_as_empty(
+    committed_git_repo: Path,
+) -> None:
+    """A refusal says one true thing about why the run stopped.
+
+    The catalogue named a check. It was rejected for the directory it names,
+    and that rejection is the reason. Telling the operator the analysis names
+    no check as well sends them to the wrong file.
+    """
+    binary_dir = committed_git_repo.parent / "refused-shape-bin"
+    binary_dir.mkdir()
+    _executable(binary_dir, "example-test", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "Makefile",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["example-test"],
+                    "verifies": True,
+                    "cwd": "absent-directory",
+                }
+            ],
+        }
+    }
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "repo-relative directory" in result.reason
+    assert "declares no command that verifies" not in result.reason

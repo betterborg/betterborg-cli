@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
@@ -21,7 +20,6 @@ from betterborg_cli.store.models import (
     AgentAttempt,
     Borg,
     BorgState,
-    ComposeResource,
     EnvironmentAttempt,
     ExecutionAttemptStatus,
     ExecutionDecision,
@@ -1077,7 +1075,12 @@ class SqliteStore:
         return _row_to_execution_decision(row) if row is not None else None
 
     def _promote_published_task_generation(
-        self, generation_id: UUID, *, durable_root: Path
+        self,
+        generation_id: UUID,
+        *,
+        durable_root: Path,
+        tasks_root: Path,
+        owned_root: Path,
     ) -> TaskGeneration:
         """Commit publication after ``TaskPublisher`` crosses its durable seam.
 
@@ -1086,6 +1089,11 @@ class SqliteStore:
         fsyncs the final tree before opening the current-generation transaction;
         ``TaskPublisher`` remains the sole production caller and has already
         crossed the stricter stage-and-rename boundaries when it invokes this.
+
+        Where Betterborg's own files live is ``RepoPaths``' to decide, so the
+        caller names both the published-task root and the root Betterborg owns
+        them under. What the store verifies independently is what only SQLite
+        knows: the Borg, the generation, and every file digest beneath them.
         """
         generation = self.get_task_generation(generation_id)
         if generation is None:
@@ -1096,9 +1104,7 @@ class SqliteStore:
         repository = self.get_repository(borg.repository_id)
         if repository is None:
             raise ValueError("task generation repository not found")
-        expected_root = (
-            repository.root / ".betterborg" / "tasks" / borg.name / str(generation.id)
-        )
+        expected_root = tasks_root / borg.name / str(generation.id)
         if durable_root != expected_root:
             raise ValueError("durable task generation path does not match SQLite")
         records = self.list_task_records(generation.id)
@@ -1113,9 +1119,7 @@ class SqliteStore:
             for relative in expected_files
         ):
             raise ValueError("durable task generation contains an unsafe path")
-        _verify_and_fsync_task_tree(
-            repository.root, durable_root, expected_files
-        )
+        _verify_and_fsync_task_tree(owned_root, durable_root, expected_files)
 
         promoted_at = utcnow()
         with self.transaction() as connection:
@@ -1629,11 +1633,7 @@ class SqliteStore:
                 },
                 created_at=transitioned_at,
             )
-            terminal_without_cleanup = (
-                new_status in _TERMINAL_TASK_STATUSES
-                and not self._claim_has_pending_compose(connection, claim_id)
-            )
-            if terminal_without_cleanup:
+            if new_status in _TERMINAL_TASK_STATUSES:
                 connection.execute(
                     "UPDATE task_claims SET released_at = ? WHERE id = ?",
                     (transitioned_at.isoformat(), str(claim_id)),
@@ -1650,8 +1650,8 @@ class SqliteStore:
         *,
         reason: str = "execution interrupted",
         now: datetime | None = None,
-    ) -> list[ComposeResource]:
-        """Cooperatively stop an owned run and return cleanup still required."""
+    ) -> None:
+        """Cooperatively stop a run this caller still owns."""
         interrupted_at = _execution_time(now)
         if not reason.strip():
             raise ValueError("execution interruption reason must not be empty")
@@ -1671,13 +1671,11 @@ class SqliteStore:
                     reason=reason,
                     event_kind="run.interrupted",
                 )
-            rows = self._stale_compose_rows(connection, run_id=run_id)
-        return [_row_to_compose_resource(row) for row in rows]
 
     def reconcile_expired_execution_runs(
         self, *, now: datetime | None = None
-    ) -> list[ComposeResource]:
-        """Interrupt every expired run and identify exact pending Compose resources."""
+    ) -> None:
+        """Interrupt every run whose lease expired, on any Borg."""
         reconciled_at = _execution_time(now)
         with self.transaction() as connection:
             expired = connection.execute(
@@ -1696,195 +1694,6 @@ class SqliteStore:
                     reason="execution lease expired",
                     event_kind="run.expired",
                 )
-            rows = self._stale_compose_rows(connection)
-        return [_row_to_compose_resource(row) for row in rows]
-
-    def list_stale_compose_resources(
-        self, run_id: UUID | None = None
-    ) -> list[ComposeResource]:
-        """Return stale resources whose exact project awaits teardown."""
-        with self.locked_connection() as connection:
-            rows = self._stale_compose_rows(connection, run_id=run_id)
-        return [_row_to_compose_resource(row) for row in rows]
-
-    def confirm_compose_project_cleanup(
-        self,
-        run_id: UUID,
-        task_id: UUID,
-        project_name: str,
-        *,
-        command: Iterable[str] | None = None,
-        now: datetime | None = None,
-    ) -> list[ComposeResource]:
-        """Record successful external teardown and release its blocked claim."""
-        cleaned_at = _execution_time(now)
-        if not project_name.strip():
-            raise ValueError("Compose project name must not be empty")
-        with self.transaction() as connection:
-            resources = connection.execute(
-                """
-                SELECT * FROM compose_resources
-                WHERE run_id = ? AND task_id = ? AND project_name = ?
-                ORDER BY created_at, id
-                """,
-                (str(run_id), str(task_id), project_name),
-            ).fetchall()
-            if not resources:
-                raise KeyError("Compose project identity not found")
-            self._reconcile_expired_claims(connection, run_id, now=cleaned_at)
-            pending = [
-                row
-                for row in resources
-                if not self._compose_resource_cleanup_confirmed(
-                    connection,
-                    run_id=run_id,
-                    task_id=task_id,
-                    resource_id=UUID(row["id"]),
-                )
-            ]
-            if pending:
-                command_payload = list(command or ())
-                self._insert_execution_event(
-                    connection,
-                    run_id=run_id,
-                    task_id=task_id,
-                    kind="compose.stopped",
-                    payload={
-                        "project_name": project_name,
-                        "resource_ids": [row["id"] for row in pending],
-                        "command": command_payload,
-                    },
-                    created_at=cleaned_at,
-                )
-                self._insert_execution_event(
-                    connection,
-                    run_id=run_id,
-                    task_id=task_id,
-                    kind="compose.cleanup_completed",
-                    payload={
-                        "project_name": project_name,
-                        "resource_ids": [row["id"] for row in pending],
-                        "command": command_payload,
-                    },
-                    created_at=cleaned_at,
-                )
-            claim_ids = {UUID(row["claim_id"]) for row in resources}
-            for claim_id in claim_ids:
-                if not self._claim_has_pending_compose(connection, claim_id):
-                    claim = connection.execute(
-                        "SELECT lease_expires_at FROM task_claims WHERE id = ?",
-                        (str(claim_id),),
-                    ).fetchone()
-                    cleanup_failures = connection.execute(
-                        """
-                        SELECT payload_json FROM execution_events
-                        WHERE run_id = ? AND task_id = ?
-                          AND kind = 'compose.cleanup_failed'
-                          AND json_extract(payload_json, '$.project_name') = ?
-                        """,
-                        (str(run_id), str(task_id), project_name),
-                    ).fetchall()
-                    reclaimable_statuses = {
-                        status.value for status in _ACTIVE_TASK_STATUSES
-                    } | {TaskRuntimeStatus.PENDING.value}
-                    reset_cleanup_block = any(
-                        json.loads(row["payload_json"]).get("previous_status")
-                        in reclaimable_statuses
-                        for row in cleanup_failures
-                    )
-                    self._release_reconciled_claim(
-                        connection,
-                        claim_id,
-                        now=cleaned_at,
-                        reason="Compose cleanup completed",
-                        force=(
-                            datetime.fromisoformat(claim["lease_expires_at"])
-                            <= cleaned_at
-                        ),
-                        reset_cleanup_block=reset_cleanup_block,
-                    )
-        return [_row_to_compose_resource(row) for row in resources]
-
-    def record_compose_cleanup_failure(
-        self,
-        run_id: UUID,
-        task_id: UUID,
-        project_name: str,
-        *,
-        command: Iterable[str],
-        error: str,
-        now: datetime | None = None,
-    ) -> bool:
-        """Persist a failed teardown only while its project remains pending."""
-        failed_at = _execution_time(now)
-        command_payload = list(command)
-        if not project_name.strip() or not command_payload or not error.strip():
-            raise ValueError("Compose cleanup failure details must not be empty")
-        with self.transaction() as connection:
-            resource = connection.execute(
-                """
-                SELECT resource.id
-                FROM compose_resources AS resource
-                WHERE resource.run_id = ?
-                  AND resource.task_id = ?
-                  AND resource.project_name = ?
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM execution_events AS event,
-                           json_each(event.payload_json, '$.resource_ids') AS cleaned
-                      WHERE event.run_id = resource.run_id
-                        AND event.task_id = resource.task_id
-                        AND event.kind = 'compose.cleanup_completed'
-                        AND cleaned.value = resource.id
-                  )
-                LIMIT 1
-                """,
-                (str(run_id), str(task_id), project_name),
-            ).fetchone()
-            if resource is None:
-                known = connection.execute(
-                    """
-                    SELECT 1 FROM compose_resources
-                    WHERE run_id = ? AND task_id = ? AND project_name = ?
-                    LIMIT 1
-                    """,
-                    (str(run_id), str(task_id), project_name),
-                ).fetchone()
-                if known is None:
-                    raise KeyError("Compose project identity not found")
-                return False
-            runtime = connection.execute(
-                "SELECT status FROM task_runtimes WHERE task_id = ?",
-                (str(task_id),),
-            ).fetchone()
-            if runtime is None:
-                raise KeyError("task runtime not found")
-            self._insert_execution_event(
-                connection,
-                run_id=run_id,
-                task_id=task_id,
-                kind="compose.cleanup_failed",
-                payload={
-                    "project_name": project_name,
-                    "command": command_payload,
-                    "error": error,
-                    "previous_status": runtime["status"],
-                },
-                created_at=failed_at,
-            )
-            reason = (
-                f"Compose cleanup failed for project {project_name!r}; command: "
-                f"{shlex.join(command_payload)}; {error}"
-            )
-            connection.execute(
-                """
-                UPDATE task_runtimes
-                SET status = 'blocked', state_reason = ?, updated_at = ?
-                WHERE task_id = ? AND status NOT IN ('done', 'failed')
-                """,
-                (reason, failed_at.isoformat(), str(task_id)),
-            )
-            return True
 
     @staticmethod
     def _insert_execution_run(
@@ -2040,22 +1849,9 @@ class SqliteStore:
                 payload={"claim_id": claim["id"], "reason": reason},
                 created_at=now,
             )
-            if self._claim_has_pending_compose(connection, claim_id):
-                connection.execute(
-                    """
-                    UPDATE task_runtimes SET state_reason = ?, updated_at = ?
-                    WHERE task_id = ? AND status NOT IN ('done', 'blocked', 'failed')
-                    """,
-                    (
-                        f"{reason}; awaiting Compose cleanup",
-                        now.isoformat(),
-                        claim["task_id"],
-                    ),
-                )
-            else:
-                self._release_reconciled_claim(
-                    connection, claim_id, now=now, reason=reason
-                )
+            self._release_reconciled_claim(
+                connection, claim_id, now=now, reason=reason
+            )
         self._insert_execution_event(
             connection,
             run_id=UUID(run["id"]),
@@ -2116,7 +1912,6 @@ class SqliteStore:
         now: datetime,
         reason: str,
         force: bool = False,
-        reset_cleanup_block: bool = False,
     ) -> None:
         claim = connection.execute(
             "SELECT * FROM task_claims WHERE id = ?", (str(claim_id),)
@@ -2141,9 +1936,7 @@ class SqliteStore:
             "UPDATE task_claims SET released_at = ? WHERE id = ?",
             (now.isoformat(), str(claim_id)),
         )
-        if runtime_status in _ACTIVE_TASK_STATUSES or (
-            runtime_status is TaskRuntimeStatus.BLOCKED and reset_cleanup_block
-        ):
+        if runtime_status in _ACTIVE_TASK_STATUSES:
             connection.execute(
                 """
                 UPDATE task_runtimes
@@ -2192,110 +1985,13 @@ class SqliteStore:
                 payload={"claim_id": claim["id"]},
                 created_at=now,
             )
-            if self._claim_has_pending_compose(connection, claim_id):
-                connection.execute(
-                    """
-                    UPDATE task_runtimes
-                    SET state_reason = ?, updated_at = ?
-                    WHERE task_id = ? AND status NOT IN ('done', 'blocked', 'failed')
-                    """,
-                    (
-                        "task claim expired; awaiting Compose cleanup",
-                        now.isoformat(),
-                        claim["task_id"],
-                    ),
-                )
-            else:
-                self._release_reconciled_claim(
-                    connection,
-                    claim_id,
-                    now=now,
-                    reason="task claim expired",
-                    force=True,
-                )
-
-    @staticmethod
-    def _claim_has_pending_compose(
-        connection: sqlite3.Connection, claim_id: UUID
-    ) -> bool:
-        row = connection.execute(
-            """
-            SELECT 1
-            FROM compose_resources AS resource
-            WHERE resource.claim_id = ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM execution_events AS event,
-                       json_each(event.payload_json, '$.resource_ids') AS cleaned
-                  WHERE event.run_id = resource.run_id
-                    AND event.task_id = resource.task_id
-                    AND event.kind = 'compose.cleanup_completed'
-                    AND cleaned.value = resource.id
-              )
-            LIMIT 1
-            """,
-            (str(claim_id),),
-        ).fetchone()
-        return row is not None
-
-    @staticmethod
-    def _compose_resource_cleanup_confirmed(
-        connection: sqlite3.Connection,
-        *,
-        run_id: UUID,
-        task_id: UUID,
-        resource_id: UUID,
-    ) -> bool:
-        row = connection.execute(
-            """
-            SELECT 1
-            FROM execution_events AS event,
-                 json_each(event.payload_json, '$.resource_ids') AS cleaned
-            WHERE event.run_id = ? AND event.task_id = ?
-              AND event.kind = 'compose.cleanup_completed'
-              AND cleaned.value = ?
-            LIMIT 1
-            """,
-            (str(run_id), str(task_id), str(resource_id)),
-        ).fetchone()
-        return row is not None
-
-    @staticmethod
-    def _stale_compose_rows(
-        connection: sqlite3.Connection, *, run_id: UUID | None = None
-    ) -> list[sqlite3.Row]:
-        filters = "AND resource.run_id = ?" if run_id is not None else ""
-        parameters = (str(run_id),) if run_id is not None else ()
-        return connection.execute(
-            f"""
-            SELECT resource.*
-            FROM compose_resources AS resource
-            JOIN execution_runs AS run ON run.id = resource.run_id
-            WHERE (
-                run.status != 'running'
-                OR EXISTS (
-                    SELECT 1 FROM execution_events AS expired
-                    WHERE expired.run_id = resource.run_id
-                      AND expired.task_id = resource.task_id
-                      AND expired.kind = 'task.claim_expired'
-                      AND json_extract(expired.payload_json, '$.claim_id') =
-                          resource.claim_id
-                )
-              )
-              {filters}
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM execution_events AS event,
-                       json_each(event.payload_json, '$.resource_ids') AS cleaned
-                  WHERE event.run_id = resource.run_id
-                    AND event.task_id = resource.task_id
-                    AND event.kind = 'compose.cleanup_completed'
-                    AND cleaned.value = resource.id
-              )
-            ORDER BY resource.project_name, resource.created_at, resource.id
-            """,
-            parameters,
-        ).fetchall()
+            self._release_reconciled_claim(
+                connection,
+                claim_id,
+                now=now,
+                reason="task claim expired",
+                force=True,
+            )
 
     def add_execution_run(self, run: ExecutionRun) -> None:
         """Persist a newly leased execution run."""
@@ -2778,26 +2474,18 @@ class SqliteStore:
         fingerprint: str,
         *,
         kind: str,
-        task_id: UUID | None = None,
+        task_id: UUID,
     ) -> EnvironmentAttempt | None:
-        """Return the newest successful attempt matching an exact descriptor.
+        """Return one task's newest successful attempt for an exact key.
 
-        Preparation caches are reusable across tasks and execution runs, while
-        checkout materialization is task-local.  The optional task filter lets
-        callers enforce that distinction without treating failed, cancelled,
-        or interrupted attempts as cache hits.
+        Failed, cancelled, and interrupted attempts are never returned, so a
+        caller reading this cannot mistake one for work already done.
         """
         if not fingerprint.strip() or not kind.strip():
             raise ValueError("environment fingerprint and kind must not be empty")
-        task_filter = (
-            "AND environment_attempts.task_id = ?" if task_id is not None else ""
-        )
-        parameters: list[str] = [fingerprint, kind]
-        if task_id is not None:
-            parameters.append(str(task_id))
         with self.locked_connection() as connection:
             row = connection.execute(
-                f"""
+                """
                 SELECT environment_attempts.*,
                        terminal.kind AS terminal_kind,
                        terminal.payload_json AS terminal_payload_json,
@@ -2811,7 +2499,7 @@ class SqliteStore:
                  )
                 WHERE environment_attempts.fingerprint = ?
                   AND environment_attempts.kind = ?
-                  {task_filter}
+                  AND environment_attempts.task_id = ?
                   AND (
                     (
                       terminal.kind = 'environment.attempt_finished'
@@ -2827,7 +2515,7 @@ class SqliteStore:
                          environment_attempts.id DESC
                 LIMIT 1
                 """,
-                parameters,
+                (fingerprint, kind, str(task_id)),
             ).fetchone()
         return _row_to_environment_attempt(row) if row is not None else None
 
@@ -3274,59 +2962,6 @@ class SqliteStore:
                 ).fetchall()
         return [_row_to_execution_event(row) for row in rows]
 
-    def add_compose_resource(
-        self,
-        resource: ComposeResource,
-        owner_token: str,
-        claim_token: str,
-        *,
-        now: datetime | None = None,
-    ) -> None:
-        """Persist Compose identity while its run and task claim are owned."""
-        persisted_at = _execution_time(now)
-        with self.transaction() as connection:
-            self._require_live_claim(
-                connection,
-                run_id=resource.run_id,
-                owner_token=owner_token,
-                claim_id=resource.claim_id,
-                claim_token=claim_token,
-                task_id=resource.task_id,
-                now=persisted_at,
-            )
-            connection.execute(
-                """
-                INSERT INTO compose_resources(
-                    id, run_id, claim_id, task_id, project_name,
-                    resource_type, resource_name, labels_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(resource.id),
-                    str(resource.run_id),
-                    str(resource.claim_id),
-                    str(resource.task_id),
-                    resource.project_name,
-                    resource.resource_type,
-                    resource.resource_name,
-                    _encode_json(resource.labels),
-                    resource.created_at.isoformat(),
-                ),
-            )
-
-    def list_compose_resources(self, task_id: UUID) -> list[ComposeResource]:
-        """Return durable Compose resources owned by one task."""
-        with self.locked_connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM compose_resources
-                WHERE task_id = ?
-                ORDER BY created_at, id
-                """,
-                (str(task_id),),
-            ).fetchall()
-        return [_row_to_compose_resource(row) for row in rows]
-
     def add_prd_session(self, session: PrdSession) -> None:
         """Persist a PRD session that points to tracked Markdown."""
         with self.transaction() as connection:
@@ -3699,12 +3334,12 @@ def _row_to_task_finding(row: sqlite3.Row) -> TaskFinding:
 
 
 def _verify_and_fsync_task_tree(
-    repository_root: Path,
+    owned_root: Path,
     durable_root: Path,
     expected_files: dict[Path, str],
 ) -> None:
-    candidate = repository_root
-    for component in durable_root.relative_to(repository_root).parts:
+    candidate = owned_root
+    for component in durable_root.relative_to(owned_root).parts:
         candidate /= component
         if candidate.is_symlink():
             raise ValueError(f"durable task publication path is a symlink: {candidate}")
@@ -4076,19 +3711,5 @@ def _row_to_execution_event(row: sqlite3.Row) -> ExecutionEvent:
         ),
         kind=row["kind"],
         payload=json.loads(row["payload_json"]),
-        created_at=datetime.fromisoformat(row["created_at"]),
-    )
-
-
-def _row_to_compose_resource(row: sqlite3.Row) -> ComposeResource:
-    return ComposeResource(
-        id=UUID(row["id"]),
-        run_id=UUID(row["run_id"]),
-        claim_id=UUID(row["claim_id"]),
-        task_id=UUID(row["task_id"]),
-        project_name=row["project_name"],
-        resource_type=row["resource_type"],
-        resource_name=row["resource_name"],
-        labels=json.loads(row["labels_json"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
