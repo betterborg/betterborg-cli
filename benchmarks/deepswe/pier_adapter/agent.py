@@ -21,7 +21,7 @@ from pier.models.agent.network import NetworkAllowlist
 
 # Betterborg build the container installs. A commit rather than a release, so
 # a result names the exact code that produced it. It must be on the remote.
-BETTERBORG_COMMIT = "ec313d7662a93de9da37eaa72f10d1339db36574"
+BETTERBORG_COMMIT = "4a174151a23e7c02f3a936c3bca5629c33b46fa9"
 BETTERBORG_REPO = "https://github.com/betterborg/betterborg-cli"
 
 _APP = "/app"
@@ -37,12 +37,6 @@ _HOME = "/opt/betterborg-home"
 # was 892 lines of scaffolding and no solution.
 _TRACKED = "/opt/betterborg-tracked"
 
-# Each entry is one thing we want to learn. `ok` records whether it worked.
-_STEPS: list[dict[str, object]] = []
-# The base the diff is measured from, held where the incremental report
-# writer can reach it before the run reaches its end.
-_BASE_SHA: list[str] = [""]
-
 
 class _FailedStep:
     """Stands in for a step whose command never returned a result."""
@@ -56,6 +50,19 @@ class _FailedStep:
 
 class BetterborgPierAgent(Codex):
     """Drives Betterborg instead of `codex exec`, reusing Codex install/auth."""
+
+    # Pier constructs one agent per trial, so a step log held here is that
+    # trial's alone. A module-level one is shared by every trial the
+    # process runs and each report then carries its predecessors' steps.
+    @property
+    def _steps(self) -> list[dict[str, object]]:
+        log = getattr(self, "_step_log", None)
+        if log is None:
+            log = []
+            self._step_log = log
+        return log
+
+    _base_sha: str = ""
 
     @staticmethod
     def name() -> str:
@@ -167,7 +174,7 @@ class BetterborgPierAgent(Codex):
         except Exception as exc:  # noqa: BLE001 - recorded, not handled
             result = _FailedStep(f"{type(exc).__name__}: {exc}")
         code = getattr(result, "return_code", getattr(result, "exit_code", None))
-        _STEPS.append(
+        self._steps.append(
             {
                 "step": label,
                 "command": command,
@@ -190,7 +197,7 @@ class BetterborgPierAgent(Codex):
             path = Path(self.logs_dir) / "pier-report.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps({"base": _BASE_SHA[0], "steps": _STEPS}, indent=2)
+                json.dumps({"base": self._base_sha, "steps": self._steps}, indent=2)
             )
         except Exception:  # noqa: BLE001 - a diagnostic, never a failure
             pass
@@ -246,7 +253,7 @@ class BetterborgPierAgent(Codex):
         )
         auth_source = self._resolve_auth_json_path()
         if auth_source is None:
-            _STEPS.append(
+            self._steps.append(
                 {
                     "step": "codex-auth",
                     "ok": False,
@@ -277,23 +284,18 @@ class BetterborgPierAgent(Codex):
             environment, "base-commit", "git rev-parse HEAD"
         )
         base_sha = (getattr(base, "stdout", "") or "").strip()
-        _BASE_SHA[0] = base_sha
+        self._base_sha = base_sha
 
-        # The Pier instruction is the PRD. The appended note is a naming rule
-        # the plan schema enforces but no prompt states, so planning can fail
-        # repeatedly on a phase name alone. It adds nothing to what the task
-        # asks for and is not part of the task contract.
-        prd = (
-            f"{instruction}\n\n"
-            "Plan structure note: name each phase as a short slug of the form "
-            "NN-lower-case-words, at most 32 characters in total, for example "
-            "01-first-phase. This is a naming rule only and changes nothing "
-            "about what the work must deliver."
-        )
+        # The Pier instruction is the PRD, written through unaltered. A note
+        # restating the plan's phase-naming rule used to be appended here,
+        # because the schema enforced a shape no prompt stated; the Architect
+        # states it itself now, and anything added here is contamination of
+        # the task contract.
         await self._step(
             environment,
             "write-prd",
-            f"mkdir -p {_STATE} && cat > {_STATE}/prd.md <<'BBEOF'\n{prd}\nBBEOF",
+            f"mkdir -p {_STATE} && cat > {_STATE}/prd.md <<'BBEOF'\n"
+            f"{instruction}\nBBEOF",
             cwd="/",
         )
 
@@ -343,6 +345,9 @@ SHIM
         # the two to lower the effort. It does accept an existing config, so
         # write a complete valid one up front: version, a repository identity,
         # and the stage tables it would have generated.
+        # The sanity gate is off because the grader is the judgement that
+        # counts here, and a repository check that fails for an environment
+        # reason would otherwise discard a reviewed, merged task.
         seed = (
             "import uuid, subprocess, pathlib\n"
             "branch = subprocess.run("
@@ -355,7 +360,8 @@ SHIM
             "body += 'default_branch = \"%s\"\\n\\n' % branch\n"
             "body += '[planning]\\nreview_rounds = 8\\n"
             "decomposition_rounds = 6\\n\\n'\n"
-            "body += '[execution]\\njobs = 4\\n\\n'\n"
+            "body += '[execution]\\njobs = 4\\nreview_passes = 5\\n"
+            "sanity = false\\n\\n'\n"
             "body += '[agents.defaults]\\nadapter = \"codex\"\\n"
             "model = \"gpt-5.6-sol\"\\neffort = \"low\"\\n\\n'\n"
             "body += ''.join('[agents.%s]\\n\\n' % s for s in stages)\n"
@@ -384,7 +390,7 @@ SHIM
         )
         probe_code = getattr(probe, "return_code", getattr(probe, "exit_code", 1))
         if probe_code != 0:
-            _STEPS.append(
+            self._steps.append(
                 {
                     "step": "abort",
                     "ok": False,
@@ -526,14 +532,24 @@ SHIM
             f"wc -c < /logs/artifacts/model.patch",
         )
 
+        # Uploaded rather than written through a command: the report grew
+        # past the argument-length limit and the step that carried it failed
+        # with E2BIG, losing the account of the run it existed to keep.
         self._write_report()
-        report = json.dumps({"base": base_sha, "steps": _STEPS}, indent=2)
-        await self._step(
-            environment,
-            "save-report",
-            f"cat > {_STATE}/report.json <<'BBEOF'\n{report}\nBBEOF",
-            cwd="/",
-        )
+        try:
+            await environment.upload_file(
+                Path(self.logs_dir) / "pier-report.json", f"{_STATE}/report.json"
+            )
+            self._steps.append({"step": "save-report", "ok": True})
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, never a failure
+            self._steps.append(
+                {
+                    "step": "save-report",
+                    "ok": False,
+                    "stderr": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        self._write_report()
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Codex's trajectory parsing expects its own session layout; this run
