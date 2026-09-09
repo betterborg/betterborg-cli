@@ -31,7 +31,7 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
         with store.transaction():
             store.add_repository(repository)
             store.append_operation(operation)
-        assert store.applied_migrations() == tuple(range(1, 12))
+        assert store.applied_migrations() == tuple(range(1, 13))
         with store.locked_connection() as connection:
             applied_at = connection.execute(
                 "SELECT applied_at FROM schema_version WHERE version = 1"
@@ -50,7 +50,7 @@ def test_store_reopens_without_reapplying_migration_and_preserves_rows(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 12))
+        assert reopened.applied_migrations() == tuple(range(1, 13))
         reopened_repository = reopened.get_repository(repository.id)
         reopened_operations = reopened.list_operations(repository.id)
         assert reopened_repository == repository
@@ -190,7 +190,7 @@ def test_borg_and_prd_session_history_survive_reopen(tmp_path: Path) -> None:
         assert "body_md" not in session_columns
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 12))
+        assert reopened.applied_migrations() == tuple(range(1, 13))
         assert reopened.get_borg(borg.id) == borg
         assert reopened.get_borg_by_name(repository.id, "Ada") == borg
         assert reopened.get_prd_session(session.id) == session
@@ -265,3 +265,52 @@ def test_prd_turns_reject_mutation_deletion_and_replacement(
                 connection.execute(sql, parameters)
 
         assert store.list_prd_turns(session.id) == [turn]
+
+
+def test_dropping_compose_resources_upgrades_a_database_holding_rows(
+    tmp_path: Path,
+) -> None:
+    """Upgrading a database that still holds Compose rows is the whole point.
+
+    Every other migration assertion opens a fresh database, where the table
+    is created and dropped empty. A real upgrade meets rows guarded by an
+    append-only trigger that aborts a delete, so the migration has to drop
+    the table rather than clear it, and the store has to keep opening.
+    """
+    database = tmp_path / "compose-era.sqlite3"
+    migrations = SqliteStore._load_migrations()
+    assert [version for version, _ in migrations] == list(range(1, 13))
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            "CREATE TABLE schema_version ("
+            "  version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);"
+        )
+        for version, sql in migrations[:11]:
+            connection.executescript(
+                f"BEGIN IMMEDIATE;\n{sql.rstrip()}\n"
+                "INSERT INTO schema_version(version, applied_at) VALUES "
+                f"({version}, '2026-01-01T00:00:00+00:00');\nCOMMIT;\n"
+            )
+        connection.execute(
+            "INSERT INTO compose_resources (id, run_id, claim_id, task_id,"
+            " project_name, resource_type, resource_name, labels_json,"
+            " created_at) VALUES ('r', 'run', 'claim', 'task', 'borg-p',"
+            " 'network', 'borg-p_default', '{}', '2026-01-01T00:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SqliteStore.open(database) as store:
+        assert store.applied_migrations() == tuple(range(1, 13))
+        with store.locked_connection() as live:
+            surviving = [
+                row["name"]
+                for row in live.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%compose%'"
+                )
+            ]
+
+    assert surviving == []

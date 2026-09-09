@@ -5,14 +5,6 @@ from betterborg_cli.host_execution.coding import (
     HostCodingConfig,
     HostCodingPhase,
 )
-from betterborg_cli.host_execution.compose import (
-    ComposeCleanupResult,
-    ComposeStack,
-    ComposeStackError,
-    HostComposeManager,
-    compose_project_name,
-    service_url_environment,
-)
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterialization,
     EnvironmentMaterializationError,
@@ -42,7 +34,6 @@ from betterborg_cli.host_execution.preflight import (
     HostPreflightPlan,
     HostPreflightResult,
     HostSecret,
-    HostService,
 )
 from betterborg_cli.host_execution.review import (
     REVIEW_RESULT_SCHEMA,
@@ -79,9 +70,6 @@ from betterborg_cli.host_execution.worktrees import (
 
 __all__ = [
     "ActivitySink",
-    "ComposeCleanupResult",
-    "ComposeStack",
-    "ComposeStackError",
     "CodingPhaseError",
     "EnvironmentMaterialization",
     "EnvironmentMaterializationError",
@@ -92,7 +80,6 @@ __all__ = [
     "HostMergeConfig",
     "HostMergePhase",
     "HostMergeResult",
-    "HostComposeManager",
     "HostCodingConfig",
     "HostCodingPhase",
     "HostWorktreeManager",
@@ -111,7 +98,6 @@ __all__ = [
     "HostSanityPhase",
     "HostSanityResult",
     "HostSecret",
-    "HostService",
     "HostTaskBehavior",
     "HostTaskRuntime",
     "HostTaskScheduler",
@@ -130,7 +116,5 @@ __all__ = [
     "UnsafeGitError",
     "WorktreeError",
     "WorktreeSpec",
-    "compose_project_name",
     "redacted_dropped_command_summary",
-    "service_url_environment",
 ]

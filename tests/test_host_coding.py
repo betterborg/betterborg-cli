@@ -327,8 +327,6 @@ def _coding_fixture(tmp_path: Path) -> CodingFixture:
             environment_files=(),
             executables=(),
             required_secret_names=(),
-            compose_files=(),
-            services=(),
         )
         HostEnvironmentManager(repository_root).materialize_claimed_task(
             store, plan, claim, acquisition.owner_token

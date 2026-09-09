@@ -184,7 +184,7 @@ class HostTaskScheduler:
         clock: Callable[[], datetime] = _utcnow,
         activity: TaskActivitySink | None = None,
         progress: RunProgress | None = None,
-        interruption_cleanup: Callable[[], None] | None = None,
+        expired_run_sweep: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._behavior = behavior
@@ -192,7 +192,7 @@ class HostTaskScheduler:
         self._clock = clock
         self._activity = activity
         self._progress = progress
-        self._interruption_cleanup = interruption_cleanup
+        self._expired_run_sweep = expired_run_sweep
 
     def run(
         self,
@@ -365,8 +365,8 @@ class HostTaskScheduler:
                 token.cancel()
                 try:
                     self._drain(active)
-                    if self._interruption_cleanup is not None:
-                        self._interruption_cleanup()
+                    if self._expired_run_sweep is not None:
+                        self._expired_run_sweep()
                 finally:
                     self._reconcile_interrupted_progress(
                         acquisition.run_id, generation_id
@@ -583,7 +583,7 @@ class HostTaskScheduler:
                 self._progress.begin_cancellation()
             except BaseException as error:
                 # Output is advisory: preserve its failure without letting it
-                # bypass durable cancellation and owned-resource cleanup.
+                # bypass durable cancellation and the expired-run sweep.
                 progress_error = error
         try:
             self._drain_cancelled(active, run_id, owner_token, next_heartbeat)
@@ -593,8 +593,8 @@ class HostTaskScheduler:
                 reason="execution cancelled",
                 now=self._clock(),
             )
-            if self._interruption_cleanup is not None:
-                self._interruption_cleanup()
+            if self._expired_run_sweep is not None:
+                self._expired_run_sweep()
         finally:
             try:
                 self._reconcile_interrupted_progress(run_id, generation_id)

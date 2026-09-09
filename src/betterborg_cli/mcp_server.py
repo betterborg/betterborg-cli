@@ -757,7 +757,6 @@ def _progress_phase(
     namespace = event.kind.partition(".")[0]
     return {
         "base": "merging",
-        "compose": "environment",
         "environment": "environment",
         "merge": "merging",
         "run": "execution",

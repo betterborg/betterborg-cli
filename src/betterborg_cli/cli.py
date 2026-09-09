@@ -34,7 +34,6 @@ from betterborg_cli.execution_estimate import (
 from betterborg_cli.host_execution import (
     HostCodingConfig,
     HostCodingPhase,
-    HostComposeManager,
     HostEnvironmentManager,
     HostExecutionResult,
     HostExecutionService,
@@ -1416,7 +1415,6 @@ def _invoke_host_execution(
     )
     git = SafeGit(paths.root, cancel=cancel)
     environment = HostEnvironmentManager(paths.root, cancel=cancel, git=git)
-    compose = HostComposeManager(paths.root)
     worktrees = HostWorktreeManager(
         paths.root,
         paths.worktrees_dir,
@@ -1432,7 +1430,6 @@ def _invoke_host_execution(
     runtime = HostTaskRuntime(
         validated,
         environment_manager=environment,
-        compose_manager=compose,
         coding=HostCodingPhase(
             paths.root,
             coding_agent,
@@ -1474,7 +1471,6 @@ def _invoke_host_execution(
             paths.root,
             validated,
             environment_manager=environment,
-            compose_manager=compose,
             worktree_manager=worktrees,
             repository_lock=locked_repository,
             cancel=cancel,
@@ -1486,7 +1482,6 @@ def _invoke_host_execution(
         preflight,
         runtime,
         worktree_manager=worktrees,
-        compose_manager=compose,
         scheduler_config=HostSchedulerConfig(jobs=config.execution.jobs),
         progress=progress,
     )

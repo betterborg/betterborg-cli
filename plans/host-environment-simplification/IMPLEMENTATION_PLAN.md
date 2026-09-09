@@ -551,7 +551,7 @@ reads any of them.
   the command inherits it from the operator's environment, but the mechanism
   that injected it does not.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 5: Preflight validates what outlives it
 

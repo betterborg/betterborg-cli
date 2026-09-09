@@ -176,7 +176,7 @@ def test_generation_transitions_preserve_immutable_history_after_reopen(
         assert store.get_current_task_generation(borg.id) == second_current
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 12))
+        assert reopened.applied_migrations() == tuple(range(1, 13))
         assert reopened.list_plan_approvals(borg.id) == [approval]
         assert reopened.list_task_batches(borg.id) == [first_batch, second_batch]
         assert reopened.list_task_findings(borg.id) == [finding]

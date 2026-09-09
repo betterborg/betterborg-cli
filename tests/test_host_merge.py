@@ -7,7 +7,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 import pytest
@@ -33,9 +33,33 @@ from betterborg_cli.host_execution import (
     SafeGit,
     UnsafeGitError,
 )
-from betterborg_cli.host_execution._locking import path_lock
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.store import SqliteStore, TaskRuntimeStatus
+
+
+class NonReentrantLock:
+    """A repository lock that refuses to be taken twice without a release.
+
+    Re-entering while held is the regression this guards, so it raises there
+    instead of blocking forever on a lock nothing will release.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.entries = 0
+
+    def __call__(self) -> AbstractContextManager[None]:
+        self.entries += 1
+        return self._hold()
+
+    @contextmanager
+    def _hold(self):
+        if not self._lock.acquire(blocking=False):
+            raise AssertionError("repository lock was re-acquired before release")
+        try:
+            yield
+        finally:
+            self._lock.release()
 
 
 class RecordingLock:
@@ -984,17 +1008,12 @@ def test_conflict_invokes_agent_outside_lock_and_persists_merge_attempt(
     )
 
 
-def test_conflict_verification_reacquires_real_path_lock_factory(
+def test_conflict_verification_releases_the_lock_before_reacquiring_it(
     tmp_path: Path,
 ) -> None:
     fixture = _approved_merge_fixture(tmp_path)
     _advance_project_base(fixture, "feature.txt", "project version\n")
-    lock_entries = 0
-
-    def repository_lock() -> AbstractContextManager[None]:
-        nonlocal lock_entries
-        lock_entries += 1
-        return path_lock(tmp_path / "repository.lock")
+    repository_lock = NonReentrantLock()
 
     def resolve(spec):
         (spec.cwd / "feature.txt").write_text("resolved\n", encoding="utf-8")
@@ -1011,7 +1030,7 @@ def test_conflict_verification_reacquires_real_path_lock_factory(
     assert result.status is TaskRuntimeStatus.MERGING
     assert result.tip is not None and result.tip.agent_used
     assert len(adapter.calls) == 1
-    assert lock_entries == 2
+    assert repository_lock.entries == 2
 
 
 def test_completed_conflict_merge_resumes_without_replaying_agent(

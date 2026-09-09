@@ -13,7 +13,6 @@ from uuid import uuid4
 import pytest
 
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
-from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.host_execution import (
     HostCommand,
     HostExecutable,
@@ -22,12 +21,10 @@ from betterborg_cli.host_execution import (
     HostPreflightBlock,
     HostPreflightPlan,
     HostSecret,
-    service_url_environment,
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
-from betterborg_cli.repo_analysis import DIMENSIONS, run_analyzer
 from betterborg_cli.repo_paths import RepoPaths
-from betterborg_cli.store import Repository, SqliteStore
+from betterborg_cli.store import SqliteStore
 from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
 
@@ -52,27 +49,6 @@ def _executable(directory: Path, name: str, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(0o755)
     return path
-
-
-def _compose_executable(
-    directory: Path,
-    *,
-    version: str = "2.30.0",
-    model: dict[str, object] | None = None,
-) -> Path:
-    resolved_model = model or {
-        "services": {"postgres": {}},
-        "networks": {"default": {}},
-    }
-    return _executable(
-        directory,
-        "docker",
-        (
-            "if test \"$1 $2\" = 'compose version'; then "
-            f"echo 'Docker Compose v{version}'; exit 0; fi\n"
-            f"printf '%s\\n' {shlex.quote(json.dumps(resolved_model))}"
-        ),
-    )
 
 
 def _base_plan() -> dict[str, object]:
@@ -141,27 +117,19 @@ def _base_plan() -> dict[str, object]:
 
 
 def _complete_probe_plan(repository: Path) -> dict[str, object]:
-    """Prepare one plan that reaches every direct preflight probe."""
+    """Prepare one plan that reaches both direct preflight probes."""
     (repository / "package").mkdir(exist_ok=True)
     (repository / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
-    (repository / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
     return _base_plan()
 
 
 def _probe_name(command: list[str] | tuple[str, ...]) -> str | None:
-    """Identify the four ordered direct probes covered by cancellation tests."""
+    """Identify the two ordered direct probes covered by cancellation tests."""
     argv = tuple(command)
     if argv[-1:] == ("--show-toplevel",):
         return "root"
     if argv[-1:] == ("--git-common-dir",):
         return "identity"
-    if argv[-2:] == ("compose", "version"):
-        return "compose-version"
-    if argv[-3:] == ("config", "--format", "json"):
-        return "topology"
     return None
 
 
@@ -171,7 +139,6 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
     binary_dir = committed_git_repo.parent / "all-probe-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -195,20 +162,17 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
     ).validate(
         plan,
         available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
     assert isinstance(result, HostPreflightPlan)
     assert [_probe_name(command) for command, _token in calls] == [
         "root",
         "identity",
-        "compose-version",
-        "topology",
     ]
     assert all(observed is cancel for _command, observed in calls)
     assert [activity.kind for activity in activities] == [
         AgentActivityKind.COMMAND
-    ] * 4
+    ] * 2
     assert [activity.detail for activity in activities] == [
         shlex.join(command) for command, _token in calls
     ]
@@ -216,7 +180,7 @@ def test_all_direct_probes_share_token_runner_and_command_activity(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
     committed_git_repo: Path,
@@ -226,7 +190,6 @@ def test_cancellation_reaps_each_direct_probe_and_stops_later_probes(
     binary_dir = committed_git_repo.parent / f"{target}-cancel-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -288,7 +251,6 @@ try:
         ).validate(
             _base_plan(),
             available_secret_names={"PACKAGE_TOKEN"},
-            external_urls={"SEARCH_URL": "https://search.example.test/api"},
         )
 except KeyboardInterrupt:
     (marker_root / f"{target}.interrupted").write_text("yes", encoding="utf-8")
@@ -312,12 +274,7 @@ finally:
     assert real_process_harness.wait_for_exit(process) == 130
     real_process_harness.assert_tree_absent(target)
     probes = real_process_harness.wait_for_marker(f"{target}.probes").splitlines()
-    assert probes == [
-        "root",
-        "identity",
-        "compose-version",
-        "topology",
-    ][: probes.index(target) + 1]
+    assert probes == ["root", "identity"][: probes.index(target) + 1]
     activities = real_process_harness.wait_for_marker(
         f"{target}.activities"
     ).splitlines()
@@ -326,7 +283,7 @@ finally:
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_cancelled_probe_result_propagates_interruption(
     committed_git_repo: Path,
@@ -335,7 +292,6 @@ def test_cancelled_probe_result_propagates_interruption(
     binary_dir = committed_git_repo.parent / f"{target}-interrupt-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -363,7 +319,6 @@ def test_cancelled_probe_result_propagates_interruption(
         ).validate(
             plan,
             available_secret_names={"PACKAGE_TOKEN"},
-            external_urls={"SEARCH_URL": "https://search.example.test/api"},
         )
 
     assert probes[-1] == target
@@ -371,7 +326,7 @@ def test_cancelled_probe_result_propagates_interruption(
 
 @pytest.mark.parametrize(
     "target",
-    ["root", "identity", "compose-version", "topology"],
+    ["root", "identity"],
 )
 def test_each_concrete_probe_cancels_before_run_or_claim_creation(
     committed_git_repo: Path,
@@ -380,7 +335,6 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
     binary_dir = committed_git_repo.parent / f"{target}-boundary-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    _compose_executable(binary_dir)
     plan = _complete_probe_plan(committed_git_repo)
     trust_store = _trust_store(committed_git_repo)
     require_workspace_trust(
@@ -412,15 +366,11 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
                 preflight,
                 SimpleNamespace(plan=None),
                 worktree_manager=SimpleNamespace(),
-                compose_manager=SimpleNamespace(),
             ).run(
                 borg_id,
                 generation_id,
                 plan,
                 secret_values={"PACKAGE_TOKEN": "available"},
-                external_urls={
-                    "SEARCH_URL": "https://search.example.test/api"
-                },
                 cancel=cancel,
             )
 
@@ -430,43 +380,6 @@ def test_each_concrete_probe_cancels_before_run_or_claim_creation(
                 "SELECT COUNT(*) FROM task_claims"
             ).fetchone()[0]
         assert claim_count == 0
-
-
-@pytest.mark.parametrize("outcome", ["timeout", "nonzero"])
-def test_ordinary_probe_failures_remain_host_blocks(
-    committed_git_repo: Path,
-    outcome: str,
-) -> None:
-    binary_dir = committed_git_repo.parent / f"ordinary-{outcome}-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "exit 0")
-    _compose_executable(binary_dir)
-    plan = _complete_probe_plan(committed_git_repo)
-    store = _trust_store(committed_git_repo)
-    require_workspace_trust(
-        RepoPaths.discover(committed_git_repo), store=store, explicit=True
-    )
-
-    def runner(command, **kwargs):
-        if _probe_name(command) == "compose-version":
-            if outcome == "timeout":
-                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-            return subprocess.CompletedProcess(command, 7, "", "probe failed")
-        return run_captured(command, **kwargs)
-
-    result = HostPreflight(
-        committed_git_repo,
-        trust_store=store,
-        environment={"PATH": str(binary_dir)},
-        command_runner=runner,
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "Docker Compose plugin must be available" in result.reason
 
 
 def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
@@ -492,25 +405,18 @@ def test_workspace_trust_blocks_before_analyzer_plan_is_loaded(
     assert "betterborg trust --yes" in result.reason
 
 
-def test_validates_complete_plan_and_ignores_unselected_service(
+def test_declared_services_and_compose_files_leave_the_plan(
     committed_git_repo: Path,
 ) -> None:
+    """The analysis still names services; the validated plan no longer does.
+
+    Nothing on this host can run Docker, and the analysis selects a Compose
+    service and an external one. Both used to refuse the run before a task
+    was claimed.
+    """
     binary_dir = committed_git_repo.parent / "host-bin"
     binary_dir.mkdir()
     _executable(binary_dir, "example-runtime", "echo 'example 3.11.9'")
-    docker = _compose_executable(
-        binary_dir,
-        model={
-            "services": {
-                "postgres": {
-                    "build": {"context": "."},
-                    "image": "betterborg/shared-postgres:dev",
-                }
-            },
-            "networks": {"backend": {}},
-            "volumes": {"database": {}},
-        },
-    )
     (committed_git_repo / "package").mkdir()
     (committed_git_repo / "runtime.version").write_text("3.11.9\n", encoding="utf-8")
     (committed_git_repo / "compose.yml").write_text(
@@ -524,41 +430,21 @@ def test_validates_complete_plan_and_ignores_unselected_service(
     ).validate(
         lambda: _base_plan(),
         available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
     )
 
     assert isinstance(result, HostPreflightPlan)
     assert result.commands[0].cwd == "package"
     assert result.environment_files == (committed_git_repo / "runtime.version",)
-    assert {tool.name for tool in result.executables} == {
-        "docker",
-        "example-runtime",
-    }
-    assert next(tool.path for tool in result.executables if tool.name == "docker") == (
-        docker
-    )
+    assert {tool.name for tool in result.executables} == {"example-runtime"}
     assert result.required_secret_names == ("PACKAGE_TOKEN",)
     assert result.package_managers == ()
     assert [secret.scope for secret in result.secret_requirements] == ["build"]
-    assert result.compose_files == (committed_git_repo / "compose.yml",)
-    assert result.compose_networks == ("backend",)
-    assert result.compose_volumes == ("database",)
-    assert result.compose_build_services == ("postgres",)
-    assert [(service.name, service.kind) for service in result.services] == [
-        ("database", "compose"),
-        ("search", "external"),
-    ]
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "tcp"),)
-    assert result.services[1].url == "https://search.example.test/api"
-    assert service_url_environment(result.services) == {
-        "SEARCH_URL": "https://search.example.test/api",
-    }
-    assert service_url_environment(
-        result.services, published_ports={("postgres", 5432, "tcp"): 49152}
-    ) == {
-        "DATABASE_URL": "postgres://127.0.0.1:49152/postgres",
-        "SEARCH_URL": "https://search.example.test/api",
-    }
+    assert not hasattr(result, "services")
+    assert not hasattr(result, "compose_files")
+    assert not hasattr(result, "compose_profiles")
+    assert not hasattr(result, "compose_networks")
+    assert not hasattr(result, "compose_volumes")
+    assert not hasattr(result, "compose_build_services")
 
 
 def test_preserves_prepare_and_materialize_command_phases(
@@ -883,506 +769,13 @@ def test_command_derived_failures_retain_exact_source_evidence(
     ).validate(plan)
 
     assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 3
+    # The command names a service no dependency declares, which is no longer
+    # anything to refuse.
+    assert len(result.failures) == 2
     assert all(failure.evidence == source for failure in result.failures)
     assert "host executable is required: missing-runtime" in result.reason
     assert "undeclared required secret: PACKAGE_TOKEN" in result.reason
-    assert "exactly one analyzer dependency: database" in result.reason
-
-
-@pytest.mark.parametrize(
-    ("service", "external_urls", "expected"),
-    [
-        (
-            {"name": "dependency", "source": "app.toml#dependency"},
-            {},
-            "ambiguous or inferred",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://exa mple.test/api"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://example.test:not-a-port/api"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "localhost:9000"},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-        (
-            {
-                "name": "dependency",
-                "url_env": "DEPENDENCY_URL",
-                "source": "app.toml#dependency",
-            },
-            {"DEPENDENCY_URL": "https://["},
-            "requires an absolute service URL in DEPENDENCY_URL",
-        ),
-    ],
-)
-def test_selected_service_must_be_explicit_and_external_url_supplied(
-    committed_git_repo: Path,
-    service: dict[str, object],
-    external_urls: dict[str, str],
-    expected: str,
-) -> None:
-    binary_dir = committed_git_repo.parent / f"{committed_git_repo.name}-service-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["dependency"],
-                }
-            ]
-        },
-        "service_dependencies": [service],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan, external_urls=external_urls)
-
-    assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert expected in result.reason
-    assert "app.toml#dependency" in result.reason
-
-
-def test_compose_url_environment_requires_an_exact_service_port(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-url-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _compose_executable(binary_dir)
-    (committed_git_repo / "package").mkdir()
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
-    plan = _base_plan()
-    del plan["service_dependencies"][0]["port"]
-
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "DATABASE_URL requires an exact port" in result.reason
-
-def test_compose_url_environment_does_not_infer_a_multi_port_target(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-port-fallback-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-runtime", "echo '3.11.9'")
-    _compose_executable(binary_dir)
-    (committed_git_repo / "package").mkdir()
-    (committed_git_repo / "runtime.version").write_text(
-        "3.11.9\n", encoding="utf-8"
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n",
-        encoding="utf-8",
-    )
-    plan = _base_plan()
-    dependencies = plan["service_dependencies"]
-    assert isinstance(dependencies, list)
-    database = dependencies[0]
-    assert isinstance(database, dict)
-    del database["port"]
-    database["ports"] = [
-        {"port": 5432, "protocol": "udp", "env": "POSTGRES_PORT"},
-        {"port": 9187, "protocol": "tcp", "env": "METRICS_URL"},
-    ]
-
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "DATABASE_URL requires an exact port" in result.reason
-
-    database["port"] = 5432
-    result = _preflight(
-        committed_git_repo,
-        environment={"PATH": str(binary_dir)},
-    ).validate(
-        plan,
-        available_secret_names={"PACKAGE_TOKEN"},
-        external_urls={"SEARCH_URL": "https://search.example.test/api"},
-    )
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services[0].url_targets == (("DATABASE_URL", 5432, "udp"),)
-    assert result.services[0].port_targets == (
-        ("POSTGRES_PORT", 5432, "udp"),
-        ("METRICS_URL", 9187, "tcp"),
-    )
-    assert service_url_environment(
-        result.services,
-        published_ports={
-            ("postgres", 5432, "udp"): 49152,
-            ("postgres", 9187, "tcp"): 49153,
-        },
-    )["POSTGRES_PORT"] == "49152"
-
-
-def test_missing_compose_metadata_and_plugin_block_before_claim(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _executable(binary_dir, "docker", "exit 1")
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "Compose metadata is required" in result.reason
-    assert "Docker Compose plugin must be available" in result.reason
-    assert "compose.yml#postgres" in result.reason
-
-
-@pytest.mark.parametrize(
-    ("compose_version", "supported"),
-    [("2.24.3", False), ("2.24.4", True)],
-)
-def test_compose_plugin_must_support_runtime_overrides(
-    committed_git_repo: Path,
-    compose_version: str,
-    supported: bool,
-) -> None:
-    binary_dir = (
-        committed_git_repo.parent / f"{committed_git_repo.name}-compose-version-bin"
-    )
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir, version=compose_version)
-    compose_file = committed_git_repo / "compose.yml"
-    compose_file.write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    if supported:
-        assert isinstance(result, HostPreflightPlan)
-        return
-    assert isinstance(result, HostPreflightBlock)
-    assert len(result.failures) == 1
-    assert "Docker Compose 2.24.4 or newer is required" in result.reason
-    assert f"Docker Compose v{compose_version}" in result.reason
-    assert "Upgrade the Docker Compose plugin" in result.reason
-
-
-def test_compose_topology_is_validated_before_a_plan_is_returned(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-topology-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(
-        binary_dir,
-        model={
-            "services": {
-                "postgres": {
-                    "volumes": [
-                        {
-                            "type": "bind",
-                            "source": "/var/lib/example",
-                            "target": "/data",
-                        }
-                    ]
-                }
-            },
-            "networks": {"backend": {}},
-            "volumes": {"database": {}},
-        },
-    )
-    (committed_git_repo / "compose.yml").write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightBlock)
-    assert "selected Compose service topology must be isolated" in result.reason
-    assert "writable bind mounts cannot be isolated" in result.reason
-    assert "postgres.volumes[0]" in result.reason
-
-
-def test_preserves_ordered_compose_stack_and_active_profiles(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "compose-stack-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir)
-    for name in ("compose.yml", "compose.test.yml", "compose.fragment.yml"):
-        (committed_git_repo / name).write_text(
-            "services:\n  postgres:\n    image: postgres:16\n",
-            encoding="utf-8",
-        )
-    analyzer_payload = {
-        "summary": "A repository with a multi-file Compose service stack.",
-        "primary_language": "python",
-        "is_monorepo": False,
-        "packages": [
-            {
-                "path": ".",
-                "name": "root",
-                "primary_language": "python",
-                "rubric": {
-                    dimension: {
-                        "score": 3,
-                        "evidence": f"README.md describes {dimension}",
-                    }
-                    for dimension in DIMENSIONS
-                },
-            }
-        ],
-        "recommendations": [],
-        "themes": [],
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "verifies": True,
-                    "uses_services": ["database"],
-                    "source": "README.md#test",
-                }
-            ],
-            "source": "README.md",
-        },
-        "compose": {
-            "file": "compose.yml",
-            "files": [
-                {
-                    "path": "compose.yml",
-                    "services": ["postgres"],
-                    "source": "compose.yml",
-                },
-                {
-                    "path": "compose.test.yml",
-                    "profiles": ["test"],
-                    "services": ["postgres"],
-                    "source": "compose.test.yml",
-                },
-                {
-                    "path": "compose.fragment.yml",
-                    "source": "compose.fragment.yml",
-                },
-            ],
-            "profiles": ["test", "integration"],
-            "source": "compose.yml",
-        },
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    repository = Repository(root=committed_git_repo)
-    adapter = MockAdapter(name="openai").queue(
-        MockResponse(payload=analyzer_payload)
-    )
-    with SqliteStore.open(committed_git_repo / "state.sqlite3") as store:
-        store.add_repository(repository)
-        analysis = run_analyzer(
-            repository,
-            store,
-            adapter,
-            artifact_dir=committed_git_repo / "artifacts",
-        )
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(analysis.analysis_json)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.compose_files == (
-        committed_git_repo / "compose.yml",
-        committed_git_repo / "compose.test.yml",
-        committed_git_repo / "compose.fragment.yml",
-    )
-    assert result.compose_profiles == ("test", "integration")
-
-
-def test_accepts_singular_compose_file_without_service_index(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "single-compose-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    _compose_executable(binary_dir)
-    compose_file = committed_git_repo / "compose.yml"
-    compose_file.write_text(
-        "services:\n  postgres:\n    image: postgres:16\n", encoding="utf-8"
-    )
-    plan = {
-        "command_catalog": {
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["available-command"],
-                    "uses_services": ["database"],
-                }
-            ]
-        },
-        "compose": {"file": "compose.yml", "source": "compose.yml"},
-        "service_dependencies": [
-            {
-                "name": "database",
-                "compose_service": "postgres",
-                "source": "compose.yml#services.postgres",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.compose_files == (compose_file,)
-
-
-def test_unused_service_does_not_require_docker_or_external_url(
-    committed_git_repo: Path,
-) -> None:
-    binary_dir = committed_git_repo.parent / "unused-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "available-command", "exit 0")
-    plan = {
-        "command_catalog": {
-            "commands": [{"stage": "build", "argv": ["available-command"]}]
-        },
-        "service_dependencies": [
-            {"name": "ambiguous", "source": "example.env"},
-            {
-                "name": "external",
-                "url_env": "UNSUPPLIED_URL",
-                "source": "app.toml",
-            },
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan)
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services == ()
-    assert result.compose_files == ()
+    assert "database" not in result.reason
 
 
 def test_person_readable_toolchain_inventory_does_not_block_a_run(
@@ -1463,51 +856,6 @@ def test_environment_command_program_is_still_required(
 
     assert isinstance(result, HostPreflightBlock)
     assert "host executable is required: missing-runtime" in result.reason
-
-
-def test_a_service_only_a_dropped_command_uses_does_not_block(
-    committed_git_repo: Path,
-) -> None:
-    """A service is selected because something will talk to it.
-
-    One reachable only from a command this host cannot run is a dependency
-    the run does not have, so requiring it refuses over exactly what the drop
-    was supposed to make survivable.
-    """
-    binary_dir = committed_git_repo.parent / "service-scope-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-lint", "exit 0")
-    plan = {
-        "command_catalog": {
-            "source": "pyproject.toml",
-            "commands": [
-                {"stage": "lint", "argv": ["example-lint"]},
-                {
-                    "stage": "test",
-                    "argv": ["missing-runtime"],
-                    "uses_services": ["search"],
-                },
-            ],
-        },
-        "service_dependencies": [
-            {
-                "name": "search",
-                "kind": "external",
-                "url_env": "SEARCH_URL",
-                "source": "pyproject.toml#search",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan, available_secret_names=set())
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services == ()
-    assert [dropped.command.argv[0] for dropped in result.dropped_commands] == [
-        "missing-runtime"
-    ]
 
 
 def test_secret_named_only_by_a_dropped_command_does_not_block(
@@ -1823,8 +1171,6 @@ def test_host_that_satisfies_everything_produces_the_unchanged_plan(
             HostExecutable("npm", npm, None),
         ),
         required_secret_names=("PACKAGE_TOKEN",),
-        compose_files=(),
-        services=(),
         package_managers=("npm",),
         secret_requirements=(
             HostSecret("PACKAGE_TOKEN", "build", ("test",), "pyproject.toml"),
@@ -2108,48 +1454,6 @@ def test_a_non_verifying_command_requires_no_program_and_is_not_a_drop(
     assert result.dropped_commands == ()
     assert result.dropped_command_summary == ""
     assert [tool.name for tool in result.executables] == ["example-test"]
-
-
-def test_a_service_only_a_non_verifying_command_uses_does_not_block(
-    committed_git_repo: Path,
-) -> None:
-    """A service is selected because something the run executes talks to it."""
-    binary_dir = committed_git_repo.parent / "non-verifying-service-bin"
-    binary_dir.mkdir()
-    _executable(binary_dir, "example-test", "exit 0")
-    plan = {
-        "command_catalog": {
-            "source": "package.json",
-            "commands": [
-                {
-                    "stage": "test",
-                    "argv": ["example-test"],
-                    "verifies": True,
-                },
-                {
-                    "stage": "dev",
-                    "argv": ["example-test", "--serve"],
-                    "verifies": False,
-                    "uses_services": ["search"],
-                },
-            ],
-        },
-        "service_dependencies": [
-            {
-                "name": "search",
-                "kind": "external",
-                "url_env": "SEARCH_URL",
-                "source": "package.json#search",
-            }
-        ],
-    }
-
-    result = _preflight(
-        committed_git_repo, environment={"PATH": str(binary_dir)}
-    ).validate(plan, available_secret_names=set())
-
-    assert isinstance(result, HostPreflightPlan)
-    assert result.services == ()
 
 
 def test_the_secret_a_command_named_reaches_the_command_that_named_it(

@@ -10,12 +10,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from betterborg_cli.agent_runtime import CancellationToken, run_captured
-from betterborg_cli.host_execution.compose import (
-    ComposeStack,
-    ComposeStackError,
-    HostComposeManager,
-    service_url_environment,
-)
 from betterborg_cli.host_execution.environment import (
     EnvironmentMaterializationError,
     HostEnvironmentManager,
@@ -81,10 +75,9 @@ class HostSanityResult:
 class HostSanityPhase:
     """Run the final host-only gate and publish one exact merge tip.
 
-    The shared repository lock covers descriptor rematerialization, task-owned
-    service startup and teardown, catalog execution, and the compare-and-swap
-    fast-forward. This makes a successful sanity result inseparable from the
-    project-base decision it authorizes.
+    The shared repository lock covers worktree preparation, catalog execution,
+    and the compare-and-swap fast-forward. This makes a successful sanity
+    result inseparable from the project-base decision it authorizes.
     """
 
     def __init__(
@@ -93,7 +86,6 @@ class HostSanityPhase:
         plan: HostPreflightPlan,
         *,
         environment_manager: HostEnvironmentManager,
-        compose_manager: HostComposeManager,
         worktree_manager: HostWorktreeManager,
         repository_lock: RepositoryLockFactory,
         command_runner: CommandRunner | None = None,
@@ -113,7 +105,6 @@ class HostSanityPhase:
             raise ValueError("sanity command timeout must be positive")
         self.plan = plan
         self._environment_manager = environment_manager
-        self._compose_manager = compose_manager
         self._worktree_manager = worktree_manager
         self._repository_lock = repository_lock
         self._run = command_runner or run_captured
@@ -131,22 +122,14 @@ class HostSanityPhase:
         tip: MergeTip,
         *,
         secret_values: Mapping[str, str] | None = None,
-        existing_stack: ComposeStack | None = None,
     ) -> HostSanityResult:
         """Sanity-check and publish ``tip``, or durably block the task."""
         masks = declared_secret_mask_values(self.plan, secret_values or {})
         commands: list[SanityCommandResult] = []
-        stack_to_stop = existing_stack
         try:
             runtime, worktree = self._runtime_and_worktree(context, tip)
             with self._guard.protect(self._task_ref(context), "sanity"):
                 with self._repository_lock():
-                    # From this point the locked sanity gate owns the supplied
-                    # agent-phase stack.  It retires that stack before starting
-                    # a fresh sanity stack, and tears the fresh stack down before
-                    # recording success or advancing the shared project base.
-                    locked_stack = stack_to_stop
-                    stack_to_stop = None
                     published = self._run_locked(
                         context,
                         runtime,
@@ -154,7 +137,6 @@ class HostSanityPhase:
                         tip,
                         secret_values or {},
                         commands,
-                        existing_stack=locked_stack,
                     )
                     cleanup_runtime = context.store.get_task_runtime(
                         context.claim.task_id
@@ -179,7 +161,6 @@ class HostSanityPhase:
                         ),
                     )
         except (
-            ComposeStackError,
             EnvironmentMaterializationError,
             PrimaryCheckoutContaminationError,
             SanityPhaseError,
@@ -189,24 +170,7 @@ class HostSanityPhase:
             subprocess.SubprocessError,
             ValueError,
         ) as error:
-            cleanup_detail = ""
-            if stack_to_stop is not None:
-                try:
-                    self._compose_manager.stop_claimed_stack(
-                        context.store,
-                        stack_to_stop,
-                        context.claim,
-                        context.owner_token,
-                        cancel=context.cancel,
-                        activity=context.activity,
-                    )
-                except BaseException as cleanup_error:
-                    cleanup_detail = (
-                        "; task-owned Compose cleanup also failed: "
-                        f"{cleanup_error}"
-                    )
-                stack_to_stop = None
-            reason = redact_secrets(_error_text(error) + cleanup_detail, masks)
+            reason = redact_secrets(_error_text(error), masks)
             return self._block(context, reason, tuple(commands), masks)
 
         return HostSanityResult(
@@ -227,125 +191,71 @@ class HostSanityPhase:
         tip: MergeTip,
         secret_values: Mapping[str, str],
         command_results: list[SanityCommandResult],
-        *,
-        existing_stack: ComposeStack | None,
     ) -> str:
-        prior_stack = existing_stack
-        sanity_stack = None
         commands: tuple[SanityCommandResult, ...] = ()
         materialization = None
         already_advanced = False
-        active_error: BaseException | None = None
-        try:
-            current_base = self._resolve_project_tip(tip.project_branch)
-            if current_base == tip.commit_sha:
-                if not self._advance_was_attested(context, tip):
-                    raise SanityPhaseError(
-                        "project base is already at the merge tip without a durable "
-                        "Betterborg advancement attestation"
-                    )
-                if worktree.exists():
-                    if not worktree.is_dir():
-                        raise SanityPhaseError(
-                            "merged task worktree is not a directory"
-                        )
-                    self._verify_tip(runtime, worktree, tip)
-                already_advanced = True
-            else:
-                if current_base != tip.base_commit:
-                    raise SanityPhaseError(
-                        "project base moved after the merge tip was produced; rerun "
-                        "the merge phase before sanity"
-                    )
+        current_base = self._resolve_project_tip(tip.project_branch)
+        if current_base == tip.commit_sha:
+            if not self._advance_was_attested(context, tip):
+                raise SanityPhaseError(
+                    "project base is already at the merge tip without a durable "
+                    "Betterborg advancement attestation"
+                )
+            if worktree.exists():
                 if not worktree.is_dir():
-                    raise SanityPhaseError("merged task worktree is missing")
+                    raise SanityPhaseError(
+                        "merged task worktree is not a directory"
+                    )
                 self._verify_tip(runtime, worktree, tip)
+            already_advanced = True
+        else:
+            if current_base != tip.base_commit:
+                raise SanityPhaseError(
+                    "project base moved after the merge tip was produced; rerun "
+                    "the merge phase before sanity"
+                )
+            if not worktree.is_dir():
+                raise SanityPhaseError("merged task worktree is missing")
+            self._verify_tip(runtime, worktree, tip)
 
-                # Agent phases may have changed build inputs or mutated service
-                # state.  Remove their images, volumes, and containers before
-                # rematerializing and rebuilding services from the merged tip.
-                if prior_stack is not None:
-                    self._compose_manager.stop_claimed_stack(
-                        context.store,
-                        prior_stack,
-                        context.claim,
-                        context.owner_token,
-                        cancel=context.cancel,
-                        activity=context.activity,
-                    )
-                    prior_stack = None
-                # The catalog judges this merged tree, and a digest of the
-                # declared commands cannot tell it from the tree it replaced,
-                # so reuse would otherwise skip the install the catalog is
-                # about to be run against.
-                materialization = self._environment_manager.materialize_claimed_task(
-                    context.store,
-                    self.plan,
-                    context.claim,
-                    context.owner_token,
-                    secret_values=secret_values,
-                    task_transition=context.transition,
-                    force_preparation=True,
+            # The catalog judges this merged tree, and a digest of the
+            # declared commands cannot tell it from the tree it replaced,
+            # so reuse would otherwise skip the install the catalog is
+            # about to be run against.
+            materialization = self._environment_manager.materialize_claimed_task(
+                context.store,
+                self.plan,
+                context.claim,
+                context.owner_token,
+                secret_values=secret_values,
+                task_transition=context.transition,
+                force_preparation=True,
+            )
+            commands = self._run_commands(
+                worktree,
+                materialization_environment=materialization.environment,
+                secret_values=secret_values,
+                cancel=context.cancel,
+                activity=context.activity_sink("sanity"),
+            )
+            command_results.extend(commands)
+            failure = next(
+                (result for result in commands if result.returncode != 0), None
+            )
+            if failure is not None:
+                detail = failure.stderr.strip() or failure.stdout.strip()
+                raise SanityPhaseError(
+                    "sanity command failed with exit code "
+                    f"{failure.returncode}: {shlex.join(failure.command.argv)}"
+                    + (f": {detail[-4000:]}" if detail else "")
                 )
-                sanity_stack = self._compose_manager.start_claimed_sanity_stack(
-                    context.store,
-                    self.plan,
-                    context.claim,
-                    context.owner_token,
-                    cancel=context.cancel,
-                    activity=context.activity,
+            if not commands:
+                raise SanityPhaseError("sanity command catalog is empty")
+            if not self._git.for_worktree(worktree).is_clean():
+                raise SanityPhaseError(
+                    "sanity commands changed tracked or untracked task files"
                 )
-                service_environment = service_url_environment(self.plan.services)
-                if sanity_stack is not None:
-                    service_environment.update(sanity_stack.environment)
-                commands = self._run_commands(
-                    worktree,
-                    materialization_environment=materialization.environment,
-                    service_environment=service_environment,
-                    secret_values=secret_values,
-                    cancel=context.cancel,
-                    activity=context.activity_sink("sanity"),
-                )
-                command_results.extend(commands)
-                failure = next(
-                    (result for result in commands if result.returncode != 0), None
-                )
-                if failure is not None:
-                    detail = failure.stderr.strip() or failure.stdout.strip()
-                    raise SanityPhaseError(
-                        "sanity command failed with exit code "
-                        f"{failure.returncode}: {shlex.join(failure.command.argv)}"
-                        + (f": {detail[-4000:]}" if detail else "")
-                    )
-                if not commands:
-                    raise SanityPhaseError("sanity command catalog is empty")
-                if not self._git.for_worktree(worktree).is_clean():
-                    raise SanityPhaseError(
-                        "sanity commands changed tracked or untracked task files"
-                    )
-        except BaseException as error:
-            active_error = error
-        finally:
-            stack_to_stop = sanity_stack or prior_stack
-            if stack_to_stop is not None:
-                try:
-                    self._compose_manager.stop_claimed_stack(
-                        context.store,
-                        stack_to_stop,
-                        context.claim,
-                        context.owner_token,
-                        cancel=context.cancel,
-                        activity=context.activity,
-                    )
-                except BaseException as cleanup_error:
-                    if active_error is None:
-                        active_error = cleanup_error
-                    else:
-                        active_error.add_note(
-                            f"task-owned Compose cleanup also failed: {cleanup_error}"
-                        )
-        if active_error is not None:
-            raise active_error
         if already_advanced:
             return tip.commit_sha
         if materialization is None:
@@ -404,7 +314,6 @@ class HostSanityPhase:
         worktree: Path,
         *,
         materialization_environment: Mapping[str, str],
-        service_environment: Mapping[str, str],
         secret_values: Mapping[str, str],
         cancel: CancellationToken,
         activity: Callable[[AgentActivity], None] | None,
@@ -415,7 +324,6 @@ class HostSanityPhase:
             cwd = command_cwd(worktree, command.cwd)
             environment = dict(materialization_environment)
             environment["CI"] = "true"
-            environment.update(service_environment)
             environment = command_secret_environment(
                 self.plan, command.stage, environment, secret_values
             )

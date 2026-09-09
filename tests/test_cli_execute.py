@@ -137,8 +137,6 @@ def _execution_result(
             environment_files=(),
             executables=(),
             required_secret_names=required_secret_names,
-            compose_files=(),
-            services=(),
             dropped_commands=dropped_commands,
         ),
         active_operation_id=None,
@@ -807,8 +805,6 @@ preflight = HostPreflightPlan(
     environment_files=(),
     executables=(),
     required_secret_names=(),
-    compose_files=(),
-    services=(),
 )
 cli_module.RunProgress = FastProgress
 cli_module.SafeGit = safe_git
@@ -1493,8 +1489,6 @@ preflight = HostPreflightPlan(
     environment_files=(),
     executables=(),
     required_secret_names=(),
-    compose_files=(),
-    services=(),
 )
 cli_module.RunProgress = FastProgress
 cli_module.run_captured = runner
