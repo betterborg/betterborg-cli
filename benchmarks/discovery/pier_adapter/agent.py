@@ -5,7 +5,7 @@ It is deliberately crude and is not the adapter we ship. Every Betterborg step
 is run, logged, and allowed to fail, because the failures ARE the output.
 
     PYTHONPATH=<this dir> pier run -p /tmp/deep-swe/tasks/<task> \
-        --agent-import-path bbstage1.agent:BetterborgStage1
+        --agent-import-path pier_adapter.agent:BetterborgPierAgent
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ class _FailedStep:
         self.stderr = detail
 
 
-class BetterborgStage1(Codex):
+class BetterborgPierAgent(Codex):
     """Drives Betterborg instead of `codex exec`, reusing Codex install/auth."""
 
     @staticmethod
     def name() -> str:
-        return "betterborg-stage1"
+        return "betterborg-pier"
 
     def version(self) -> str | None:
         return f"betterborg-{BETTERBORG_COMMIT[:12]}"
@@ -187,7 +187,7 @@ class BetterborgStage1(Codex):
         never be what ends a run that is otherwise working.
         """
         try:
-            path = Path(self.logs_dir) / "stage1-report.json"
+            path = Path(self.logs_dir) / "pier-report.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 json.dumps({"base": _BASE_SHA[0], "steps": _STEPS}, indent=2)
@@ -412,7 +412,7 @@ SHIM
         await self._step(
             environment,
             "create",
-            f"{_BB} create stage1 --prd {_STATE}/prd.md --adopt --yes",
+            f"{_BB} create benchmark --prd {_STATE}/prd.md --adopt --yes",
             timeout_sec=3600,
         )
         # Unattended: nobody is at a terminal, so the Architect is told to
@@ -424,7 +424,7 @@ SHIM
         await self._step(
             environment,
             "plan",
-            f"{_BB} plan start stage1 --yes --unattended > /tmp/plan.out 2>&1; "
+            f"{_BB} plan start benchmark --yes --unattended > /tmp/plan.out 2>&1; "
             "rc=$?; cat /tmp/plan.out; test $rc -eq 0 && "
             "! grep -q 'Planning blocked' /tmp/plan.out",
             timeout_sec=3600,
@@ -448,7 +448,7 @@ SHIM
         await self._step(
             environment,
             "approve",
-            f"{_BB} plan approve stage1 --yes > /tmp/approve.out 2>&1; "
+            f"{_BB} plan approve benchmark --yes > /tmp/approve.out 2>&1; "
             "rc=$?; cat /tmp/approve.out; test $rc -eq 0 && "
             "! grep -q 'decomposition blocked' /tmp/approve.out",
             timeout_sec=3600,
@@ -468,7 +468,7 @@ SHIM
         await self._step(
             environment,
             "execute",
-            f"{_BB} execute stage1 --auto-execute",
+            f"{_BB} execute benchmark --auto-execute",
             timeout_sec=7200,
         )
         # Why a task blocked lives in the database and in the per-attempt
@@ -498,15 +498,15 @@ SHIM
             environment,
             "land",
             "git rev-parse --abbrev-ref HEAD && "
-            "git log --oneline -1 project/stage1 && "
-            "git merge --ff-only project/stage1 || "
+            "git log --oneline -1 project/benchmark && "
+            "git merge --ff-only project/benchmark || "
             "git -c user.email=a@b -c user.name=bb merge --no-edit "
-            "project/stage1",
+            "project/benchmark",
         )
         await self._step(
             environment,
             "diff",
-            f"git add -A && git -c user.email=a@b -c user.name=bb commit -q -m stage1 "
+            f"git add -A && git -c user.email=a@b -c user.name=bb commit -q -m benchmark "
             f"|| true; git diff --stat {base_sha} HEAD",
         )
         # The task declares the artifact pier collects, and separately declares

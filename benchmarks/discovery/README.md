@@ -18,7 +18,7 @@ holding this package on `PYTHONPATH`:
 
     env PYTHONPATH=. CODEX_FORCE_AUTH_JSON=1 pier run \
       -p /path/to/deep-swe/tasks/abs-module-cache-flags \
-      --agent-import-path bbstage1.agent:BetterborgStage1 \
+      --agent-import-path pier_adapter.agent:BetterborgPierAgent \
       -m gpt-5.6-sol --ae CODEX_FORCE_AUTH_JSON=1 \
       -o <out>/jobs --job-name <name> -n 1 -k 1
 
@@ -35,7 +35,7 @@ image build resolves nothing.
 |---|---|---|
 | `docker-stub` | 1 | a `docker` that logs and exits 0, because preparation's program is always required |
 | `npm-shim` | 3 | rewrites a plain `npm install` to `npm ci`, because preparation may not modify tracked files |
-| `land` | 4 | merges `project/stage1` onto the checkout, because execution leaves its work on its own branch |
+| `land` | 4 | merges `project/benchmark` onto the checkout, because execution leaves its work on its own branch |
 | running as `root` | 5 | the worktrees directory is derived from the checkout's parent and cannot be placed |
 | `seed-config` | 6 | a hand-written `config.toml`, because configuration cannot be supplied before analysis runs |
 | `git-identity` | 7 | a global git identity, because the coding phase requires a commit and supplies none |
