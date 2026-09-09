@@ -89,6 +89,7 @@ def _sanity_phase(
     *,
     cancel: CancellationToken | None = None,
     git: SafeGit | None = None,
+    enabled: bool = True,
 ) -> HostSanityPhase:
     return HostSanityPhase(
         fixture.repository,
@@ -118,6 +119,7 @@ def _sanity_phase(
         command_runner=runner,
         cancel=cancel,
         git=git,
+        enabled=enabled,
     )
 
 
@@ -692,4 +694,75 @@ def test_a_task_with_no_check_to_run_blocks_rather_than_publishing(
     assert runtime is not None and runtime.status is TaskRuntimeStatus.BLOCKED
     assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
         tip.base_commit
+    )
+
+
+def test_a_gate_declared_off_publishes_without_running_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """Off, the catalog is not consulted, not even to fail.
+
+    A repository turns the gate off when something outside Betterborg judges
+    the result. A check that would have refused the tip must not run, because
+    running it would decide a question the operator declared is not this run's
+    to answer.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="broken")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(
+            fixture, _plan(fixture), repository_lock, runner, enabled=False
+        ).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert "sanity is off" in result.reason
+    assert "the review agent's judgement alone" in result.reason
+    assert result.commands == ()
+    assert calls == []
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.DONE
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.commit_sha
+    )
+
+
+def test_a_gate_declared_off_publishes_a_catalogue_holding_no_check(
+    tmp_path: Path,
+) -> None:
+    """The empty catalogue blocks only because the gate needs one.
+
+    Preflight refuses an empty catalogue for a gated run, and lets one through
+    when the gate is off. This is the other half of that decision: what
+    reaches here then has to publish rather than block on the missing check.
+    """
+    fixture, tip, repository_lock = _merged_fixture(tmp_path)
+    plan = replace(_plan(fixture), commands=())
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    with SqliteStore.open(fixture.database) as store:
+        result = _sanity_phase(
+            fixture, plan, repository_lock, runner, enabled=False
+        ).run(
+            fixture.context(store),
+            tip,
+            secret_values={"BUILD_TOKEN": "build", "AGENT_TOKEN": "agent"},
+        )
+
+    assert result.status is TaskRuntimeStatus.DONE
+    assert calls == []
+    assert _git(fixture.repository, "rev-parse", _project_branch(fixture)) == (
+        tip.commit_sha
     )

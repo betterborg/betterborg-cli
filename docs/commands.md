@@ -298,6 +298,33 @@ is told the round it is on and the budget it has. Raising the budget buys
 further rounds, never approval: a plan that spends the larger budget
 unapproved blocks exactly as one that spends the default does.
 
+Execution has its own table. `jobs` is how many tasks the scheduler runs at
+once, one to ten. `review_passes` is how many times a task may go round the
+review-and-fix loop before it blocks with its findings kept, and it is a whole
+number of at least one:
+
+```toml
+[execution]
+jobs = 4
+review_passes = 5
+```
+
+`sanity` decides whether a merged tip must pass the repository's own checks
+before the project base advances. It is on unless a repository says otherwise:
+
+```toml
+[execution]
+sanity = false
+```
+
+Turning it off makes the review agent the last judgement in the run. Nothing
+then runs the repository's tests between an approval and the project base, and
+a run holding no check its host can run is no longer refused before it starts.
+Turn it off when something outside Betterborg decides whether the work is
+good — a grader, a CI pipeline, a person reading the branch — and leave it on
+otherwise. A task published this way says so in its outcome, so a result never
+reads as having passed checks that never ran.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

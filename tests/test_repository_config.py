@@ -265,6 +265,8 @@ effort = "low"
         ("jobs = 0", "jobs must be in 1..10"),
         ("jobs = 11", "jobs must be in 1..10"),
         ("review_passes = 0", "review_passes must be at least 1"),
+        ("sanity = 0", "sanity must be true or false"),
+        ('sanity = "off"', "sanity must be true or false"),
     ],
 )
 def test_rejects_execution_limits_outside_planned_ranges(
@@ -400,3 +402,30 @@ def test_unconfigured_repository_keeps_the_default_decomposition_budget() -> Non
     from betterborg_cli.planning import SUPERVISOR_ROUND_CAP
 
     assert PlanningLimits().decomposition_rounds == SUPERVISOR_ROUND_CAP
+
+
+def test_a_repository_can_declare_that_nothing_gates_its_merged_tip(
+    git_repo: Path,
+) -> None:
+    """The gate is on unless a repository says otherwise.
+
+    Turning it off hands the last judgement in a run to the review agent, so
+    the default has to be the one that keeps a check between an approval and
+    the project base.
+    """
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[execution]
+sanity = false
+""",
+    )
+
+    assert load_repository_config(paths).execution == ExecutionLimits(sanity=False)
+    assert ExecutionLimits().sanity is True

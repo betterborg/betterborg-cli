@@ -179,8 +179,15 @@ class HostPreflight:
         analyzer_plan: Mapping[str, Any] | AnalyzerPlanLoader,
         *,
         available_secret_names: Collection[str] = (),
+        sanity: bool = True,
     ) -> HostPreflightResult:
-        """Return a complete plan or every actionable reason it is blocked."""
+        """Return a complete plan or every actionable reason it is blocked.
+
+        ``sanity`` states whether this run will gate a merged tip on the
+        repository's own checks. It is the premise of the catalogue refusal
+        below, and a run that will not gate on checks must not be refused for
+        holding none.
+        """
         self._report_command(
             [
                 "git",
@@ -251,10 +258,12 @@ class HostPreflight:
         # coded, reviewed and merged, and every one would then block. Whether
         # the checks were dropped here or the analysis declared none, the
         # answer is the same run and the refusal belongs before the spend.
+        # A run whose sanity gate is off publishes without them by declaration,
+        # so the premise does not hold and neither does the refusal.
         # A catalogue whose records were refused already said why, in the
         # failures those refusals raised. Adding that the analysis names no
         # check would be a second reason, and a false one: it named several.
-        if not running_commands and not failures:
+        if sanity and not running_commands and not failures:
             if dropped_commands:
                 failures.append(
                     HostPreflightFailure(

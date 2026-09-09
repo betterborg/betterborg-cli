@@ -92,6 +92,7 @@ class HostSanityPhase:
         timeout_seconds: float = 600,
         cancel: CancellationToken | None = None,
         git: SafeGit | None = None,
+        enabled: bool = True,
     ) -> None:
         self.repository_root = Path(repository_root).resolve()
         paths = RepoPaths.discover(self.repository_root, cancel=cancel)
@@ -104,6 +105,10 @@ class HostSanityPhase:
         if timeout_seconds <= 0:
             raise ValueError("sanity command timeout must be positive")
         self.plan = plan
+        # Off, this phase still owns the base advance and the worktree cleanup;
+        # only the judgement is gone. A repository turns it off when something
+        # outside Betterborg decides whether the work is good.
+        self.enabled = enabled
         self._environment_manager = environment_manager
         self._worktree_manager = worktree_manager
         self._repository_lock = repository_lock
@@ -176,7 +181,13 @@ class HostSanityPhase:
         return HostSanityResult(
             TaskRuntimeStatus.DONE,
             self._with_dropped_commands(
-                f"sanity passed and advanced {tip.project_branch} to {published}",
+                (
+                    f"sanity passed and advanced {tip.project_branch} to "
+                    f"{published}"
+                    if self.enabled
+                    else f"sanity is off; advanced {tip.project_branch} to "
+                    f"{published} on the review agent's judgement alone"
+                ),
                 masks,
             ),
             published,
@@ -219,46 +230,49 @@ class HostSanityPhase:
                 raise SanityPhaseError("merged task worktree is missing")
             self._verify_tip(runtime, worktree, tip)
 
-            # The catalog judges this merged tree, and a digest of the
-            # declared commands cannot tell it from the tree it replaced,
-            # so reuse would otherwise skip the install the catalog is
-            # about to be run against.
-            materialization = self._environment_manager.materialize_claimed_task(
-                context.store,
-                self.plan,
-                context.claim,
-                context.owner_token,
-                secret_values=secret_values,
-                task_transition=context.transition,
-                force_preparation=True,
-            )
-            commands = self._run_commands(
-                worktree,
-                materialization_environment=materialization.environment,
-                secret_values=secret_values,
-                cancel=context.cancel,
-                activity=context.activity_sink("sanity"),
-            )
-            command_results.extend(commands)
-            failure = next(
-                (result for result in commands if result.returncode != 0), None
-            )
-            if failure is not None:
-                detail = failure.stderr.strip() or failure.stdout.strip()
-                raise SanityPhaseError(
-                    "sanity command failed with exit code "
-                    f"{failure.returncode}: {shlex.join(failure.command.argv)}"
-                    + (f": {detail[-4000:]}" if detail else "")
+            if self.enabled:
+                # The catalog judges this merged tree, and a digest of the
+                # declared commands cannot tell it from the tree it replaced,
+                # so reuse would otherwise skip the install the catalog is
+                # about to be run against.
+                materialization = (
+                    self._environment_manager.materialize_claimed_task(
+                        context.store,
+                        self.plan,
+                        context.claim,
+                        context.owner_token,
+                        secret_values=secret_values,
+                        task_transition=context.transition,
+                        force_preparation=True,
+                    )
                 )
-            if not commands:
-                raise SanityPhaseError("sanity command catalog is empty")
-            if not self._git.for_worktree(worktree).is_clean():
-                raise SanityPhaseError(
-                    "sanity commands changed tracked or untracked task files"
+                commands = self._run_commands(
+                    worktree,
+                    materialization_environment=materialization.environment,
+                    secret_values=secret_values,
+                    cancel=context.cancel,
+                    activity=context.activity_sink("sanity"),
                 )
+                command_results.extend(commands)
+                failure = next(
+                    (result for result in commands if result.returncode != 0), None
+                )
+                if failure is not None:
+                    detail = failure.stderr.strip() or failure.stdout.strip()
+                    raise SanityPhaseError(
+                        "sanity command failed with exit code "
+                        f"{failure.returncode}: {shlex.join(failure.command.argv)}"
+                        + (f": {detail[-4000:]}" if detail else "")
+                    )
+                if not commands:
+                    raise SanityPhaseError("sanity command catalog is empty")
+                if not self._git.for_worktree(worktree).is_clean():
+                    raise SanityPhaseError(
+                        "sanity commands changed tracked or untracked task files"
+                    )
         if already_advanced:
             return tip.commit_sha
-        if materialization is None:
+        if self.enabled and materialization is None:
             raise SanityPhaseError("sanity materialization did not complete")
 
         masks = declared_secret_mask_values(self.plan, secret_values)
@@ -269,7 +283,12 @@ class HostSanityPhase:
                 "project_branch": tip.project_branch,
                 "base_commit": tip.base_commit,
                 "commit_sha": tip.commit_sha,
-                "preparation_key": materialization.preparation_key,
+                "skipped": not self.enabled,
+                "preparation_key": (
+                    materialization.preparation_key
+                    if materialization is not None
+                    else None
+                ),
                 "commands": [
                     {
                         "argv": [

@@ -1844,3 +1844,38 @@ def test_a_catalogue_refused_for_its_own_shape_is_not_reported_as_empty(
     assert isinstance(result, HostPreflightBlock)
     assert "repo-relative directory" in result.reason
     assert "declares no command that verifies" not in result.reason
+
+
+def test_a_run_whose_gate_is_off_is_not_refused_for_holding_no_check(
+    committed_git_repo: Path,
+) -> None:
+    """The refusal rests on a premise a declared-off gate removes.
+
+    A run holding no check is refused because every task would be coded,
+    reviewed and merged and every one would then block at the gate. A run that
+    does not gate on checks publishes without them by declaration, so the same
+    catalogue is not a reason to refuse it before the spend.
+    """
+    plan = {
+        "command_catalog": {
+            "source": "Cargo.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["absent-cargo", "test"],
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    gated = _preflight(committed_git_repo).validate(plan)
+    ungated = _preflight(committed_git_repo).validate(plan, sanity=False)
+
+    assert isinstance(gated, HostPreflightBlock)
+    assert "no catalogued check can run on this host" in gated.reason
+    assert isinstance(ungated, HostPreflightPlan)
+    assert ungated.commands == ()
+    # The drop is still recorded: what could not run is what the operator reads
+    # to learn the gate had nothing to run even had it been on.
+    assert "absent-cargo" in ungated.dropped_command_summary

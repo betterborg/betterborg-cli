@@ -98,6 +98,11 @@ class ExecutionLimits:
 
     jobs: int = 1
     review_passes: int = 3
+    #: Whether a merged tip must pass the repository's own checks before the
+    #: project base advances. Off, the review agent is the last judgement in
+    #: the run, so a repository turns this off only when something outside
+    #: Betterborg judges the result.
+    sanity: bool = True
 
 
 @dataclass(frozen=True)
@@ -260,7 +265,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
 
     execution_document = _optional_table(document, "execution")
     _require_only_keys(
-        execution_document, {"jobs", "review_passes"}, section="execution"
+        execution_document, {"jobs", "review_passes", "sanity"}, section="execution"
     )
     jobs = _optional_int(execution_document, "jobs", default=1, section="execution")
     review_passes = _optional_int(
@@ -268,6 +273,9 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     )
     if not 1 <= jobs <= 10:
         raise RepositoryConfigError("execution.jobs must be in 1..10")
+    sanity = _optional_bool(
+        execution_document, "sanity", default=True, section="execution"
+    )
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
 
@@ -295,7 +303,9 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         repository_id=repository_id,
         default_branch=default_branch,
         agents=AgentChoices(**agent_choices),
-        execution=ExecutionLimits(jobs=jobs, review_passes=review_passes),
+        execution=ExecutionLimits(
+            jobs=jobs, review_passes=review_passes, sanity=sanity
+        ),
         planning=PlanningLimits(
             review_rounds=review_rounds,
             decomposition_rounds=decomposition_rounds,
@@ -378,6 +388,15 @@ def _optional_int(
     value = document.get(key, default)
     if not isinstance(value, int) or isinstance(value, bool):
         raise RepositoryConfigError(f"{section}.{key} must be an integer")
+    return value
+
+
+def _optional_bool(
+    document: Mapping[str, Any], key: str, *, default: bool, section: str
+) -> bool:
+    value = document.get(key, default)
+    if not isinstance(value, bool):
+        raise RepositoryConfigError(f"{section}.{key} must be true or false")
     return value
 
 

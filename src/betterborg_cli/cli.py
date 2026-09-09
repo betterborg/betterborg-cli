@@ -1654,6 +1654,7 @@ def _invoke_host_execution(
         validated = preflight.validate(
             analyzer_plan,
             available_secret_names=os.environ.keys(),
+            sanity=config.execution.sanity,
         )
     except BaseException as error:
         _finish_execution_preflight(progress, cancel=cancel, error=error)
@@ -1746,6 +1747,7 @@ def _invoke_host_execution(
             repository_lock=locked_repository,
             cancel=cancel,
             git=git,
+            enabled=config.execution.sanity,
         ),
     )
     service = HostExecutionService(
