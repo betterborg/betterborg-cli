@@ -21,7 +21,7 @@ from pier.models.agent.network import NetworkAllowlist
 
 # Betterborg build the container installs. A commit rather than a release, so
 # a result names the exact code that produced it. It must be on the remote.
-BETTERBORG_COMMIT = "4a174151a23e7c02f3a936c3bca5629c33b46fa9"
+BETTERBORG_COMMIT = "aa25c82514f0444490d7769c0cb6744cec978cdb"
 BETTERBORG_REPO = "https://github.com/betterborg/betterborg-cli"
 
 _APP = "/app"
@@ -347,7 +347,9 @@ SHIM
         # and the stage tables it would have generated.
         # The sanity gate is off because the grader is the judgement that
         # counts here, and a repository check that fails for an environment
-        # reason would otherwise discard a reviewed, merged task.
+        # reason would otherwise discard a reviewed, merged task. Preparation
+        # is optional for the same reason one layer earlier: an install this
+        # analysis got wrong should cost the agent its tooling, not the task.
         seed = (
             "import uuid, subprocess, pathlib\n"
             "branch = subprocess.run("
@@ -361,7 +363,7 @@ SHIM
             "body += '[planning]\\nreview_rounds = 8\\n"
             "decomposition_rounds = 6\\n\\n'\n"
             "body += '[execution]\\njobs = 4\\nreview_passes = 5\\n"
-            "sanity = false\\n\\n'\n"
+            "sanity = false\\npreparation = \\'optional\\'\\n\\n'\n"
             "body += '[agents.defaults]\\nadapter = \"codex\"\\n"
             "model = \"gpt-5.6-sol\"\\neffort = \"low\"\\n\\n'\n"
             "body += ''.join('[agents.%s]\\n\\n' % s for s in stages)\n"
@@ -511,6 +513,30 @@ SHIM
             "git merge --ff-only project/benchmark || "
             "git -c user.email=a@b -c user.name=bb merge --no-edit "
             "project/benchmark",
+        )
+        # A task that blocks keeps its commits on its own branch and nothing
+        # merges them, so a review budget that runs out discards work that was
+        # coded, reviewed and fixed. The grader is the judgement here, so the
+        # adapter lands what the run built and abandons only what will not
+        # merge. Branch order is the stem order the Project Manager numbered,
+        # which is the order the tasks were meant to run in.
+        await self._step(
+            environment,
+            "land-blocked",
+            "for branch in "
+            "$(git for-each-ref --format='%(refname:short)' "
+            "refs/heads/betterborg-tasks/); do "
+            'if git merge-base --is-ancestor "$branch" HEAD; then '
+            'echo "[land] already landed: $branch"; '
+            "elif git -c user.email=a@b -c user.name=bb merge --no-edit "
+            '"$branch"; then '
+            'echo "[land] landed: $branch"; '
+            "else "
+            "git merge --abort || true; "
+            'echo "[land] conflict, abandoned: $branch"; '
+            "fi; "
+            "done; "
+            "git status --porcelain",
         )
         await self._step(
             environment,
