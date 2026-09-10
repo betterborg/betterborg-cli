@@ -23,6 +23,7 @@ from betterborg_cli.host_execution import (
     HostSecret,
     HostWorktreeManager,
 )
+from betterborg_cli.host_execution.environment import materialization_marker
 from betterborg_cli.planning import render_task_markdown, task_markdown_digest
 from betterborg_cli.progress import AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
@@ -1171,6 +1172,29 @@ def _git(repository: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def _assert_coding_can_start(fixture, store, claim) -> None:  # noqa: ANN001
+    """Reaching CODING is not the same as coding being able to run.
+
+    Every agent phase re-reads the checkout through `require_ready_worktree`,
+    which wants a completed materialization and a marker matching it. A run
+    that transitions without leaving those behind blocks on the first phase
+    that looks, which is the failure this exists to catch.
+    """
+    completed = [
+        attempt
+        for attempt in store.list_environment_attempts(claim.task_id)
+        if attempt.kind == "materialize"
+        and attempt.status is ExecutionAttemptStatus.COMPLETED
+    ]
+    assert completed, "no completed materialization: every agent phase refuses"
+    runtime = store.get_task_runtime(claim.task_id)
+    assert runtime is not None and runtime.worktree_path is not None
+    marker = materialization_marker(
+        RepoPaths.discover(fixture.repository), Path(runtime.worktree_path)
+    )
+    assert marker.read_text(encoding="utf-8").strip() == completed[-1].fingerprint
+
+
 def test_skipped_preparation_runs_nothing_and_says_so(
     execution_preflight_fixture,
 ) -> None:
@@ -1188,6 +1212,7 @@ def test_skipped_preparation_runs_nothing_and_says_so(
             PreparationMode.SKIPPED
         ).materialize_claimed_task(store, plan, claim, fixture.owner_token)
         runtime = store.get_task_runtime(fixture.task_ids[0])
+        _assert_coding_can_start(fixture, store, claim)
 
     assert fixture.commands == []
     assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING
@@ -1215,6 +1240,7 @@ def test_optional_preparation_survives_a_command_that_fails(
             PreparationMode.OPTIONAL
         ).materialize_claimed_task(store, plan, claim, fixture.owner_token)
         runtime = store.get_task_runtime(fixture.task_ids[0])
+        _assert_coding_can_start(fixture, store, claim)
 
     assert fixture.commands == [["./fake-package-manager", "fail-dirty"]]
     assert runtime is not None and runtime.status is TaskRuntimeStatus.CODING

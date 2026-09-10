@@ -212,40 +212,44 @@ class HostEnvironmentManager:
             command_environments = self._command_environments(
                 plan, base_environment, secret_values or {}
             )
-            materialization_reused = False
-            preparation_note: str | None = None
-            if self.preparation is PreparationMode.SKIPPED:
+            skipped = self.preparation is PreparationMode.SKIPPED
+            # Skipping runs the same recording path with nothing to run, so a
+            # skipped checkout is exactly a checkout whose repository declared
+            # no preparation, which every later phase already handles.
+            commands = (
+                ()
+                if skipped
+                else selected_preparation_commands(
+                    prepare_commands=plan.prepare_commands,
+                    materialize_commands=plan.materialize_commands,
+                )
+            )
+            # Optional preparation survives a command that fails and leaves
+            # the checkout as it found it. It cannot survive one that wrote
+            # into the checkout: those writes are not the task's work and
+            # would be graded as if they were, and discarding them needs the
+            # destructive Git the worktree guard deliberately withholds.
+            materialization_reused, failure = self._materialize_worktree(
+                store,
+                plan,
+                claim,
+                owner_token,
+                preparation_key=preparation_key,
+                commands=commands,
+                worktree=worktree,
+                command_environments=command_environments,
+                force_preparation=force_preparation,
+                relaxed=self.preparation is not PreparationMode.REQUIRED,
+                activity=activity,
+            )
+            preparation_note = None
+            if skipped:
                 preparation_note = (
                     "preparation is skipped by configuration; the checkout "
                     "holds only what its commit tracks"
                 )
-            else:
-                try:
-                    materialization_reused = self._materialize_worktree(
-                        store,
-                        plan,
-                        claim,
-                        owner_token,
-                        preparation_key=preparation_key,
-                        worktree=worktree,
-                        command_environments=command_environments,
-                        force_preparation=force_preparation,
-                        activity=activity,
-                    )
-                except EnvironmentMaterializationError as error:
-                    if self.preparation is PreparationMode.REQUIRED:
-                        raise
-                    # Optional preparation survives a command that fails and
-                    # leaves the checkout as it found it. It cannot survive
-                    # one that wrote into the checkout: those writes are not
-                    # the task's work and would be graded as if they were,
-                    # and discarding them needs the destructive Git the
-                    # worktree guard deliberately withholds. So this refuses
-                    # exactly what it cannot clean up, and says which it was.
-                    self._assert_no_tracked_changes(
-                        worktree, "after preparation failed"
-                    )
-                    preparation_note = f"preparation did not complete: {error}"
+            elif failure is not None:
+                preparation_note = f"preparation did not complete: {failure}"
         except BaseException as error:
             self._raise_if_cancelled(error)
             self._block_environment_task(
@@ -282,13 +286,15 @@ class HostEnvironmentManager:
         owner_token: str,
         *,
         preparation_key: str,
+        commands: Sequence[HostCommand],
         worktree: Path,
         command_environments: Mapping[
             str, tuple[Mapping[str, str], Sequence[str]]
         ],
         force_preparation: bool,
+        relaxed: bool,
         activity: ActivitySink | None,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         marker = self._materialization_marker(worktree)
         if (
             not force_preparation
@@ -298,28 +304,26 @@ class HostEnvironmentManager:
             is not None
             and _prepared_marker_matches(marker, preparation_key)
         ):
-            return True
+            return True, None
 
         # A failed or intervening preparation may already have changed ignored
         # checkout-local dependencies.  Invalidate the prior state before
         # running so a later A -> B -> A transition cannot reuse A.
         _invalidate_marker(marker)
 
-        self._record_attempt(
+        note = self._record_attempt(
             store,
             claim,
             owner_token,
             preparation_key=preparation_key,
-            commands=selected_preparation_commands(
-                prepare_commands=plan.prepare_commands,
-                materialize_commands=plan.materialize_commands,
-            ),
+            commands=commands,
             worktree=worktree,
             completion_marker=marker,
             command_environments=command_environments,
             activity=activity,
+            relaxed=relaxed,
         )
-        return False
+        return False, note
 
     def _record_attempt(
         self,
@@ -335,7 +339,8 @@ class HostEnvironmentManager:
         ],
         completion_marker: Path,
         activity: ActivitySink | None = None,
-    ) -> None:
+        relaxed: bool = False,
+    ) -> str | None:
         task_id = claim.task_id
         prior = [
             attempt
@@ -389,6 +394,30 @@ class HostEnvironmentManager:
         except BaseException as error:
             duration = time.monotonic() - started
             redacted = redact_secrets(str(error), mask_values)
+            if (
+                # An interrupted run is never a survivable preparation: the
+                # commands did not decline to work, they were stopped.
+                not self._is_cancelled()
+                and relaxed
+                and isinstance(error, EnvironmentMaterializationError)
+                and self._worktree_is_clean(worktree)
+            ):
+                # The checkout is as prepared as this run intends, so it needs
+                # the completed record and the marker a repository declaring
+                # no preparation already gets. Without them every phase that
+                # reads them refuses to start and the task blocks anyway,
+                # which is the outcome the declaration exists to prevent.
+                _write_marker(completion_marker, preparation_key)
+                store.complete_environment_attempt(
+                    attempt.id,
+                    owner_token,
+                    claim.claim_token,
+                    status=ExecutionAttemptStatus.COMPLETED,
+                    result={"commands": [], "preparation_error": redacted},
+                    duration_seconds=duration,
+                    now=self._clock(),
+                )
+                return redacted
             store.complete_environment_attempt(
                 attempt.id,
                 owner_token,
@@ -399,8 +428,6 @@ class HostEnvironmentManager:
                 now=self._clock(),
             )
             self._raise_if_cancelled(error)
-            if isinstance(error, EnvironmentMaterializationError):
-                raise EnvironmentMaterializationError(redacted) from error
             raise EnvironmentMaterializationError(redacted) from error
 
         store.complete_environment_attempt(
@@ -531,6 +558,17 @@ class HostEnvironmentManager:
                 mask_values,
             )
         return environments
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel is not None and self._cancel.is_set()
+
+    def _worktree_is_clean(self, worktree: Path) -> bool:
+        """Answer whether preparation left the checkout as it found it."""
+        try:
+            self._assert_no_tracked_changes(worktree, "after preparation failed")
+        except EnvironmentMaterializationError:
+            return False
+        return True
 
     def _assert_no_tracked_changes(self, worktree: Path, when: str) -> None:
         output = self._git.for_worktree(worktree).run(
