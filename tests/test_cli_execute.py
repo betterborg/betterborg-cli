@@ -55,7 +55,7 @@ from betterborg_cli.progress import (
     StageSpec,
     StageState,
 )
-from betterborg_cli.repository_config import AgentStage
+from betterborg_cli.repository_config import AgentStage, PreparationMode
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
@@ -3155,3 +3155,86 @@ def test_the_preflight_progress_line_masks_a_secret_a_dropped_check_quoted(
     assert reported is not None
     assert "missing-runtime" in reported
     assert "s3cr3t-value" not in reported
+
+
+def test_execute_carries_the_declared_gates_to_every_consumer(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    approved_task_generation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both declarations are decided in two places each, not one.
+
+    A gate honoured by the phase but not by preflight is a run refused before
+    it starts; one honoured by preflight but not the phase is a run that
+    blocks on the check it was told to skip. Only the wiring proves neither.
+    """
+    repository, paths, borg, _approval, fixture, _publication = (
+        _seed_executable_generation(
+            committed_git_repo,
+            planning_cli_repository,
+            approved_task_generation,
+            name="declared-gates",
+        )
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\n[execution]\nsanity = false\npreparation = "optional"\n',
+        encoding="utf-8",
+    )
+    _trust(cli_runner, committed_git_repo, monkeypatch)
+    config = cli_module.load_repository_config(paths)
+    assert config.execution.sanity is False
+    assert config.execution.preparation is PreparationMode.OPTIONAL
+
+    def select(_config, stage, selected_paths, **_kwargs):
+        return SelectedAgent(
+            role=ApiAgentRole(stage.value),
+            adapter=MockAdapter(name="openai"),
+            paths=selected_paths,
+            model=f"{stage.value}-model",
+            effort="low",
+        )
+
+    preflight_kwargs: list[dict[str, object]] = []
+    original_validate = cli_module.HostPreflight.validate
+
+    def validate(self, analyzer_plan, **kwargs):
+        preflight_kwargs.append(dict(kwargs))
+        return original_validate(self, analyzer_plan, **kwargs)
+
+    observed: list[tuple[object, object]] = []
+
+    def run(service, borg_id, generation_id, analyzer_plan, **kwargs):
+        observed.append(
+            (
+                service._runtime._sanity.enabled,
+                service._runtime._environment.preparation,
+            )
+        )
+        return HostExecutionResult(service._runtime.plan)
+
+    monkeypatch.setattr(cli_module, "select_agent", select)
+    monkeypatch.setattr(cli_module.HostPreflight, "validate", validate)
+    monkeypatch.setattr(cli_module.HostExecutionService, "run", run)
+    cancel = CancellationToken()
+    progress = RunProgress(enabled=False)
+    progress.declare(StageSpec("preflight", "Preflight"))
+    progress.start("preflight")
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        cli_module._invoke_host_execution(
+            paths,
+            store,
+            config,
+            repository.id,
+            borg.id,
+            fixture.generation.id,
+            cancel=cancel,
+            progress=progress,
+        )
+
+    assert observed == [(False, PreparationMode.OPTIONAL)]
+    assert preflight_kwargs and preflight_kwargs[-1]["sanity"] is False
+    assert preflight_kwargs[-1]["preparation"] is PreparationMode.OPTIONAL
