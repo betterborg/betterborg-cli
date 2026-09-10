@@ -21,7 +21,7 @@ from pier.models.agent.network import NetworkAllowlist
 
 # Betterborg build the container installs. A commit rather than a release, so
 # a result names the exact code that produced it. It must be on the remote.
-BETTERBORG_COMMIT = "288504478509071df931e944fbdf9e88f3b658c7"
+BETTERBORG_COMMIT = "c95984bdbf8469ddfc7a08c44afa732c720f35fb"
 BETTERBORG_REPO = "https://github.com/betterborg/betterborg-cli"
 
 _APP = "/app"
@@ -363,7 +363,8 @@ SHIM
             "body += '[planning]\\nreview_rounds = 8\\n"
             "decomposition_rounds = 6\\n\\n'\n"
             "body += '[execution]\\njobs = 4\\nreview_passes = 5\\n"
-            "sanity = false\\npreparation = \\'optional\\'\\n\\n'\n"
+            "sanity = false\\npreparation = \\'optional\\'\\n"
+            "blocked_tasks = \\'review\\'\\n\\n'\n"
             "body += '[agents.defaults]\\nadapter = \"codex\"\\n"
             "model = \"gpt-5.6-sol\"\\neffort = \"low\"\\n\\n'\n"
             "body += ''.join('[agents.%s]\\n\\n' % s for s in stages)\n"
