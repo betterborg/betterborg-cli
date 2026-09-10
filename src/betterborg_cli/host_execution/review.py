@@ -31,13 +31,14 @@ from betterborg_cli.host_execution._agent_phase import (
 )
 from betterborg_cli.host_execution.coding import (
     CODING_RESULT_SCHEMA,
-    REVIEWABLE_CODING_STATUSES,
+    reviewable_coding_statuses,
 )
 from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import BlockedTaskPolicy
 from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
@@ -88,6 +89,7 @@ class HostReviewFixConfig:
     fix_effort: str | None = None
     review_allowed_tools: tuple[str, ...] = ()
     fix_allowed_tools: tuple[str, ...] = ()
+    blocked_tasks: BlockedTaskPolicy = BlockedTaskPolicy.STOP
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
     artifact_root: Path | None = None
 
@@ -460,6 +462,9 @@ class HostReviewFixPhase:
         else:
             outcome = self._classify_fix(
                 result,
+                reviewable=reviewable_coding_statuses(
+                    self._config.blocked_tasks
+                ),
                 runtime=runtime,
                 previous_commit=current_commit,
                 final_commit=final_commit,
@@ -605,6 +610,7 @@ class HostReviewFixPhase:
     def _classify_fix(
         result: AgentResult,
         *,
+        reviewable: frozenset[str],
         runtime: TaskRuntime,
         previous_commit: str,
         final_commit: str,
@@ -646,7 +652,7 @@ class HostReviewFixPhase:
                 runtime.review_round,
                 "fix",
             )
-        elif payload_status not in REVIEWABLE_CODING_STATUSES:
+        elif payload_status not in reviewable:
             reason = f"fix agent reported {payload_status or 'no status'}"
         elif final_commit == previous_commit:
             reason = (

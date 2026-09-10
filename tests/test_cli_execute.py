@@ -55,7 +55,11 @@ from betterborg_cli.progress import (
     StageSpec,
     StageState,
 )
-from betterborg_cli.repository_config import AgentStage, PreparationMode
+from betterborg_cli.repository_config import (
+    AgentStage,
+    BlockedTaskPolicy,
+    PreparationMode,
+)
 from betterborg_cli.store import (
     BorgState,
     ExecutionRunStatus,
@@ -3181,13 +3185,17 @@ def test_execute_carries_the_declared_gates_to_every_consumer(
     config_path = paths.tracked_dir / "config.toml"
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + '\n[execution]\nsanity = false\npreparation = "optional"\n',
+        + (
+            '\n[execution]\nsanity = false\npreparation = "optional"\n'
+            'blocked_tasks = "review"\n'
+        ),
         encoding="utf-8",
     )
     _trust(cli_runner, committed_git_repo, monkeypatch)
     config = cli_module.load_repository_config(paths)
     assert config.execution.sanity is False
     assert config.execution.preparation is PreparationMode.OPTIONAL
+    assert config.execution.blocked_tasks is BlockedTaskPolicy.REVIEW
 
     def select(_config, stage, selected_paths, **_kwargs):
         return SelectedAgent(
@@ -3212,6 +3220,8 @@ def test_execute_carries_the_declared_gates_to_every_consumer(
             (
                 service._runtime._sanity.enabled,
                 service._runtime._environment.preparation,
+                service._runtime._coding._config.blocked_tasks,
+                service._runtime._review_fix._config.blocked_tasks,
             )
         )
         return HostExecutionResult(service._runtime.plan)
@@ -3235,6 +3245,13 @@ def test_execute_carries_the_declared_gates_to_every_consumer(
             progress=progress,
         )
 
-    assert observed == [(False, PreparationMode.OPTIONAL)]
+    assert observed == [
+        (
+            False,
+            PreparationMode.OPTIONAL,
+            BlockedTaskPolicy.REVIEW,
+            BlockedTaskPolicy.REVIEW,
+        )
+    ]
     assert preflight_kwargs and preflight_kwargs[-1]["sanity"] is False
     assert preflight_kwargs[-1]["preparation"] is PreparationMode.OPTIONAL

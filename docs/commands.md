@@ -348,6 +348,24 @@ A task whose checkout was not prepared is told so, in the same words its
 outcome records, because a command that fails for want of a dependency is a
 fact about the checkout rather than about the change.
 
+`blocked_tasks` says what a run does with a task whose coding agent returned
+`blocked` — the agent reporting that the task does not make sense as given,
+usually because the work it was assigned contradicts something the repository
+already asserts. `stop`, the default, takes that at its word: the task ends and
+the tasks depending on it never start, because a run that carries on past its
+own alarm is a run that ships work nobody judged. `review` hands the commit and
+the agent's account of what stopped it to the reviewer instead:
+
+```toml
+[execution]
+blocked_tasks = "review"
+```
+
+Set it where something outside Betterborg decides whether the work is worth
+having, and leave it alone otherwise. The reviewer is told what the coding
+agent reported and why, and can still reject, so this widens who may judge a
+blocked task rather than removing the judgement.
+
 ## Progress output
 
 Agent-backed terminal commands (`init`, `analyze`, `create`, the planning

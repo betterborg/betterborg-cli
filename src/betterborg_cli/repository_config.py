@@ -68,6 +68,20 @@ class PreparationMode(StrEnum):
     SKIPPED = "skipped"
 
 
+class BlockedTaskPolicy(StrEnum):
+    """What a run does with a task its coding agent refused to finish.
+
+    ``blocked`` is the agent saying the task does not make sense as given, and
+    ``stop`` takes it at its word: the task ends and the tasks waiting on it do
+    not start. ``review`` hands the commit and the agent's own account of what
+    stopped it to the reviewer instead, for a repository where something
+    outside Betterborg decides whether the work is worth having.
+    """
+
+    STOP = "stop"
+    REVIEW = "review"
+
+
 @dataclass(frozen=True)
 class AgentChoice:
     """Optional adapter selection for one agent stage."""
@@ -120,6 +134,7 @@ class ExecutionLimits:
     #: Betterborg judges the result.
     sanity: bool = True
     preparation: PreparationMode = PreparationMode.REQUIRED
+    blocked_tasks: BlockedTaskPolicy = BlockedTaskPolicy.STOP
 
 
 @dataclass(frozen=True)
@@ -283,7 +298,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     execution_document = _optional_table(document, "execution")
     _require_only_keys(
         execution_document,
-        {"jobs", "review_passes", "sanity", "preparation"},
+        {"jobs", "review_passes", "sanity", "preparation", "blocked_tasks"},
         section="execution",
     )
     jobs = _optional_int(execution_document, "jobs", default=1, section="execution")
@@ -301,6 +316,13 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         default=PreparationMode.REQUIRED,
         section="execution",
         choices=PreparationMode,
+    )
+    blocked_tasks = _optional_choice(
+        execution_document,
+        "blocked_tasks",
+        default=BlockedTaskPolicy.STOP,
+        section="execution",
+        choices=BlockedTaskPolicy,
     )
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
@@ -334,6 +356,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
             review_passes=review_passes,
             sanity=sanity,
             preparation=preparation,
+            blocked_tasks=blocked_tasks,
         ),
         planning=PlanningLimits(
             review_rounds=review_rounds,

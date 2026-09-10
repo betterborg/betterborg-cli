@@ -33,6 +33,7 @@ from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError
 from betterborg_cli.repo_paths import RepoPaths
+from betterborg_cli.repository_config import BlockedTaskPolicy
 from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
@@ -94,6 +95,18 @@ CODING_RESULT_SCHEMA: dict[str, Any] = {
 REVIEWABLE_CODING_STATUSES = frozenset({"completed", "partial"})
 
 
+def reviewable_coding_statuses(policy: BlockedTaskPolicy) -> frozenset[str]:
+    """Return the statuses whose commit this run will carry into review.
+
+    ``blocked`` joins them only by declaration. It is the agent reporting that
+    the task does not make sense as given, and a run that continues past it by
+    default would be the product ignoring its own alarm.
+    """
+    if policy is BlockedTaskPolicy.REVIEW:
+        return REVIEWABLE_CODING_STATUSES | {"blocked"}
+    return REVIEWABLE_CODING_STATUSES
+
+
 class CodingPhaseError(RuntimeError):
     """Raised when a claimed task is not safe or ready for coding."""
 
@@ -108,6 +121,7 @@ class HostCodingConfig:
     allowed_tools: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
     artifact_root: Path | None = None
+    blocked_tasks: BlockedTaskPolicy = BlockedTaskPolicy.STOP
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -283,6 +297,7 @@ class HostCodingPhase:
 
         outcome = self._classify(
             result,
+            reviewable=reviewable_coding_statuses(self._config.blocked_tasks),
             base_head=base_head,
             final_head=final_head,
             expected_branch=runtime.branch or "",
@@ -396,6 +411,7 @@ class HostCodingPhase:
     def _classify(
         result: AgentResult,
         *,
+        reviewable: frozenset[str],
         base_head: str,
         final_head: str,
         expected_branch: str,
@@ -421,7 +437,7 @@ class HostCodingPhase:
         payload_status = (result.payload or {}).get("status")
         if payload_status == "failed":
             return TaskRuntimeStatus.FAILED, "coding agent reported failed"
-        if payload_status not in REVIEWABLE_CODING_STATUSES:
+        if payload_status not in reviewable:
             return (
                 TaskRuntimeStatus.BLOCKED,
                 f"coding agent reported {payload_status or 'no status'}",

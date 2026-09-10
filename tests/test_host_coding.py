@@ -53,6 +53,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
+from betterborg_cli.repository_config import BlockedTaskPolicy
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -482,6 +483,7 @@ def _prepare_review(
     *,
     usage: AgentUsage | None = None,
     coding_payload: dict | None = None,
+    coding_config: HostCodingConfig | None = None,
 ) -> None:
     coding_prompt = store.get_latest_generated_prompts(
         fixture.borg.repository_id
@@ -499,7 +501,7 @@ def _prepare_review(
                 fixture.task, usage=usage, payload=coding_payload
             )
         ),
-        config=HostCodingConfig(model="coding-model"),
+        config=coding_config or HostCodingConfig(model="coding-model"),
     ).run(fixture.context(store))
     assert status is TaskRuntimeStatus.REVIEW
 
@@ -1472,3 +1474,89 @@ def test_a_prepared_checkout_says_nothing_about_itself(tmp_path: Path) -> None:
         ).run(fixture.context(store))
 
     assert "This checkout is not installed" not in adapter.calls[0].user_prompt
+
+
+def test_a_blocked_commit_stops_the_task_unless_a_repository_says_otherwise(
+    tmp_path: Path,
+) -> None:
+    """Blocked is the agent saying the task does not make sense as given.
+
+    Carrying on past that by default would be the run ignoring its own alarm,
+    so the commit reaches review only where a repository has said something
+    outside Betterborg decides whether the work is worth having.
+    """
+    stopped = _coding_fixture(tmp_path)
+    with SqliteStore.open(stopped.database) as store:
+        status = HostCodingPhase(
+            stopped.repository,
+            MockAdapter().queue(
+                _committing_response(
+                    stopped.task,
+                    payload=_unfinished_payload(stopped.task, status="blocked"),
+                )
+            ),
+            config=HostCodingConfig(model="test-model"),
+        ).run(stopped.context(store))
+        stopped_runtime = store.get_task_runtime(stopped.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert stopped_runtime is not None
+    assert stopped_runtime.state_reason == "coding agent reported blocked"
+
+    reviewed_root = tmp_path / "reviewed"
+    reviewed_root.mkdir()
+    reviewed = _coding_fixture(reviewed_root)
+    with SqliteStore.open(reviewed.database) as store:
+        status = HostCodingPhase(
+            reviewed.repository,
+            MockAdapter().queue(
+                _committing_response(
+                    reviewed.task,
+                    payload=_unfinished_payload(reviewed.task, status="blocked"),
+                )
+            ),
+            config=HostCodingConfig(
+                model="test-model",
+                blocked_tasks=BlockedTaskPolicy.REVIEW,
+            ),
+        ).run(reviewed.context(store))
+        reviewed_runtime = store.get_task_runtime(reviewed.task.id)
+
+    assert status is TaskRuntimeStatus.REVIEW
+    assert reviewed_runtime is not None
+    head = _git(Path(reviewed_runtime.worktree_path), "rev-parse", "HEAD")
+    assert reviewed_runtime.state_reason == (
+        f"coding reported blocked and committed {head}"
+    )
+
+
+def test_a_blocked_commit_that_reaches_review_carries_its_blockers(
+    tmp_path: Path,
+) -> None:
+    """The reason it stopped is exactly what the reviewer needs to judge it."""
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(payload=_review_payload(fixture.task, status="approved"))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(
+            fixture,
+            store,
+            coding_payload=_unfinished_payload(fixture.task, status="blocked"),
+            coding_config=HostCodingConfig(
+                model="coding-model", blocked_tasks=BlockedTaskPolicy.REVIEW
+            ),
+        )
+        HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                blocked_tasks=BlockedTaskPolicy.REVIEW,
+            ),
+        ).run(fixture.context(store))
+
+    prompt = review.calls[0].user_prompt
+    assert "'blocked'" in prompt
+    assert UNRESOLVED_BLOCKER in prompt
