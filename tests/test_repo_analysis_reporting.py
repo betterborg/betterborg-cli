@@ -1205,6 +1205,22 @@ def test_a_catalogued_command_directory_must_belong_to_the_repository(
         assert store.list_analyses(repository.id) == []
 
 
+def test_the_analyzer_is_told_where_a_preparation_command_runs() -> None:
+    """Discovery withholds an untracked file; only this sentence says why.
+
+    The index names it as an untracked omission, which reads as evidence the
+    analysis merely could not see. Without the rule, an install form keyed to
+    that file is still the obvious declaration, and it refuses in every
+    worktree.
+    """
+    from betterborg_cli.repo_analysis.analyzer import _SYSTEM_PROMPT
+
+    prompt = " ".join(_SYSTEM_PROMPT.split())
+    assert "runs in a worktree checked out from a commit" in prompt
+    assert "declare one the tracked tree supports" in prompt
+    assert "untracked omission" in prompt
+
+
 def test_the_analyzer_is_told_what_decides_whether_a_command_verifies() -> None:
     """The schema forces a boolean; only this sentence decides which one.
 

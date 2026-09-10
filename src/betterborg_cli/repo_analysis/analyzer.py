@@ -382,6 +382,11 @@ false for everything else, including a command that serves, watches, publishes,
 releases, waits for input, measures rather than checks, or writes anything the
 repository tracks or would report as untracked. Read .gitignore to decide what
 a command's output does; where you cannot tell, verifies is false.
+A prepare or materialize command runs in a worktree checked out from a commit,
+so declare one the tracked tree supports. The index lists a file this checkout
+holds without committing as an untracked omission; that file is absent where the
+command runs, and an install form requiring it refuses there however plainly
+this checkout shows it.
 A command's cwd is a directory of this repository written relative to
 its root, never an absolute path and never a working directory inside a
 container image. Service env
