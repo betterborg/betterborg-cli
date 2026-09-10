@@ -24,6 +24,10 @@ from betterborg_cli.planning import (
     build_plan_element_catalog,
 )
 from betterborg_cli.planning import task_publication as publication_module
+from betterborg_cli.planning.supervisor import (
+    _SUPERVISOR_SYSTEM_PROMPT,
+    SUPERVISOR_DECISION_ROUND_CAP,
+)
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repository_config import AgentStage, load_repository_config
@@ -112,6 +116,21 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
         "decision": decision,
         "summary": message,
         "findings": findings,
+    }
+
+
+def _contradictory_review(message: str = "Only small things here.") -> dict:
+    """A decision the schema admits and the decision contract refuses."""
+    return {
+        "decision": "request_changes",
+        "summary": message,
+        "findings": [
+            {
+                "severity": "minor",
+                "message": message,
+                "suggestion": "Tidy the wording.",
+            }
+        ],
     }
 
 
@@ -1023,3 +1042,93 @@ def test_plan_approve_honors_the_repository_decomposition_budget(
         borg = store.get_borg_by_name(repository.id, "budgeted-tasks")
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
+
+
+def test_a_supervisor_decision_contradicting_its_findings_is_sent_back(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+) -> None:
+    """The rule is the product's, so the cost of breaking it is a turn.
+
+    Requesting changes while holding only minor findings is a combination the
+    schema admits, and ending decomposition on it spends a whole budget on one
+    turn that was never told the rule.
+    """
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo, planning_cli_repository, "decision-retry", plan
+    )
+    adapter = MockAdapter(name="openai")
+    for response in (
+        _pm_tasks(plan),
+        _contradictory_review(),
+        _review("approve"),
+    ):
+        adapter.queue(MockResponse(payload=response))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".decision-retry-state",
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "approve", "decision-retry", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # The Project Manager is not re-run: the batch was never the problem.
+    assert len(adapter.calls) == 3
+    retry_prompt = adapter.calls[2].user_prompt
+    assert "Rejected review" in retry_prompt
+    assert "at least one blocker or major finding" in retry_prompt
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "decision-retry")
+        assert borg is not None
+        assert borg.state is BorgState.READY_TO_EXECUTE
+
+
+def test_a_supervisor_that_keeps_contradicting_itself_still_ends_the_run(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+) -> None:
+    """Correction is a cap, not a licence to loop."""
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo, planning_cli_repository, "decision-cap", plan
+    )
+    adapter = MockAdapter(name="openai")
+    adapter.queue(MockResponse(payload=_pm_tasks(plan)))
+    for _ in range(SUPERVISOR_DECISION_ROUND_CAP):
+        adapter.queue(MockResponse(payload=_contradictory_review()))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".decision-cap-state",
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "approve", "decision-cap", "--yes"])
+
+    assert result.exit_code != 0
+    assert len(adapter.calls) == 1 + SUPERVISOR_DECISION_ROUND_CAP
+    assert "blocker or major finding" in result.output
+
+
+def test_the_supervisor_is_told_the_rule_its_decision_is_judged_by() -> None:
+    assert "request_changes only while holding at least one blocker or major" in (
+        _SUPERVISOR_SYSTEM_PROMPT
+    )
+    assert "approve only while holding none" in _SUPERVISOR_SYSTEM_PROMPT

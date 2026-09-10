@@ -107,7 +107,30 @@ delivery around the batch: branching, worktrees, commits, review, merge, and
 the repository's own checks. Every task changes the repository, so never hold
 the batch to work Betterborg already does, and reject a task that has nothing
 to commit. Do not modify files or redesign the batch; return actionable
-findings for the Project Manager. Return only the required JSON object.
+findings for the Project Manager. Your decision and your findings have to
+agree: return request_changes only while holding at least one blocker or major
+finding, and return approve only while holding none. A batch whose every fault
+is minor is one you approve, saying what the faults are. Return only the
+required JSON object.
+"""
+
+
+#: A decision that contradicts its own findings is sent back the way the
+#: Architect's contract failures are, rather than ending decomposition on the
+#: turn that made it.
+SUPERVISOR_DECISION_ROUND_CAP = 3
+
+_DECISION_CORRECTION = """
+
+## Rejected review
+
+Your last review never reached the Project Manager:
+
+{error}
+
+Review the batch again and return the whole result. A decision of
+request_changes carries at least one blocker or major finding; a decision of
+approve carries none. Minor findings ride along with either.
 """
 
 
@@ -287,6 +310,8 @@ class SupervisorLoop:
     ) -> SupervisorResult:
         """Execute the active Supervisor parent through all revision cycles."""
 
+        decision_correction = ""
+        decision_rounds = 0
         while True:
             borg = self._turns.current_borg()
             if borg.state is BorgState.PM_WORKING:
@@ -368,6 +393,7 @@ class SupervisorLoop:
                     "Review task batch "
                     f"{batch.id} "
                     + _review_round_phrase(review_round, self.review_rounds)
+                    + decision_correction
                 ),
                 current_plan=json.dumps(
                     self._review_context(plan, batch, tasks),
@@ -393,8 +419,16 @@ class SupervisorLoop:
                     result=payload,
                     summary=str(error),
                 )
-                raise
+                decision_rounds += 1
+                if decision_rounds >= SUPERVISOR_DECISION_ROUND_CAP:
+                    raise
+                # A failed attempt is not a completed review, so this costs the
+                # batch none of its rounds and leaves the revision check
+                # reading the same last decision it read before.
+                decision_correction = _DECISION_CORRECTION.format(error=error)
+                continue
 
+            decision_correction = ""
             decision = payload["decision"]
             if decision == "approve":
                 next_state = BorgState.READY_TO_EXECUTE
