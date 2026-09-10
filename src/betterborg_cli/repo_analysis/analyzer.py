@@ -236,6 +236,23 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
         {"required": ["prepare_commands"]},
         {"required": ["materialize_commands"]},
     ],
+    "allOf": [
+        {
+            "description": (
+                "Naming a package manager says this repository is installed "
+                "before its own commands can run, so say how it is installed: "
+                "an environment naming one carries prepare_commands or "
+                "materialize_commands. Silence here is read as a repository "
+                "that needs no install, and a repository that needs one is "
+                "handed to its build with nothing fetched."
+            ),
+            "anyOf": [
+                {"not": {"required": ["package_managers"]}},
+                {"required": ["prepare_commands"]},
+                {"required": ["materialize_commands"]},
+            ],
+        }
+    ],
     "properties": {
         "version": {"type": "integer", "const": 1},
         "source": {"type": "string", "minLength": 1},
@@ -251,6 +268,7 @@ _ENVIRONMENT_SCHEMA: dict[str, Any] = {
         },
         "package_managers": {
             "type": "array",
+            "minItems": 1,
             "items": {"type": "string", "minLength": 1},
         },
         "prepare_commands": {

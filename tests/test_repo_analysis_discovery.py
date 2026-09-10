@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -379,3 +380,63 @@ def test_discovery_rejects_file_replaced_before_copy(tmp_path: Path) -> None:
         for omission in manifest.omitted
     )
     assert not (workspace / "files" / "README.md").exists()
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    repo = _repo(tmp_path)
+    for argv in (
+        ["init", "--quiet"],
+        ["config", "user.email", "discovery@example.test"],
+        ["config", "user.name", "Discovery"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True)
+    return repo
+
+
+def test_an_untracked_lockfile_is_not_evidence(tmp_path: Path) -> None:
+    """The tree a declared command runs in holds only what the commit tracks.
+
+    A checkout that installed once holds a lockfile its repository ignores.
+    Analysis reading that checkout would cite it as the evidence for an
+    install command, and the task worktree the command runs in has no such
+    file.
+    """
+    repo = _git_repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    (repo / "package.json").write_text('{"name": "app"}\n', encoding="utf-8")
+    (repo / ".gitignore").write_text("package-lock.json\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "package.json", ".gitignore"], check=True
+    )
+    (repo / "package-lock.json").write_text(
+        '{"lockfileVersion": 3}\n', encoding="utf-8"
+    )
+
+    manifest = build_discovery_workspace(repo, workspace)
+
+    copied = {file.path for file in manifest.files}
+    assert "package.json" in copied
+    assert "package-lock.json" not in copied
+    assert "files/package-lock.json" not in _workspace_files(workspace)
+    omission = next(
+        omitted for omitted in manifest.omitted if omitted.path == "package-lock.json"
+    )
+    assert omission.reason == "untracked"
+
+
+def test_a_repository_outside_git_keeps_every_allowlisted_file(
+    tmp_path: Path,
+) -> None:
+    """There is no tracked/untracked distinction to draw, so none is drawn."""
+    repo = _repo(tmp_path)
+    workspace = tmp_path / "analysis-workspace"
+    (repo / "package.json").write_text('{"name": "app"}\n', encoding="utf-8")
+    (repo / "package-lock.json").write_text(
+        '{"lockfileVersion": 3}\n', encoding="utf-8"
+    )
+
+    manifest = build_discovery_workspace(repo, workspace)
+
+    assert {"package.json", "package-lock.json"} <= {
+        file.path for file in manifest.files
+    }

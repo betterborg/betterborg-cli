@@ -1045,6 +1045,13 @@ def test_analyze_appends_history_and_refreshes_generated_outputs(
     initialized = cli_runner.invoke(cli, ["init", "--yes"])
 
     assert initialized.exit_code == 0, initialized.output
+    # Analysis reasons about the tree a task worktree is checked out into, so
+    # the ignore file init writes is evidence once the repository owns it.
+    subprocess.run(["git", "-C", str(git_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(git_repo), "commit", "--quiet", "-m", "ignore state"],
+        check=True,
+    )
     config = load_repository_config(paths)
     confirmed_path = paths.tracked_dir / "prds" / "Confirmed.md"
     confirmed_body = "# Confirmed\n\nKeep this approved product requirement.\n"

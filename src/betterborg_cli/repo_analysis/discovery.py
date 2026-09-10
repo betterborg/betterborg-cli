@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
@@ -14,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from betterborg_cli.agent_runtime.base import CancellationToken
+from betterborg_cli.agent_runtime.process import run_captured
 
 Clock = Callable[[], float]
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 #: Index of the evidence workspace, written beside the copied files. Analysis is
 #: told to open it first, so a model naming it as evidence is describing where it
@@ -273,8 +276,16 @@ def build_discovery_workspace(
     deadline_monotonic: float | None = None,
     clock: Clock = time.monotonic,
     cancel: CancellationToken | None = None,
+    command_runner: CommandRunner = run_captured,
 ) -> DiscoveryManifest:
-    """Copy bounded, allowlisted evidence into a sanitized workspace."""
+    """Copy bounded, allowlisted evidence into a sanitized workspace.
+
+    Only what Git tracks is evidence. Analysis declares the commands that
+    prepare a task worktree, and a task worktree is checked out from a commit,
+    so a file this checkout holds without committing it is one the declared
+    command will not find. A repository that is not a Git working tree has no
+    such distinction to draw and every allowlisted file stands.
+    """
     _cancellation_checkpoint(cancel)
     repo = Path(repo_root).resolve()
     if not repo.is_dir():
@@ -301,6 +312,7 @@ def build_discovery_workspace(
         deadline=deadline,
         clock=clock,
         cancel=cancel,
+        tracked=_tracked_paths(repo, cancel=cancel, command_runner=command_runner),
     )
 
     copied_files: list[DiscoveryFile] = []
@@ -437,6 +449,32 @@ def _prepare_workspace(repo: Path, workspace: Path) -> None:
     workspace.mkdir(parents=True, exist_ok=False)
 
 
+def _tracked_paths(
+    repo: Path,
+    *,
+    cancel: CancellationToken | None,
+    command_runner: CommandRunner,
+) -> frozenset[str] | None:
+    """Return every path Git tracks under ``repo``, or ``None`` outside Git.
+
+    ``git ls-files`` answers for the index rather than for a commit, which is
+    the right answer here: a file staged but not yet committed is one the
+    operator has already declared belongs to the repository, and refusing it as
+    evidence would describe a checkout nobody has.
+    """
+    try:
+        result = command_runner(
+            ["git", "-C", str(repo), "ls-files", "-z"],
+            check=False,
+            cancel=cancel,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return frozenset(entry for entry in result.stdout.split("\0") if entry)
+
+
 def _collect_candidates(
     repo: Path,
     *,
@@ -444,6 +482,7 @@ def _collect_candidates(
     deadline: float,
     clock: Clock,
     cancel: CancellationToken | None,
+    tracked: frozenset[str] | None,
 ) -> tuple[list[_Candidate], list[DiscoveryOmission], bool]:
     candidates: list[_Candidate] = []
     omitted: list[DiscoveryOmission] = []
@@ -504,6 +543,16 @@ def _collect_candidates(
             if not stat.S_ISREG(file_stat.st_mode):
                 omitted.append(
                     DiscoveryOmission(path=rel, reason="not_regular_file")
+                )
+                continue
+            if tracked is not None and rel not in tracked:
+                omitted.append(
+                    DiscoveryOmission(
+                        path=rel,
+                        reason="untracked",
+                        category=category,
+                        size_bytes=file_stat.st_size,
+                    )
                 )
                 continue
             candidates.append(

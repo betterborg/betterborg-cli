@@ -635,7 +635,7 @@ def test_materialize_command_alone_is_a_valid_environment_input(
     }
 
 
-def test_package_manager_alone_is_a_valid_cited_environment_input(
+def test_a_package_manager_carries_the_command_that_installs_it(
     git_repo: Path,
 ) -> None:
     (git_repo / "pyproject.toml").write_text(
@@ -663,6 +663,7 @@ def test_package_manager_alone_is_a_valid_cited_environment_input(
         "environment": {
             "source": "pyproject.toml",
             "package_managers": ["pip"],
+            "materialize_commands": [{"argv": ["pip", "install", "-e", "."]}],
         },
     }
     repository = Repository(root=git_repo)
@@ -683,14 +684,50 @@ def test_package_manager_alone_is_a_valid_cited_environment_input(
     assert environment == {
         "status": "detected",
         "label": "Detected",
-        "summary": "1 environment input persisted for harness use.",
+        "summary": "2 environment inputs persisted for harness use.",
         "files": [],
         "toolchains": [],
         "package_managers": ["pip"],
         "prepare_commands": [],
-        "materialize_commands": [],
+        "materialize_commands": [{"argv": ["pip", "install", "-e", "."]}],
         "source": "pyproject.toml",
     }
+
+
+def test_a_named_package_manager_without_an_install_command_is_rejected() -> None:
+    """Silence about how a repository installs is read as needing no install.
+
+    A worktree holds only what its commit tracks, so an environment that names
+    a package manager and no command hands every phase a checkout with nothing
+    fetched and no record that anything is missing.
+    """
+    payload = {
+        "summary": "A small Python application using the pip package manager.",
+        "primary_language": "python",
+        "is_monorepo": False,
+        "packages": [
+            {
+                "path": ".",
+                "name": "root",
+                "primary_language": "python",
+                "rubric": _rubric(3),
+            }
+        ],
+        "recommendations": [],
+        "themes": [],
+        "environment": {
+            "source": "pyproject.toml",
+            "package_managers": ["pip"],
+        },
+    }
+
+    with pytest.raises(StructuredResultError, match="package_managers"):
+        validate_structured_result(payload, ANALYZER_OUTPUT_SCHEMA)
+
+    payload["environment"]["materialize_commands"] = [
+        {"argv": ["pip", "install", "-e", "."]}
+    ]
+    validate_structured_result(payload, ANALYZER_OUTPUT_SCHEMA)
 
 
 def test_analyzer_rejects_uncited_harness_detections(git_repo: Path) -> None:
