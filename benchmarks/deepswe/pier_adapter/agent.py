@@ -21,7 +21,7 @@ from pier.models.agent.network import NetworkAllowlist
 
 # Betterborg build the container installs. A commit rather than a release, so
 # a result names the exact code that produced it. It must be on the remote.
-BETTERBORG_COMMIT = "c95984bdbf8469ddfc7a08c44afa732c720f35fb"
+BETTERBORG_COMMIT = "edd12e48a01b87b8f5d7ab8e6a531d3054b8c412"
 BETTERBORG_REPO = "https://github.com/betterborg/betterborg-cli"
 
 _APP = "/app"
