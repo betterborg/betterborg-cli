@@ -53,7 +53,6 @@ CODING_RESULT_SCHEMA: dict[str, Any] = {
                 "blocked",
                 "partial",
                 "failed",
-                "environment_refresh_required",
             ],
         },
         "summary": {"type": "string", "minLength": 1},
@@ -73,7 +72,6 @@ CODING_RESULT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
         },
-        "environment_refresh": {"type": ["object", "null"]},
     },
     "required": [
         "task_file",

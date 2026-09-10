@@ -23,6 +23,7 @@ from betterborg_cli.agent_runtime import (
     run_captured,
 )
 from betterborg_cli.host_execution import (
+    REVIEW_RESULT_SCHEMA,
     EnvironmentMaterializationError,
     HostCodingConfig,
     HostCodingPhase,
@@ -40,7 +41,10 @@ from betterborg_cli.host_execution._agent_phase import (
     EXISTING_TEST_RULE,
     VerifiedTaskInputs,
 )
-from betterborg_cli.host_execution.coding import _render_user_prompt
+from betterborg_cli.host_execution.coding import (
+    CODING_RESULT_SCHEMA,
+    _render_user_prompt,
+)
 from betterborg_cli.host_execution.merge import _render_merge_prompt
 from betterborg_cli.host_execution.review import (
     _render_fix_prompt,
@@ -1560,3 +1564,77 @@ def test_a_blocked_commit_that_reaches_review_carries_its_blockers(
     prompt = review.calls[0].user_prompt
     assert "'blocked'" in prompt
     assert UNRESOLVED_BLOCKER in prompt
+
+
+@pytest.mark.parametrize(
+    "status", sorted(CODING_RESULT_SCHEMA["properties"]["status"]["enum"])
+)
+def test_the_coding_schema_offers_only_statuses_the_run_acts_on(
+    tmp_path: Path, status: str
+) -> None:
+    """Every status the coding agent may return has a rule that names it.
+
+    A status offered by the schema and implemented nowhere costs the task
+    everything the agent built, so the catch-all is reachable only by a
+    payload the schema would have rejected.
+    """
+    fixture = _coding_fixture(tmp_path)
+    adapter = MockAdapter().queue(
+        _committing_response(
+            fixture.task, payload=_unfinished_payload(fixture.task, status=status)
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        HostCodingPhase(
+            fixture.repository,
+            adapter,
+            config=HostCodingConfig(
+                model="test-model", blocked_tasks=BlockedTaskPolicy.REVIEW
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert runtime is not None
+    assert (runtime.status, runtime.state_reason) != (
+        TaskRuntimeStatus.BLOCKED,
+        f"coding agent reported {status}",
+    )
+
+
+@pytest.mark.parametrize(
+    "status", sorted(REVIEW_RESULT_SCHEMA["properties"]["status"]["enum"])
+)
+def test_the_review_schema_offers_only_statuses_the_run_acts_on(
+    tmp_path: Path, status: str
+) -> None:
+    """The same rule over the review agent's own vocabulary."""
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status=status,
+                findings=(
+                    ["the media-type pattern is too broad"]
+                    if status == "issues_found"
+                    else None
+                ),
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert runtime is not None
+    assert (runtime.status, runtime.state_reason) != (
+        TaskRuntimeStatus.BLOCKED,
+        f"review agent reported {status}",
+    )

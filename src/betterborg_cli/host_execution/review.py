@@ -57,7 +57,6 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
                 "approved",
                 "issues_found",
                 "failed",
-                "environment_refresh_required",
             ],
         },
         "summary": {"type": "string", "minLength": 1},
@@ -66,7 +65,6 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
         },
-        "environment_refresh": {"type": ["object", "null"]},
     },
     "required": ["task_file", "status", "summary", "issues_file", "findings"],
 }
