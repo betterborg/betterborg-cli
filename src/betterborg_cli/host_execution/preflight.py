@@ -107,6 +107,50 @@ class HostPreflightPlan:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ProgramReason:
+    """Why a run cannot invoke one program, worded for both of its outcomes.
+
+    A check is dropped and a preparation command refuses, so one cause reaches
+    an operator as two sentences: what is wrong, and what is required.
+    """
+
+    dropped: str
+    required: str
+    guidance: str
+    #: The same cause where it leaves a run with no check at all.
+    no_check: str
+    no_check_guidance: str
+
+
+#: This host's answer: nothing here can invoke the program at all.
+_PROGRAM_MISSING = _ProgramReason(
+    dropped="host executable is not available",
+    required="host executable is required",
+    guidance=(
+        "Install {name!r} on the host or update the analyzer command "
+        "evidence; Betterborg will not install runtimes during preflight."
+    ),
+    no_check="no catalogued check can run on this host",
+    no_check_guidance=(
+        "Install one of the repository's checks on this host, or run where "
+        "one is available."
+    ),
+)
+#: The task worktree's answer: this checkout holds the program and no worktree
+#: checked out from a commit will, so it is missing where it runs.
+_PROGRAM_UNTRACKED = _ProgramReason(
+    dropped="repository program is not tracked by Git",
+    required="repository program must be tracked by Git",
+    guidance="Commit {name!r} so every task worktree carries it.",
+    no_check="no catalogued check is tracked by Git",
+    no_check_guidance=(
+        "Commit one of the repository's checks so every task worktree "
+        "carries it."
+    ),
+)
+
+
 def selected_preparation_commands(
     *,
     prepare_commands: Sequence[HostCommand],
@@ -254,11 +298,12 @@ class HostPreflight:
         running_commands: list[HostCommand] = []
         running_records: list[Mapping[str, Any]] = []
         for command, record in zip(commands, catalog_records, strict=True):
-            if _command_executable_key(command) in unresolved:
+            reason = unresolved.get(_command_executable_key(command))
+            if reason is not None:
                 dropped_commands.append(
                     HostDroppedCommand(
                         command,
-                        f"host executable is not available: {command.argv[0]} "
+                        f"{reason.dropped}: {command.argv[0]} "
                         f"(evidence: {command.evidence})",
                     )
                 )
@@ -284,7 +329,8 @@ class HostPreflight:
                         # secret the repository spelled into a script, and a
                         # program name is what the operator needs anyway.
                         requirement=(
-                            "no catalogued check can run on this host: "
+                            _dropped_reason(dropped_commands, unresolved).no_check
+                            + ": "
                             + ", ".join(
                                 sorted(
                                     {
@@ -300,10 +346,9 @@ class HostPreflight:
                                 for dropped in dropped_commands
                             )
                         ),
-                        guidance=(
-                            "Install one of the repository's checks on this "
-                            "host, or run where one is available."
-                        ),
+                        guidance=_dropped_reason(
+                            dropped_commands, unresolved
+                        ).no_check_guidance,
                     )
                 )
             else:
@@ -508,8 +553,8 @@ class HostPreflight:
         catalog_commands: Sequence[HostCommand],
         preparation_commands: Sequence[HostCommand],
         failures: list[HostPreflightFailure],
-    ) -> set[tuple[str, str]]:
-        """Name the programs this host cannot run, refusing the required ones."""
+    ) -> dict[tuple[str, str], _ProgramReason]:
+        """Name every program a run cannot invoke, refusing the required ones."""
         requested: dict[tuple[str, str], list[str]] = {}
         required: set[tuple[str, str]] = set()
 
@@ -528,23 +573,20 @@ class HostPreflight:
             if blocking:
                 required.add(key)
 
-        unresolved: set[tuple[str, str]] = set()
+        unresolved: dict[tuple[str, str], _ProgramReason] = {}
         for key, evidence_values in requested.items():
             name, cwd = key
-            if self._can_run(name, cwd=cwd):
+            reason = self._unavailable_reason(name, cwd=cwd)
+            if reason is None:
                 continue
-            unresolved.add(key)
+            unresolved[key] = reason
             if key not in required:
                 continue
             failures.append(
                 HostPreflightFailure(
-                    requirement=f"host executable is required: {name}",
+                    requirement=f"{reason.required}: {name}",
                     evidence=_join_evidence(evidence_values),
-                    guidance=(
-                        f"Install {name!r} on the host or update the analyzer "
-                        "command evidence; Betterborg will not install "
-                        "runtimes during preflight."
-                    ),
+                    guidance=reason.guidance.format(name=name),
                 )
             )
 
@@ -730,21 +772,55 @@ class HostPreflight:
             return None
         return resolved
 
-    def _can_run(self, name: str, *, cwd: str = ".") -> bool:
-        """Answer whether this host can invoke one command's program.
+    def _unavailable_reason(
+        self, name: str, *, cwd: str = "."
+    ) -> _ProgramReason | None:
+        """Say why one command's program cannot run, or ``None`` when it can.
 
         Nothing records where the program was found, so nothing resolves it
         beyond the question a refusal is made of.
+
+        A program named by path is answered for twice. This checkout is where
+        preflight can see it at all; the task worktree is where it will run,
+        and a worktree is checked out from a commit, so a script this checkout
+        holds without committing it is missing by the time anything invokes
+        it — after coding, review and merge have been paid for.
         """
         if "/" in name or "\\" in name:
             candidate = self.repository_root / PurePosixPath(cwd) / PurePosixPath(name)
             resolved = candidate.resolve()
-            return (
+            if not (
                 resolved.is_relative_to(self.repository_root)
                 and resolved.is_file()
                 and os.access(resolved, os.X_OK)
-            )
-        return self._find_executable(name, self._environment.get("PATH")) is not None
+            ):
+                return _PROGRAM_MISSING
+            if not self._is_tracked(resolved):
+                return _PROGRAM_UNTRACKED
+            return None
+        if self._find_executable(name, self._environment.get("PATH")) is None:
+            return _PROGRAM_MISSING
+        return None
+
+    def _is_tracked(self, resolved: Path) -> bool:
+        """Answer whether Git carries this repository file into a worktree."""
+        relative = resolved.relative_to(self.repository_root).as_posix()
+        command = [
+            "git",
+            "-C",
+            str(self.repository_root),
+            "ls-files",
+            "--error-unmatch",
+            "-z",
+            "--",
+            relative,
+        ]
+        self._report_command(command)
+        try:
+            result = self._run(command, check=False, cancel=self._cancel)
+        except OSError:
+            return False
+        return result.returncode == 0
 
     def _report_command(self, command: Sequence[str]) -> None:
         """Publish the current secret-free probe without affecting validation."""
@@ -841,6 +917,26 @@ def _string_sequence(value: object) -> bool:
         and bool(value)
         and all(isinstance(item, str) and item for item in value)
     )
+
+
+def _dropped_reason(
+    dropped: Sequence[HostDroppedCommand],
+    unresolved: Mapping[tuple[str, str], _ProgramReason],
+) -> _ProgramReason:
+    """Return the one cause every dropped check shares, else the host's.
+
+    A run left with no check states why in one sentence, so a mixed set of
+    causes falls back to the one an operator can always act on: whatever else
+    is true of the others, this host cannot invoke them all.
+    """
+    reasons = {
+        unresolved[key]
+        for key in (_command_executable_key(entry.command) for entry in dropped)
+        if key in unresolved
+    }
+    if len(reasons) == 1:
+        return next(iter(reasons))
+    return _PROGRAM_MISSING
 
 
 def _evidence(record: Mapping[str, Any], fallback: str) -> str:

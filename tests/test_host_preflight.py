@@ -44,6 +44,15 @@ def _preflight(
     )
 
 
+def _commit(repo: Path, *paths: str) -> None:
+    """Track one repository file, as every task worktree needs it to be."""
+    subprocess.run(["git", "-C", str(repo), "add", *paths], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--quiet", "-m", "add repository program"],
+        check=True,
+    )
+
+
 def _executable(directory: Path, name: str, body: str) -> Path:
     path = directory / name
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
@@ -1545,6 +1554,7 @@ def test_a_program_named_by_path_is_resolved_against_its_own_directory(
     tools = committed_git_repo / "tools"
     tools.mkdir()
     _executable(tools, "check.sh", "exit 0")
+    _commit(committed_git_repo, "tools/check.sh")
     plan = {
         "command_catalog": {
             "source": "pyproject.toml",
@@ -1564,6 +1574,74 @@ def test_a_program_named_by_path_is_resolved_against_its_own_directory(
     assert isinstance(result, HostPreflightPlan)
     assert [command.argv for command in result.commands] == [("./check.sh",)]
     assert result.dropped_commands == ()
+
+
+def test_an_untracked_repository_program_is_not_runnable(
+    committed_git_repo: Path,
+) -> None:
+    """Preflight sees this checkout; the command runs in a task worktree.
+
+    A worktree is checked out from a commit, so a script this checkout holds
+    without committing it is gone by the time the sanity gate invokes it —
+    after a coding turn, a review turn and a merge have been paid for.
+    """
+    tools = committed_git_repo / "tools"
+    tools.mkdir()
+    _executable(tools, "check.sh", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {
+                    "stage": "test",
+                    "argv": ["./check.sh"],
+                    "cwd": "tools",
+                    "verifies": True,
+                }
+            ],
+        }
+    }
+
+    result = _preflight(committed_git_repo, environment={"PATH": ""}).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert "no catalogued check is tracked by Git: ./check.sh" in result.reason
+    assert "Commit one of the repository's checks" in result.reason
+
+
+def test_an_untracked_preparation_program_refuses_the_run(
+    committed_git_repo: Path,
+) -> None:
+    """The same rule where a missing program ends the task rather than a check."""
+    _executable(committed_git_repo, "bootstrap.sh", "exit 0")
+    plan = {
+        "command_catalog": {
+            "source": "pyproject.toml",
+            "commands": [
+                {"stage": "test", "argv": ["example-test"], "verifies": True}
+            ],
+        },
+        "environment": {
+            "source": "pyproject.toml",
+            "materialize_commands": [{"argv": ["./bootstrap.sh"]}],
+        },
+    }
+    binary_dir = committed_git_repo.parent / "untracked-preparation-bin"
+    binary_dir.mkdir(exist_ok=True)
+    _executable(binary_dir, "example-test", "exit 0")
+
+    result = _preflight(
+        committed_git_repo, environment={"PATH": str(binary_dir)}
+    ).validate(plan)
+
+    assert isinstance(result, HostPreflightBlock)
+    assert (
+        "repository program must be tracked by Git: ./bootstrap.sh"
+        in result.reason
+    )
+    assert "Commit './bootstrap.sh' so every task worktree carries it." in (
+        result.reason
+    )
 
 
 @pytest.mark.parametrize(
