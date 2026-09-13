@@ -24,6 +24,7 @@ from betterborg_cli.store.models import (
     ExecutionAttemptStatus,
     ExecutionDecision,
     ExecutionEvent,
+    ExecutionLedgerFinding,
     ExecutionRun,
     ExecutionRunAcquisition,
     ExecutionRunStatus,
@@ -2868,6 +2869,55 @@ class SqliteStore:
             row = self._agent_attempt_projection(connection, attempt_id)
         return _row_to_agent_attempt(row)
 
+    def record_execution_ledger_findings(
+        self, rows: Iterable[ExecutionLedgerFinding]
+    ) -> None:
+        """Persist one reconciled review ledger, inserting and updating rows."""
+        with self.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO execution_finding_ledger(
+                        id, task_id, attempt_id, first_seen_round,
+                        last_seen_round, status, severity, message, suggestion,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    -- Only lifecycle moves, for the same reason the planning
+                    -- ledgers keep what they were first recorded with.
+                    ON CONFLICT(id) DO UPDATE SET
+                        attempt_id = excluded.attempt_id,
+                        last_seen_round = excluded.last_seen_round,
+                        status = excluded.status
+                    """,
+                    (
+                        str(row.id),
+                        str(row.task_id),
+                        str(row.attempt_id),
+                        row.first_seen_round,
+                        row.last_seen_round,
+                        row.status.value,
+                        row.severity,
+                        row.message,
+                        row.suggestion,
+                        row.created_at.isoformat(),
+                    ),
+                )
+
+    def list_execution_ledger_findings(
+        self, task_id: UUID
+    ) -> list[ExecutionLedgerFinding]:
+        """Return the review ledger rows one task's rounds have built."""
+        with self.locked_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM execution_finding_ledger
+                WHERE task_id = ?
+                ORDER BY created_at, id
+                """,
+                (str(task_id),),
+            ).fetchall()
+        return [_row_to_execution_ledger_finding(row) for row in rows]
+
     def _require_owned_open_attempt(
         self,
         connection: sqlite3.Connection,
@@ -3811,6 +3861,21 @@ def _row_to_agent_attempt(row: sqlite3.Row) -> AgentAttempt:
         ),
         started_at=datetime.fromisoformat(row["started_at"]),
         finished_at=finished_at,
+    )
+
+
+def _row_to_execution_ledger_finding(row: sqlite3.Row) -> ExecutionLedgerFinding:
+    return ExecutionLedgerFinding(
+        id=UUID(row["id"]),
+        task_id=UUID(row["task_id"]),
+        attempt_id=UUID(row["attempt_id"]),
+        first_seen_round=row["first_seen_round"],
+        last_seen_round=row["last_seen_round"],
+        status=FindingStatus(row["status"]),
+        severity=row["severity"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 

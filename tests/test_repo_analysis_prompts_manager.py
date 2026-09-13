@@ -1153,3 +1153,20 @@ def test_the_generator_is_asked_for_the_rule_on_existing_assertions() -> None:
 
     assert "never by weakening an assertion either side made" in merge
     assert "fails the merge rather than picking a side" in merge
+
+
+def test_the_generator_is_asked_for_the_review_finding_contract() -> None:
+    """The generated half must not contradict the half Betterborg renders.
+
+    The requirement already named the severity vocabulary, the approval
+    criteria and the result contract, and this stage changed all three. It is
+    not where the contract lands — a rule placed only here can be reworded or
+    dropped by the model that writes the prompt, and a reviewer that never says
+    what a round closed leaves a ledger that never drains, per repository.
+    """
+    review = " ".join(prompts_manager._system_prompt("review").split())
+
+    assert "every finding carries its severity as a field" in review
+    assert "a minor finding does not hold the task" in review
+    assert "every review declares the ids of the open findings it closes" in review
+    assert "the id of the open finding that finding raises again" in review

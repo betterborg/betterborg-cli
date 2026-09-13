@@ -17,6 +17,7 @@ from uuid import UUID
 
 from betterborg_cli.planning.cycles import current_planning_cycle_id
 from betterborg_cli.store import (
+    ExecutionLedgerFinding,
     FindingStatus,
     PlanningFinding,
     PlanningLedgerFinding,
@@ -44,7 +45,12 @@ RESOLVED_SCHEMA: dict[str, Any] = {
     "items": {"type": "string", "minLength": 1, "pattern": r"\S"},
 }
 
-_LedgerRow = TypeVar("_LedgerRow", PlanningLedgerFinding, TaskLedgerFinding)
+_LedgerRow = TypeVar(
+    "_LedgerRow",
+    ExecutionLedgerFinding,
+    PlanningLedgerFinding,
+    TaskLedgerFinding,
+)
 
 
 def open_findings(rows: Iterable[_LedgerRow]) -> list[_LedgerRow]:
@@ -79,6 +85,18 @@ def open_task_findings(
             borg_id, plan_approval_id=plan_approval_id
         )
     )
+
+
+def open_execution_findings(
+    store: SqliteStore, task_id: UUID
+) -> list[ExecutionLedgerFinding]:
+    """Return the review objections this task's commit still has to answer.
+
+    One ledger spans the task's review rounds, so a finding an earlier round
+    raised and no later round repeated is still in front of whoever answers it.
+    """
+
+    return open_findings(store.list_execution_ledger_findings(task_id))
 
 
 def planning_ledger_json(row: PlanningLedgerFinding) -> dict[str, Any]:
@@ -194,10 +212,53 @@ def reconcile_task_ledger(
     )
 
 
+def reconcile_execution_ledger(
+    existing: Sequence[ExecutionLedgerFinding],
+    *,
+    findings: Sequence[tuple[ExecutionLedgerFinding, str | None]],
+    resolved: Sequence[str],
+    attempt_id: UUID,
+    review_round: int,
+    approved: bool,
+) -> list[ExecutionLedgerFinding]:
+    """Fold one execution review into the ledger its task has been building.
+
+    A declared finding arrives as the row this round would record, because the
+    review attempt's own payload is the immutable record here and there is no
+    snapshot row to build one from. What the round it belongs to and the attempt
+    that produced it are is still the reconciler's to say, as it is for the two
+    ledgers whose rows it builds itself: one owner for the numbers a later round
+    reads back.
+    """
+
+    def build(
+        finding: ExecutionLedgerFinding, status: FindingStatus
+    ) -> ExecutionLedgerFinding:
+        return replace(
+            finding,
+            status=status,
+            first_seen_round=review_round,
+            last_seen_round=review_round,
+            attempt_id=attempt_id,
+        )
+
+    return _reconcile(
+        existing,
+        findings=findings,
+        resolved=resolved,
+        attempt_id=attempt_id,
+        review_round=review_round,
+        approved=approved,
+        build=build,
+    )
+
+
 def _reconcile(
     existing: Sequence[_LedgerRow],
     *,
-    findings: Sequence[tuple[PlanningFinding | TaskFinding, str | None]],
+    findings: Sequence[
+        tuple[ExecutionLedgerFinding | PlanningFinding | TaskFinding, str | None]
+    ],
     resolved: Sequence[str],
     attempt_id: UUID,
     review_round: int,

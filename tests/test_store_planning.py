@@ -100,7 +100,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         applied_at = store.applied_migrations()
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == applied_at == tuple(range(1, 15))
+        assert reopened.applied_migrations() == applied_at == tuple(range(1, 16))
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg
         assert reopened.list_planning_attempts(borg.id) == [
@@ -360,7 +360,7 @@ def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 15))
+        assert reopened.applied_migrations() == tuple(range(1, 16))
         rows = reopened.list_planning_ledger_findings(borg.id)
         assert len(rows) == 2
         closed = next(row for row in rows if row.id == raised.id)
@@ -445,7 +445,7 @@ def test_migration_014_review_assessments_survive_reopen(tmp_path: Path) -> None
             store.record_review_assessment(assessment)
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 15))
+        assert reopened.applied_migrations() == tuple(range(1, 16))
         rows = reopened.list_review_assessments(borg.id, loop="tech_review")
         assert rows == [minimum_round, granted_round, next_cycle]
         # A round inside the minimum is neither charged nor refunded, so it

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -15,12 +15,17 @@ import pytest
 
 from betterborg_cli.agent_runtime import (
     AgentArtifact,
+    AgentStatus,
     AgentUsage,
     BillingMode,
     CancellationToken,
     MockAdapter,
     MockResponse,
     run_captured,
+)
+from betterborg_cli.agent_runtime.structured import (
+    StructuredResultError,
+    validate_structured_result,
 )
 from betterborg_cli.host_execution import (
     REVIEW_RESULT_SCHEMA,
@@ -39,6 +44,7 @@ from betterborg_cli.host_execution._agent_phase import (
     EXISTING_TEST_MERGE_RULE,
     EXISTING_TEST_REVIEW_RULE,
     EXISTING_TEST_RULE,
+    REVIEW_FINDING_RULE,
     VerifiedTaskInputs,
 )
 from betterborg_cli.host_execution.coding import (
@@ -62,6 +68,8 @@ from betterborg_cli.store import (
     Borg,
     BorgState,
     ExecutionAttemptStatus,
+    ExecutionLedgerFinding,
+    FindingStatus,
     PlanApproval,
     Repository,
     RepositoryAnalysis,
@@ -440,11 +448,19 @@ def test_coding_phase_ready_worktree_reuses_cancellable_git_binding(
     assert observed_tokens == [cancel]
 
 
+def _finding(
+    message: str, *, severity: str = "major", repeats: str | None = None
+) -> dict:
+    """One declared review finding, by default one that holds the task."""
+    return {"severity": severity, "message": message, "repeats": repeats}
+
+
 def _review_payload(
     task: TaskRecord,
     *,
     status: str,
-    findings: list[str] | None = None,
+    findings: Sequence[str | dict] | None = None,
+    resolved: Sequence[str] = (),
 ) -> dict:
     return {
         "task_file": f"{task.stage}/{task.stem}.md",
@@ -455,8 +471,30 @@ def _review_payload(
             else "Implementation needs changes."
         ),
         "issues_file": "",
-        "findings": findings or [],
+        "resolved": list(resolved),
+        "findings": [
+            _finding(item) if isinstance(item, str) else item
+            for item in findings or ()
+        ],
     }
+
+
+def _ledger_row(
+    task: TaskRecord,
+    message: str,
+    *,
+    severity: str = "major",
+    first_raised: int = 1,
+) -> ExecutionLedgerFinding:
+    """One open ledger row, for a prompt rendered without a store behind it."""
+    return ExecutionLedgerFinding(
+        task_id=task.id,
+        attempt_id=uuid4(),
+        first_seen_round=first_raised,
+        last_seen_round=first_raised,
+        severity=severity,
+        message=message,
+    )
 
 
 def _fixing_response(
@@ -1067,7 +1105,7 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
         ("fix", 1),
         ("review", 1),
     ]
-    assert attempts[1].result["findings"] == [finding]
+    assert attempts[1].result["findings"] == [_finding(finding)]
     assert review.calls[0].activity_sink is not None
     assert fix.calls[0].activity_sink is not None
     assert received == [
@@ -1137,8 +1175,727 @@ def test_review_pass_cap_blocks_after_persisting_last_findings(
         "fix",
         "review",
     ]
-    assert attempts[-1].result["findings"] == ["still failing after the fix"]
+    assert attempts[-1].result["findings"] == [
+        _finding("still failing after the fix")
+    ]
     assert len(fix.calls) == 1
+
+
+_BROAD_PATTERN = "the media-type pattern is too broad"
+_UNBOUNDED_TIMEOUT = "the timeout is unbounded"
+_UNNAMED_FIXTURE = "name the fixture the suite already has"
+
+
+def _ledger_row_for(
+    rows: Sequence[ExecutionLedgerFinding], message: str
+) -> ExecutionLedgerFinding:
+    return next(row for row in rows if row.message == message)
+
+
+def test_review_findings_reach_the_ledger_with_the_severity_they_declared(
+    tmp_path: Path,
+) -> None:
+    """Severity is a field of the finding rather than a prefix nobody reads.
+
+    Reviewers write "[blocker]" at the front of their findings and no code ever
+    read it, which leaves the one signal that tells a stuck loop from a
+    productive one to a convention.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[
+                    _finding(_BROAD_PATTERN, severity="blocker"),
+                    _finding(_UNNAMED_FIXTURE, severity="minor"),
+                ],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert {(row.severity, row.message) for row in rows} == {
+        ("blocker", _BROAD_PATTERN),
+        ("minor", _UNNAMED_FIXTURE),
+    }
+    assert {row.status for row in rows} == {FindingStatus.OPEN}
+    assert {row.first_seen_round for row in rows} == {1}
+    # Keyed to the attempt that produced it, and written with it, so the round
+    # that ran out of passes still left the rows a later grant can read.
+    assert {row.attempt_id for row in rows} == {attempts[-1].id}
+
+
+def test_a_fix_answers_every_open_finding_and_not_just_the_latest_round(
+    tmp_path: Path,
+) -> None:
+    """Silence is not agreement, so a carried objection stays in front of the fixer.
+
+    A fixer shown only the newest round's findings answers less than the ledger
+    holds against it: an objection raised in round one and not repeated in
+    round two never reaches the one agent that could close it, while its row
+    stays open against the task.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_BROAD_PATTERN],
+                )
+            )
+        )
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_UNBOUNDED_TIMEOUT],
+                )
+            )
+        )
+        .queue(MockResponse(payload=_review_payload(fixture.task, status="approved")))
+    )
+    fix = (
+        MockAdapter()
+        .queue(_fixing_response(fixture.task))
+        .queue(_fixing_response(fixture.task))
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                fix_model="fix-model",
+                review_passes=3,
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    second_fix = fix.calls[1].user_prompt
+    assert _BROAD_PATTERN in second_fix
+    assert _UNBOUNDED_TIMEOUT in second_fix
+    assert "Fix round: 2" in second_fix
+    # The approval closed both, including the one no round ever answered.
+    assert {row.status for row in rows} == {FindingStatus.RESOLVED}
+
+
+def test_a_second_review_closes_one_objection_and_raises_another_again(
+    tmp_path: Path,
+) -> None:
+    """The reviewer is given the open ledger and answers for every row on it.
+
+    Across the five rounds of one task the sweep lost, every round named a
+    fresh line of one file and none mentioned an earlier round's finding. A
+    reviewer that never sees round one's findings can neither close one nor say
+    it is back.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def second_review(spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                resolved=[str(_ledger_row_for(rows, _BROAD_PATTERN).id)],
+                findings=[
+                    _finding(
+                        "the timeout is still unbounded",
+                        severity="blocker",
+                        repeats=str(
+                            _ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id
+                        ),
+                    )
+                ],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[
+                            _finding(_BROAD_PATTERN),
+                            _finding(_UNBOUNDED_TIMEOUT, severity="blocker"),
+                        ],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=second_review))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=2
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    closed = _ledger_row_for(rows, _BROAD_PATTERN)
+    assert closed.status is FindingStatus.RESOLVED
+    assert closed.last_seen_round == 2
+    # One objection is one row for as long as the loop argues about it, so the
+    # repeat moved the row it named rather than adding a second.
+    standing = _ledger_row_for(rows, _UNBOUNDED_TIMEOUT)
+    assert len(rows) == 2
+    assert standing.status is FindingStatus.REGRESSED
+    assert (standing.first_seen_round, standing.last_seen_round) == (1, 2)
+    assert standing.severity == "blocker"
+    # The ids the second review named came out of the prompt it was handed.
+    assert "Open findings this commit has to answer" not in (
+        review.calls[0].user_prompt
+    )
+    second_prompt = review.calls[1].user_prompt
+    assert "Review round: 2" in second_prompt
+    assert f"- {closed.id} (major, first raised in round 1)" in second_prompt
+    assert f"- {standing.id} (blocker, first raised in round 1)" in second_prompt
+
+
+@pytest.mark.parametrize(
+    ("mutate", "missing"),
+    [
+        pytest.param(
+            lambda payload: payload.pop("resolved"), "resolved", id="resolved"
+        ),
+        pytest.param(
+            lambda payload: payload["findings"][0].pop("repeats"),
+            "repeats",
+            id="repeats",
+        ),
+    ],
+)
+def test_a_review_omitting_a_ledger_declaration_fails_its_schema(
+    mutate, missing: str, tmp_path: Path
+) -> None:
+    """Requiring both is what forces a reviewer to answer rather than omit.
+
+    Read as absent, a missing `repeats` says every objection is new and a
+    missing `resolved` says the round closed nothing — the two readings that
+    leave a ledger which never drains.
+    """
+    fixture = _coding_fixture(tmp_path)
+    payload = _review_payload(
+        fixture.task,
+        status="issues_found",
+        findings=[_finding(_BROAD_PATTERN)],
+    )
+    validate_structured_result(payload, REVIEW_RESULT_SCHEMA)
+
+    mutate(payload)
+    with pytest.raises(StructuredResultError, match=missing):
+        validate_structured_result(payload, REVIEW_RESULT_SCHEMA)
+
+
+_MISSING_ROLLBACK = "the rollback path is untested"
+
+
+def test_neither_prompt_carries_an_objection_a_round_already_closed(
+    tmp_path: Path,
+) -> None:
+    """The ledger is the row set, so the status filter is the whole narrowing.
+
+    Handed a row its own reviewer closed, the fixer is asked to fix something
+    that is already fixed — and the round after it is told nobody has closed an
+    objection its predecessor said it closed.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def closing_review(spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                resolved=[str(_ledger_row_for(rows, _BROAD_PATTERN).id)],
+                findings=[_finding(_MISSING_ROLLBACK)],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[
+                            _finding(_BROAD_PATTERN),
+                            _finding(_UNBOUNDED_TIMEOUT, severity="blocker"),
+                        ],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=closing_review))
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_finding(_UNNAMED_FIXTURE)],
+                    )
+                )
+            )
+        )
+        fix = MockAdapter()
+        for _ in range(2):
+            fix.queue(_fixing_response(fixture.task))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=3
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    closed = _ledger_row_for(rows, _BROAD_PATTERN)
+    assert closed.status is FindingStatus.RESOLVED
+
+    # The fix the closing round asked for, and the round that judged it, were
+    # both handed what still stands and not what that round closed.
+    second_fix = fix.calls[1].user_prompt
+    third_review = review.calls[2].user_prompt
+    for prompt in (second_fix, third_review):
+        assert str(closed.id) not in prompt
+        assert _BROAD_PATTERN not in prompt
+        assert _UNBOUNDED_TIMEOUT in prompt
+        assert _MISSING_ROLLBACK in prompt
+
+
+def test_an_approval_whose_every_fault_is_minor_merges(tmp_path: Path) -> None:
+    """A minor finding does not hold a task, as it does not hold a batch.
+
+    A reviewer that notices something small has to be able to say so without
+    holding the work, or it says nothing and the objection is lost.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="approved",
+                findings=[_finding(_UNNAMED_FIXTURE, severity="minor")],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert [(row.severity, row.status) for row in rows] == [
+        ("minor", FindingStatus.RESOLVED)
+    ]
+
+
+def test_a_review_reporting_only_minor_issues_still_spends_a_fix_pass(
+    tmp_path: Path,
+) -> None:
+    """What the reviewer decides is left to the reviewer.
+
+    A minor finding does not hold a task the reviewer approved. It does not
+    follow that a reviewer asking for changes over one is overruled by its own
+    severity.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_finding(_UNNAMED_FIXTURE, severity="minor")],
+                )
+            )
+        )
+        .queue(MockResponse(payload=_review_payload(fixture.task, status="approved")))
+    )
+    fix = MockAdapter().queue(_fixing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=2
+            ),
+        ).run(fixture.context(store))
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(fix.calls) == 1
+    assert _UNNAMED_FIXTURE in fix.calls[0].user_prompt
+
+
+@pytest.mark.parametrize("severity", ["blocker", "major"])
+def test_an_approval_carrying_a_holding_finding_still_blocks(
+    tmp_path: Path, severity: str
+) -> None:
+    """A reviewer contradicting itself in one response is caught as it was.
+
+    The check reads the approving round's own findings, and its job is to catch
+    that contradiction rather than to make approval an enumeration exercise.
+    Minor is the only severity that does not hold the task, so it is the only
+    one an approval may carry.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="approved",
+                findings=[_finding(_BROAD_PATTERN, severity=severity)],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.state_reason == (
+        "review approval included blocker or major findings"
+    )
+    assert rows == []
+
+
+def test_an_unplaceable_resolved_id_leaves_its_row_open_and_a_repeat_regresses(
+    tmp_path: Path,
+) -> None:
+    """The two declarations fall different ways, which is what makes them safe.
+
+    The history a reviewer also reads carries an id for every restatement of an
+    objection while the ledger keys each one by its first, so an id the ledger
+    cannot place is a mistake a reviewer can make. Left to cost a grant it is
+    harmless; treating an unplaceable repeat as fresh discovery would grant a
+    loop holding a blocker it has already failed to close.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_BROAD_PATTERN],
+                )
+            )
+        )
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    resolved=[str(uuid4())],
+                    findings=[
+                        _finding(
+                            _UNBOUNDED_TIMEOUT,
+                            severity="blocker",
+                            repeats=str(uuid4()),
+                        )
+                    ],
+                )
+            )
+        )
+    )
+    fix = MockAdapter().queue(_fixing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=2
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    unclosed = _ledger_row_for(rows, _BROAD_PATTERN)
+    assert unclosed.status is FindingStatus.OPEN
+    assert (unclosed.first_seen_round, unclosed.last_seen_round) == (1, 2)
+    regressed = _ledger_row_for(rows, _UNBOUNDED_TIMEOUT)
+    assert regressed.status is FindingStatus.REGRESSED
+    assert regressed.first_seen_round == 2
+
+
+def test_a_review_that_could_not_review_leaves_the_ledger_untouched(
+    tmp_path: Path,
+) -> None:
+    """Only a review that actually reviewed reconciles.
+
+    A reviewer that reports it could not review still carries the findings key
+    its schema requires, and the task is already going to its terminal failed
+    state, so recording objections it says it could not form would leave rows
+    no later round can answer.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = (
+        MockAdapter()
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_BROAD_PATTERN],
+                )
+            )
+        )
+        .queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="failed",
+                    findings=[_finding("the suite will not build", severity="blocker")],
+                )
+            )
+        )
+    )
+    fix = MockAdapter().queue(_fixing_response(fixture.task))
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=3
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        first_review = store.list_agent_attempts(fixture.task.id)[1]
+
+    assert status is TaskRuntimeStatus.FAILED
+    assert [(row.message, row.status) for row in rows] == [
+        (_BROAD_PATTERN, FindingStatus.OPEN)
+    ]
+    assert rows[0].last_seen_round == 1
+    assert rows[0].attempt_id == first_review.id
+
+
+class _CancelledHoldingAPayload(MockAdapter):
+    """Report a cancellation and a payload in one result.
+
+    No adapter in the product does: each one's cancellation omits the payload,
+    so the branch that discards an interrupted round's objections cannot be
+    reached through a real one, and the rule it keeps would go untested.
+    """
+
+    def run(self, spec, *, cancel=None):
+        return replace(
+            super().run(spec, cancel=None), status=AgentStatus.CANCELLED
+        )
+
+
+def test_a_cancelled_round_records_nothing_and_its_rerun_records_once(
+    tmp_path: Path,
+) -> None:
+    """An interrupted round left no review, so it left no objections either.
+
+    A round that did not review leaves nothing for the round replacing it to
+    say over again — which matters because a re-run mints fresh ids, so rows an
+    interrupted round had recorded would stand beside the new ones rather than
+    being replaced by them.
+    """
+    fixture = _coding_fixture(tmp_path)
+    interrupted = _CancelledHoldingAPayload().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[_BROAD_PATTERN],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        config = HostReviewFixConfig(review_model="review-model", review_passes=1)
+        resumable = HostReviewFixPhase(
+            fixture.repository, interrupted, config=config
+        ).run(fixture.context(store))
+        # The round really did hand back a reviewed payload, and it was really
+        # discarded: an unconsumed response would prove nothing.
+        assert interrupted.responses == []
+        after_cancellation = store.list_execution_ledger_findings(fixture.task.id)
+
+        review = MockAdapter().queue(
+            MockResponse(
+                payload=_review_payload(
+                    fixture.task,
+                    status="issues_found",
+                    findings=[_BROAD_PATTERN],
+                )
+            )
+        )
+        status = HostReviewFixPhase(
+            fixture.repository, review, config=config
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert resumable is TaskRuntimeStatus.REVIEW
+    assert after_cancellation == []
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert [(row.message, row.first_seen_round) for row in rows] == [
+        (_BROAD_PATTERN, 1)
+    ]
+    assert rows[0].attempt_id == attempts[-1].id
+
+
+def test_a_rounds_findings_are_durable_with_the_attempt_that_produced_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume replays a completed attempt's outcome without classifying again.
+
+    So rows written after the attempt finished are rows never written at all:
+    the round that raised them never runs again, and the fix it asked for would
+    be handed nothing to answer.
+    """
+    fixture = _coding_fixture(tmp_path)
+    interrupted = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[_BROAD_PATTERN],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        transition = store.transition_task_runtime
+
+        def crash_before_fix(*args, **kwargs):
+            if kwargs.get("new_status") is TaskRuntimeStatus.FIX:
+                raise RuntimeError("simulated restart after durable review")
+            return transition(*args, **kwargs)
+
+        monkeypatch.setattr(store, "transition_task_runtime", crash_before_fix)
+        with pytest.raises(RuntimeError, match="simulated restart"):
+            HostReviewFixPhase(
+                fixture.repository,
+                interrupted,
+                config=HostReviewFixConfig(review_model="review-model"),
+            ).run(fixture.context(store))
+        monkeypatch.setattr(store, "transition_task_runtime", transition)
+        stalled = store.get_task_runtime(fixture.task.id)
+        recorded = store.list_execution_ledger_findings(fixture.task.id)
+
+        review = MockAdapter().queue(
+            MockResponse(payload=_review_payload(fixture.task, status="approved"))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(review_model="review-model"),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert stalled is not None and stalled.status is TaskRuntimeStatus.REVIEW
+    assert [row.message for row in recorded] == [_BROAD_PATTERN]
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(interrupted.calls) == 1
+    assert _BROAD_PATTERN in fix.calls[0].user_prompt
+    assert [row.id for row in rows] == [recorded[0].id]
+
+
+def test_findings_that_cannot_be_recorded_leave_their_attempt_unfinished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger write and the attempt's completion are one durable step.
+
+    The other half of the same rule: an interruption must not leave a round's
+    objections recorded against an attempt that never finished, because the
+    resume that replays the attempt would then answer them twice.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[_BROAD_PATTERN],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def refuse(rows):
+            raise RuntimeError("simulated ledger failure")
+
+        monkeypatch.setattr(store, "record_execution_ledger_findings", refuse)
+        with pytest.raises(RuntimeError, match="simulated ledger failure"):
+            HostReviewFixPhase(
+                fixture.repository,
+                review,
+                config=HostReviewFixConfig(review_model="review-model"),
+            ).run(fixture.context(store))
+        monkeypatch.undo()
+        attempt = store.list_agent_attempts(fixture.task.id)[-1]
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+
+    assert attempt.phase == "review"
+    assert attempt.status is ExecutionAttemptStatus.RUNNING
+    assert rows == []
 
 
 def test_cancelled_review_remains_resumable_with_immutable_attempt(
@@ -1241,7 +1998,12 @@ def test_every_phase_is_told_not_to_weaken_an_existing_assertion() -> None:
     assert EXISTING_TEST_RULE in _render_user_prompt(inputs)
     assert EXISTING_TEST_RULE in _render_fix_prompt(
         inputs,
-        findings=("the parser must keep the documented omitted-start value",),
+        findings=(
+            _ledger_row(
+                task,
+                "the parser must keep the documented omitted-start value",
+            ),
+        ),
         review_round=1,
     )
     assert EXISTING_TEST_REVIEW_RULE in _render_review_prompt(
@@ -1249,7 +2011,7 @@ def test_every_phase_is_told_not_to_weaken_an_existing_assertion() -> None:
         branch="betterborg/09-run-coding-agent",
         base_commit="a" * 40,
         current_commit="b" * 40,
-        review_round=0,
+        review_round=1,
     )
     assert EXISTING_TEST_MERGE_RULE in _render_merge_prompt(
         inputs,
@@ -1277,6 +2039,41 @@ def test_the_rules_keep_an_honest_assertion_change_possible() -> None:
     assert "an earlier round of this task" in EXISTING_TEST_REVIEW_RULE
     assert "resolve the code" in EXISTING_TEST_MERGE_RULE
     assert "fail rather than choose one" in EXISTING_TEST_MERGE_RULE
+
+
+def test_the_reviewer_is_told_the_finding_contract_in_a_rendered_prompt() -> None:
+    """Severity and the two declarations reach the reviewer in a rendered prompt.
+
+    The review role prompt is generated per repository, so the requirement it
+    comes from can be reworded or dropped by the model that writes it. The
+    schema can require the declarations, but a required field with no
+    instruction behind it comes back empty every round and a ledger that is
+    never told what closed never drains.
+    """
+    borg = Borg(repository_id=uuid4(), name="review-finding-rule")
+    task = _record(
+        uuid4(), borg, position=1, stem="09-run-coding-agent", dependencies=[]
+    )
+    inputs = VerifiedTaskInputs(
+        task=task,
+        task_path=Path(f"{task.stem}.md"),
+        task_markdown=render_task_markdown(task.task),
+        dependencies=(),
+        system_prompt="You are the generated review agent.\n",
+    )
+
+    assert REVIEW_FINDING_RULE in _render_review_prompt(
+        inputs,
+        branch="betterborg/09-run-coding-agent",
+        base_commit="a" * 40,
+        current_commit="b" * 40,
+        review_round=1,
+    )
+    assert "severity of blocker, major, or minor" in REVIEW_FINDING_RULE
+    assert "A minor finding does not hold the task" in REVIEW_FINDING_RULE
+    assert "list in resolved the id of every one" in REVIEW_FINDING_RULE
+    assert "set repeats to the id" in REVIEW_FINDING_RULE
+    assert "neither resolve nor repeat stays open" in REVIEW_FINDING_RULE
 
 
 def test_a_committed_partial_reaches_review_rather_than_being_discarded(

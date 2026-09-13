@@ -92,6 +92,11 @@ from betterborg_cli.store import (
 from betterborg_cli.workspace_trust import TrustStore, require_workspace_trust
 
 
+def _review_finding(message: str) -> dict:
+    """One declared review finding of a severity that holds the task."""
+    return {"severity": "major", "message": message, "repeats": None}
+
+
 def _store_fixture(
     tmp_path: Path, task_count: int = 1
 ) -> tuple[SqliteStore, Borg, TaskGeneration, list[TaskRecord]]:
@@ -711,6 +716,7 @@ def _concrete_host_fixture(
                     "status": "approved",
                     "summary": "Implementation approved.",
                     "issues_file": "",
+                    "resolved": [],
                     "findings": [],
                 },
                 delay_seconds=review_delay_seconds,
@@ -2153,6 +2159,7 @@ def test_concrete_review_cancellation_resumes_without_replaying_coding(
                     "status": "approved",
                     "summary": "Implementation approved after resume.",
                     "issues_file": "",
+                    "resolved": [],
                     "findings": [],
                 }
             )
@@ -2258,7 +2265,8 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
                 "status": "issues_found",
                 "summary": "The implementation needs a fix.",
                 "issues_file": ".betterborg-task/issues.md",
-                "findings": [finding],
+                "resolved": [],
+                "findings": [_review_finding(finding)],
             }
         )
     ).queue(
@@ -2281,6 +2289,7 @@ def test_concrete_fix_cancellation_resumes_without_replaying_review(
                 "status": "approved",
                 "summary": "The fix is approved.",
                 "issues_file": "",
+                "resolved": [],
                 "findings": [],
             }
         )
@@ -2381,6 +2390,7 @@ def test_cancellation_after_fix_resumes_from_fixed_commit(
                     "status": "approved",
                     "summary": "The fixed commit is approved after resume.",
                     "issues_file": "",
+                    "resolved": [],
                     "findings": [],
                 }
             )
@@ -2406,7 +2416,8 @@ def test_cancellation_after_fix_resumes_from_fixed_commit(
                 "status": "issues_found",
                 "summary": "The implementation needs a fix.",
                 "issues_file": ".betterborg-task/issues.md",
-                "findings": ["commit the reviewed fix"],
+                "resolved": [],
+                "findings": [_review_finding("commit the reviewed fix")],
             }
         )
     ).queue(MockResponse(dynamic=commit_fix_then_cancel))
@@ -2476,7 +2487,8 @@ def test_cancelled_fix_commit_is_not_a_resume_attestation(
                 "status": "issues_found",
                 "summary": "The implementation needs a fix.",
                 "issues_file": ".betterborg-task/issues.md",
-                "findings": ["commit the reviewed fix"],
+                "resolved": [],
+                "findings": [_review_finding("commit the reviewed fix")],
             }
         )
     )
@@ -2572,7 +2584,8 @@ def test_concrete_retry_exhaustion_stops_and_resumes_fix(
                 "status": "issues_found",
                 "summary": "The implementation needs a fix.",
                 "issues_file": ".betterborg-task/issues.md",
-                "findings": [finding],
+                "resolved": [],
+                "findings": [_review_finding(finding)],
             }
         )
     ).queue(MockResponse(dynamic=commit_fix)).queue(
@@ -2582,6 +2595,7 @@ def test_concrete_retry_exhaustion_stops_and_resumes_fix(
                 "status": "approved",
                 "summary": "The resumed fix is approved.",
                 "issues_file": "",
+                "resolved": [],
                 "findings": [],
             }
         )

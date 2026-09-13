@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from betterborg_cli.agent_runtime import (
     AgentAdapter,
@@ -20,6 +20,7 @@ from betterborg_cli.agent_runtime import (
 from betterborg_cli.host_execution._agent_phase import (
     EXISTING_TEST_REVIEW_RULE,
     EXISTING_TEST_RULE,
+    REVIEW_FINDING_RULE,
     AgentAttemptArtifacts,
     HostAgentPhaseError,
     VerifiedTaskInputs,
@@ -37,14 +38,26 @@ from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError
+from betterborg_cli.planning.findings_ledger import (
+    REPEATS_SCHEMA,
+    RESOLVED_SCHEMA,
+    open_execution_findings,
+    reconcile_execution_ledger,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import BlockedTaskPolicy
 from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
+    ExecutionLedgerFinding,
     TaskRuntime,
     TaskRuntimeStatus,
 )
+
+#: Severities that hold a task. A batch whose every fault is minor is one the
+#: Supervisor approves, saying what the faults are, and a commit is held to the
+#: same rule.
+_HOLDING_SEVERITIES = frozenset({"blocker", "major"})
 
 REVIEW_RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -61,12 +74,37 @@ REVIEW_RESULT_SCHEMA: dict[str, Any] = {
         },
         "summary": {"type": "string", "minLength": 1},
         "issues_file": {"type": "string"},
+        "resolved": RESOLVED_SCHEMA,
         "findings": {
             "type": "array",
-            "items": {"type": "string", "minLength": 1},
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["severity", "message", "repeats"],
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["blocker", "major", "minor"],
+                    },
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": r"\S",
+                    },
+                    "suggestion": {"type": "string"},
+                    "repeats": REPEATS_SCHEMA,
+                },
+            },
         },
     },
-    "required": ["task_file", "status", "summary", "issues_file", "findings"],
+    "required": [
+        "task_file",
+        "status",
+        "summary",
+        "issues_file",
+        "findings",
+        "resolved",
+    ],
 }
 
 
@@ -267,7 +305,10 @@ class HostReviewFixPhase:
             branch=runtime.branch or "",
             base_commit=base_commit,
             current_commit=current_commit,
-            review_round=runtime.review_round,
+            review_round=_ledger_round(runtime),
+            open_findings=open_execution_findings(
+                context.store, context.claim.task_id
+            ),
             unfinished=_unfinished_coding_report(context),
         )
         return self._invoke(
@@ -303,6 +344,9 @@ class HostReviewFixPhase:
         user_prompt = _render_fix_prompt(
             inputs,
             findings=findings,
+            # The review that raised these findings advanced the counter as it
+            # requested the fix, so the runtime already carries that review's
+            # ledger round and the round line agrees with the rows below it.
             review_round=runtime.review_round,
         )
         return self._invoke(
@@ -444,10 +488,16 @@ class HostReviewFixPhase:
             actual_branch = runtime.branch or ""
             after_status = before_status
 
+        ledger: tuple[ExecutionLedgerFinding, ...] = ()
         if phase == "review":
-            outcome = self._classify_review(
+            classified = self._classify_review(
                 result,
                 runtime=runtime,
+                task_id=context.claim.task_id,
+                attempt_id=attempt_id,
+                ledger=context.store.list_execution_ledger_findings(
+                    context.claim.task_id
+                ),
                 expected_commit=current_commit,
                 final_commit=final_commit,
                 expected_branch=runtime.branch or "",
@@ -457,6 +507,8 @@ class HostReviewFixPhase:
                 operational_error=operational_error,
                 cancellation_reason=cancellation_reason,
             )
+            outcome = classified.outcome
+            ledger = classified.ledger
         else:
             outcome = self._classify_fix(
                 result,
@@ -508,20 +560,27 @@ class HostReviewFixPhase:
             AgentStatus.CANCELLED: ExecutionAttemptStatus.CANCELLED,
             AgentStatus.FAILED: ExecutionAttemptStatus.FAILED,
         }[result.status]
-        context.store.complete_agent_attempt(
-            attempt.id,
-            context.owner_token,
-            context.claim.claim_token,
-            status=terminal_attempt_status,
-            result_path=(
-                artifacts.reference(result_path) if result_path.is_file() else None
-            ),
-            result=durable_result,
-            summary=result_summary(result),
-            duration_seconds=result.duration_seconds,
-            usage=result.usage,
-            now=context.clock(),
-        )
+        # One durable step for the round's findings and the attempt that
+        # produced them: an interruption cannot leave objections recorded
+        # against an attempt that never finished, and a resume replays a
+        # completed attempt's outcome without re-running the classifier, so
+        # rows written after it would never be written at all.
+        with context.store.transaction():
+            context.store.complete_agent_attempt(
+                attempt.id,
+                context.owner_token,
+                context.claim.claim_token,
+                status=terminal_attempt_status,
+                result_path=(
+                    artifacts.reference(result_path) if result_path.is_file() else None
+                ),
+                result=durable_result,
+                summary=result_summary(result),
+                duration_seconds=result.duration_seconds,
+                usage=result.usage,
+                now=context.clock(),
+            )
+            context.store.record_execution_ledger_findings(ledger)
         if outcome.status is runtime.status:
             return outcome.status
         return self._transition(context, runtime.status, outcome)
@@ -531,6 +590,9 @@ class HostReviewFixPhase:
         result: AgentResult,
         *,
         runtime: TaskRuntime,
+        task_id: UUID,
+        attempt_id: UUID,
+        ledger: Sequence[ExecutionLedgerFinding],
         expected_commit: str,
         final_commit: str,
         expected_branch: str,
@@ -539,69 +601,123 @@ class HostReviewFixPhase:
         after_status: str,
         operational_error: BaseException | None,
         cancellation_reason: str | None,
-    ) -> _PhaseOutcome:
+    ) -> _ReviewClassification:
         if operational_error is not None:
-            return _blocked_outcome(runtime, str(operational_error))
+            return _ReviewClassification(
+                _blocked_outcome(runtime, str(operational_error))
+            )
         if actual_branch != expected_branch or final_commit != expected_commit:
-            return _blocked_outcome(runtime, "review agent changed the task branch")
+            return _ReviewClassification(
+                _blocked_outcome(runtime, "review agent changed the task branch")
+            )
         if after_status != before_status:
-            return _blocked_outcome(runtime, "review agent modified the task worktree")
+            return _ReviewClassification(
+                _blocked_outcome(runtime, "review agent modified the task worktree")
+            )
         if result.status is AgentStatus.CANCELLED:
-            return _PhaseOutcome(
-                TaskRuntimeStatus.REVIEW,
-                cancellation_reason or "review agent was interrupted",
-                runtime.review_round,
-                "review",
+            return _ReviewClassification(
+                _PhaseOutcome(
+                    TaskRuntimeStatus.REVIEW,
+                    cancellation_reason or "review agent was interrupted",
+                    runtime.review_round,
+                    "review",
+                )
             )
         if result.status is AgentStatus.FAILED:
-            return _PhaseOutcome(
-                TaskRuntimeStatus.FAILED,
-                result.error or "review agent failed",
-                runtime.review_round,
-                "review",
+            return _ReviewClassification(
+                _PhaseOutcome(
+                    TaskRuntimeStatus.FAILED,
+                    result.error or "review agent failed",
+                    runtime.review_round,
+                    "review",
+                )
             )
         payload = result.payload or {}
         payload_status = payload.get("status")
-        findings = payload.get("findings")
-        if payload_status == "approved":
-            if findings:
-                return _blocked_outcome(
-                    runtime, "review approval included unresolved findings"
-                )
-            return _PhaseOutcome(
-                TaskRuntimeStatus.MERGING,
-                str(payload.get("summary") or "review approved"),
-                runtime.review_round,
-                "merging",
-            )
-        if payload_status == "issues_found":
-            if not isinstance(findings, list) or not findings:
-                return _blocked_outcome(
-                    runtime, "review reported issues without findings"
-                )
-            next_round = runtime.review_round + 1
-            if next_round >= self._config.review_passes:
-                return _PhaseOutcome(
-                    TaskRuntimeStatus.BLOCKED,
-                    f"review pass limit {self._config.review_passes} reached",
-                    next_round,
+        if payload_status == "failed":
+            return _ReviewClassification(
+                _PhaseOutcome(
+                    TaskRuntimeStatus.FAILED,
+                    str(payload.get("summary") or "review agent could not review"),
+                    runtime.review_round,
                     "review",
                 )
-            return _PhaseOutcome(
+            )
+        if payload_status not in {"approved", "issues_found"}:
+            return _ReviewClassification(
+                _blocked_outcome(
+                    runtime,
+                    f"review agent reported {payload_status or 'no status'}",
+                )
+            )
+        # The runtime counts the rounds behind it while the ledger numbers the
+        # round in hand, so the count this review leaves behind is its own
+        # ledger round. One number, and the rows, the reason and the pass limit
+        # all read it.
+        review_round = _ledger_round(runtime)
+        try:
+            declared = _declared_findings(
+                payload,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                review_round=review_round,
+            )
+            resolved = _declared_resolved(payload)
+        except (TypeError, ValueError) as error:
+            return _ReviewClassification(
+                _blocked_outcome(runtime, f"review declarations are invalid: {error}")
+            )
+        approved = payload_status == "approved"
+        if approved and any(
+            finding.severity in _HOLDING_SEVERITIES for finding, _ in declared
+        ):
+            return _ReviewClassification(
+                _blocked_outcome(
+                    runtime, "review approval included blocker or major findings"
+                )
+            )
+        if not approved and not declared:
+            return _ReviewClassification(
+                _blocked_outcome(runtime, "review reported issues without findings")
+            )
+        reconciled = tuple(
+            reconcile_execution_ledger(
+                ledger,
+                findings=declared,
+                resolved=resolved,
+                attempt_id=attempt_id,
+                review_round=review_round,
+                approved=approved,
+            )
+        )
+        if approved:
+            return _ReviewClassification(
+                _PhaseOutcome(
+                    TaskRuntimeStatus.MERGING,
+                    str(payload.get("summary") or "review approved"),
+                    runtime.review_round,
+                    "merging",
+                ),
+                reconciled,
+            )
+        if review_round >= self._config.review_passes:
+            return _ReviewClassification(
+                _PhaseOutcome(
+                    TaskRuntimeStatus.BLOCKED,
+                    f"review pass limit {self._config.review_passes} reached",
+                    review_round,
+                    "review",
+                ),
+                reconciled,
+            )
+        return _ReviewClassification(
+            _PhaseOutcome(
                 TaskRuntimeStatus.FIX,
-                f"review round {next_round} requested fixes",
-                next_round,
+                f"review round {review_round} requested fixes",
+                review_round,
                 "fix",
-            )
-        if payload_status == "failed":
-            return _PhaseOutcome(
-                TaskRuntimeStatus.FAILED,
-                str(payload.get("summary") or "review agent could not review"),
-                runtime.review_round,
-                "review",
-            )
-        return _blocked_outcome(
-            runtime, f"review agent reported {payload_status or 'no status'}"
+            ),
+            reconciled,
         )
 
     @staticmethod
@@ -788,25 +904,21 @@ class HostReviewFixPhase:
 
     def _findings_for_fix(
         self, context: ScheduledTaskContext, review_round: int
-    ) -> tuple[str, ...]:
-        reviews = [
-            attempt
-            for attempt in context.store.list_agent_attempts(context.claim.task_id)
-            if attempt.phase == "review"
-            and attempt.status is ExecutionAttemptStatus.COMPLETED
-            and isinstance(attempt.result, Mapping)
-            and (attempt.result or {}).get("status") == "issues_found"
-        ]
-        if not reviews:
+    ) -> tuple[ExecutionLedgerFinding, ...]:
+        """Return every objection still standing against the task's commit.
+
+        The last review's payload holds only what that round said. A finding an
+        earlier round raised and no later round repeated is still open, and a
+        fixer shown less than the ledger holds against it answers less.
+        """
+        findings = tuple(
+            open_execution_findings(context.store, context.claim.task_id)
+        )
+        if not findings:
             raise ReviewFixPhaseError(
-                f"fix round {review_round} has no persisted review findings"
+                f"fix round {review_round} has no open review findings"
             )
-        findings = (reviews[-1].result or {}).get("findings")
-        if not isinstance(findings, list) or not all(
-            isinstance(finding, str) and finding.strip() for finding in findings
-        ):
-            raise ReviewFixPhaseError("persisted review findings are invalid")
-        return tuple(findings)
+        return findings
 
     def _transition(
         self,
@@ -851,6 +963,31 @@ class _PhaseOutcome:
     resume_phase: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ReviewClassification:
+    """A review's outcome beside the ledger its round leaves behind.
+
+    Only a review that actually reviewed reconciles, so every other outcome
+    carries no ledger at all: a reviewer that could not review, an agent that
+    failed or was cancelled, a changed branch and a modified worktree all leave
+    the rows as the round before them left them, because objections recorded
+    from a review that never formed them are objections no later round answers.
+    """
+
+    outcome: _PhaseOutcome
+    ledger: tuple[ExecutionLedgerFinding, ...] = ()
+
+
+def _ledger_round(runtime: TaskRuntime) -> int:
+    """Return the ledger round a review of this runtime runs as.
+
+    The ledger numbers its rounds from one, as a planning ledger does, so that
+    every prompt, reason and row speaks one numbering. The task runtime counts
+    the review rounds behind it instead, from zero.
+    """
+    return runtime.review_round + 1
+
+
 def _blocked_outcome(runtime: TaskRuntime, reason: str) -> _PhaseOutcome:
     return _PhaseOutcome(
         TaskRuntimeStatus.BLOCKED,
@@ -889,6 +1026,75 @@ def _unfinished_coding_report(
     return status, notes
 
 
+def _declared_findings(
+    payload: Mapping[str, Any],
+    *,
+    task_id: UUID,
+    attempt_id: UUID,
+    review_round: int,
+) -> tuple[tuple[ExecutionLedgerFinding, str | None], ...]:
+    """Build this round's findings, each beside the objection it restates."""
+
+    raw = payload.get("findings")
+    if not isinstance(raw, list):
+        raise ValueError("findings must be a list")
+    declared: list[tuple[ExecutionLedgerFinding, str | None]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("every finding must be an object")
+        # Both declarations are required, so both are read as required. An
+        # absent severity is the sharper one: it is the field this loop
+        # branches on, and read as empty it would pass for one that does not
+        # hold the task.
+        for required in ("severity", "message", "repeats"):
+            if required not in item:
+                raise ValueError(f"every finding declares its {required}")
+        repeats = item["repeats"]
+        if repeats is not None and not isinstance(repeats, str):
+            raise ValueError("a finding repeats one id or nothing")
+        suggestion = str(item.get("suggestion") or "").strip()
+        declared.append(
+            (
+                ExecutionLedgerFinding(
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    first_seen_round=review_round,
+                    last_seen_round=review_round,
+                    severity=str(item["severity"]),
+                    message=str(item["message"]).strip(),
+                    suggestion=suggestion or None,
+                ),
+                repeats,
+            )
+        )
+    return tuple(declared)
+
+
+def _declared_resolved(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the ids a review says its round closed.
+
+    An id the ledger cannot place is left to the reconciliation rather than
+    refused here: the row it meant stays open, which costs the loop a grant and
+    lets no blocker through.
+    """
+
+    raw = payload.get("resolved")
+    if not isinstance(raw, list):
+        raise ValueError("resolved must be a list")
+    return tuple(str(item) for item in raw)
+
+
+def _ledger_lines(findings: Sequence[ExecutionLedgerFinding]) -> list[str]:
+    """Render open objections as the list an agent names ids from."""
+
+    return [
+        f"- {finding.id} ({finding.severity}, first raised in round "
+        f"{finding.first_seen_round}): {finding.message}"
+        + (f" (suggestion: {finding.suggestion})" if finding.suggestion else "")
+        for finding in findings
+    ]
+
+
 def _render_review_prompt(
     inputs: VerifiedTaskInputs,
     *,
@@ -896,6 +1102,7 @@ def _render_review_prompt(
     base_commit: str,
     current_commit: str,
     review_round: int,
+    open_findings: Sequence[ExecutionLedgerFinding] = (),
     unfinished: tuple[str, tuple[str, ...]] | None = None,
 ) -> str:
     sections = [
@@ -905,6 +1112,8 @@ def _render_review_prompt(
         "",
         EXISTING_TEST_REVIEW_RULE,
         "",
+        REVIEW_FINDING_RULE,
+        "",
         f"Task file: {inputs.task_path.as_posix()}",
         f"Task digest: {inputs.task.digest}",
         f"Task branch: {branch}",
@@ -912,6 +1121,19 @@ def _render_review_prompt(
         f"Current task commit: {current_commit}",
         f"Review round: {review_round}",
     ]
+    if open_findings:
+        sections.extend(
+            [
+                "",
+                "## Open findings this commit has to answer",
+                "",
+                "Earlier rounds raised these and no round has closed them. "
+                "Judge each against the tree in front of you, and name it by "
+                "the id shown here in resolved or in repeats.",
+                "",
+                *_ledger_lines(open_findings),
+            ]
+        )
     if unfinished is not None:
         status, notes = unfinished
         sections.extend(
@@ -954,11 +1176,11 @@ def _render_review_prompt(
 def _render_fix_prompt(
     inputs: VerifiedTaskInputs,
     *,
-    findings: tuple[str, ...],
+    findings: Sequence[ExecutionLedgerFinding],
     review_round: int,
 ) -> str:
     sections = [
-        "Fix every persisted review finding in the current worktree. Keep the "
+        "Fix every open review finding in the current worktree. Keep the "
         "change in scope, run relevant verification, and commit the fix before "
         "returning completed.",
         "",
@@ -968,9 +1190,12 @@ def _render_fix_prompt(
         f"Task digest: {inputs.task.digest}",
         f"Fix round: {review_round}",
         "",
-        "## Review findings",
+        "## Open review findings",
         "",
-        *(f"- {finding}" for finding in findings),
+        "Every objection still standing against this commit, including ones an "
+        "earlier round raised that the latest review did not repeat.",
+        "",
+        *_ledger_lines(findings),
         "",
         "## Assigned task",
         "",

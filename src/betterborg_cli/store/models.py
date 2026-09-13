@@ -1125,6 +1125,46 @@ class AgentAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionLedgerFinding:
+    """One review objection whose lifecycle outlives the round that raised it.
+
+    The review attempt's persisted payload is the record of what a reviewer
+    said; this is the current view of whether the task's commit still has to
+    answer it. Its rounds are numbered from one, as a planning ledger's are,
+    which is one past the task runtime's own zero-based review round.
+    """
+
+    task_id: UUID
+    attempt_id: UUID
+    first_seen_round: int
+    last_seen_round: int
+    severity: str
+    message: str
+    status: FindingStatus = FindingStatus.OPEN
+    suggestion: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "task_id", "attempt_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"execution ledger finding {name} must be a UUID")
+        if self.first_seen_round < 1:
+            raise ValueError("execution ledger finding rounds must be positive")
+        if self.last_seen_round < self.first_seen_round:
+            raise ValueError(
+                "execution ledger finding cannot be seen before it was raised"
+            )
+        if not isinstance(self.status, FindingStatus):
+            raise TypeError("execution ledger finding status must be a FindingStatus")
+        if not self.severity.strip() or not self.message.strip():
+            raise ValueError(
+                "execution ledger finding severity and message must not be empty"
+            )
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionEvent:
     """One immutable event emitted by the host-execution pipeline."""
 

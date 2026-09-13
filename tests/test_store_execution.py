@@ -3,9 +3,11 @@
 import hashlib
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 
@@ -17,9 +19,11 @@ from betterborg_cli.store import (
     EnvironmentAttempt,
     ExecutionAttemptStatus,
     ExecutionEvent,
+    ExecutionLedgerFinding,
     ExecutionOwnershipError,
     ExecutionRun,
     ExecutionRunStatus,
+    FindingStatus,
     PlanApproval,
     Repository,
     SqliteStore,
@@ -163,6 +167,118 @@ def _dependency_execution_fixture(tmp_path: Path):
     return database, borg, generation, foundation, consumer
 
 
+def test_migration_015_execution_ledger_moves_only_lifecycle(
+    tmp_path: Path, approved_task_generation
+) -> None:
+    """The ledger is the mutable view; what a round first said is not rewritten.
+
+    A later write offering a different severity, message, suggestion or birth
+    round changes none of them, which is what keeps a repeat from escalating a
+    minor into a blocker.
+    """
+    database, borg, generation, task = _execution_fixture(
+        tmp_path, approved_task_generation
+    )
+    started_at = utcnow()
+    run = ExecutionRun(
+        borg_id=borg.id,
+        generation_id=generation.id,
+        started_at=started_at,
+        heartbeat_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=5),
+    )
+    claim = TaskClaim(
+        run_id=run.id,
+        task_id=task.id,
+        resume_phase="review",
+        claimed_at=started_at,
+        lease_expires_at=started_at + timedelta(minutes=2),
+    )
+
+    def _attempt(round_number: int) -> AgentAttempt:
+        return AgentAttempt(
+            run_id=run.id,
+            claim_id=claim.id,
+            task_id=task.id,
+            phase="review",
+            review_round=round_number,
+            attempt_number=1,
+            adapter="codex",
+            model="test-model",
+            billing_mode=BillingMode.API,
+            status=AgentStatus.COMPLETED,
+            log_path=f"artifacts/review-{round_number}.log",
+            started_at=started_at,
+            finished_at=started_at + timedelta(seconds=1),
+        )
+
+    first, second = _attempt(0), _attempt(1)
+    raised = ExecutionLedgerFinding(
+        task_id=task.id,
+        attempt_id=first.id,
+        first_seen_round=1,
+        last_seen_round=1,
+        severity="blocker",
+        message="The rollback path is untested.",
+        suggestion="Name the checks it runs.",
+    )
+
+    with SqliteStore.open(database) as store:
+        store.add_execution_run(run)
+        store.add_task_runtime(
+            TaskRuntime(
+                generation_id=generation.id,
+                task_id=task.id,
+                status=TaskRuntimeStatus.REVIEW,
+                resume_phase="review",
+                branch="betterborg-tasks/07-host-execution/01-foundation",
+                worktree_path="worktrees/01-foundation",
+                last_run_id=run.id,
+            )
+        )
+        store.append_task_claim(claim)
+        for attempt in (first, second):
+            store.append_agent_attempt(
+                attempt, run.owner_token, claim.claim_token, now=started_at
+            )
+        store.record_execution_ledger_findings([raised])
+        store.record_execution_ledger_findings(
+            [
+                replace(
+                    raised,
+                    attempt_id=second.id,
+                    first_seen_round=2,
+                    last_seen_round=2,
+                    status=FindingStatus.RESOLVED,
+                    severity="minor",
+                    message="A later round said something else.",
+                    suggestion="And suggested something else.",
+                )
+            ]
+        )
+
+    with SqliteStore.open(database) as reopened:
+        assert reopened.applied_migrations() == tuple(range(1, 16))
+        rows = reopened.list_execution_ledger_findings(task.id)
+        assert len(rows) == 1
+        closed = rows[0]
+        assert closed.status is FindingStatus.RESOLVED
+        assert closed.last_seen_round == 2
+        assert closed.attempt_id == second.id
+        assert closed.severity == "blocker"
+        assert closed.message == "The rollback path is untested."
+        assert closed.suggestion == "Name the checks it runs."
+        assert closed.first_seen_round == 1
+        # A row of another task is another task's to answer for.
+        assert reopened.list_execution_ledger_findings(uuid4()) == []
+
+        # The attempt a row cites has to exist.
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.record_execution_ledger_findings(
+                [replace(raised, id=uuid4(), attempt_id=uuid4())]
+            )
+
+
 def test_execution_ownership_records_round_trip_after_reopen(
     tmp_path: Path, approved_task_generation
 ) -> None:
@@ -259,7 +375,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 15))
+        assert reopened.applied_migrations() == tuple(range(1, 16))
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime

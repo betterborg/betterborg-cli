@@ -6,8 +6,16 @@ from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
-from betterborg_cli.planning.findings_ledger import reconcile_planning_ledger
-from betterborg_cli.store import FindingStatus, PlanningFinding, PlanningLedgerFinding
+from betterborg_cli.planning.findings_ledger import (
+    reconcile_execution_ledger,
+    reconcile_planning_ledger,
+)
+from betterborg_cli.store import (
+    ExecutionLedgerFinding,
+    FindingStatus,
+    PlanningFinding,
+    PlanningLedgerFinding,
+)
 
 _BORG = uuid4()
 
@@ -176,3 +184,41 @@ def test_two_findings_naming_one_row_move_it_once() -> None:
     assert moved.severity == "minor"
     assert moved.first_seen_round == 1
     assert moved.last_seen_round == 2
+
+
+def test_the_reconciler_says_which_round_and_attempt_a_row_belongs_to() -> None:
+    """An execution finding arrives as a row, and the round is still not its own.
+
+    There is no snapshot table on this side, so a declared finding is handed
+    over already shaped like the row it becomes. What round it belongs to and
+    which attempt established it are the reconciler's to say all the same, or a
+    caller that built the row before the round was known would record it under
+    one no assessment covers.
+    """
+    task, stale, current = uuid4(), uuid4(), uuid4()
+    declared = ExecutionLedgerFinding(
+        task_id=task,
+        attempt_id=stale,
+        first_seen_round=1,
+        last_seen_round=1,
+        severity="blocker",
+        message="The rollback path is untested.",
+    )
+
+    rows = reconcile_execution_ledger(
+        (),
+        findings=[(declared, None)],
+        resolved=(),
+        attempt_id=current,
+        review_round=4,
+        approved=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].first_seen_round == 4
+    assert rows[0].last_seen_round == 4
+    assert rows[0].attempt_id == current
+    assert rows[0].status is FindingStatus.OPEN
+    # What the reviewer said is still the reviewer's.
+    assert rows[0].severity == "blocker"
+    assert rows[0].message == "The rollback path is untested."

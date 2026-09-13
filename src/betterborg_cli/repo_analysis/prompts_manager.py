@@ -77,9 +77,14 @@ requires to change is reported with its reason.""",
 method by file class, duplication/over-abstraction/orphaned-code lenses, test
 value and established test infrastructure, verification commands, sensitive
 paths, blocker/major/minor severity, approval criteria, and the review result
-contract. It must instruct the reviewer to inspect rather than edit, and to
-treat an existing assertion the change weakens, deletes, or reverses as a
-blocker unless the task required that behaviour to change.""",
+contract. It must state that every finding carries its severity as a field,
+that a minor finding does not hold the task so a commit whose every fault is
+minor is approved with those faults named, and that every review declares the
+ids of the open findings it closes and, on each finding of its own, the id of
+the open finding that finding raises again. It must instruct the reviewer to
+inspect rather than edit, and to treat an existing assertion the change
+weakens, deletes, or reverses as a blocker unless the task required that
+behaviour to change.""",
     "merge": """The merge prompt must cover mission, rebase inputs, conflict
 resolution using surrounding code, append-only migrations when present,
 regeneration of generated code and lock files using discovered commands, Git

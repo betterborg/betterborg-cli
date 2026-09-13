@@ -46,6 +46,22 @@ EXISTING_TEST_REVIEW_RULE = (
     "it arrived with the repository or with an earlier round of this task."
 )
 
+#: Severity and the two declarations are schema fields this loop reads, and
+#: they reach the reviewer here for the same reason: a review that never says
+#: what a round closed leaves a ledger that never drains, silently and per
+#: repository.
+REVIEW_FINDING_RULE = (
+    "Give every finding a severity of blocker, major, or minor. A minor "
+    "finding does not hold the task: approve when nothing worse than minor is "
+    "left, and say in your summary what the minor findings are. Account for "
+    "the open findings you were given: list in resolved the id of every one "
+    "this commit closes, and on each finding of your own set repeats to the id "
+    "of the open finding it raises again, or null when the objection is new. "
+    "Both are always required, so a review that closes nothing sends an empty "
+    "list and a new finding sends null. An open finding you neither resolve "
+    "nor repeat stays open."
+)
+
 #: The merge agent is told to verify the merged tree, so it holds the same
 #: pressure over a tree it may edit, and it is the last judgement in a run:
 #: sanity runs commands, and no agent reads the merge commit after it.
