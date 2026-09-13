@@ -139,10 +139,15 @@ class ExecutionLimits:
 
 @dataclass(frozen=True)
 class PlanningLimits:
-    """Repository defaults that bound repeated planning review."""
+    """Repository defaults for how long planning review may argue.
+
+    The two round counts are minimums. ``grant_budget`` is how many rounds
+    past its minimum a loop may spend closing nothing before it stops.
+    """
 
     review_rounds: int = 3
     decomposition_rounds: int = 3
+    grant_budget: int = 10
 
 
 @dataclass(frozen=True)
@@ -330,7 +335,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     planning_document = _optional_table(document, "planning")
     _require_only_keys(
         planning_document,
-        {"review_rounds", "decomposition_rounds"},
+        {"review_rounds", "decomposition_rounds", "grant_budget"},
         section="planning",
     )
     review_rounds = _optional_int(
@@ -345,6 +350,15 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         raise RepositoryConfigError(
             "planning.decomposition_rounds must be at least 1"
         )
+    grant_budget = _optional_int(
+        planning_document, "grant_budget", default=10, section="planning"
+    )
+    # Zero is legal where every budget beside it starts at one: it is how an
+    # operator asks for exactly the declared rounds and the terminal states
+    # they reach today, and a budget sold as a price control has to admit the
+    # price of nothing.
+    if grant_budget < 0:
+        raise RepositoryConfigError("planning.grant_budget must not be negative")
 
     return RepositoryConfig(
         version=version,
@@ -361,6 +375,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         planning=PlanningLimits(
             review_rounds=review_rounds,
             decomposition_rounds=decomposition_rounds,
+            grant_budget=grant_budget,
         ),
     )
 

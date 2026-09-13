@@ -72,6 +72,8 @@ from betterborg_cli.planning import (
     task_markdown_digest,
 )
 from betterborg_cli.planning.findings_ledger import open_planning_findings
+from betterborg_cli.planning.grants import GrantAccount
+from betterborg_cli.planning.tech_lead import tech_lead_grant_account
 from betterborg_cli.planning.turns import (
     current_planning_cycle_attempts,
     latest_planning_review_requests_changes,
@@ -864,10 +866,12 @@ def start_plan(
     unattended: bool,
 ) -> None:
     """Start or resume planning for the named Borg."""
-    borg = _continue_planning(paths, name, cancel=cancel, unattended=unattended)
+    planned = _continue_planning(
+        paths, name, cancel=cancel, unattended=unattended
+    )
     _write_after_progress(
         _repository_progress(False),
-        lambda: _write_planning_gate(name, borg, changed=False),
+        lambda: _write_planning_gate(name, planned, changed=False),
     )
 
 
@@ -2142,7 +2146,10 @@ def approve_plan(
             for item in workflow.publication.files:
                 click.echo(f"  {paths.label(item.path)}")
         else:
-            _stop_blocked(f"Task decomposition blocked for Borg {name!r}.")
+            _stop_blocked(
+                f"Task decomposition blocked for Borg {name!r}.",
+                *_grant_lines(workflow.grants),
+            )
 
     _write_after_progress(progress, write_result)
 
@@ -2179,13 +2186,27 @@ def change_plan(
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
 
-    borg = _continue_planning(
+    planned = _continue_planning(
         paths, name, change_note=note, cancel=cancel, unattended=unattended
     )
     _write_after_progress(
         _repository_progress(False),
-        lambda: _write_planning_gate(name, borg, changed=True),
+        lambda: _write_planning_gate(name, planned, changed=True),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuedPlanning:
+    """One drained planning lifecycle and what its rounds cost.
+
+    The gate that reports a blocked plan prints with the store closed, and a
+    blocked plan has to explain itself the same way however it is reached, so
+    the account is assembled from the record while the store is open and
+    travels out beside the Borg.
+    """
+
+    borg: Borg
+    grants: GrantAccount | None = None
 
 
 def _continue_planning(
@@ -2196,7 +2217,7 @@ def _continue_planning(
     io: InteractiveIO | None = None,
     cancel: CancellationToken | None = None,
     unattended: bool = False,
-) -> Borg:
+) -> ContinuedPlanning:
     """Load and drain one initial or change-request planning lifecycle."""
     change_requested = change_note is not None
     resumable = False
@@ -2284,9 +2305,23 @@ def _continue_planning(
                     io=planning_io,
                     unattended=unattended,
                     review_rounds=config.planning.review_rounds,
+                    grant_budget=config.planning.grant_budget,
                     cancel=cancel,
                     progress=progress,
                 ).run().borg
+            # Only where the Tech Lead is what stopped. A plan blocked in
+            # decomposition is blocked in the same state, and its review loop
+            # reached approval, so its account would explain someone else's
+            # block with a loop that agreed.
+            grants = (
+                tech_lead_grant_account(store, borg.id)
+                if borg.state is BorgState.BLOCKED
+                and latest_planning_review_requests_changes(
+                    current_planning_cycle_attempts(store, borg.id),
+                    "tech_review",
+                )
+                else None
+            )
     except (ArchitectCancelled, TechLeadCancelled, KeyboardInterrupt) as error:
         message = str(error).strip()
         detail = f" ({message})" if message else ""
@@ -2305,7 +2340,7 @@ def _continue_planning(
                 f"Run 'betterborg plan start {name}' to resume."
             ) from error
         raise click.ClickException(str(error)) from error
-    return borg
+    return ContinuedPlanning(borg=borg, grants=grants)
 
 
 def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
@@ -2313,6 +2348,15 @@ def _awaiting_architect_revision(store: SqliteStore, borg: Borg) -> bool:
     return latest_planning_review_requests_changes(
         current_planning_cycle_attempts(store, borg.id), "tech_review"
     )
+
+
+def _grant_lines(account: GrantAccount | None) -> tuple[str, ...]:
+    """Say what a stopped loop's rounds cost, where the record can say it.
+
+    A loop that quietly ran eleven rounds is otherwise indistinguishable from
+    a slow one.
+    """
+    return () if account is None else (account.sentence(),)
 
 
 def _stop_blocked(first: str, *rest: str) -> NoReturn:
@@ -2327,8 +2371,11 @@ def _stop_blocked(first: str, *rest: str) -> NoReturn:
     raise click.exceptions.Exit(1)
 
 
-def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
+def _write_planning_gate(
+    name: str, planned: ContinuedPlanning, *, changed: bool
+) -> None:
     """Report the terminal gate reached, stopping on any but approval pending."""
+    borg = planned.borg
     if borg.state is BorgState.PLAN_APPROVAL_PENDING:
         suffix = " after applying the change" if changed else ""
         click.echo(f"Plan approval pending for Borg {name!r}{suffix}.")
@@ -2337,6 +2384,7 @@ def _write_planning_gate(name: str, borg: Borg, *, changed: bool) -> None:
         suffix = " while applying the change" if changed else ""
         _stop_blocked(
             f"Planning blocked for Borg {name!r}{suffix}.",
+            *_grant_lines(planned.grants),
             f"Review the saved Tech Lead findings with: "
             f"betterborg plan show {name}",
         )

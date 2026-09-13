@@ -264,15 +264,20 @@ with nobody watching stops on it rather than carrying on. A plan waiting for
 approval is the ordinary end of `betterborg plan start NAME` and exits zero,
 because it is what an unattended plan is meant to reach.
 
-## Choose how many revisions a plan gets
+## Choose how long a plan's review may argue
 
 The Tech Lead reviews the Architect's plan, and where it finds something wrong
-the Architect revises and it reviews again. Three rounds is what a plan gets,
-and one the Tech Lead still will not approve then blocks with its findings
-kept, so `betterborg plan show NAME` says what stood in the way.
+the Architect revises and it reviews again. Three rounds is the minimum a plan
+gets, and a plan still unapproved after them keeps going on its own: every
+further round is granted automatically, for as long as the loop is getting
+somewhere. A round that leaves fewer findings open than the round before it
+costs nothing. A round that closes nothing spends one grant, and when the
+grants are gone the plan blocks with its findings kept, so `betterborg plan
+show NAME` says what stood in the way — and the gate that reports the block
+says how many granted rounds the loop took and how its last one read.
 
-A repository that wants more or fewer attempts at agreement sets its own
-budget in `.betterborg/config.toml`:
+A repository that wants a longer or shorter argument before the grants begin
+sets its own minimum in `.betterborg/config.toml`:
 
 ```toml
 [planning]
@@ -281,22 +286,43 @@ review_rounds = 5
 
 Decomposition has the same shape and the same knob. The Supervisor reviews the
 Project Manager's task batch, sends it back where it finds something wrong, and
-after its rounds a batch it still will not approve blocks with its findings
-kept. `decomposition_rounds` sets how many it gets:
+continues past its own minimum on the same terms. `decomposition_rounds` sets
+how many rounds it gets before the grants begin:
 
 ```toml
 [planning]
 decomposition_rounds = 5
 ```
 
-Both are read when a run starts and govern that run. A plan or a batch that has
-already blocked stays blocked whatever the setting becomes afterwards.
+`grant_budget` is how many rounds of showing nothing either loop may add to
+its minimum, ten by default, counted per loop:
 
-The value is a whole number of at least one, and anything else is refused when
-the configuration is read rather than part-way through a review. Each review
-is told the round it is on and the budget it has. Raising the budget buys
-further rounds, never approval: a plan that spends the larger budget
-unapproved blocks exactly as one that spends the default does.
+```toml
+[planning]
+grant_budget = 10
+```
+
+Zero is a legal budget, and asks for exactly the rounds the minimum declares
+and the blocks they reach: the first round past the minimum has no budget to
+come out of. Below zero is refused. The two minimums are whole numbers of at
+least one, and anything else is refused when the configuration is read rather
+than part-way through a review.
+
+The budget bounds how long a loop may grind, not how long it may run. A
+reviewer that raises findings on one round and closes them over the next
+several is refunded for every closing round and charged for the raising one, so
+a productive loop can run far past its minimum plus its budget. What the budget
+guarantees is that a loop showing no progress stops; it is not a number to plan
+capacity against. Raising the minimum buys further rounds before the grants
+begin, never approval.
+
+Each review is told the round it is on and nothing about the budget: no loop
+knows whether a round is its last, because that depends on findings the round
+has not produced yet. All three settings are read when a run starts and govern that
+run, and a plan or a batch that has already blocked stays blocked whatever any
+of them becomes afterwards — including the account the gate gives of why it
+blocked, which is read from what the rounds recorded rather than from the
+settings in force now.
 
 Execution has its own table. `jobs` is how many tasks the scheduler runs at
 once, one to ten. `review_passes` is how many times a task may go round the

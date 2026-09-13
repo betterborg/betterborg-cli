@@ -29,6 +29,7 @@ from betterborg_cli.host_execution import (
 from betterborg_cli.onboarding import CreateService, OnboardingDispatcher
 from betterborg_cli.planning import ArchitectCancelled
 from betterborg_cli.planning.findings_ledger import open_planning_findings
+from betterborg_cli.planning.grants import GrantAccount
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
@@ -228,9 +229,24 @@ class PlanDocument(ProtocolModel):
     open_questions: tuple[str, ...] = ()
 
 
+class GrantAccountData(ProtocolModel):
+    """What a stopped review loop's rounds cost it.
+
+    A headless caller has no terminal to read the gate's line in, so the
+    account travels in the payload the way the findings do.
+    """
+
+    rounds: int = Field(ge=0)
+    minimum: int = Field(ge=0)
+    grants: int = Field(ge=0)
+    charged: int = Field(ge=0)
+    converging: bool | None = None
+
+
 class PlanProgressData(ProtocolModel):
     borg: str
     questions: tuple[PlanningQuestionData, ...]
+    grants: GrantAccountData | None = None
 
 
 class PlanFindingData(ProtocolModel):
@@ -1381,6 +1397,20 @@ def _plan_findings(
     )
 
 
+def _grant_account(account: GrantAccount | None) -> GrantAccountData | None:
+    """Carry one loop's grant account into a headless caller's payload."""
+
+    if account is None:
+        return None
+    return GrantAccountData(
+        rounds=account.rounds,
+        minimum=account.minimum,
+        grants=account.grants,
+        charged=account.charged,
+        converging=account.converging,
+    )
+
+
 def _plan_actions(
     name: str, state: BorgState
 ) -> tuple[PlanNextAction | TaskListNextAction | ExecuteNextAction, ...]:
@@ -1530,13 +1560,15 @@ def _plan(
     if action == "change" and (note is None or not note.strip()):
         raise ValueError("plan change note must not be empty")
     try:
-        borg = cli_module._continue_planning(
+        planned = cli_module._continue_planning(
             paths,
             name,
             change_note=note.strip() if action == "change" and note else None,
             io=io,
             cancel=cancel,
         )
+        borg = planned.borg
+        grants = _grant_account(planned.grants)
         questions: list[dict[str, Any]] = []
     except click.ClickException as error:
         cause = error.__cause__
@@ -1561,6 +1593,7 @@ def _plan(
                 PlanningQuestionData.model_validate(question)
                 for question in questions
             ),
+            grants=grants,
         ),
     )
 

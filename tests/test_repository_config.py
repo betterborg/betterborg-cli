@@ -306,6 +306,8 @@ default_branch = "main"
             "decomposition_rounds = 1.5",
             "planning.decomposition_rounds must be an integer",
         ),
+        ("grant_budget = -1", "planning.grant_budget must not be negative"),
+        ("grant_budget = 1.5", "planning.grant_budget must be an integer"),
     ],
 )
 def test_rejects_planning_budgets_that_are_not_whole_and_positive(
@@ -399,9 +401,55 @@ decomposition_rounds = 6
 
 
 def test_unconfigured_repository_keeps_the_default_decomposition_budget() -> None:
-    from betterborg_cli.planning import SUPERVISOR_ROUND_CAP
+    from betterborg_cli.planning import SUPERVISOR_ROUND_MINIMUM
 
-    assert PlanningLimits().decomposition_rounds == SUPERVISOR_ROUND_CAP
+    assert PlanningLimits().decomposition_rounds == SUPERVISOR_ROUND_MINIMUM
+
+
+def test_loads_the_grant_budget_both_loops_read(git_repo: Path) -> None:
+    """How many rounds of showing nothing a loop may add to its minimum."""
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[planning]
+grant_budget = 4
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.planning == PlanningLimits(grant_budget=4)
+
+
+def test_a_grant_budget_of_nothing_is_a_legal_answer(git_repo: Path) -> None:
+    """It is how an operator asks for exactly the minimum and its blocks.
+
+    Every budget beside it starts at one, and a budget sold as a price control
+    has to admit the price of nothing.
+    """
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[planning]
+grant_budget = 0
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.planning.grant_budget == 0
 
 
 def test_a_repository_can_declare_that_nothing_gates_its_merged_tip(

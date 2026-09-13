@@ -42,6 +42,7 @@ from betterborg_cli.store.models import (
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
+    ReviewAssessment,
     TaskBatch,
     TaskClaim,
     TaskCompletionSample,
@@ -790,6 +791,61 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_row_to_planning_ledger_finding(row) for row in rows]
+
+    def record_review_assessment(self, assessment: ReviewAssessment) -> None:
+        """Persist one round's read of whether its review loop is progressing."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO review_assessments(
+                    id, borg_id, loop, cycle_id, plan_approval_id, batch_id,
+                    task_id, round, minimum, attempt_id, converging,
+                    open_findings, refunded, evidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(assessment.id),
+                    str(assessment.borg_id),
+                    assessment.loop,
+                    assessment.cycle_id,
+                    _optional_id(assessment.plan_approval_id),
+                    _optional_id(assessment.batch_id),
+                    _optional_id(assessment.task_id),
+                    assessment.round,
+                    assessment.minimum,
+                    _optional_id(assessment.attempt_id),
+                    int(assessment.converging),
+                    assessment.open_findings,
+                    None if assessment.refunded is None else int(assessment.refunded),
+                    _encode_json(assessment.evidence),
+                    assessment.created_at.isoformat(),
+                ),
+            )
+
+    def list_review_assessments(
+        self,
+        borg_id: UUID,
+        *,
+        loop: str | None = None,
+        cycle_id: str | None = None,
+        plan_approval_id: UUID | None = None,
+    ) -> list[ReviewAssessment]:
+        """Return recorded assessments, optionally limited to one loop's scope."""
+        query = "SELECT * FROM review_assessments WHERE borg_id = ?"
+        parameters: list[object] = [str(borg_id)]
+        if loop is not None:
+            query += " AND loop = ?"
+            parameters.append(loop)
+        if cycle_id is not None:
+            query += " AND cycle_id = ?"
+            parameters.append(cycle_id)
+        if plan_approval_id is not None:
+            query += " AND plan_approval_id = ?"
+            parameters.append(str(plan_approval_id))
+        query += " ORDER BY created_at, round, id"
+        with self.locked_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_row_to_review_assessment(row) for row in rows]
 
     def append_plan_change_request(self, request: PlanChangeRequest) -> None:
         """Append one immutable human plan-revision request."""
@@ -3226,6 +3282,14 @@ def _encode_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _optional_id(value: UUID | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_uuid(value: str | None) -> UUID | None:
+    return None if value is None else UUID(value)
+
+
 def _execution_time(value: datetime | None) -> datetime:
     timestamp = value or utcnow()
     if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
@@ -3391,6 +3455,28 @@ def _row_to_planning_ledger_finding(row: sqlite3.Row) -> PlanningLedgerFinding:
         severity=row["severity"],
         message=row["message"],
         suggestion=row["suggestion"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_review_assessment(row: sqlite3.Row) -> ReviewAssessment:
+    return ReviewAssessment(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        loop=row["loop"],
+        cycle_id=row["cycle_id"],
+        plan_approval_id=_optional_uuid(row["plan_approval_id"]),
+        batch_id=_optional_uuid(row["batch_id"]),
+        task_id=_optional_uuid(row["task_id"]),
+        round=row["round"],
+        minimum=row["minimum"],
+        attempt_id=_optional_uuid(row["attempt_id"]),
+        converging=bool(row["converging"]),
+        open_findings=row["open_findings"],
+        refunded=(
+            None if row["refunded"] is None else bool(row["refunded"])
+        ),
+        evidence=json.loads(row["evidence"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

@@ -25,6 +25,8 @@ from betterborg_cli.planning import (
     render_plan_markdown,
     validate_plan,
 )
+from betterborg_cli.planning.grants import GrantAccount
+from betterborg_cli.planning.supervisor import supervisor_grant_account
 from betterborg_cli.progress import RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
@@ -70,12 +72,18 @@ class HostInvoker(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PlanApprovalWorkflowResult:
-    """Durable result of approving and decomposing one exact plan."""
+    """Durable result of approving and decomposing one exact plan.
+
+    ``grants`` accounts for what the Supervisor's rounds cost, assembled from
+    the record while the store is open because the gate that reports a stopped
+    loop prints after it closes.
+    """
 
     borg: Borg
     approval: PlanApproval
     plan_path: Path
     publication: TaskPublication | None
+    grants: GrantAccount | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +150,7 @@ def approve_plan_workflow(
                 cancel=cancel,
                 progress=progress,
                 review_rounds=config.planning.decomposition_rounds,
+                grant_budget=config.planning.grant_budget,
             ).run()
             borg = supervisor.borg
             publication = supervisor.publication
@@ -166,7 +175,17 @@ def approve_plan_workflow(
                 f"decomposition stopped in unexpected state {borg.state.value!r}"
             )
 
-    return PlanApprovalWorkflowResult(borg, approval, plan_path, publication)
+        grants = (
+            supervisor_grant_account(
+                store, borg.id, plan_approval_id=approval.id
+            )
+            if borg.state is BorgState.BLOCKED
+            else None
+        )
+
+    return PlanApprovalWorkflowResult(
+        borg, approval, plan_path, publication, grants
+    )
 
 
 def execute_workflow(

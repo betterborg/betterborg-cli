@@ -727,8 +727,10 @@ def test_successful_agent_commands_finalize_once_before_unchanged_report(
         monkeypatch.setattr(
             cli_module,
             "_continue_planning",
-            lambda *_args, **_kwargs: SimpleNamespace(
-                state=cli_module.BorgState.PLAN_APPROVAL_PENDING
+            lambda *_args, **_kwargs: cli_module.ContinuedPlanning(
+                borg=SimpleNamespace(
+                    state=cli_module.BorgState.PLAN_APPROVAL_PENDING
+                )
             ),
         )
         changed = command_name == "plan-change"

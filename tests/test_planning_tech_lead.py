@@ -14,7 +14,8 @@ from planning_progress_test_support import BoundaryInterruptProgress
 from betterborg_cli.agent_runtime import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
-    TECH_REVIEW_ROUND_CAP,
+    ARCHITECT_QUESTION_ROUND_CAP,
+    TECH_REVIEW_ROUND_MINIMUM,
     ArchitectCancelled,
     ArchitectError,
     ArchitectLoop,
@@ -23,6 +24,7 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
 from betterborg_cli.planning.findings_ledger import open_planning_findings
+from betterborg_cli.planning.tech_lead import tech_lead_grant_account
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import (
     ChildRecord,
@@ -972,6 +974,7 @@ def test_third_change_request_blocks_with_durable_resumable_history(
             reviewer,
             architect_agent=architect,
             io=_io(),
+            grant_budget=0,
         )
 
         result = loop.run()
@@ -990,7 +993,7 @@ def test_third_change_request_blocks_with_durable_resumable_history(
 
 
 def test_unconfigured_repository_keeps_the_default_review_round_budget() -> None:
-    assert PlanningLimits().review_rounds == TECH_REVIEW_ROUND_CAP
+    assert PlanningLimits().review_rounds == TECH_REVIEW_ROUND_MINIMUM
 
 
 def test_raised_review_budget_approves_on_a_round_the_default_denies(
@@ -1039,13 +1042,14 @@ def test_raised_review_budget_approves_on_a_round_the_default_denies(
             architect_agent=architect,
             io=_io(),
             review_rounds=4,
+            grant_budget=0,
         ).run()
 
         assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
         assert result.plan == plans[-1]
         assert len(reviewer.calls) == 4
-        assert "review round 1 of 4" in reviewer.calls[0].user_prompt
-        assert "review round 4 of 4" in reviewer.calls[-1].user_prompt
+        assert "review round 1." in reviewer.calls[0].user_prompt
+        assert "review round 4." in reviewer.calls[-1].user_prompt
         assert [item.round for item in store.list_planning_findings(borg.id)] == [
             1,
             2,
@@ -1117,13 +1121,10 @@ def test_lowering_the_budget_does_not_strand_a_revision_already_under_way(
         ).run()
 
         assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
-        # The round the stranded revision leads to is the last one, and saying
-        # so is the only description of it that is true. "Round 2 of 1" hands
-        # the reviewer a number it cannot use.
-        assert "review round 1 of 3." in reviewer.calls[0].user_prompt
-        assert (
-            "review round 2, the final round." in reviewer.calls[-1].user_prompt
-        )
+        # The round the stranded revision leads to is an ordinary granted one,
+        # and it is told its number and nothing else.
+        assert "review round 1." in reviewer.calls[0].user_prompt
+        assert "review round 2." in reviewer.calls[-1].user_prompt
         assert "of 1" not in reviewer.calls[-1].user_prompt
 
 
@@ -1159,12 +1160,13 @@ def test_lowered_review_budget_blocks_after_its_only_round(
             architect_agent=architect,
             io=_io(),
             review_rounds=1,
+            grant_budget=0,
         )
 
         result = loop.run()
 
         assert result.borg.state is BorgState.BLOCKED
-        assert "review round 1 of 1" in reviewer.calls[0].user_prompt
+        assert "review round 1." in reviewer.calls[0].user_prompt
         assert len(reviewer.calls) == 1
         assert len(architect.calls) == 2
         assert [
@@ -1430,7 +1432,11 @@ def _blocked_by_three_rejections(
     planning_plan_response,
     tech_lead_change_request_response,
 ):
-    """Drive a Borg to BLOCKED on the default budget and return its adapters."""
+    """Drive a Borg to BLOCKED on the default minimum and return its adapters.
+
+    A budget of nothing is what asks for exactly the minimum's rounds and the
+    block they reach, which is what this exercises.
+    """
     architect = MockAdapter(name="openai").queue(
         MockResponse(payload={"decision": "ready_to_plan"})
     )
@@ -1451,6 +1457,7 @@ def _blocked_by_three_rejections(
         reviewer,
         architect_agent=architect,
         io=_io(),
+        grant_budget=0,
     ).run()
     assert result.borg.state is BorgState.BLOCKED
     return architect, reviewer, result
@@ -1628,8 +1635,16 @@ def _run_reviews(
     planning_plan_response,
     reviews: Sequence[Callable[[list[dict], list[dict]], dict]],
     handed: list[list[dict]],
+    *,
+    review_rounds: int | None = None,
+    grant_budget: int = 0,
 ):
-    """Drive one Tech Lead cycle whose budget is exactly the rounds supplied."""
+    """Drive one Tech Lead cycle over the reviews supplied.
+
+    The minimum is the number of reviews and nothing is granted past them by
+    default, so a rule about the ledger is read off the rounds the test wrote
+    rather than off however far the loop would run.
+    """
     architect = _architect(planning_plan_response, len(reviews) - 1)
     handoff = ArchitectLoop(repository, borg, store, architect, io=_io()).run()
     return TechLeadLoop(
@@ -1639,14 +1654,108 @@ def _run_reviews(
         _reviewer(reviews, handed),
         architect_agent=architect,
         io=_io(),
-        review_rounds=len(reviews),
+        review_rounds=len(reviews) if review_rounds is None else review_rounds,
+        grant_budget=grant_budget,
     ).run()
+
+
+def _assessments(store, borg_id) -> list[tuple[int, int | None, bool | None, bool]]:
+    """Read back each round's recorded verdict, snapshot and refund."""
+    return [
+        (row.round, row.open_findings, row.refunded, row.converging)
+        for row in store.list_review_assessments(borg_id, loop="tech_review")
+    ]
 
 
 def _ledger(store, borg_id) -> dict[str, object]:
     return {
         row.message: row for row in store.list_planning_ledger_findings(borg_id)
     }
+
+
+@pytest.mark.parametrize("budget", [-1, 1.5])
+def test_a_grant_budget_that_is_not_a_whole_number_at_or_above_zero_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+    budget: object,
+) -> None:
+    """Below zero would stop the loop short of the minimum it was told to run."""
+    database = committed_git_repo.parent / "tech-lead-grant.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"grant-{str(budget).strip('-.')}"
+        )
+        with pytest.raises(TechLeadError, match="at least 0"):
+            TechLeadLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                io=_io(),
+                grant_budget=budget,
+            )
+
+
+def test_the_account_of_a_stopped_loop_is_read_off_its_record(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A blocked plan explains itself the same way however it is reached.
+
+    Re-running the command against it runs no loop at all, and a setting edited
+    since does not move a plan that has already blocked, so the account of why
+    it blocked comes from what its rounds recorded rather than from the numbers
+    in force now. The rounds a loop charged as grants are what say where its
+    minimum was.
+    """
+    handed: list[list[dict]] = []
+
+    def repeat(ledger, _history):
+        if not ledger:
+            return _review(
+                "request_changes",
+                summary="The rollback is uncovered.",
+                findings=[_raised("Cover a partial rollback.", severity="blocker")],
+            )
+        return _review(
+            "request_changes",
+            summary="The rollback is still uncovered.",
+            findings=[
+                _raised(
+                    "Cover a partial rollback.",
+                    severity="blocker",
+                    repeats=ledger[0]["id"],
+                )
+            ],
+        )
+
+    database = committed_git_repo.parent / "grants-account.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-account"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [repeat, repeat, repeat, repeat],
+            handed,
+            review_rounds=2,
+            grant_budget=2,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        account = tech_lead_grant_account(store, borg.id)
+        assert (account.rounds, account.grants, account.charged) == (4, 2, 2)
+        # Two of its four rounds were charged as grants, so the minimum those
+        # rounds ran under was two, whatever the repository now configures.
+        assert account.minimum == 2
+        assert account.sentence() == (
+            "The loop took 2 granted rounds past its minimum of 2, 2 of them "
+            "closing nothing, and its last round was not converging."
+        )
 
 
 def test_a_repeated_objection_stays_one_row_the_loop_already_failed_to_close(
@@ -2301,3 +2410,879 @@ def test_a_review_that_omits_a_ledger_declaration_fails_its_schema(
             ).run()
 
         assert store.list_planning_ledger_findings(borg.id) == []
+
+
+def test_a_draining_loop_runs_past_its_minimum_and_finishes_on_approval(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Every granted round that closed something is refunded, so none is spent.
+
+    The loop terminates anyway: a refund needs a count that keeps falling, a
+    review that continues always reports at least one finding, and a strictly
+    decreasing sequence above a floor of one cannot run forever. It reaches
+    agreement instead.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Four things stand in the way.",
+            findings=[_raised(f"Objection {index}.") for index in range(4)],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two are answered.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 4.")],
+        )
+
+    def round_three(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two more are answered.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 5.")],
+        )
+
+    def round_four(ledger, _history):
+        return _review(
+            "approve",
+            summary="The plan is ready.",
+            resolved=[row["id"] for row in ledger],
+        )
+
+    database = committed_git_repo.parent / "grants-draining.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-draining"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three, round_four],
+            handed,
+            review_rounds=1,
+            grant_budget=10,
+        )
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert len(handed) == 4
+        # Round one is the minimum and carries no refund decision; the three
+        # that follow are grants, and each of them closed more than it raised.
+        assert _assessments(store, borg.id) == [
+            (1, 4, None, False),
+            (2, 3, True, True),
+            (3, 2, True, True),
+            (4, 0, True, True),
+        ]
+
+
+def test_a_loop_repeating_one_blocker_stops_at_the_minimum_plus_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A grant that closed nothing is charged, and the charges are capped."""
+    handed: list[list[dict]] = []
+
+    def raise_it(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    def repeat_it(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is still uncovered.",
+            findings=[
+                _raised(
+                    "Cover a partial rollback.",
+                    severity="blocker",
+                    repeats=ledger[0]["id"],
+                )
+            ],
+        )
+
+    database = committed_git_repo.parent / "grants-repeating.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-repeating"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [raise_it, repeat_it, repeat_it],
+            handed,
+            review_rounds=1,
+            grant_budget=2,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert _assessments(store, borg.id) == [
+            (1, 1, None, False),
+            (2, 1, False, False),
+            (3, 1, False, False),
+        ]
+        # One objection is one row for as long as the loop argues about it.
+        assert [row.status for row in store.list_planning_ledger_findings(borg.id)] == [
+            FindingStatus.REGRESSED
+        ]
+
+
+def test_a_loop_alternating_two_objections_earns_no_refund_either(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Closing one objection while reopening another leaves the count where it was."""
+    handed: list[list[dict]] = []
+
+    def raise_first(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.")],
+        )
+
+    def swap(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="One answered, one raised.",
+            resolved=[ledger[0]["id"]],
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def swap_back(ledger, history):
+        first = next(
+            item for item in history if item["message"] == "Cover a partial rollback."
+        )
+        return _review(
+            "request_changes",
+            summary="The first objection is back.",
+            resolved=[ledger[0]["id"]],
+            findings=[
+                _raised("Cover a partial rollback.", repeats=str(first["id"]))
+            ],
+        )
+
+    database = committed_git_repo.parent / "grants-alternating.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-alternating"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [raise_first, swap, swap_back],
+            handed,
+            review_rounds=1,
+            grant_budget=2,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert _assessments(store, borg.id) == [
+            (1, 1, None, False),
+            (2, 1, False, False),
+            (3, 1, False, False),
+        ]
+
+
+def test_each_round_keeps_the_verdict_it_was_judged_by(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A loop that converges and then stalls keeps both answers on the record.
+
+    A later round's verdict pasted over the rounds before it would lose the
+    one Stage 6 reads a round later, and the refund earned on the way would be
+    unaccountable.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Four things stand in the way.",
+            findings=[_raised(f"Objection {index}.") for index in range(4)],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two are answered.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 4.")],
+        )
+
+    def round_three(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Nothing is answered and something else is wrong.",
+            findings=[_raised("Objection 5.", severity="blocker")],
+        )
+
+    database = committed_git_repo.parent / "grants-verdicts.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-verdicts"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three],
+            handed,
+            review_rounds=1,
+            grant_budget=1,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert _assessments(store, borg.id) == [
+            (1, 4, None, False),
+            (2, 3, True, True),
+            (3, 4, False, False),
+        ]
+
+
+def test_a_resumed_run_honours_the_refund_the_round_before_it_earned(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Grants are read off the record, because a run is rebuilt on every entry.
+
+    A resumed loop that assessed a round it had already granted would spend
+    the budget twice and lose the bound the budget promises. Here the refunded
+    round is what buys the fourth: a loop that forgot it would have stopped at
+    the third.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Three things stand in the way.",
+            findings=[_raised(f"Objection {index}.") for index in range(3)],
+        )
+
+    def closing(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two are answered, one is new.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 3.")],
+        )
+
+    def standing_still(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Nothing moved.",
+            findings=[_raised("Objection 4.")],
+        )
+
+    database = committed_git_repo.parent / "grants-resumed.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-resumed"
+        )
+        architect = _architect(planning_plan_response, 1)
+        reviewer = _reviewer([round_one, closing], handed)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        # The second review asks for a revision, and the run dies before the
+        # Architect can answer it.
+        with pytest.raises((TechLeadError, ArchitectError)):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+                review_rounds=1,
+                grant_budget=2,
+            ).run()
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.ARCHITECT_WORKING
+        assert _assessments(store, borg.id) == [
+            (1, 3, None, False),
+            (2, 2, True, True),
+        ]
+
+        for _ in range(2):
+            architect.queue(
+                MockResponse(payload=planning_plan_response(summary="Resumed."))
+            )
+        resumed = TechLeadLoop(
+            repository,
+            interrupted,
+            store,
+            _reviewer([standing_still, standing_still], handed),
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=2,
+        ).run()
+
+        assert resumed.borg.state is BorgState.BLOCKED
+        # Four rounds, not five: the granted round the interrupted run
+        # assessed is counted once, and its refund is still on the record.
+        assert _assessments(store, borg.id) == [
+            (1, 3, None, False),
+            (2, 2, True, True),
+            (3, 3, False, False),
+            (4, 4, False, False),
+        ]
+
+
+def test_a_budget_of_nothing_stops_a_draining_loop_where_its_counter_did(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Zero asks for exactly today's rounds and today's terminal state.
+
+    The loop is closing findings and the verdict says so, and it blocks all
+    the same, because the first round past the minimum has no budget to come
+    out of.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Three things stand in the way.",
+            findings=[_raised(f"Objection {index}.") for index in range(3)],
+        )
+
+    def draining(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two are answered, one is new.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 3.")],
+        )
+
+    database = committed_git_repo.parent / "grants-zero-budget.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-zero-budget"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, draining],
+            handed,
+            review_rounds=2,
+            grant_budget=0,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert _assessments(store, borg.id) == [
+            (1, 3, None, False),
+            (2, 2, None, True),
+        ]
+
+
+def test_the_reviewer_is_told_its_round_and_nothing_about_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """No loop knows whether a round is its last, so the sentence never says.
+
+    A remaining-grants count would be no better than the total it replaced:
+    any budget number in a reviewer's prompt reads as a deadline it is being
+    held to.
+    """
+    handed: list[list[dict]] = []
+
+    def asking(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Something is wrong.",
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def approving(ledger, _history):
+        return _review(
+            "approve",
+            summary="The plan is ready.",
+            resolved=[row["id"] for row in ledger],
+        )
+
+    database = committed_git_repo.parent / "grants-prompt.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-prompt"
+        )
+        architect = _architect(planning_plan_response, 2)
+        reviewer = _reviewer([asking, asking, approving], handed)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=7,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        prompts = [call.user_prompt for call in reviewer.calls]
+        assert [
+            f"This is Tech Lead review round {round_number}." in prompt
+            for round_number, prompt in enumerate(prompts, start=1)
+        ] == [True, True, True]
+        for prompt in prompts:
+            assert "final" not in prompt
+            assert " of " not in prompt
+            assert "7" not in prompt
+
+
+@pytest.mark.parametrize("review_rounds", [1, 2])
+def test_a_contract_slip_ends_a_granted_round_as_it_ends_one_inside_the_minimum(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    review_rounds: int,
+) -> None:
+    """The Tech Lead's own contract has no allowance, and this plan adds none.
+
+    A longer loop reaches that bound more often, and a round it reaches on a
+    grant ends the run needing a person exactly as one inside the minimum
+    does, rather than blocking with its findings kept.
+    """
+    handed: list[list[dict]] = []
+
+    def asking(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Something is wrong.",
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def silent(_ledger, _history):
+        return _review("request_changes", summary="Something is still wrong.")
+
+    database = committed_git_repo.parent / f"grants-slip-{review_rounds}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"grants-slip-{review_rounds}"
+        )
+        architect = _architect(planning_plan_response, 1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        with pytest.raises(TechLeadError, match="must include findings"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                _reviewer([asking, silent], handed),
+                architect_agent=architect,
+                io=_io(),
+                review_rounds=review_rounds,
+                grant_budget=5,
+            ).run()
+
+        current = store.get_borg(borg.id)
+        assert current is not None
+        assert current.state is BorgState.TECH_REVIEW_WORKING
+        # The failed round was never assessed, so it earned no refund.
+        assert [row.round for row in store.list_review_assessments(borg.id)] == [1]
+
+
+@pytest.mark.parametrize("review_rounds", [1, 2])
+def test_the_architect_answer_budget_ends_a_granted_run_the_same_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    review_rounds: int,
+) -> None:
+    """The Architect may assume answers three times in a planning cycle.
+
+    The allowance was sized when a loop could not exceed its configured
+    rounds. Nothing here moves it, so a revision that raises a fourth round of
+    questions ends the run rather than blocking, whether the revision was
+    granted or inside the minimum.
+    """
+    handed: list[list[dict]] = []
+    architect = MockAdapter(name="openai")
+    for index in range(ARCHITECT_QUESTION_ROUND_CAP):
+        architect.queue(
+            MockResponse(
+                payload={
+                    "decision": "ask_more",
+                    "questions": [
+                        {"id": "q1", "question": f"Question {index + 1}?"}
+                    ],
+                }
+            )
+        )
+        architect.queue(
+            MockResponse(
+                payload={
+                    "answers": [
+                        {"q_id": "q1", "answer": f"Assumption {index + 1}."}
+                    ]
+                }
+            )
+        )
+    architect.queue(
+        MockResponse(
+            payload={
+                **planning_plan_response(),
+                # Named, so the plan is not sent back once to account for the
+                # answers it assumed, which would spend the revision response.
+                "assumptions": [
+                    {
+                        "question": f"Question {index + 1}?",
+                        "assumption": f"Assumption {index + 1}.",
+                    }
+                    for index in range(ARCHITECT_QUESTION_ROUND_CAP)
+                ],
+            }
+        )
+    )
+    architect.queue(
+        MockResponse(
+            payload={
+                **planning_plan_response(summary="Revised."),
+                "open_questions": ["Which release channel is the default?"],
+            }
+        )
+    )
+
+    def asking(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Something is wrong.",
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / f"grants-answers-{review_rounds}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"grants-answers-{review_rounds}"
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+
+        with pytest.raises(ArchitectError, match="asked past question round"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                _reviewer([asking], handed),
+                architect_agent=architect,
+                io=_io(),
+                unattended=True,
+                review_rounds=review_rounds,
+                grant_budget=5,
+            ).run()
+
+        current = store.get_borg(borg.id)
+        assert current is not None
+        assert current.state is BorgState.ARCHITECT_AWAITING_ANSWERS
+
+
+@pytest.mark.parametrize(
+    ("declaration", "converging"),
+    [("declared", False), ("undeclared", True)],
+)
+def test_an_undeclared_repeat_of_a_closed_blocker_reads_as_fresh_discovery(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    declaration: str,
+    converging: bool,
+) -> None:
+    """The declaration is what lets the veto see a loop that is stuck.
+
+    Recorded as a plain new row, an objection the loop already failed to close
+    reads as new discovery on new surface, which is the one shape that looks
+    like convergence while the loop is going nowhere. So the round the omission
+    bought runs unsteered, where a declared repeat would have steered it.
+    """
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is covered; the checks are not.",
+            resolved=[ledger[0]["id"]],
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def declared(ledger, history):
+        first = next(
+            item for item in history if item["message"] == "Cover a partial rollback."
+        )
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered again.",
+            resolved=[ledger[0]["id"]],
+            findings=[
+                _raised(
+                    "Cover a partial rollback.",
+                    severity="blocker",
+                    repeats=str(first["id"]),
+                )
+            ],
+        )
+
+    def undeclared(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered again.",
+            resolved=[ledger[0]["id"]],
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    handed: list[list[dict]] = []
+    third = declared if declaration == "declared" else undeclared
+    database = committed_git_repo.parent / f"grants-{declaration}-repeat.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"grants-{declaration}-repeat"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, third],
+            handed,
+            review_rounds=1,
+            grant_budget=2,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        assert _assessments(store, borg.id)[-1] == (3, 1, False, converging)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "state", "rounds"),
+    [
+        (
+            "declared",
+            BorgState.PLAN_APPROVAL_PENDING,
+            [(1, 2, None, False), (2, 1, True, True), (3, 0, True, True)],
+        ),
+        (
+            "undeclared",
+            BorgState.BLOCKED,
+            [(1, 2, None, False), (2, 2, False, False)],
+        ),
+    ],
+)
+def test_an_undeclared_repeat_costs_the_grant_a_declared_one_earns_back(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    declaration: str,
+    state: BorgState,
+    rounds: list[tuple[int, int | None, bool | None, bool]],
+) -> None:
+    """The omission adds a second row where the declaration moves the first.
+
+    So the open count does not fall, the grant is charged, and the loop stops
+    a round earlier than the one that said what it was repeating.
+    """
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Two things stand in the way.",
+            findings=[
+                _raised("Cover a partial rollback."),
+                _raised("Name the rollback checks."),
+            ],
+        )
+
+    def declared(ledger, _history):
+        rollback = next(
+            row for row in ledger if row["message"] == "Cover a partial rollback."
+        )
+        checks = next(
+            row for row in ledger if row["message"] == "Name the rollback checks."
+        )
+        return _review(
+            "request_changes",
+            summary="The checks are named; the rollback is not covered.",
+            resolved=[checks["id"]],
+            findings=[
+                _raised("Cover a partial rollback.", repeats=rollback["id"])
+            ],
+        )
+
+    def undeclared(ledger, _history):
+        checks = next(
+            row for row in ledger if row["message"] == "Name the rollback checks."
+        )
+        return _review(
+            "request_changes",
+            summary="The checks are named; the rollback is not covered.",
+            resolved=[checks["id"]],
+            findings=[_raised("Cover a partial rollback.")],
+        )
+
+    def approving(ledger, _history):
+        return _review(
+            "approve",
+            summary="The plan is ready.",
+            resolved=[row["id"] for row in ledger],
+        )
+
+    handed: list[list[dict]] = []
+    second = declared if declaration == "declared" else undeclared
+    database = committed_git_repo.parent / f"grants-{declaration}-cost.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"grants-{declaration}-cost"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, second, approving],
+            handed,
+            review_rounds=1,
+            grant_budget=1,
+        )
+
+        assert result.borg.state is state
+        assert _assessments(store, borg.id) == rounds
+
+
+def test_the_recorded_snapshot_outlives_a_regression_that_moves_the_drain(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A refund compares two recorded snapshots, never two rows of a drain.
+
+    The drain is recomputed from current lifecycle state every time it runs, so
+    an objection that regresses raises the counts of the rounds it was open
+    through after the fact. A reader built on those rows would reopen a
+    decision the round they belong to already made, and deny a refund the
+    round it belonged to earned.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="Three things stand in the way.",
+            findings=[
+                _raised("Cover a partial rollback.", severity="blocker"),
+                _raised("Name the rollback checks."),
+                _raised("Document the release channel."),
+            ],
+        )
+
+    def round_two(ledger, _history):
+        closed = [
+            row["id"]
+            for row in ledger
+            if row["message"]
+            in {"Cover a partial rollback.", "Name the rollback checks."}
+        ]
+        return _review(
+            "request_changes",
+            summary="The rollback is covered and the checks are named.",
+            resolved=closed,
+            findings=[_raised("Name the release owner.")],
+        )
+
+    def round_three(_ledger, history):
+        first = next(
+            item for item in history if item["message"] == "Cover a partial rollback."
+        )
+        return _review(
+            "request_changes",
+            summary="The rollback regressed.",
+            findings=[
+                _raised(
+                    "Cover a partial rollback.",
+                    severity="blocker",
+                    repeats=str(first["id"]),
+                )
+            ],
+        )
+
+    database = committed_git_repo.parent / "grants-drain-divergence.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "grants-drain-divergence"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three],
+            handed,
+            review_rounds=1,
+            grant_budget=1,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        rows = store.list_review_assessments(borg.id, loop="tech_review")
+        # Round two closed two of the three objections and raised one, which
+        # is the refund it earned and keeps.
+        assert [
+            (row.round, row.open_findings, row.refunded) for row in rows
+        ] == [(1, 3, None), (2, 2, True), (3, 3, False)]
+
+        # The same round, recomputed after the regression, counts the objection
+        # as open throughout: a reader comparing these rows would read round
+        # two as having closed nothing and deny it the refund it earned.
+        recomputed = {
+            entry["round"]: entry["open_after"] for entry in rows[-1].evidence["drain"]
+        }
+        assert recomputed == {1: 3, 2: 3, 3: 3}
+        assert recomputed[2] > rows[1].open_findings

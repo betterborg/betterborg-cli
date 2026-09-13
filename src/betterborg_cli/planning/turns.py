@@ -63,26 +63,19 @@ def completed_planning_phase_attempts(
 
 
 def planning_request_change_attempts(
-    attempts: Sequence[PlanningAttempt],
-    phase: str,
-    *,
-    round_cap: int | None,
+    attempts: Sequence[PlanningAttempt], phase: str
 ) -> list[PlanningAttempt]:
-    """Return review rejections which are eligible to create revision work.
+    """Return the review rejections a revision can belong to.
 
-    A caller reading history rather than deciding what to do next passes no
-    cap. Whether a rejection was the one that blocked instead of revising was
-    settled when it completed, and a budget applied to the record afterwards
-    would rewrite that answer.
+    Whether a rejection revised or stopped the loop was settled when it
+    completed and is held in the Borg's state, so this reads the record and
+    nothing else.
     """
 
     return [
         item
-        for index, item in enumerate(
-            completed_planning_phase_attempts(attempts, phase), start=1
-        )
-        if (round_cap is None or index < round_cap)
-        and (item.result or {}).get("decision") == "request_changes"
+        for item in completed_planning_phase_attempts(attempts, phase)
+        if (item.result or {}).get("decision") == "request_changes"
     ]
 
 

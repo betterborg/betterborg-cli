@@ -22,6 +22,7 @@ from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
 from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
+from betterborg_cli.planning.grants import GrantAccount
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_paths import RepoPaths
@@ -36,6 +37,7 @@ from betterborg_cli.store import (
     PlanningFinding,
     PlanningLedgerFinding,
     PlanningQuestion,
+    ReviewAssessment,
     SqliteStore,
 )
 
@@ -397,6 +399,12 @@ def test_plan_start_reports_review_cap_as_blocked(
     ):
         tech_lead_adapter.queue(MockResponse(payload=payload))
     repository, paths = planning_cli_repository(committed_git_repo, "blocked-plan")
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\ngrant_budget = 0\n",
+        encoding="utf-8",
+    )
     configure_interactive_cli(
         repository.root,
         architect_adapter,
@@ -420,8 +428,10 @@ def test_plan_start_reports_review_cap_as_blocked(
     # `.stdout` is the merged stream on the locked Click and the
     # separated one on newer releases, so pin the absence either way.
     assert "Error:" not in result.output
-    assert result.stdout.splitlines()[-2:] == [
+    assert result.stdout.splitlines()[-3:] == [
         "Planning blocked for Borg 'blocked-plan'.",
+        "The loop took no rounds past its minimum of 3, and its last round "
+        "was not converging.",
         "Review the saved Tech Lead findings with: "
         "betterborg plan show blocked-plan",
     ]
@@ -446,8 +456,12 @@ def test_plan_start_reports_review_cap_as_blocked(
     # takes the other one, and a blocked Borg reports the same gate on resume.
     capsys.readouterr()
     assert cli_module.main(["plan", "start", "blocked-plan", "--yes"]) == 1
+    # The resumed command runs no loop at all and still accounts for the
+    # rounds, because it reads the record rather than a loop's bookkeeping.
     assert capsys.readouterr().out.splitlines() == [
         "Planning blocked for Borg 'blocked-plan'.",
+        "The loop took no rounds past its minimum of 3, and its last round "
+        "was not converging.",
         "Review the saved Tech Lead findings with: "
         "betterborg plan show blocked-plan",
     ]
@@ -491,7 +505,7 @@ def test_plan_start_honors_the_repository_review_round_budget(
     config_path = paths.tracked_dir / "config.toml"
     config_path.write_text(
         f"{config_path.read_text(encoding='utf-8')}\n"
-        "[planning]\nreview_rounds = 1\n",
+        "[planning]\nreview_rounds = 1\ngrant_budget = 0\n",
         encoding="utf-8",
     )
     configure_interactive_cli(
@@ -517,19 +531,80 @@ def test_plan_start_honors_the_repository_review_round_budget(
     # `.stdout` is the merged stream on the locked Click and the
     # separated one on newer releases, so pin the absence either way.
     assert "Error:" not in result.output
-    assert result.stdout.splitlines()[-2:] == [
+    assert result.stdout.splitlines()[-3:] == [
         "Planning blocked for Borg 'budgeted-plan'.",
+        "The loop took no rounds past its minimum of 1.",
         "Review the saved Tech Lead findings with: "
         "betterborg plan show budgeted-plan",
     ]
     assert len(architect_adapter.calls) == 2
     assert len(tech_lead_adapter.calls) == 1
-    assert "review round 1 of 1" in tech_lead_adapter.calls[0].user_prompt
+    assert "review round 1." in tech_lead_adapter.calls[0].user_prompt
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "budgeted-plan")
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
         assert len(store.list_planning_findings(borg.id)) == 1
+
+
+def test_a_plan_blocked_after_its_review_agreed_claims_no_grant_account(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    monkeypatch,
+) -> None:
+    """The account explains the loop that stopped, not the one that agreed.
+
+    Decomposition blocks in the same state planning does, and it is reached
+    only through a review that approved. Accounting for that review's rounds
+    here would explain someone else's block with a loop that finished.
+    """
+    repository, paths = planning_cli_repository(committed_git_repo, "agreed-plan")
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "agreed-plan")
+        assert borg is not None
+        review = PlanningAttempt(
+            borg_id=borg.id,
+            phase="tech_review",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(review)
+        store.complete_planning_attempt(
+            review.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result={"decision": "approve"},
+            summary="The plan is ready.",
+        )
+        store.record_review_assessment(
+            ReviewAssessment(
+                borg_id=borg.id,
+                loop="tech_review",
+                cycle_id=INITIAL_PLANNING_CYCLE,
+                attempt_id=review.id,
+                round=1,
+                minimum=1,
+                converging=True,
+                open_findings=0,
+            )
+        )
+        store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.BLOCKED,
+        )
+    monkeypatch.chdir(repository.root)
+
+    result = cli_runner.invoke(cli, ["plan", "start", "agreed-plan", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert result.stdout.splitlines() == [
+        "Planning blocked for Borg 'agreed-plan'.",
+        "Review the saved Tech Lead findings with: "
+        "betterborg plan show agreed-plan",
+    ]
 
 
 def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
@@ -1486,10 +1561,12 @@ def test_planning_gate_exits_non_zero_when_blocked_and_zero_when_pending(
 
     cli_module._write_planning_gate(
         "gate-borg",
-        Borg(
-            repository_id=repository_id,
-            name="gate-borg",
-            state=BorgState.PLAN_APPROVAL_PENDING,
+        cli_module.ContinuedPlanning(
+            borg=Borg(
+                repository_id=repository_id,
+                name="gate-borg",
+                state=BorgState.PLAN_APPROVAL_PENDING,
+            )
         ),
         changed=changed,
     )
@@ -1503,18 +1580,27 @@ def test_planning_gate_exits_non_zero_when_blocked_and_zero_when_pending(
     with pytest.raises(click.exceptions.Exit) as blocked:
         cli_module._write_planning_gate(
             "gate-borg",
-            Borg(
-                repository_id=repository_id,
-                name="gate-borg",
-                state=BorgState.BLOCKED,
+            cli_module.ContinuedPlanning(
+                borg=Borg(
+                    repository_id=repository_id,
+                    name="gate-borg",
+                    state=BorgState.BLOCKED,
+                ),
+                grants=GrantAccount(
+                    rounds=5, minimum=3, grants=2, charged=2, converging=False
+                ),
             ),
             changed=changed,
         )
 
     assert blocked.value.exit_code == 1
     blocked_suffix = " while applying the change" if changed else ""
+    # A loop that quietly ran five rounds is otherwise indistinguishable from a
+    # slow one, so the gate says what the grants bought.
     assert capsys.readouterr().out.splitlines() == [
         f"Planning blocked for Borg 'gate-borg'{blocked_suffix}.",
+        "The loop took 2 granted rounds past its minimum of 3, 2 of them "
+        "closing nothing, and its last round was not converging.",
         "Review the saved Tech Lead findings with: "
         "betterborg plan show gate-borg",
     ]
@@ -1555,7 +1641,16 @@ def test_main_returns_the_planning_gate_exit_code(
 
     @command.command(name="gate")
     def gate() -> None:
-        cli_module._write_planning_gate("gate-borg", borg, changed=False)
+        cli_module._write_planning_gate(
+            "gate-borg",
+            cli_module.ContinuedPlanning(
+                borg=borg,
+                grants=GrantAccount(
+                    rounds=3, minimum=3, grants=0, charged=0, converging=False
+                ),
+            ),
+            changed=False,
+        )
 
     monkeypatch.setattr(cli_module, "cli", command)
 

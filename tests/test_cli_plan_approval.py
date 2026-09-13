@@ -938,6 +938,12 @@ def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(
     repository, _attempt, paths = _seed_approval_pending(
         committed_git_repo, planning_cli_repository, "blocked-tasks", plan
     )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\ngrant_budget = 0\n",
+        encoding="utf-8",
+    )
     adapter = MockAdapter(name="openai")
     for response in (
         _pm_tasks(plan),
@@ -966,9 +972,11 @@ def test_plan_approve_reports_bounded_decomposition_block_without_task_gate(
     # `.stdout` is the merged stream on the locked Click and the
     # separated one on newer releases, so pin the absence either way.
     assert "Error:" not in result.output
-    assert result.stdout.splitlines()[-1] == (
-        "Task decomposition blocked for Borg 'blocked-tasks'."
-    )
+    assert result.stdout.splitlines()[-2:] == [
+        "Task decomposition blocked for Borg 'blocked-tasks'.",
+        "The loop took no rounds past its minimum of 3, and its last round "
+        "was not converging.",
+    ]
     assert "approval pending" not in result.output.casefold()
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "blocked-tasks")
@@ -1009,7 +1017,7 @@ def test_plan_approve_honors_the_repository_decomposition_budget(
     config_path = paths.tracked_dir / "config.toml"
     config_path.write_text(
         f"{config_path.read_text(encoding='utf-8')}\n"
-        "[planning]\ndecomposition_rounds = 1\n",
+        "[planning]\ndecomposition_rounds = 1\ngrant_budget = 0\n",
         encoding="utf-8",
     )
     adapter = MockAdapter(name="openai")
@@ -1036,12 +1044,13 @@ def test_plan_approve_honors_the_repository_decomposition_budget(
     # `.stdout` is the merged stream on the locked Click and the
     # separated one on newer releases, so pin the absence either way.
     assert "Error:" not in result.output
-    assert result.stdout.splitlines()[-1] == (
-        "Task decomposition blocked for Borg 'budgeted-tasks'."
-    )
+    assert result.stdout.splitlines()[-2:] == [
+        "Task decomposition blocked for Borg 'budgeted-tasks'.",
+        "The loop took no rounds past its minimum of 1.",
+    ]
     # One review, not the three the default would have spent.
     assert len(adapter.calls) == 2
-    assert "in round 1 of 1." in adapter.calls[-1].user_prompt
+    assert "in round 1." in adapter.calls[-1].user_prompt
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "budgeted-tasks")
         assert borg is not None

@@ -454,6 +454,61 @@ class PlanningLedgerFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewAssessment:
+    """One round's recorded read of whether its loop is getting anywhere.
+
+    Loops are reconstructed from configuration on every entry and derive their
+    round from completed attempts, so a verdict held in memory is lost the
+    moment a run is interrupted and a resumed loop would spend its budget
+    again. This is the row that keeps every read of the budget a read of
+    recorded decisions.
+
+    ``cycle_id``, ``plan_approval_id``, ``batch_id`` and ``task_id`` are the
+    scopes a loop can run in, and a loop fills only the ones it has.
+    ``refunded`` is set on a granted round alone, because a round inside the
+    minimum is neither charged nor refunded. ``minimum`` is the one this round
+    ran under, kept here so an account of a stopped loop owes nothing to a
+    setting edited since.
+    """
+
+    borg_id: UUID
+    loop: str
+    round: int
+    minimum: int
+    converging: bool
+    evidence: dict[str, Any] = field(default_factory=dict)
+    open_findings: int | None = None
+    refunded: bool | None = None
+    cycle_id: str | None = None
+    plan_approval_id: UUID | None = None
+    batch_id: UUID | None = None
+    task_id: UUID | None = None
+    attempt_id: UUID | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"review assessment {name} must be a UUID")
+        for name in ("plan_approval_id", "batch_id", "task_id", "attempt_id"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, UUID):
+                raise TypeError(f"review assessment {name} must be a UUID")
+        if not self.loop.strip():
+            raise ValueError("review assessment loop must not be empty")
+        if self.round < 1:
+            raise ValueError("review assessment round must be positive")
+        if self.minimum < 1:
+            raise ValueError("review assessment minimum must be positive")
+        if self.cycle_id is not None and not self.cycle_id.strip():
+            raise ValueError("review assessment cycle must not be empty")
+        if self.open_findings is not None and self.open_findings < 0:
+            raise ValueError("review assessment open findings must not be negative")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
 class PlanChangeRequest:
     """One immutable human request in a Borg's plan-revision thread."""
 

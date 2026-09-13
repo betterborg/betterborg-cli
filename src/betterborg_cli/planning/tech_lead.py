@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from betterborg_cli.agent_runtime.base import (
     AgentAdapter,
@@ -19,11 +20,19 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.planning.architect import ArchitectCancelled, ArchitectLoop
+from betterborg_cli.planning.convergence import assess_convergence, drain_evidence
 from betterborg_cli.planning.cycles import current_planning_cycle_id
 from betterborg_cli.planning.findings_ledger import (
     REPEATS_SCHEMA,
     RESOLVED_SCHEMA,
+    open_findings,
     reconcile_planning_ledger,
+)
+from betterborg_cli.planning.grants import (
+    PLANNING_GRANT_BUDGET,
+    GrantAccount,
+    assess_grant,
+    planning_grant_account,
 )
 from betterborg_cli.planning.plan_contracts import PlanValidationError
 from betterborg_cli.planning.turns import (
@@ -44,11 +53,13 @@ from betterborg_cli.store import (
     PlanningAttemptStatus,
     PlanningFinding,
     Repository,
+    ReviewAssessment,
     SqliteStore,
 )
 
-#: Review rounds a plan gets where its repository configures no budget.
-TECH_REVIEW_ROUND_CAP = 3
+#: Review rounds a plan gets before every further round is a grant, where its
+#: repository configures no minimum of its own.
+TECH_REVIEW_ROUND_MINIMUM = 3
 _TECH_REVIEW_PHASE = "tech_review"
 _ARCHITECT_PLAN_PHASE = "architect_plan"
 
@@ -121,21 +132,33 @@ class TechLeadResult:
     attempt: PlanningAttempt
 
 
-def _review_round_sentence(review_round: int, budget: int) -> str:
-    """State the round without contradicting itself.
+def tech_lead_grant_account(
+    store: SqliteStore, borg_id: UUID
+) -> GrantAccount:
+    """Account for what the current cycle's review rounds cost this plan."""
 
-    A revision already under way outlives a budget lowered beneath it, and the
-    round that follows it is the last one. Calling that "round 2 of 1" hands
-    the reviewer a number it cannot use on the one turn the number matters.
+    return planning_grant_account(
+        store,
+        borg_id,
+        loop=_TECH_REVIEW_PHASE,
+        cycle_id=current_planning_cycle_id(store, borg_id),
+    )
+
+
+def _review_round_sentence(review_round: int) -> str:
+    """Name the round and nothing else.
+
+    No loop knows whether a round is its last: that depends on findings the
+    round has not produced yet. And a budget number in a reviewer's prompt
+    reads as a deadline it is being held to, so where the loop stands belongs
+    to the operator's surfaces.
     """
 
-    if review_round > budget:
-        return f"This is Tech Lead review round {review_round}, the final round."
-    return f"This is Tech Lead review round {review_round} of {budget}."
+    return f"This is Tech Lead review round {review_round}."
 
 
 class TechLeadLoop:
-    """Review a validated plan, revising it within its round budget."""
+    """Review a validated plan, revising it while its grant budget holds."""
 
     def __init__(
         self,
@@ -147,7 +170,8 @@ class TechLeadLoop:
         architect_agent: AgentAdapter | SelectedAgent | None = None,
         io: InteractiveIO,
         unattended: bool = False,
-        review_rounds: int = TECH_REVIEW_ROUND_CAP,
+        review_rounds: int = TECH_REVIEW_ROUND_MINIMUM,
+        grant_budget: int = PLANNING_GRANT_BUDGET,
         artifact_dir: Path | None = None,
         model: str | None = None,
         architect_model: str | None = None,
@@ -158,6 +182,12 @@ class TechLeadLoop:
     ) -> None:
         if cancel is not None and cancel.is_set():
             raise TechLeadCancelled("Tech Lead run cancelled")
+        # Zero buys nothing and is legal; below zero would stop the loop short
+        # of the minimum it was told to run.
+        if not isinstance(grant_budget, int) or grant_budget < 0:
+            raise TechLeadError(
+                "Tech Lead grant budget must be a whole number of at least 0"
+            )
         architect = architect_agent or agent
         require_read_only_agent(
             agent, role="Tech Lead", error_factory=TechLeadError
@@ -184,6 +214,7 @@ class TechLeadLoop:
         self.io = io
         self.unattended = unattended
         self.review_rounds = review_rounds
+        self.grant_budget = grant_budget
         self.artifact_dir = Path(
             artifact_dir or paths.artifacts_dir / "planning" / str(borg.id)
         ).resolve()
@@ -216,7 +247,7 @@ class TechLeadLoop:
         )
 
     def run(self) -> TechLeadResult:
-        """Continue reviewing and revising until approved or review-capped."""
+        """Continue reviewing and revising until approved or out of budget."""
         try:
             self._seed_architect_progress()
             self._declare_revision_progress()
@@ -324,9 +355,37 @@ class TechLeadLoop:
                 approved=approved,
             )
 
+            # Two questions of the same round, and they are not the same
+            # question: what the round cost decides whether the loop gets
+            # another, and whether its argument is closing in is a judgement on
+            # the shape of it that the record keeps.
+            convergence = assess_convergence(ledger)
+            snapshot = len(open_findings(ledger))
+            grant = assess_grant(
+                review_round=review_round,
+                minimum=self.review_rounds,
+                budget=self.grant_budget,
+                snapshot=snapshot,
+                recorded=self.store.list_review_assessments(
+                    self.borg_id, loop=_TECH_REVIEW_PHASE, cycle_id=cycle_id
+                ),
+            )
+            assessment = ReviewAssessment(
+                borg_id=self.borg_id,
+                loop=_TECH_REVIEW_PHASE,
+                cycle_id=cycle_id,
+                attempt_id=attempt.id,
+                round=review_round,
+                minimum=self.review_rounds,
+                converging=convergence.converging,
+                open_findings=snapshot,
+                refunded=grant.refunded,
+                evidence=drain_evidence(convergence),
+            )
+
             if approved:
                 next_state = BorgState.PLAN_APPROVAL_PENDING
-            elif review_round < self.review_rounds:
+            elif grant.continues:
                 next_state = BorgState.ARCHITECT_WORKING
             else:
                 next_state = BorgState.BLOCKED
@@ -341,6 +400,7 @@ class TechLeadLoop:
                 for finding in findings:
                     self.store.append_planning_finding(finding)
                 self.store.record_planning_ledger_findings(ledger)
+                self.store.record_review_assessment(assessment)
                 borg = self._turns.transition(borg, next_state)
 
             if next_state is not BorgState.ARCHITECT_WORKING:
@@ -363,7 +423,7 @@ class TechLeadLoop:
             user_prompt=(
                 "Read .betterborg/state/planning/context/manifest.json and all "
                 "referenced evidence. Review the complete current plan. "
-                + _review_round_sentence(review_round, self.review_rounds)
+                + _review_round_sentence(review_round)
             ),
             current_plan=json.dumps(plan, indent=2, sort_keys=True),
             turn_name="review",
@@ -505,16 +565,8 @@ class TechLeadLoop:
         )
 
     def _revision_reviews(self) -> list[PlanningAttempt]:
-        # No cap: this reads which rejection a revision belongs to, and it is
-        # only ever asked while one is under way. Whether a rejection revised
-        # or blocked was decided when it completed and is held in the Borg's
-        # state, so filtering the record by today's budget would strand a run
-        # whose budget has since been lowered, with no way back but restoring
-        # the old number.
         return planning_request_change_attempts(
-            self._cycle_attempts(),
-            _TECH_REVIEW_PHASE,
-            round_cap=None,
+            self._cycle_attempts(), _TECH_REVIEW_PHASE
         )
 
     @staticmethod

@@ -34,6 +34,7 @@ from betterborg_cli.planning import (
     validate_task_repair_progress,
 )
 from betterborg_cli.planning.findings_ledger import open_task_findings
+from betterborg_cli.planning.supervisor import SUPERVISOR_DECISION_ROUND_CAP
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.store import (
     Borg,
@@ -1451,6 +1452,7 @@ def test_supervisor_blocks_after_bounded_review_exhaustion(
             supervisor,
             pm_agent=pm,
             approved_plan=plan,
+            grant_budget=0,
         ).run()
 
         assert result.borg.state is BorgState.BLOCKED
@@ -2256,11 +2258,12 @@ def test_a_lowered_decomposition_budget_blocks_on_its_only_round(
             supervisor,
             approved_plan=plan,
             review_rounds=1,
+            grant_budget=0,
         ).run()
 
         assert result.borg.state is BorgState.BLOCKED
         assert len(supervisor.calls) == 1
-        assert "in round 1 of 1." in supervisor.calls[0].user_prompt
+        assert "in round 1." in supervisor.calls[0].user_prompt
         assert store.list_task_findings(borg.id)
 
 
@@ -2299,6 +2302,7 @@ def test_a_blocked_decomposition_reports_its_record_under_any_budget(
             supervisor,
             approved_plan=plan,
             review_rounds=1,
+            grant_budget=0,
         ).run()
         assert first.borg.state is BorgState.BLOCKED
 
@@ -2395,10 +2399,11 @@ def test_lowering_the_decomposition_budget_does_not_strand_a_revision_under_way(
             pm_agent=pm,
             approved_plan=plan,
             review_rounds=2,
+            grant_budget=0,
         ).run()
 
         assert resumed.borg.state is BorgState.BLOCKED
-        assert "the final round." in supervisor.calls[-1].user_prompt
+        assert "in round 3." in supervisor.calls[-1].user_prompt
         assert "of 2." not in supervisor.calls[-1].user_prompt
 
 
@@ -2940,6 +2945,7 @@ def test_a_supervisor_review_closes_and_repeats_the_rows_it_names(
             supervisor,
             pm_agent=pm,
             approved_plan=plan,
+            grant_budget=0,
         ).run()
 
         assert result.borg.state is BorgState.BLOCKED
@@ -3036,3 +3042,197 @@ def test_a_supervisor_review_omitting_a_ledger_declaration_fails_its_schema(
         StructuredResultError, match=f"missing required property '{missing}'"
     ):
         validate_structured_result(payload, SUPERVISOR_REVIEW_SCHEMA)
+
+
+def _grant_review(
+    decision: str,
+    *,
+    raised: int = 1,
+    close_open: bool = False,
+    severity: str = "major",
+    label: str = "",
+):
+    """Review the batch in hand, closing the ledger rows it was handed.
+
+    A round that closes more than it raises is what lowers the open count a
+    refund compares on.
+    """
+
+    def respond(spec):
+        context = _planning_context(spec)
+        ledger = context["open_supervisor_findings"]
+        task_ref = context["task_batch"]["tasks"][0]["task_ref"]
+        return {
+            "decision": decision,
+            "summary": f"Supervisor decided to {decision}.",
+            "findings": [
+                {
+                    "severity": severity,
+                    "message": f"{label}Objection {index}.",
+                    "suggestion": "Keep the task independently testable.",
+                    "task_ref": task_ref,
+                    "repeats": None,
+                }
+                for index in range(raised)
+            ],
+            "resolved": [row["id"] for row in ledger] if close_open else [],
+        }
+
+    return respond
+
+
+def _decomposition_assessments(store, borg_id, approval):
+    return [
+        (row.round, row.open_findings, row.refunded, row.converging)
+        for row in store.list_review_assessments(
+            borg_id, loop="supervisor_review", plan_approval_id=approval.id
+        )
+    ]
+
+
+def test_a_draining_decomposition_runs_past_its_minimum_and_approves(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Past the minimum every round is a grant, and a productive one is free.
+
+    The batch the Supervisor is closing findings against reaches approval with
+    no operator action, where its counter would have stopped it on the round
+    the minimum named.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-granted.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-granted"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        for revision in (1, 2):
+            payload = _pm_payload(plan)
+            payload["tasks"][0]["title"] = f"Foundation revision {revision}"
+            pm.queue(MockResponse(payload=payload))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=3))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review(
+                    "request_changes", raised=1, close_open=True, label="Narrower: "
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=10,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(supervisor.calls) == 3
+        assert _decomposition_assessments(store, borg.id, approval) == [
+            (1, 3, None, False),
+            (2, 1, True, True),
+            (3, 0, True, True),
+        ]
+
+
+@pytest.mark.parametrize("review_rounds", [1, 2])
+def test_the_decision_allowance_ends_a_granted_round_the_same_way(
+    committed_git_repo: Path,
+    persist_planning_context,
+    review_rounds: int,
+) -> None:
+    """The Supervisor gets three tries at its own decision contract, no more.
+
+    The allowance spans the loop's whole life and was sized when a loop could
+    not exceed its configured rounds. Nothing here moves it, so a round that
+    keeps contradicting itself ends the run needing a person whether the round
+    was granted or inside the minimum.
+    """
+    plan = _plan()
+    database = (
+        committed_git_repo.parent / f"supervisor-decision-{review_rounds}.sqlite3"
+    )
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"supervisor-decision-{review_rounds}"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(MockResponse(dynamic=_grant_review("request_changes")))
+        for _ in range(SUPERVISOR_DECISION_ROUND_CAP):
+            supervisor.queue(
+                MockResponse(
+                    dynamic=_grant_review("request_changes", severity="minor")
+                )
+            )
+
+        with pytest.raises(SupervisorError, match="blocker or major finding"):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                approved_plan=plan,
+                review_rounds=review_rounds,
+                grant_budget=5,
+            ).run()
+
+        assert len(supervisor.calls) == 1 + SUPERVISOR_DECISION_ROUND_CAP
+        # The round that never reached a decision was never assessed, so it
+        # earned no refund either.
+        assert [
+            number
+            for number, *_ in _decomposition_assessments(store, borg.id, approval)
+        ] == [1]
+
+
+@pytest.mark.parametrize("budget", [-1, 1.5])
+def test_a_grant_budget_that_is_not_a_whole_number_at_or_above_zero_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+    budget: object,
+) -> None:
+    """Below zero would stop the loop short of the minimum it was told to run."""
+    plan = _plan()
+    database = committed_git_repo.parent / f"supervisor-grant-{budget}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"supervisor-grant-{str(budget).strip('-.')}"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(SupervisorError, match="at least 0"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                grant_budget=budget,
+            )

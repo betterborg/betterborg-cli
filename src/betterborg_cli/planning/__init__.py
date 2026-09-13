@@ -31,7 +31,7 @@ from betterborg_cli.planning.pm import (
 )
 from betterborg_cli.planning.supervisor import (
     SUPERVISOR_REVIEW_SCHEMA,
-    SUPERVISOR_ROUND_CAP,
+    SUPERVISOR_ROUND_MINIMUM,
     SupervisorCancelled,
     SupervisorError,
     SupervisorLoop,
@@ -61,7 +61,7 @@ from betterborg_cli.planning.task_validation import (
 )
 from betterborg_cli.planning.tech_lead import (
     TECH_LEAD_REVIEW_SCHEMA,
-    TECH_REVIEW_ROUND_CAP,
+    TECH_REVIEW_ROUND_MINIMUM,
     TechLeadCancelled,
     TechLeadError,
     TechLeadLoop,
@@ -92,13 +92,13 @@ __all__ = [
     "ProjectManagerResult",
     "PublishedTaskFile",
     "SUPERVISOR_REVIEW_SCHEMA",
-    "SUPERVISOR_ROUND_CAP",
+    "SUPERVISOR_ROUND_MINIMUM",
     "SupervisorCancelled",
     "SupervisorError",
     "SupervisorLoop",
     "SupervisorResult",
     "TECH_LEAD_REVIEW_SCHEMA",
-    "TECH_REVIEW_ROUND_CAP",
+    "TECH_REVIEW_ROUND_MINIMUM",
     "TechLeadCancelled",
     "TechLeadError",
     "TechLeadLoop",

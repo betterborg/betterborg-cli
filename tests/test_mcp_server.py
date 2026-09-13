@@ -2911,6 +2911,12 @@ def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
     to call, is in exactly the state keeping the findings exists to prevent.
     """
     repository, paths = planning_cli_repository(committed_git_repo, "mcp-blocked")
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\ngrant_budget = 0\n",
+        encoding="utf-8",
+    )
     architect = MockAdapter(name="openai")
     for payload in (
         {"decision": "ready_to_plan"},
@@ -2953,10 +2959,18 @@ def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
         "Cover a partial rollback.",
     ]
     assert [finding["round"] for finding in shown["data"]["findings"]] == [1, 2, 3]
-    # And the caller is told which call reaches them.
+    # And the caller is told which call reaches them, and what the loop's
+    # rounds cost, which the terminal reports on the line beside the block.
     assert [
         action["arguments"]["action"] for action in started["next_actions"]
     ] == ["show"]
+    assert started["data"]["grants"] == {
+        "rounds": 3,
+        "minimum": 3,
+        "grants": 0,
+        "charged": 0,
+        "converging": False,
+    }
 
 
 def test_the_headless_findings_are_narrowed_to_what_still_stands(

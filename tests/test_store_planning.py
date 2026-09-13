@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -20,6 +21,7 @@ from betterborg_cli.store import (
     PlanningLedgerFinding,
     PlanningQuestion,
     Repository,
+    ReviewAssessment,
     SqliteStore,
     StaleBorgStateError,
 )
@@ -98,7 +100,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         applied_at = store.applied_migrations()
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == applied_at == tuple(range(1, 14))
+        assert reopened.applied_migrations() == applied_at == tuple(range(1, 15))
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg
         assert reopened.list_planning_attempts(borg.id) == [
@@ -358,7 +360,7 @@ def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 14))
+        assert reopened.applied_migrations() == tuple(range(1, 15))
         rows = reopened.list_planning_ledger_findings(borg.id)
         assert len(rows) == 2
         closed = next(row for row in rows if row.id == raised.id)
@@ -379,3 +381,95 @@ def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
         assert reopened.list_planning_ledger_findings(
             borg.id, cycle_id=INITIAL_PLANNING_CYCLE
         ) == [closed]
+
+
+def test_migration_014_review_assessments_survive_reopen(tmp_path: Path) -> None:
+    """One row per round, scoped by the run of rounds its loop compares.
+
+    Loops are rebuilt from configuration on every entry, so a verdict held in
+    memory is lost the moment a run is interrupted and the budget would be
+    spent twice.
+    """
+    database = tmp_path / "state.sqlite3"
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="AssessedPlanner")
+    review = PlanningAttempt(
+        borg_id=borg.id,
+        phase="tech_review",
+        round=1,
+        adapter="mock",
+        model="test-model",
+    )
+    change_request = PlanChangeRequest(
+        borg_id=borg.id, round=1, note="Stage the rollout."
+    )
+    minimum_round = ReviewAssessment(
+        borg_id=borg.id,
+        loop="tech_review",
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        attempt_id=review.id,
+        round=1,
+        minimum=1,
+        converging=False,
+        open_findings=2,
+        evidence={"drain": [], "trend": None},
+    )
+    granted_round = ReviewAssessment(
+        borg_id=borg.id,
+        loop="tech_review",
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        attempt_id=review.id,
+        round=2,
+        minimum=1,
+        converging=True,
+        open_findings=1,
+        refunded=True,
+        evidence={"trend": "improving"},
+    )
+    next_cycle = ReviewAssessment(
+        borg_id=borg.id,
+        loop="tech_review",
+        cycle_id=str(change_request.id),
+        round=1,
+        minimum=1,
+        converging=False,
+        open_findings=1,
+    )
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_planning_attempt(review)
+        store.append_plan_change_request(change_request)
+        for assessment in (minimum_round, granted_round, next_cycle):
+            store.record_review_assessment(assessment)
+
+    with SqliteStore.open(database) as reopened:
+        assert reopened.applied_migrations() == tuple(range(1, 15))
+        rows = reopened.list_review_assessments(borg.id, loop="tech_review")
+        assert rows == [minimum_round, granted_round, next_cycle]
+        # A round inside the minimum is neither charged nor refunded, so it
+        # records no refund decision at all.
+        assert rows[0].refunded is None
+        assert reopened.list_review_assessments(
+            borg.id, cycle_id=INITIAL_PLANNING_CYCLE
+        ) == [minimum_round, granted_round]
+        assert reopened.list_review_assessments(borg.id, loop="supervisor_review") == []
+
+        # One assessment per round of one scope, enforced rather than relied on:
+        # the budget is read by counting the rounds that earned no refund, so a
+        # second row for a round that earned one lifts the refund count above
+        # the number of grants and the loop never stops.
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.record_review_assessment(
+                replace(granted_round, id=uuid4(), converging=False)
+            )
+        # The same round of another scope is a different round.
+        reopened.record_review_assessment(
+            replace(
+                granted_round,
+                id=uuid4(),
+                cycle_id=str(change_request.id),
+                refunded=False,
+            )
+        )
