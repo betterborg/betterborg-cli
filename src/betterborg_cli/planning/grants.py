@@ -29,6 +29,16 @@ from betterborg_cli.store import ReviewAssessment, SqliteStore
 #: budget to come out of.
 PLANNING_GRANT_BUDGET = 10
 
+#: Grants a task's review gets where its repository configures no budget. Ten,
+#: for the reason ``PLANNING_GRANT_BUDGET`` gives: one number bounds every loop
+#: in the same way, and zero is legal here on the same terms.
+EXECUTION_GRANT_BUDGET = 10
+
+#: The loop a task's review rounds record themselves under. Named rather than
+#: spelled at each reader, because the account and the round that writes it have
+#: to agree on it or the budget reads an empty history.
+TASK_REVIEW_LOOP = "task_review"
+
 
 @dataclass(frozen=True, slots=True)
 class GrantDecision:
@@ -132,12 +142,41 @@ def planning_grant_account(
 ) -> GrantAccount:
     """Account for what one planning loop's rounds cost it."""
 
-    recorded = store.list_review_assessments(
-        borg_id,
-        loop=loop,
-        cycle_id=cycle_id,
-        plan_approval_id=plan_approval_id,
+    return grant_account(
+        store.list_review_assessments(
+            borg_id,
+            loop=loop,
+            cycle_id=cycle_id,
+            plan_approval_id=plan_approval_id,
+        )
     )
+
+
+def execution_grant_account(
+    store: SqliteStore, borg_id: UUID, *, task_id: UUID
+) -> GrantAccount:
+    """Account for what one task's review passes cost it.
+
+    Scoped to the task as well as the loop, because the configured minimum is
+    shared by every task in the run and cannot carry one task's grants.
+    """
+
+    return grant_account(
+        store.list_review_assessments(
+            borg_id, loop=TASK_REVIEW_LOOP, task_id=task_id
+        )
+    )
+
+
+def grant_account(recorded: Sequence[ReviewAssessment]) -> GrantAccount:
+    """Total up the rounds one loop has assessed, and nothing but them.
+
+    The one place assessments become an account, so a reader that wants to know
+    what a loop's rounds cost never counts them itself. A round that has been
+    assessed but not yet written is one of its own rounds too: the reason a loop
+    gives for stopping accounts for the round it stopped on.
+    """
+
     grants = [item for item in recorded if item.refunded is not None]
     latest = max(recorded, key=lambda item: item.round, default=None)
     return GrantAccount(
@@ -150,9 +189,13 @@ def planning_grant_account(
 
 
 __all__ = [
+    "EXECUTION_GRANT_BUDGET",
     "PLANNING_GRANT_BUDGET",
+    "TASK_REVIEW_LOOP",
     "GrantAccount",
     "GrantDecision",
     "assess_grant",
+    "execution_grant_account",
+    "grant_account",
     "planning_grant_account",
 ]

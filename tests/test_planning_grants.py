@@ -6,12 +6,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from betterborg_cli.planning.grants import (
+    EXECUTION_GRANT_BUDGET,
     PLANNING_GRANT_BUDGET,
+    TASK_REVIEW_LOOP,
     GrantAccount,
     assess_grant,
+    execution_grant_account,
     planning_grant_account,
 )
-from betterborg_cli.repository_config import PlanningLimits
+from betterborg_cli.repository_config import ExecutionLimits, PlanningLimits
 from betterborg_cli.store import Borg, Repository, ReviewAssessment, SqliteStore
 
 _BORG = uuid4()
@@ -37,6 +40,9 @@ def _recorded(
 
 def test_the_unconfigured_budget_is_the_one_the_loops_default_to() -> None:
     assert PlanningLimits().grant_budget == PLANNING_GRANT_BUDGET
+    # The two loops declare the constant itself as their default, so what is
+    # worth pinning is the literal the repository reports against it.
+    assert ExecutionLimits().grant_budget == EXECUTION_GRANT_BUDGET
 
 
 def test_a_round_inside_the_minimum_is_neither_charged_nor_refunded() -> None:
@@ -273,3 +279,44 @@ def test_the_account_reads_the_minimum_its_last_round_recorded(
     assert account.rounds - account.grants == 5
     assert account.minimum == 6
     assert "past its minimum of 6" in account.sentence()
+
+
+def test_one_tasks_account_never_counts_another_tasks_passes(
+    tmp_path: Path,
+) -> None:
+    """The minimum belongs to the run; the grants belong to one task.
+
+    Every task in a run records under the same loop, so an account reading the
+    loop alone would charge one task for the passes another ground through.
+    """
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="TwoTasks")
+    reviewed, other = uuid4(), uuid4()
+    with SqliteStore.open(tmp_path / "state.sqlite3") as store:
+        with store.transaction():
+            store.add_repository(repository)
+            store.add_borg(borg)
+        for task_id, number, refunded in (
+            (reviewed, 1, None),
+            (reviewed, 2, False),
+            (other, 1, None),
+            (other, 2, False),
+            (other, 3, False),
+        ):
+            store.record_review_assessment(
+                ReviewAssessment(
+                    borg_id=borg.id,
+                    loop=TASK_REVIEW_LOOP,
+                    task_id=task_id,
+                    round=number,
+                    minimum=1,
+                    converging=False,
+                    open_findings=1,
+                    refunded=refunded,
+                )
+            )
+
+        account = execution_grant_account(store, borg.id, task_id=reviewed)
+
+    assert (account.rounds, account.grants, account.charged) == (2, 1, 1)
+    assert account.minimum == 1

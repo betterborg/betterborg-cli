@@ -23,6 +23,7 @@ from betterborg_cli.host_execution import (
     ScheduledTaskContext,
 )
 from betterborg_cli.host_execution.service import _ExecutionActivityBinding
+from betterborg_cli.planning.grants import TASK_REVIEW_LOOP
 from betterborg_cli.progress import (
     AgentActivity,
     AgentActivityKind,
@@ -40,6 +41,7 @@ from betterborg_cli.store import (
     ExecutionRunStatus,
     PlanApproval,
     Repository,
+    ReviewAssessment,
     SqliteStore,
     TaskBatch,
     TaskComplexity,
@@ -629,9 +631,11 @@ def test_task_activity_sink_rejects_an_empty_agent_label(tmp_path: Path) -> None
         (TaskRuntimeStatus.REVIEW, 1, "review (pass 2/3)"),
         (TaskRuntimeStatus.FIX, 2, "fix (pass 2/3)"),
         (TaskRuntimeStatus.REVIEW, 2, "review (pass 3/3)"),
-        (TaskRuntimeStatus.REVIEW, 3, "review: durable reason"),
+        # A pass past the minimum is a granted one, and its denominator is what
+        # the budget has left rather than a total it has already exceeded.
+        (TaskRuntimeStatus.REVIEW, 3, "review (pass 4, 10 grants left)"),
         (TaskRuntimeStatus.FIX, 0, "fix: durable reason"),
-        (TaskRuntimeStatus.FIX, 3, "fix: durable reason"),
+        (TaskRuntimeStatus.FIX, 3, "fix (pass 3/3)"),
     ],
 )
 def test_scheduler_projects_durable_review_and_fix_passes(
@@ -717,6 +721,85 @@ def test_scheduler_projects_durable_review_and_fix_passes(
         assert observed_runtime.state_reason == "durable reason"
         assert result.status is ExecutionRunStatus.COMPLETED
         assert progress.stages[str(records["task"].id)].result == "merged"
+
+
+def test_a_granted_pass_is_projected_against_the_grants_it_has_left(
+    tmp_path: Path,
+) -> None:
+    """Past the minimum there is no total to count against, only a budget.
+
+    What remains is read off the passes' own records rather than recounted from
+    them, because a projection that does its own arithmetic is a second owner of
+    it and the two owners drift.
+    """
+    database, borg, generation, records = _scheduler_fixture(
+        tmp_path,
+        task_refs=("task",),
+        dependencies=(),
+    )
+    progress = RunProgress(stream=StringIO(), enabled=False)
+    observed: list[str | None] = []
+
+    with SqliteStore.open(database) as store:
+        for round_number, refunded in ((1, None), (2, None), (3, False), (4, True)):
+            store.record_review_assessment(
+                ReviewAssessment(
+                    borg_id=borg.id,
+                    loop=TASK_REVIEW_LOOP,
+                    task_id=records["task"].id,
+                    round=round_number,
+                    minimum=2,
+                    converging=True,
+                    open_findings=1,
+                    refunded=refunded,
+                )
+            )
+
+        def behavior(context: ScheduledTaskContext) -> TaskRuntimeStatus:
+            context.transition(
+                TaskRuntimeStatus.CLAIMED,
+                TaskRuntimeStatus.ENVIRONMENT,
+                resume_phase="environment",
+            )
+            context.transition(
+                TaskRuntimeStatus.ENVIRONMENT,
+                TaskRuntimeStatus.CODING,
+                resume_phase="coding",
+            )
+            context.transition(
+                TaskRuntimeStatus.CODING,
+                TaskRuntimeStatus.REVIEW,
+                resume_phase="review",
+                review_round=4,
+                state_reason="durable reason",
+            )
+            observed.append(progress.stages[context.stage_key].detail)
+            context.transition(
+                TaskRuntimeStatus.REVIEW,
+                TaskRuntimeStatus.DONE,
+                resume_phase="done",
+            )
+            return TaskRuntimeStatus.DONE
+
+        result = HostTaskScheduler(
+            store,
+            behavior,
+            config=HostSchedulerConfig(review_passes=2, grant_budget=3),
+            progress=progress,
+        ).run(borg.id, generation.id)
+
+    assert result.status is ExecutionRunStatus.COMPLETED
+    # Four passes recorded, two of them grants, one of those charged: the fifth
+    # is the next grant and two of the three are still there to buy it.
+    assert observed == ["review (pass 5, 2 grants left)"]
+
+
+def test_a_scheduler_grant_budget_below_zero_is_refused() -> None:
+    """Zero is how an operator asks for today's passes; below zero asks for
+    fewer passes than the minimum it declared."""
+    assert HostSchedulerConfig(grant_budget=0).grant_budget == 0
+    with pytest.raises(ValueError, match="grant budget must not be negative"):
+        HostSchedulerConfig(grant_budget=-1)
 
 
 @pytest.mark.parametrize(

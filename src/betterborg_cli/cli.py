@@ -1728,6 +1728,7 @@ def _invoke_host_execution(
             config=HostReviewFixConfig(
                 review_model=review_agent.model,
                 review_passes=config.execution.review_passes,
+                grant_budget=config.execution.grant_budget,
                 review_billing_mode=_agent_billing_mode(review_agent.name),
                 fix_billing_mode=_agent_billing_mode(review_agent.name),
                 review_effort=review_agent.effort,
@@ -1768,6 +1769,7 @@ def _invoke_host_execution(
         scheduler_config=HostSchedulerConfig(
             jobs=config.execution.jobs,
             review_passes=config.execution.review_passes,
+            grant_budget=config.execution.grant_budget,
         ),
         progress=progress,
     )

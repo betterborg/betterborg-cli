@@ -325,15 +325,24 @@ blocked, which is read from what the rounds recorded rather than from the
 settings in force now.
 
 Execution has its own table. `jobs` is how many tasks the scheduler runs at
-once, one to ten. `review_passes` is how many times a task may go round the
-review-and-fix loop before it blocks with its findings kept, and it is a whole
-number of at least one:
+once, one to ten. `review_passes` is the minimum number of times a task goes
+round the review-and-fix loop, a whole number of at least one, and a task still
+unapproved after them keeps going on the terms a plan's review does: a pass
+that leaves fewer findings open than the pass before it costs nothing, a pass
+that closes nothing spends one grant of `grant_budget`, and when the grants are
+gone the task blocks holding its reviewed commit and the reason it was not
+approved. `grant_budget` is ten by default, counted per task, and the run's
+progress shows what a granted pass has left of it:
 
 ```toml
 [execution]
 jobs = 4
 review_passes = 5
+grant_budget = 10
 ```
+
+Zero is a legal budget here too, and asks for exactly the passes
+`review_passes` declares and the blocks they reach. Below zero is refused.
 
 `sanity` decides whether a merged tip must pass the repository's own checks
 before the project base advances. It is on unless a repository says otherwise:

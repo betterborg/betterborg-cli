@@ -124,10 +124,15 @@ class AgentChoices:
 
 @dataclass(frozen=True)
 class ExecutionLimits:
-    """Repository defaults that bound concurrent and repeated execution."""
+    """Repository defaults that bound concurrent and repeated execution.
+
+    ``review_passes`` is a minimum. ``grant_budget`` is how many passes past it
+    a task's review may spend closing nothing before the task blocks.
+    """
 
     jobs: int = 1
     review_passes: int = 3
+    grant_budget: int = 10
     #: Whether a merged tip must pass the repository's own checks before the
     #: project base advances. Off, the review agent is the last judgement in
     #: the run, so a repository turns this off only when something outside
@@ -303,7 +308,14 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     execution_document = _optional_table(document, "execution")
     _require_only_keys(
         execution_document,
-        {"jobs", "review_passes", "sanity", "preparation", "blocked_tasks"},
+        {
+            "jobs",
+            "review_passes",
+            "grant_budget",
+            "sanity",
+            "preparation",
+            "blocked_tasks",
+        },
         section="execution",
     )
     jobs = _optional_int(execution_document, "jobs", default=1, section="execution")
@@ -331,6 +343,13 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     )
     if review_passes < 1:
         raise RepositoryConfigError("execution.review_passes must be at least 1")
+    execution_grant_budget = _optional_int(
+        execution_document, "grant_budget", default=10, section="execution"
+    )
+    # Zero on the same terms as its planning counterpart below: it asks for
+    # exactly the passes the minimum declares and the block they reach.
+    if execution_grant_budget < 0:
+        raise RepositoryConfigError("execution.grant_budget must not be negative")
 
     planning_document = _optional_table(document, "planning")
     _require_only_keys(
@@ -368,6 +387,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         execution=ExecutionLimits(
             jobs=jobs,
             review_passes=review_passes,
+            grant_budget=execution_grant_budget,
             sanity=sanity,
             preparation=preparation,
             blocked_tasks=blocked_tasks,

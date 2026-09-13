@@ -1140,9 +1140,10 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
     monkeypatch.setattr(
         cli_module,
         "HostSchedulerConfig",
-        lambda *, jobs, review_passes: actual_scheduler_config(
+        lambda *, jobs, review_passes, grant_budget: actual_scheduler_config(
             jobs=jobs,
             review_passes=review_passes,
+            grant_budget=grant_budget,
             poll_interval_seconds=0.005,
         ),
     )
@@ -1404,9 +1405,10 @@ def test_execute_reporter_finished_rows_match_in_plain_and_interactive_modes(
         run_patch.setattr(
             cli_module,
             "HostSchedulerConfig",
-            lambda *, jobs, review_passes: actual_scheduler_config(
+            lambda *, jobs, review_passes, grant_budget: actual_scheduler_config(
                 jobs=jobs,
                 review_passes=review_passes,
+                grant_budget=grant_budget,
                 poll_interval_seconds=0.005,
             ),
         )
@@ -2972,7 +2974,17 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         )
     )
     _trust(cli_runner, committed_git_repo, monkeypatch)
+    # Both review budgets are declared away from their defaults, so an
+    # assertion that one reached a loop cannot pass on the loop's own default
+    # happening to agree with the repository's.
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[execution]\nreview_passes = 2\ngrant_budget = 4\n",
+        encoding="utf-8",
+    )
     config = cli_module.load_repository_config(paths)
+    assert (config.execution.review_passes, config.execution.grant_budget) == (2, 4)
     monkeypatch.setenv("EXECUTE_TOKEN", "owner-secret")
     selected_agents: list[SelectedAgent] = []
     selected_stages: list[AgentStage] = []
@@ -3015,8 +3027,12 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         assert review_config.review_effort == "review-effort"
         assert review_config.fix_effort == "review-effort"
         assert review_config.review_passes == config.execution.review_passes
+        assert review_config.grant_budget == config.execution.grant_budget
         assert service._scheduler_config.review_passes == (
             config.execution.review_passes
+        )
+        assert service._scheduler_config.grant_budget == (
+            config.execution.grant_budget
         )
         merge_config = service._runtime._merge._config
         assert merge_config.model == "selected-merge-model"

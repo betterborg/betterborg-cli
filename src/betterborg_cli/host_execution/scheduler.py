@@ -12,6 +12,10 @@ from typing import Protocol
 from uuid import UUID
 
 from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.planning.grants import (
+    EXECUTION_GRANT_BUDGET,
+    execution_grant_account,
+)
 from betterborg_cli.progress import (
     AgentActivity,
     ProgressError,
@@ -48,10 +52,16 @@ TaskActivitySink = Callable[[UUID, AgentActivity], None]
 
 @dataclass(frozen=True, slots=True)
 class HostSchedulerConfig:
-    """Timing and concurrency limits for one execution scheduler."""
+    """Timing and concurrency limits for one execution scheduler.
+
+    ``review_passes`` is the minimum number of review rounds a task gets and
+    ``grant_budget`` how many rounds past it may close nothing, which together
+    are what a projected pass number is read against.
+    """
 
     jobs: int = 1
     review_passes: int = 3
+    grant_budget: int = EXECUTION_GRANT_BUDGET
     lease_duration: timedelta = timedelta(minutes=2)
     heartbeat_interval: timedelta = timedelta(seconds=30)
     poll_interval_seconds: float = 0.02
@@ -61,6 +71,10 @@ class HostSchedulerConfig:
             raise ValueError("scheduler jobs must be positive")
         if self.review_passes < 1:
             raise ValueError("scheduler review passes must be positive")
+        # Zero buys nothing and is legal; below zero would stop a task short of
+        # the passes it was told to run.
+        if self.grant_budget < 0:
+            raise ValueError("scheduler grant budget must not be negative")
         if self.lease_duration <= timedelta(0):
             raise ValueError("scheduler lease duration must be positive")
         if not timedelta(0) < self.heartbeat_interval < self.lease_duration:
@@ -610,20 +624,47 @@ class HostTaskScheduler:
         """Project one durable active phase without changing its lifecycle."""
         phase_label = runtime.status.value if phase is None else phase
         if phase_label == TaskRuntimeStatus.REVIEW.value:
+            # The review the task is about to run, which the loop numbers from
+            # one while the runtime counts the rounds behind it.
             pass_number = runtime.review_round + 1
-            if 1 <= pass_number <= self._config.review_passes:
-                return (
-                    f"review (pass {pass_number}/{self._config.review_passes})"
-                )
         elif phase_label == TaskRuntimeStatus.FIX.value:
+            # The review round that asked for this fix.
             pass_number = runtime.review_round
-            if 1 <= pass_number < self._config.review_passes:
-                return f"fix (pass {pass_number}/{self._config.review_passes})"
+        else:
+            pass_number = 0
+        if 1 <= pass_number <= self._config.review_passes:
+            return f"{phase_label} (pass {pass_number}/{self._config.review_passes})"
+        if pass_number > self._config.review_passes:
+            return (
+                f"{phase_label} (pass {pass_number}, "
+                f"{self._remaining_grants(runtime)})"
+            )
 
         detail = phase_label
         if runtime.state_reason:
             detail += f": {runtime.state_reason}"
         return detail
+
+    def _remaining_grants(self, runtime: TaskRuntime) -> str:
+        """Say how much of this task's review budget its passes have left.
+
+        Read off the assessments the passes recorded rather than recounted from
+        them, because a display that does its own arithmetic is a second owner
+        of it and the two owners drift.
+        """
+        # Through the generation, because a projection has a runtime and not a
+        # claim in hand. It is the same Borg the review loop reads off the run,
+        # whose generation carries the Borg that owns it.
+        generation = self._store.get_task_generation(runtime.generation_id)
+        if generation is None:
+            raise KeyError(f"task generation {runtime.generation_id} not found")
+        account = execution_grant_account(
+            self._store, generation.borg_id, task_id=runtime.task_id
+        )
+        # Floored, because a budget lowered under a task already past it would
+        # otherwise report a debt rather than an empty budget.
+        remaining = max(self._config.grant_budget - account.charged, 0)
+        return f"{remaining} grant{'' if remaining == 1 else 's'} left"
 
     @staticmethod
     def _progress_result(runtime: TaskRuntime) -> str:

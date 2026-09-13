@@ -38,11 +38,19 @@ from betterborg_cli.host_execution.git import SafeGit
 from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError
+from betterborg_cli.planning.convergence import assess_convergence, drain_evidence
 from betterborg_cli.planning.findings_ledger import (
     REPEATS_SCHEMA,
     RESOLVED_SCHEMA,
     open_execution_findings,
+    open_findings,
     reconcile_execution_ledger,
+)
+from betterborg_cli.planning.grants import (
+    EXECUTION_GRANT_BUDGET,
+    TASK_REVIEW_LOOP,
+    assess_grant,
+    grant_account,
 )
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import BlockedTaskPolicy
@@ -50,6 +58,7 @@ from betterborg_cli.store import (
     AgentAttempt,
     ExecutionAttemptStatus,
     ExecutionLedgerFinding,
+    ReviewAssessment,
     TaskRuntime,
     TaskRuntimeStatus,
 )
@@ -114,11 +123,17 @@ class ReviewFixPhaseError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class HostReviewFixConfig:
-    """Provider, artifact, and pass-limit settings for review and fixes."""
+    """Provider, artifact, and review-budget settings for review and fixes.
+
+    ``review_passes`` is the minimum number of review rounds a task gets.
+    ``grant_budget`` is how many rounds past it the loop may spend closing
+    nothing before the task blocks.
+    """
 
     review_model: str
     fix_model: str | None = None
     review_passes: int = 3
+    grant_budget: int = EXECUTION_GRANT_BUDGET
     review_billing_mode: BillingMode = BillingMode.API
     fix_billing_mode: BillingMode | None = None
     review_effort: str | None = None
@@ -136,6 +151,10 @@ class HostReviewFixConfig:
             raise ValueError("fix model must not be empty")
         if self.review_passes < 1:
             raise ValueError("review passes must be positive")
+        # Zero buys nothing and is legal; below zero would stop a task short of
+        # the passes it was told to run.
+        if self.grant_budget < 0:
+            raise ValueError("review grant budget must not be negative")
         object.__setattr__(
             self, "review_billing_mode", BillingMode(self.review_billing_mode)
         )
@@ -162,7 +181,7 @@ class HostReviewFixConfig:
 
 
 class HostReviewFixPhase:
-    """Review a coding commit and run bounded, commit-producing fix turns."""
+    """Review a coding commit, fixing it while its grant budget holds."""
 
     def __init__(
         self,
@@ -211,7 +230,7 @@ class HostReviewFixPhase:
         review_environment: Mapping[str, str] | None = None,
         fix_environment: Mapping[str, str] | None = None,
     ) -> TaskRuntimeStatus:
-        """Drive REVIEW/FIX until approval, a cap, or another durable stop."""
+        """Drive REVIEW/FIX to approval, a spent budget, or a durable stop."""
         while True:
             try:
                 runtime, worktree = require_ready_worktree(
@@ -235,6 +254,13 @@ class HostReviewFixPhase:
                 )
                 base_commit, current_commit = self._declared_commits(
                     context, worktree
+                )
+                # Only a review records an assessment, so only a review pays
+                # for finding out whose record it goes in.
+                borg_id = (
+                    _assessment_borg_id(context)
+                    if runtime.status is TaskRuntimeStatus.REVIEW
+                    else None
                 )
             except (
                 HostAgentPhaseError,
@@ -263,6 +289,7 @@ class HostReviewFixPhase:
                     runtime,
                     worktree,
                     inputs,
+                    borg_id=borg_id,
                     base_commit=base_commit,
                     current_commit=current_commit,
                     environment={
@@ -296,6 +323,7 @@ class HostReviewFixPhase:
         worktree: Path,
         inputs: VerifiedTaskInputs,
         *,
+        borg_id: UUID,
         base_commit: str,
         current_commit: str,
         environment: Mapping[str, str] | None,
@@ -306,7 +334,7 @@ class HostReviewFixPhase:
             base_commit=base_commit,
             current_commit=current_commit,
             review_round=_ledger_round(runtime),
-            open_findings=open_execution_findings(
+            open_ledger=open_execution_findings(
                 context.store, context.claim.task_id
             ),
             unfinished=_unfinished_coding_report(context),
@@ -316,6 +344,7 @@ class HostReviewFixPhase:
             runtime,
             worktree,
             phase="review",
+            borg_id=borg_id,
             adapter=self._review_adapter,
             model=self._config.review_model,
             billing_mode=self._config.review_billing_mode,
@@ -374,6 +403,9 @@ class HostReviewFixPhase:
         worktree: Path,
         *,
         phase: str,
+        # The review phase's alone: it is the only one that records an
+        # assessment, and the only one given a Borg to record it under.
+        borg_id: UUID | None = None,
         adapter: AgentAdapter,
         model: str,
         billing_mode: BillingMode,
@@ -489,14 +521,22 @@ class HostReviewFixPhase:
             after_status = before_status
 
         ledger: tuple[ExecutionLedgerFinding, ...] = ()
+        assessment: ReviewAssessment | None = None
         if phase == "review":
             classified = self._classify_review(
                 result,
                 runtime=runtime,
+                borg_id=borg_id,
                 task_id=context.claim.task_id,
                 attempt_id=attempt_id,
                 ledger=context.store.list_execution_ledger_findings(
                     context.claim.task_id
+                ),
+                # Read here rather than in the classifier, which keeps every
+                # read of this round's own history outside the durable step
+                # that appends to it.
+                recorded=context.store.list_review_assessments(
+                    borg_id, loop=TASK_REVIEW_LOOP, task_id=context.claim.task_id
                 ),
                 expected_commit=current_commit,
                 final_commit=final_commit,
@@ -509,6 +549,7 @@ class HostReviewFixPhase:
             )
             outcome = classified.outcome
             ledger = classified.ledger
+            assessment = classified.assessment
         else:
             outcome = self._classify_fix(
                 result,
@@ -560,11 +601,16 @@ class HostReviewFixPhase:
             AgentStatus.CANCELLED: ExecutionAttemptStatus.CANCELLED,
             AgentStatus.FAILED: ExecutionAttemptStatus.FAILED,
         }[result.status]
-        # One durable step for the round's findings and the attempt that
-        # produced them: an interruption cannot leave objections recorded
-        # against an attempt that never finished, and a resume replays a
-        # completed attempt's outcome without re-running the classifier, so
-        # rows written after it would never be written at all.
+        # One durable step for the round's findings, the grant it spent and the
+        # attempt that produced them: an interruption cannot leave objections
+        # recorded against an attempt that never finished, and a resume replays
+        # a completed attempt's outcome without re-running the classifier, so
+        # rows written after it would never be written at all. The assessment
+        # goes with them for the same reason: a round whose objections are
+        # recorded without its snapshot denies the round after it the refund it
+        # earned. A round the artifact write has already turned into a block has
+        # no round after it, and records what it found all the same rather than
+        # being carved out of the rule.
         with context.store.transaction():
             context.store.complete_agent_attempt(
                 attempt.id,
@@ -581,6 +627,8 @@ class HostReviewFixPhase:
                 now=context.clock(),
             )
             context.store.record_execution_ledger_findings(ledger)
+            if assessment is not None:
+                context.store.record_review_assessment(assessment)
         if outcome.status is runtime.status:
             return outcome.status
         return self._transition(context, runtime.status, outcome)
@@ -590,9 +638,11 @@ class HostReviewFixPhase:
         result: AgentResult,
         *,
         runtime: TaskRuntime,
+        borg_id: UUID,
         task_id: UUID,
         attempt_id: UUID,
         ledger: Sequence[ExecutionLedgerFinding],
+        recorded: Sequence[ReviewAssessment],
         expected_commit: str,
         final_commit: str,
         expected_branch: str,
@@ -652,7 +702,7 @@ class HostReviewFixPhase:
             )
         # The runtime counts the rounds behind it while the ledger numbers the
         # round in hand, so the count this review leaves behind is its own
-        # ledger round. One number, and the rows, the reason and the pass limit
+        # ledger round. One number, and the rows, the reason and the assessment
         # all read it.
         review_round = _ledger_round(runtime)
         try:
@@ -690,6 +740,34 @@ class HostReviewFixPhase:
                 approved=approved,
             )
         )
+        # Two questions of the same round, and they are not the same question:
+        # what the round cost decides whether the task gets another pass, and
+        # whether its argument is closing in is a judgement on the shape of it
+        # that the record keeps.
+        convergence = assess_convergence(reconciled)
+        snapshot = len(open_findings(reconciled))
+        grant = assess_grant(
+            review_round=review_round,
+            minimum=self._config.review_passes,
+            budget=self._config.grant_budget,
+            snapshot=snapshot,
+            recorded=recorded,
+        )
+        assessment = ReviewAssessment(
+            borg_id=borg_id,
+            loop=TASK_REVIEW_LOOP,
+            # The task, which is the scope these passes share: the configured
+            # minimum belongs to every task in the run and cannot carry one
+            # task's grants. Its attempt is left unnamed because the record's
+            # attempt column points at planning attempts alone.
+            task_id=task_id,
+            round=review_round,
+            minimum=self._config.review_passes,
+            converging=convergence.converging,
+            open_findings=snapshot,
+            refunded=grant.refunded,
+            evidence=drain_evidence(convergence),
+        )
         if approved:
             return _ReviewClassification(
                 _PhaseOutcome(
@@ -699,16 +777,24 @@ class HostReviewFixPhase:
                     "merging",
                 ),
                 reconciled,
+                assessment,
             )
-        if review_round >= self._config.review_passes:
+        if not grant.continues:
             return _ReviewClassification(
                 _PhaseOutcome(
                     TaskRuntimeStatus.BLOCKED,
-                    f"review pass limit {self._config.review_passes} reached",
+                    # The account says what the rounds cost, so the reason
+                    # names the state and lets it: a task held to its minimum
+                    # with a budget of zero spent no grants, and saying a
+                    # budget was spent would be untrue of the commonest stop
+                    # an operator configures.
+                    "review ended without approval. "
+                    f"{grant_account([*recorded, assessment]).sentence()}",
                     review_round,
                     "review",
                 ),
                 reconciled,
+                assessment,
             )
         return _ReviewClassification(
             _PhaseOutcome(
@@ -718,6 +804,7 @@ class HostReviewFixPhase:
                 "fix",
             ),
             reconciled,
+            assessment,
         )
 
     @staticmethod
@@ -965,17 +1052,34 @@ class _PhaseOutcome:
 
 @dataclass(frozen=True, slots=True)
 class _ReviewClassification:
-    """A review's outcome beside the ledger its round leaves behind.
+    """A review's outcome beside the ledger and grant its round leaves behind.
 
     Only a review that actually reviewed reconciles, so every other outcome
-    carries no ledger at all: a reviewer that could not review, an agent that
-    failed or was cancelled, a changed branch and a modified worktree all leave
-    the rows as the round before them left them, because objections recorded
-    from a review that never formed them are objections no later round answers.
+    carries neither a ledger nor an assessment: a reviewer that could not
+    review, an agent that failed or was cancelled, a changed branch and a
+    modified worktree all leave the rows as the round before them left them,
+    because objections recorded from a review that never formed them are
+    objections no later round answers — and a round with nothing to weigh has
+    no grant to account for either.
     """
 
     outcome: _PhaseOutcome
     ledger: tuple[ExecutionLedgerFinding, ...] = ()
+    assessment: ReviewAssessment | None = None
+
+
+def _assessment_borg_id(context: ScheduledTaskContext) -> UUID:
+    """Return the Borg this task's recorded assessments are scoped under.
+
+    The record is a Borg's, and a task claim names only its run, so the run is
+    where the loop finds out whose rounds it is accounting for.
+    """
+    run = context.store.get_execution_run(context.claim.run_id)
+    if run is None:
+        raise ReviewFixPhaseError(
+            f"execution run {context.claim.run_id} is no longer recorded"
+        )
+    return run.borg_id
 
 
 def _ledger_round(runtime: TaskRuntime) -> int:
@@ -1102,7 +1206,7 @@ def _render_review_prompt(
     base_commit: str,
     current_commit: str,
     review_round: int,
-    open_findings: Sequence[ExecutionLedgerFinding] = (),
+    open_ledger: Sequence[ExecutionLedgerFinding] = (),
     unfinished: tuple[str, tuple[str, ...]] | None = None,
 ) -> str:
     sections = [
@@ -1121,7 +1225,7 @@ def _render_review_prompt(
         f"Current task commit: {current_commit}",
         f"Review round: {review_round}",
     ]
-    if open_findings:
+    if open_ledger:
         sections.extend(
             [
                 "",
@@ -1131,7 +1235,7 @@ def _render_review_prompt(
                 "Judge each against the tree in front of you, and name it by "
                 "the id shown here in resolved or in repeats.",
                 "",
-                *_ledger_lines(open_findings),
+                *_ledger_lines(open_ledger),
             ]
         )
     if unfinished is not None:

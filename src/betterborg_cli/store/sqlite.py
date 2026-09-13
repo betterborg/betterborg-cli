@@ -830,6 +830,7 @@ class SqliteStore:
         loop: str | None = None,
         cycle_id: str | None = None,
         plan_approval_id: UUID | None = None,
+        task_id: UUID | None = None,
     ) -> list[ReviewAssessment]:
         """Return recorded assessments, optionally limited to one loop's scope."""
         query = "SELECT * FROM review_assessments WHERE borg_id = ?"
@@ -843,6 +844,9 @@ class SqliteStore:
         if plan_approval_id is not None:
             query += " AND plan_approval_id = ?"
             parameters.append(str(plan_approval_id))
+        if task_id is not None:
+            query += " AND task_id = ?"
+            parameters.append(str(task_id))
         query += " ORDER BY created_at, round, id"
         with self.locked_connection() as connection:
             rows = connection.execute(query, parameters).fetchall()

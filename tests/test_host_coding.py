@@ -61,6 +61,7 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.planning.grants import TASK_REVIEW_LOOP
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.repository_config import BlockedTaskPolicy
@@ -74,6 +75,7 @@ from betterborg_cli.store import (
     Repository,
     RepositoryAnalysis,
     RepositoryPackage,
+    ReviewAssessment,
     SqliteStore,
     TaskBatch,
     TaskClaim,
@@ -1123,9 +1125,14 @@ def test_rejection_increments_round_before_fix_and_projects_mixed_billing(
     assert task_row.cost.subscription_included is True
 
 
-def test_review_pass_cap_blocks_after_persisting_last_findings(
+def test_a_task_with_no_grant_budget_blocks_after_persisting_last_findings(
     tmp_path: Path,
 ) -> None:
+    """A budget of nothing asks for exactly the passes and the block they reach.
+
+    The reason it blocks with names what the passes showed rather than the
+    number configured, because the number is no longer what ended them.
+    """
     fixture = _coding_fixture(tmp_path)
     review = (
         MockAdapter()
@@ -1159,6 +1166,7 @@ def test_review_pass_cap_blocks_after_persisting_last_findings(
             config=HostReviewFixConfig(
                 review_model="review-model",
                 review_passes=2,
+                grant_budget=0,
             ),
         ).run(fixture.context(store))
         runtime = store.get_task_runtime(fixture.task.id)
@@ -1168,7 +1176,10 @@ def test_review_pass_cap_blocks_after_persisting_last_findings(
     assert runtime is not None
     assert runtime.review_round == 2
     assert runtime.resume_phase == "review"
-    assert runtime.state_reason == "review pass limit 2 reached"
+    assert runtime.state_reason == (
+        "review ended without approval. The loop took no rounds past its minimum "
+        "of 2, and its last round was not converging."
+    )
     assert [attempt.phase for attempt in attempts] == [
         "coding",
         "review",
@@ -1221,7 +1232,7 @@ def test_review_findings_reach_the_ledger_with_the_severity_they_declared(
             fixture.repository,
             review,
             config=HostReviewFixConfig(
-                review_model="review-model", review_passes=1
+                review_model="review-model", review_passes=1, grant_budget=0
             ),
         ).run(fixture.context(store))
         rows = store.list_execution_ledger_findings(fixture.task.id)
@@ -1355,7 +1366,7 @@ def test_a_second_review_closes_one_objection_and_raises_another_again(
             review,
             fix_adapter=fix,
             config=HostReviewFixConfig(
-                review_model="review-model", review_passes=2
+                review_model="review-model", review_passes=2, grant_budget=0
             ),
         ).run(fixture.context(store))
         rows = store.list_execution_ledger_findings(fixture.task.id)
@@ -1475,7 +1486,7 @@ def test_neither_prompt_carries_an_objection_a_round_already_closed(
             review,
             fix_adapter=fix,
             config=HostReviewFixConfig(
-                review_model="review-model", review_passes=3
+                review_model="review-model", review_passes=3, grant_budget=0
             ),
         ).run(fixture.context(store))
         rows = store.list_execution_ledger_findings(fixture.task.id)
@@ -1657,7 +1668,7 @@ def test_an_unplaceable_resolved_id_leaves_its_row_open_and_a_repeat_regresses(
             review,
             fix_adapter=fix,
             config=HostReviewFixConfig(
-                review_model="review-model", review_passes=2
+                review_model="review-model", review_passes=2, grant_budget=0
             ),
         ).run(fixture.context(store))
         rows = store.list_execution_ledger_findings(fixture.task.id)
@@ -1669,6 +1680,377 @@ def test_an_unplaceable_resolved_id_leaves_its_row_open_and_a_repeat_regresses(
     regressed = _ledger_row_for(rows, _UNBOUNDED_TIMEOUT)
     assert regressed.status is FindingStatus.REGRESSED
     assert regressed.first_seen_round == 2
+
+
+def _assessments(
+    store: SqliteStore, fixture: CodingFixture
+) -> list[ReviewAssessment]:
+    """Return what this task's review passes recorded about themselves."""
+    return store.list_review_assessments(
+        fixture.borg.id, loop=TASK_REVIEW_LOOP, task_id=fixture.task.id
+    )
+
+
+def _repeating_review(store: SqliteStore, fixture: CodingFixture):
+    """A reviewer that raises the one blocker it already raised, by its id."""
+
+    def review(spec):
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        return _review_payload(
+            fixture.task,
+            status="issues_found",
+            findings=[
+                _finding(
+                    _UNBOUNDED_TIMEOUT,
+                    severity="blocker",
+                    repeats=str(_ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id),
+                )
+            ],
+        )
+
+    return review
+
+
+def test_a_draining_review_ledger_runs_past_the_configured_passes(
+    tmp_path: Path,
+) -> None:
+    """The configured passes are a minimum, and a closing loop keeps going.
+
+    Three trials of a ten-task sweep lost a task to its pass limit mid-argument.
+    A pass that leaves fewer objections open than the pass before it costs the
+    task nothing, so a review that is getting somewhere argues on to agreement.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def closing_review(spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                resolved=[
+                    str(_ledger_row_for(rows, _BROAD_PATTERN).id),
+                    str(_ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id),
+                ],
+                findings=[_finding(_UNNAMED_FIXTURE)],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_BROAD_PATTERN, _UNBOUNDED_TIMEOUT],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=closing_review))
+            .queue(
+                MockResponse(
+                    payload=_review_payload(fixture.task, status="approved")
+                )
+            )
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(_fixing_response(fixture.task))
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        recorded = _assessments(store, fixture)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(review.calls) == 3
+    # The first pass is the minimum and is neither charged nor refunded. Both
+    # passes past it left fewer objections open than their predecessor, so both
+    # were refunded and the budget paid for none of them.
+    assert [
+        (item.round, item.open_findings, item.refunded) for item in recorded
+    ] == [(1, 2, None), (2, 1, True), (3, 0, True)]
+    assert {item.minimum for item in recorded} == {1}
+    # Each round keeps the drain it was judged from, so the evidence for a
+    # verdict outlives the round that reached it.
+    assert [item.evidence["drain"][-1] for item in recorded] == [
+        {"new": 2, "open_after": 2, "resolved": 0, "round": 1},
+        {"new": 1, "open_after": 1, "resolved": 2, "round": 2},
+        {"new": 0, "open_after": 0, "resolved": 1, "round": 3},
+    ]
+    assert {row.status for row in rows} == {FindingStatus.RESOLVED}
+
+
+def test_a_review_repeating_one_blocker_spends_its_budget_and_blocks(
+    tmp_path: Path,
+) -> None:
+    """A pass that closes nothing is the pass the budget exists to bound.
+
+    The recorded reason names what the passes showed rather than the number
+    configured: the number is no longer what ended them, and an operator
+    reading a blocked task wants the evidence the loop stopped on.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        repeat = _repeating_review(store, fixture)
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[
+                            _finding(_UNBOUNDED_TIMEOUT, severity="blocker")
+                        ],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=repeat))
+            .queue(MockResponse(dynamic=repeat))
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(_fixing_response(fixture.task))
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=2
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        recorded = _assessments(store, fixture)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert [(item.round, item.refunded) for item in recorded] == [
+        (1, None),
+        (2, False),
+        (3, False),
+    ]
+    assert runtime is not None
+    assert runtime.state_reason == (
+        "review ended without approval. The loop took 2 granted rounds past its "
+        "minimum of 1, 2 of them closing nothing, and its last round was not "
+        "converging."
+    )
+    # The terminal state is the one it always was: the reviewed commit is still
+    # on the task's retained branch and the objection stands.
+    assert runtime.resume_phase == "review" and runtime.branch
+    assert [row.status for row in rows] == [FindingStatus.REGRESSED]
+
+
+def test_a_budget_of_zero_leaves_a_draining_task_at_its_configured_passes(
+    tmp_path: Path,
+) -> None:
+    """Zero asks for exactly today's passes and today's block.
+
+    A draining loop is the one a budget buys passes for, so a repository that
+    configures none has to see its configured pass end even that task.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def closing_review(spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                resolved=[
+                    str(_ledger_row_for(rows, _BROAD_PATTERN).id),
+                    str(_ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id),
+                ],
+                findings=[_finding(_UNNAMED_FIXTURE)],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_BROAD_PATTERN, _UNBOUNDED_TIMEOUT],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=closing_review))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=2, grant_budget=0
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        recorded = _assessments(store, fixture)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert len(fix.calls) == 1
+    # Both passes are inside the minimum, so neither is a grant, and the loop
+    # blocks on a pass it was closing findings in.
+    assert [
+        (item.round, item.open_findings, item.refunded) for item in recorded
+    ] == [(1, 2, None), (2, 1, None)]
+    assert runtime is not None and runtime.review_round == 2
+    assert runtime.state_reason == (
+        "review ended without approval. The loop took no rounds past its minimum "
+        "of 2, and its last round was converging."
+    )
+
+
+def test_a_review_grant_budget_below_zero_is_refused() -> None:
+    """Zero asks for today's passes; below zero asks for fewer than the minimum."""
+    assert (
+        HostReviewFixConfig(review_model="review-model", grant_budget=0).grant_budget
+        == 0
+    )
+    with pytest.raises(ValueError, match="grant budget must not be negative"):
+        HostReviewFixConfig(review_model="review-model", grant_budget=-1)
+
+
+def test_a_granted_pass_is_counted_once_across_an_interrupted_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed loop must not spend the budget its interrupted round spent.
+
+    The grant is recorded with the attempt that earned it, so the round the
+    resume replays is the round the record already holds: reassessing it would
+    charge one pass twice and lose the bound the budget promises.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[
+                            _finding(_UNBOUNDED_TIMEOUT, severity="blocker")
+                        ],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=_repeating_review(store, fixture)))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        config = HostReviewFixConfig(
+            review_model="review-model", review_passes=1, grant_budget=1
+        )
+        transition = store.transition_task_runtime
+
+        def crash_before_blocking(*args, **kwargs):
+            if kwargs.get("new_status") is TaskRuntimeStatus.BLOCKED:
+                raise RuntimeError("simulated restart after durable review")
+            return transition(*args, **kwargs)
+
+        monkeypatch.setattr(store, "transition_task_runtime", crash_before_blocking)
+        with pytest.raises(RuntimeError, match="simulated restart"):
+            HostReviewFixPhase(
+                fixture.repository, review, fix_adapter=fix, config=config
+            ).run(fixture.context(store))
+        monkeypatch.setattr(store, "transition_task_runtime", transition)
+
+        replay = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository, replay, fix_adapter=replay, config=config
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        recorded = _assessments(store, fixture)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert len(review.calls) == 2
+    assert replay.calls == []
+    assert [(item.round, item.refunded) for item in recorded] == [
+        (1, None),
+        (2, False),
+    ]
+    assert runtime is not None
+    assert "took 1 granted round past its minimum of 1" in (
+        runtime.state_reason or ""
+    )
+
+
+@pytest.mark.parametrize(
+    "review_passes", [1, 3], ids=["granted-pass", "inside-the-minimum"]
+)
+def test_a_fix_without_a_commit_blocks_on_the_spot_in_any_pass(
+    review_passes: int, tmp_path: Path
+) -> None:
+    """The one bound a longer loop meets more often, and it is unchanged.
+
+    A fix round whose agent produces no commit blocks the task where it stands,
+    with no second try, and a granted pass buys it none.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_BROAD_PATTERN],
+                    )
+                )
+            )
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_UNBOUNDED_TIMEOUT],
+                    )
+                )
+            )
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(MockResponse(payload=_completed_payload(fixture.task)))
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=review_passes
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None and runtime.review_round == 2
+    assert runtime.state_reason == (
+        "fix reported completed without producing a commit; worktree preserved"
+    )
 
 
 def test_a_review_that_could_not_review_leaves_the_ledger_untouched(
@@ -1763,7 +2145,9 @@ def test_a_cancelled_round_records_nothing_and_its_rerun_records_once(
 
     with SqliteStore.open(fixture.database) as store:
         _prepare_review(fixture, store)
-        config = HostReviewFixConfig(review_model="review-model", review_passes=1)
+        config = HostReviewFixConfig(
+            review_model="review-model", review_passes=1, grant_budget=0
+        )
         resumable = HostReviewFixPhase(
             fixture.repository, interrupted, config=config
         ).run(fixture.context(store))
@@ -1854,6 +2238,123 @@ def test_a_rounds_findings_are_durable_with_the_attempt_that_produced_them(
     assert len(interrupted.calls) == 1
     assert _BROAD_PATTERN in fix.calls[0].user_prompt
     assert [row.id for row in rows] == [recorded[0].id]
+
+
+def test_a_grant_is_decided_on_this_tasks_passes_and_no_others(
+    tmp_path: Path,
+) -> None:
+    """The configured minimum is shared; the rounds that spend it are not.
+
+    Every task of a run records under one loop and one Borg, so a history read
+    without the task would compare this round against whichever task happened to
+    record the matching round first — and refund a pass that closed nothing.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    def repeat(spec):
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        if not rows:
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[_finding(_BROAD_PATTERN, severity="blocker")],
+            )
+        return _review_payload(
+            fixture.task,
+            status="issues_found",
+            findings=[
+                _finding(
+                    _BROAD_PATTERN,
+                    severity="blocker",
+                    repeats=str(rows[0].id),
+                )
+            ],
+        )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        # Another task of the same run, one round in, holding more open than
+        # this task ever will. Read into this task's history it would make every
+        # round of it look like one that closed something.
+        store.record_review_assessment(
+            ReviewAssessment(
+                borg_id=fixture.borg.id,
+                loop=TASK_REVIEW_LOOP,
+                task_id=uuid4(),
+                round=1,
+                minimum=1,
+                converging=False,
+                open_findings=5,
+            )
+        )
+        review = MockAdapter()
+        for _ in range(2):
+            review.queue(MockResponse(dynamic=repeat))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=MockAdapter().queue(_fixing_response(fixture.task)),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=1
+            ),
+        ).run(fixture.context(store))
+        recorded = store.list_review_assessments(
+            fixture.borg.id, loop=TASK_REVIEW_LOOP, task_id=fixture.task.id
+        )
+
+    # Its own round one left one objection open and round two left the same one,
+    # so the grant bought nothing and the single-grant budget is spent.
+    assert [(item.round, item.open_findings, item.refunded) for item in recorded] == [
+        (1, 1, None),
+        (2, 1, False),
+    ]
+    assert status is TaskRuntimeStatus.BLOCKED
+
+
+def test_an_assessment_that_cannot_be_recorded_leaves_its_attempt_unfinished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grant a round spent is durable with the round's own outcome.
+
+    A resume replays a completed attempt without assessing again, so a snapshot
+    written outside that step and lost is lost for good — and the round after it
+    is charged for a pass that had in fact closed findings.
+    """
+    fixture = _coding_fixture(tmp_path)
+    review = MockAdapter().queue(
+        MockResponse(
+            payload=_review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[_BROAD_PATTERN],
+            )
+        )
+    )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def refuse(assessment):
+            raise RuntimeError("simulated assessment failure")
+
+        monkeypatch.setattr(store, "record_review_assessment", refuse)
+        with pytest.raises(RuntimeError, match="simulated assessment failure"):
+            HostReviewFixPhase(
+                fixture.repository,
+                review,
+                config=HostReviewFixConfig(review_model="review-model"),
+            ).run(fixture.context(store))
+        monkeypatch.undo()
+        attempt = store.list_agent_attempts(fixture.task.id)[-1]
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        recorded = store.list_review_assessments(
+            fixture.borg.id, loop=TASK_REVIEW_LOOP, task_id=fixture.task.id
+        )
+
+    assert attempt.status is ExecutionAttemptStatus.RUNNING
+    # The findings rolled back with it, so the round is wholly replayable.
+    assert rows == []
+    assert recorded == []
 
 
 def test_findings_that_cannot_be_recorded_leave_their_attempt_unfinished(

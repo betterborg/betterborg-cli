@@ -265,6 +265,8 @@ effort = "low"
         ("jobs = 0", "jobs must be in 1..10"),
         ("jobs = 11", "jobs must be in 1..10"),
         ("review_passes = 0", "review_passes must be at least 1"),
+        ("grant_budget = -1", "execution.grant_budget must not be negative"),
+        ("grant_budget = 1.5", "execution.grant_budget must be an integer"),
         ("sanity = 0", "sanity must be true or false"),
         ('sanity = "off"', "sanity must be true or false"),
     ],
@@ -450,6 +452,52 @@ grant_budget = 0
     config = load_repository_config(paths)
 
     assert config.planning.grant_budget == 0
+
+
+def test_loads_the_grant_budget_a_task_review_reads(git_repo: Path) -> None:
+    """How many passes of closing nothing a task may add to its minimum."""
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[execution]
+review_passes = 2
+grant_budget = 4
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.execution.review_passes == 2
+    assert config.execution.grant_budget == 4
+
+
+def test_an_execution_grant_budget_of_nothing_is_a_legal_answer(
+    git_repo: Path,
+) -> None:
+    """It is how an operator asks for exactly the passes and their block."""
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[execution]
+grant_budget = 0
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.execution.grant_budget == 0
 
 
 def test_a_repository_can_declare_that_nothing_gates_its_merged_tip(

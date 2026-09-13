@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from betterborg_cli.store import (
+    ExecutionLedgerFinding,
     FindingStatus,
     PlanningLedgerFinding,
     TaskLedgerFinding,
@@ -33,7 +34,7 @@ _OPEN_STATUSES = frozenset({FindingStatus.OPEN, FindingStatus.REGRESSED})
 #: that stops the row counting as open in every round after it.
 _CLOSED_STATUSES = frozenset({FindingStatus.RESOLVED})
 
-LedgerRow = PlanningLedgerFinding | TaskLedgerFinding
+LedgerRow = ExecutionLedgerFinding | PlanningLedgerFinding | TaskLedgerFinding
 
 #: One row's ``(first_seen_round, last_seen_round, status, severity)``, which
 #: is everything the drain and the veto read.
