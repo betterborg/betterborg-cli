@@ -20,7 +20,7 @@ from betterborg_cli.planning.plan_contracts import (
     validate_plan_json,
 )
 from betterborg_cli.planning.pm import (
-    PM_OUTPUT_RETRY_CAP,
+    PM_OUTPUT_RETRY_MINIMUM,
     PROJECT_MANAGER_TASKS_SCHEMA,
     ProjectManagerCancelled,
     ProjectManagerError,
@@ -84,7 +84,7 @@ __all__ = [
     "ArchitectResult",
     "NonProgressingTaskRepairError",
     "PlanElement",
-    "PM_OUTPUT_RETRY_CAP",
+    "PM_OUTPUT_RETRY_MINIMUM",
     "PROJECT_MANAGER_TASKS_SCHEMA",
     "ProjectManagerCancelled",
     "ProjectManagerError",

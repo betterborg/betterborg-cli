@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from betterborg_cli.planning.grants import (
     EXECUTION_GRANT_BUDGET,
     PLANNING_GRANT_BUDGET,
@@ -40,8 +42,8 @@ def _recorded(
 
 def test_the_unconfigured_budget_is_the_one_the_loops_default_to() -> None:
     assert PlanningLimits().grant_budget == PLANNING_GRANT_BUDGET
-    # The two loops declare the constant itself as their default, so what is
-    # worth pinning is the literal the repository reports against it.
+    # Every loop declares the constant itself as its default, so what is worth
+    # pinning is the literal the repository reports against it.
     assert ExecutionLimits().grant_budget == EXECUTION_GRANT_BUDGET
 
 
@@ -320,3 +322,50 @@ def test_one_tasks_account_never_counts_another_tasks_passes(
 
     assert (account.rounds, account.grants, account.charged) == (2, 1, 1)
     assert account.minimum == 1
+
+
+def test_a_loop_whose_test_is_not_a_count_hands_in_its_own_verdict() -> None:
+    """Its rows carry no snapshot, so the evidence is the verdict itself.
+
+    The budget the verdict spends is the same budget and the same comparison as
+    every count-comparing loop's, which is why the verdict arrives here rather
+    than being turned into a charge somewhere else.
+    """
+    recorded = _recorded((1, None, None))
+
+    earned = assess_grant(
+        review_round=2, minimum=1, budget=1, progressed=True, recorded=recorded
+    )
+    spent = assess_grant(
+        review_round=2, minimum=1, budget=1, progressed=False, recorded=recorded
+    )
+
+    assert (earned.refunded, earned.continues) == (True, True)
+    assert (spent.refunded, spent.continues) == (False, False)
+
+
+def test_a_verdict_inside_the_minimum_is_still_neither_charged_nor_refunded() -> None:
+    """What makes a round a grant is the round it is, not its evidence."""
+    decision = assess_grant(
+        review_round=1,
+        minimum=1,
+        budget=1,
+        progressed=True,
+        recorded=[],
+    )
+
+    assert decision.refunded is None
+    assert decision.continues is True
+
+
+def test_a_round_assessed_on_two_kinds_of_evidence_or_none_is_refused() -> None:
+    """One round, one test: the alternative is a silent second answer."""
+    for evidence in ({}, {"snapshot": 1, "progressed": True}):
+        with pytest.raises(ValueError, match="exactly one kind of evidence"):
+            assess_grant(
+                review_round=2,
+                minimum=1,
+                budget=1,
+                recorded=_recorded((1, 2, None)),
+                **evidence,
+            )

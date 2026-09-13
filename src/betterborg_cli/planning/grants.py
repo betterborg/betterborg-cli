@@ -3,9 +3,11 @@
 A loop's configured rounds are a minimum. Every round past it is a grant, and
 a grant is issued whenever the budget holds, whether or not the findings are
 draining: draining decides how a granted round is spent, not whether it
-happens. A grant that closed nothing is charged against the budget and one
-that closed something is refunded, so the budget bounds how long a loop may
-grind, never how long it may run.
+happens. A grant that showed no progress is charged against the budget and
+one that showed progress is refunded, so the budget bounds how long a loop may
+grind, never how long it may run. Progress is net and each loop proves it on its
+own evidence, so a round that closes one objection while raising another is a
+round that showed nothing.
 
 The loop stops when its charged grants reach the budget. Counting from the
 other end gives the same number and is the shape the loops' own checks
@@ -97,34 +99,53 @@ def assess_grant(
     review_round: int,
     minimum: int,
     budget: int,
-    snapshot: int,
     recorded: Sequence[ReviewAssessment],
+    snapshot: int | None = None,
+    progressed: bool | None = None,
 ) -> GrantDecision:
     """Decide what this round cost its loop and whether another one follows.
 
-    ``snapshot`` is the count of objections still open after this round's
-    reconciliation, and a granted round earns its refund by coming in strictly
-    below its predecessor's recorded count. The comparison is between two
-    snapshots and never between two rows of a drain: a drain is recomputed from
-    current lifecycle state every time it is read, so an objection that
-    regresses raises its earlier rounds' counts after the fact.
+    Every loop demonstrates progress from its own evidence and one rule turns
+    that into a budget, so a round arrives here with exactly one of two things.
 
-    A round whose predecessor recorded no answer earned no refund. Progress is
-    proven, never presumed, so a loop whose bookkeeping went missing must not
-    become one that runs for free.
+    ``snapshot`` is the count of objections still open after this round's
+    reconciliation, for a loop whose evidence is a reviewer's findings: it earns
+    its refund by coming in strictly below its predecessor's recorded count. The
+    comparison is between two snapshots and never between two rows of a drain: a
+    drain is recomputed from current lifecycle state every time it is read, so an
+    objection that regresses raises its earlier rounds' counts after the fact.
+
+    A round whose predecessor recorded no count earned no refund on that arm:
+    progress is proven, never presumed, so a loop whose bookkeeping went missing
+    must not become one that runs for free.
+
+    ``progressed`` is the verdict a loop whose evidence is not a count has
+    already reached by its own test, which is why its rows carry no snapshot to
+    compare. That arm's caller owns the same guarantee in its own terms, because
+    it is the only thing that can: evidence it cannot read is evidence of
+    nothing, and the verdict it hands in says so. What is owned here either way
+    is which rounds are grants and what the grants cost.
     """
 
+    if (snapshot is None) == (progressed is None):
+        raise ValueError(
+            "a round is assessed on exactly one kind of evidence: a snapshot to "
+            "compare against its predecessor's, or a verdict its own test reached"
+        )
     history = [item for item in recorded if item.round < review_round]
     refunded: bool | None = None
     if review_round > minimum:
-        previous = next(
-            (item for item in history if item.round == review_round - 1), None
-        )
-        refunded = (
-            previous is not None
-            and previous.open_findings is not None
-            and snapshot < previous.open_findings
-        )
+        if progressed is not None:
+            refunded = progressed
+        else:
+            previous = next(
+                (item for item in history if item.round == review_round - 1), None
+            )
+            refunded = (
+                previous is not None
+                and previous.open_findings is not None
+                and snapshot < previous.open_findings
+            )
     refunds = sum(1 for item in history if item.refunded) + bool(refunded)
     return GrantDecision(
         refunded=refunded,

@@ -1145,3 +1145,62 @@ def test_the_supervisor_is_told_the_rule_its_decision_is_judged_by() -> None:
         _SUPERVISOR_SYSTEM_PROMPT
     )
     assert "approve only while holding none" in _SUPERVISOR_SYSTEM_PROMPT
+
+
+def test_a_spent_project_manager_budget_ends_the_run_the_way_it_always_did(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    configure_interactive_cli,
+) -> None:
+    """Exhaustion still names the contract and still says how to come back.
+
+    The attempts before it are the repository's own number now, and reaching the
+    end of them changes nothing about where the run stops or what it says.
+    """
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo, planning_cli_repository, "pm-contract", plan
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\npm_output_retries = 1\ngrant_budget = 1\n",
+        encoding="utf-8",
+    )
+    unowned = _pm_tasks(plan)
+    dropped = unowned["tasks"][0]["plan_refs"].pop()
+    adapter = MockAdapter(name="openai")
+    # One more than the two the configured minimum and budget allow, so a run
+    # that took an attempt it was not owed is a count that disagrees rather than
+    # an adapter that ran dry.
+    for _attempt_number in range(3):
+        adapter.queue(MockResponse(payload=unowned))
+    configure_interactive_cli(
+        repository.root,
+        adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / ".pm-contract-state",
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "approve", "pm-contract", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert len(adapter.calls) == 2
+    assert (
+        "Decomposition for Borg 'pm-contract' could not continue (Project "
+        "Manager exhausted output retries: task graph validation failed: "
+        "task.traceability.unowned: required approved-plan element has no "
+        f"valid task owner (plan element {dropped})). "
+        "Run 'betterborg plan approve pm-contract' to resume."
+    ) in result.output
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "pm-contract")
+        assert borg is not None
+        assert borg.state is BorgState.PM_WORKING
+        assert store.get_current_task_generation(borg.id) is None

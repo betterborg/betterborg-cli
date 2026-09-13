@@ -19,6 +19,7 @@ from betterborg_cli.agent_runtime.structured import (
 from betterborg_cli.planning import (
     SUPERVISOR_REVIEW_SCHEMA,
     NonProgressingTaskRepairError,
+    ProjectManagerCancelled,
     ProjectManagerError,
     ProjectManagerLoop,
     SupervisorCancelled,
@@ -1224,6 +1225,11 @@ def test_supervisor_rejects_nonprogressing_pm_revisions(
                 supervisor,
                 pm_agent=pm,
                 approved_plan=plan,
+                # A revision that changed nothing leaves no findings to weigh,
+                # so no attempt of this cycle can earn a refund. Buying no
+                # grants keeps the bound at the minimum, which is the bound
+                # this rejection is about.
+                grant_budget=0,
             ).run()
 
         assert store.get_borg(borg.id).state is BorgState.PM_WORKING
@@ -1248,6 +1254,7 @@ def test_supervisor_rejects_nonprogressing_pm_revisions(
                 supervisor,
                 pm_agent=pm,
                 approved_plan=plan,
+                grant_budget=0,
             ).run()
         assert len(pm.calls) == 3
 
@@ -1294,6 +1301,7 @@ def test_supervisor_rejects_order_only_pm_revisions(
                 supervisor,
                 pm_agent=pm,
                 approved_plan=plan,
+                grant_budget=0,
             ).run()
 
         assert len(store.list_task_batches(borg.id)) == 1
@@ -3235,4 +3243,757 @@ def test_a_grant_budget_that_is_not_a_whole_number_at_or_above_zero_is_refused(
                 MockAdapter(name="openai"),
                 approved_plan=plan,
                 grant_budget=budget,
+            )
+
+
+def _unowned(plan: dict, *dropped: str, revision: str = "") -> dict:
+    """Build a batch leaving the named required plan elements unowned.
+
+    Each dropped reference is one ``task.traceability.unowned`` finding whose
+    identity is the element it names and nothing else, so a batch dropping fewer
+    of them leaves a strict subset of the previous attempt's findings, and one
+    dropping a different element swaps one finding for another.
+    """
+
+    payload = _pm_payload(plan, revision=revision)
+    for task in payload["tasks"]:
+        task["plan_refs"] = [
+            ref for ref in task["plan_refs"] if ref not in dropped
+        ]
+    return payload
+
+
+def _pm_rows(store, borg_id, approval, *, batch_id=None):
+    """Return what one Project Manager cycle recorded, in round order."""
+    return [
+        row
+        for row in store.list_review_assessments(
+            borg_id, loop="pm_tasks", plan_approval_id=approval.id
+        )
+        if row.batch_id == batch_id
+    ]
+
+
+def _pm_assessments(store, borg_id, approval, *, batch_id=None):
+    return [
+        (row.round, row.minimum, row.open_findings, row.refunded, row.converging)
+        for row in _pm_rows(store, borg_id, approval, batch_id=batch_id)
+    ]
+
+
+def _pm_evidence(store, borg_id, approval, *, batch_id=None):
+    return [
+        row.evidence
+        for row in _pm_rows(store, borg_id, approval, batch_id=batch_id)
+    ]
+
+
+def _reenter_project_manager(store: SqliteStore, borg_id: UUID) -> Borg:
+    """Put a Borg back where a Supervisor requesting changes puts it."""
+    borg = store.get_borg(borg_id)
+    assert borg is not None
+    return store.compare_and_set_borg_state(
+        borg.id,
+        expected_state=borg.state,
+        expected_version=borg.state_version,
+        new_state=BorgState.PM_WORKING,
+    )
+
+
+def test_a_shrinking_contract_failure_earns_its_refund_and_publishes(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Past the minimum every attempt is a grant, and a repairing one is free.
+
+    The attempt that publishes is the third of a cycle whose minimum is one, so
+    a counter would have ended this run on the contract failure the attempt
+    after it repaired.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-granted.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-granted"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+
+        result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=1,
+        ).run()
+
+        assert result.borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(pm.calls) == 3
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, True, True),
+        ]
+
+
+def test_a_repeated_contract_failure_earns_no_refund_and_stops_at_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The same contract failure three times buys nothing and stops.
+
+    This is a first batch, so nothing here can be refused for coming back
+    unchanged: every attempt is judged on the finding it left standing.
+    Re-entering afterwards raises on what the attempts recorded rather than
+    running the cycle again, which is what a resumed run walks into.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-repeating.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-repeating"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        for revision in ("", " two", " three"):
+            pm.queue(
+                MockResponse(payload=_unowned(plan, required[0], revision=revision))
+            )
+
+        with pytest.raises(
+            ProjectManagerError, match="exhausted output retries.*unowned"
+        ):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=2,
+            ).run()
+
+        assert len(pm.calls) == 3
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, False, False),
+            (3, 1, None, False, False),
+        ]
+
+        with pytest.raises(ProjectManagerError, match="exhausted output retries"):
+            ProjectManagerLoop(
+                repository,
+                store.get_borg(borg.id),
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=2,
+            ).run()
+
+        assert len(pm.calls) == 3
+
+
+def test_swapping_one_contract_failure_for_another_earns_nothing(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A finding closed while another opens leaves the attempt where it was."""
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-swapped.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-swapped"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_unowned(plan, required[1])))
+
+        with pytest.raises(ProjectManagerError, match="exhausted output retries"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert len(pm.calls) == 2
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, False, False),
+        ]
+        swapped = _pm_evidence(store, borg.id, approval)[1]
+        # One finding out and one in, so the count is unmoved and the attempt
+        # is charged for a repair that repaired nothing.
+        assert len(swapped["previous"]) == len(swapped["repaired"]) == 1
+        assert swapped["previous"] != swapped["repaired"]
+
+
+def test_closing_findings_while_renumbering_the_batch_earns_nothing(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The identities compared carry the position of the task they are about.
+
+    Inserting a task shifts every later position, so a surviving finding reads
+    as one removed and one introduced. That is the conservative direction and it
+    costs the attempt its refund even though its findings fell.
+    """
+    plan = _plan()
+    first = _pm_payload(plan)
+    for task in first["tasks"]:
+        task["plan_refs"] = [*task["plan_refs"], "P9.absent"]
+    renumbered = json.loads(json.dumps(first))
+    renumbered["tasks"][0]["plan_refs"] = [
+        ref for ref in renumbered["tasks"][0]["plan_refs"] if ref != "P9.absent"
+    ]
+    inserted = json.loads(json.dumps(first["tasks"][0]))
+    inserted["stem"] = "02-extra"
+    inserted["plan_refs"] = ["P1.goal"]
+    inserted["dependencies"] = []
+    renumbered["tasks"].insert(0, inserted)
+    database = committed_git_repo.parent / "pm-renumbered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-renumbered"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=first))
+        pm.queue(MockResponse(payload=renumbered))
+
+        with pytest.raises(ProjectManagerError, match="exhausted output retries"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, False, False),
+        ]
+        charged = _pm_evidence(store, borg.id, approval)[1]
+        # Fewer findings than the attempt before it, and charged anyway.
+        assert len(charged["repaired"]) < len(charged["previous"])
+        assert [entry[1] for entry in charged["previous"]] == [
+            ["position:1"],
+            ["position:2"],
+        ]
+        assert [entry[1] for entry in charged["repaired"]] == [["position:3"]]
+
+
+def test_a_parse_failure_is_not_what_the_next_attempt_is_compared_against(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The comparison reaches back to the last attempt that produced findings.
+
+    A response this loop could not parse leaves nothing to compare, so charging
+    the revision after it would charge a draining cycle for the gap. The attempt
+    it spent still counts, because it recorded nothing.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    malformed = _pm_payload(plan)
+    malformed["tasks"][0].pop("tests")
+    database = committed_git_repo.parent / "pm-parse-gap.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-parse-gap"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        for _attempt in range(DEFAULT_SCHEMA_MAX_ATTEMPTS):
+            pm.queue(MockResponse(payload=malformed))
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+
+        result = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=2,
+        ).run()
+
+        assert result.borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(pm.calls) == DEFAULT_SCHEMA_MAX_ATTEMPTS + 3
+        # No row for the unparseable attempt: it had nothing to weigh, and an
+        # attempt with no record is one the budget counts.
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (3, 1, None, True, True),
+        ]
+
+
+def test_a_parse_loop_stops_at_the_minimum_plus_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A cycle that cannot emit a parseable batch stops where grinding stops.
+
+    The attempt that reaches the end of the budget ends the run on the response
+    it could not read, which is the failure a person is being asked about.
+    """
+    plan = _plan()
+    malformed = _pm_payload(plan)
+    malformed["tasks"][0].pop("tests")
+    database = committed_git_repo.parent / "pm-parse-loop.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-parse-loop"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        for _attempt in range(3 * DEFAULT_SCHEMA_MAX_ATTEMPTS):
+            pm.queue(MockResponse(payload=malformed))
+
+        with pytest.raises(ProjectManagerError) as error:
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert "structured result validation failed" in str(error.value)
+        assert "exhausted" not in str(error.value)
+        assert len(pm.calls) == 2 * DEFAULT_SCHEMA_MAX_ATTEMPTS
+        assert _pm_assessments(store, borg.id, approval) == []
+
+
+def test_a_revision_that_changes_nothing_stops_at_the_minimum_plus_the_budget(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A revision matching the batch it revises records nothing and counts.
+
+    It matched a batch that had already passed validation, so it produced no
+    findings to weigh, and an attempt with no record earns no refund.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "pm-unchanged.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-unchanged"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        for _attempt in range(3):
+            pm.queue(MockResponse(payload=_pm_payload(plan)))
+
+        with pytest.raises(
+            ProjectManagerError,
+            match="exhausted revision retries.*no semantic progress",
+        ):
+            ProjectManagerLoop(
+                repository,
+                _reenter_project_manager(store, borg.id),
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert len(pm.calls) == 3
+        assert (
+            _pm_assessments(store, borg.id, approval, batch_id=initial.batch.id)
+            == []
+        )
+
+
+def test_a_cycles_first_attempt_earns_nothing_from_the_cycle_before_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Findings are compared within one cycle and never across two.
+
+    The first attempt of a revision cycle revises the batch the cycle before it
+    published, so reaching past that boundary would hand it a refund off
+    evidence about a batch nobody is revising any more.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-cycles.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-cycles"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=1,
+        ).run()
+        pm.queue(
+            MockResponse(payload=_unowned(plan, required[0], revision=" revised"))
+        )
+
+        with pytest.raises(
+            ProjectManagerError, match="exhausted revision retries"
+        ):
+            ProjectManagerLoop(
+                repository,
+                _reenter_project_manager(store, borg.id),
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=0,
+            ).run()
+
+        assert len(pm.calls) == 3
+        revised = _pm_assessments(
+            store, borg.id, approval, batch_id=initial.batch.id
+        )
+        assert revised == [(1, 1, None, None, False)]
+        opening = _pm_evidence(
+            store, borg.id, approval, batch_id=initial.batch.id
+        )[0]
+        first_cycle = _pm_evidence(store, borg.id, approval)[0]
+        # Its finding is a strict subset of what the cycle before it left, and
+        # it was compared against nothing all the same.
+        assert opening["previous"] == []
+        assert len(opening["repaired"]) == 1
+        assert len(first_cycle["repaired"]) == 2
+        assert opening["repaired"][0] in first_cycle["repaired"]
+
+
+def test_a_revision_cycle_reads_its_own_records_and_not_the_cycles_before_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A cycle spends its own budget, and a refund belongs to the cycle that
+    earned it.
+
+    Read across the boundary, a revision cycle inherits the refund the cycle
+    before it earned and buys an attempt nothing about the batch in hand paid
+    for — which is the cross-cycle contamination the scope exists to stop.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-cycle-records.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-cycle-records"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        # The first cycle closes one of its two failures, so its second attempt
+        # is refunded, and its third publishes.
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=2,
+        ).run()
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, True, True),
+        ]
+
+        # The revision cycle closes nothing on any attempt, so its own records
+        # spend its own budget: one round inside the minimum and two charged.
+        for marker in (" one", " two", " three", " four"):
+            pm.queue(
+                MockResponse(
+                    payload=_unowned(plan, required[0], revision=marker)
+                )
+            )
+        with pytest.raises(ProjectManagerError, match="exhausted revision"):
+            ProjectManagerLoop(
+                repository,
+                _reenter_project_manager(store, borg.id),
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=2,
+            ).run()
+
+        # Three attempts of the revision cycle, and the fourth response is
+        # still queued: the refund the first cycle earned bought nothing here.
+        assert len(pm.calls) == 6
+        assert _pm_assessments(
+            store, borg.id, approval, batch_id=initial.batch.id
+        ) == [
+            (1, 1, None, None, False),
+            (2, 1, None, False, False),
+            (3, 1, None, False, False),
+        ]
+
+
+def test_an_attempt_that_recorded_nothing_cannot_reclaim_an_earlier_refund(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A round with no record of its own earned no refund.
+
+    A cycle's budget check reads the row for the round in hand, not the newest
+    row there is.
+    Reading the newest, an attempt that recorded nothing at all would re-claim
+    the refund the round before it earned and buy itself another turn.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    malformed = _pm_payload(plan)
+    malformed["tasks"][0].pop("tests")
+    database = committed_git_repo.parent / "pm-unrecorded.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-unrecorded"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        # The attempt after the refunded one comes back unreadable, so it
+        # records nothing of its own.
+        for _attempt in range(2 * DEFAULT_SCHEMA_MAX_ATTEMPTS):
+            pm.queue(MockResponse(payload=malformed))
+
+        with pytest.raises(ProjectManagerError) as error:
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert "structured result validation failed" in str(error.value)
+        # Two attempts that recorded, and one that did not: the budget saw one
+        # refund, not two, so the unreadable attempt was the last one.
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, True, True),
+        ]
+        assert len(pm.calls) == 2 + DEFAULT_SCHEMA_MAX_ATTEMPTS
+
+
+def test_a_resumed_cycle_reaches_the_count_the_interruption_did_not_move(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A refund survives the run that earned it, and so does the comparison.
+
+    The attempts are numbered from the durable record and the findings they are
+    compared against are recomputed from the payloads they persisted, so the
+    resumed cycle spends the same budget the uninterrupted one would have.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-resumed-grant.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-resumed-grant"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        cancel = CancellationToken()
+        pm = MockAdapter(name="openai")
+        pm.queue(
+            MockResponse(
+                payload=_unowned(plan, required[0], required[1], required[2])
+            )
+        )
+
+        def interrupted(_spec):
+            cancel.cancel()
+            return _unowned(plan, required[0], required[1])
+
+        pm.queue(MockResponse(dynamic=interrupted))
+
+        with pytest.raises(ProjectManagerCancelled, match="cancelled"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=2,
+                cancel=cancel,
+            ).run()
+
+        assert len(pm.calls) == 2
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+
+        result = ProjectManagerLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=2,
+        ).run()
+
+        assert result.borg.state is BorgState.SUPERVISOR_WORKING
+        assert len(pm.calls) == 4
+        assert _pm_assessments(store, borg.id, approval) == [
+            (1, 1, None, None, False),
+            (2, 1, None, True, True),
+            (3, 1, None, True, True),
+        ]
+
+
+def test_a_refund_missing_from_the_record_costs_one_attempt(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    """A missing record reads as an attempt that earned nothing.
+
+    The same three attempts publish a batch when the record survives. Losing it
+    costs the cycle the attempt the refund bought, which is the direction that
+    keeps the bound: a lost charge would be a cycle that never stops.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-lost-refund.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-lost-refund"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        monkeypatch.setattr(
+            store, "record_review_assessment", lambda _assessment: None
+        )
+        pm = MockAdapter(name="openai")
+        pm.queue(MockResponse(payload=_unowned(plan, required[0], required[1])))
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+
+        with pytest.raises(ProjectManagerError, match="exhausted output retries"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        assert len(pm.calls) == 2
+        assert _pm_assessments(store, borg.id, approval) == []
+
+
+def test_a_refund_that_cannot_be_recorded_leaves_its_attempt_unfinished(
+    committed_git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_planning_context,
+) -> None:
+    """The attempt's completion and what it earned are one durable step.
+
+    An attempt completed without its refund is one the guard charges for, so the
+    two land together or neither does and the resume replays the attempt whole.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-refund-write.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-refund-write"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+
+        def refuse(_assessment):
+            raise RuntimeError("simulated assessment failure")
+
+        monkeypatch.setattr(store, "record_review_assessment", refuse)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_unowned(plan, required[0]))
+        )
+
+        with pytest.raises(RuntimeError, match="simulated assessment failure"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=1,
+            ).run()
+
+        monkeypatch.undo()
+        attempt = store.list_planning_attempts(borg.id)[-1]
+        assert attempt.phase == "pm_tasks"
+        assert attempt.status is PlanningAttemptStatus.RUNNING
+        assert _pm_assessments(store, borg.id, approval) == []
+
+
+def test_project_manager_minimums_below_their_floors_are_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A minimum below one would run no attempt; a budget below zero fewer."""
+    plan = _plan()
+    database = committed_git_repo.parent / "pm-floors.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-floors"
+        )
+        _approval, borg = _approve_plan(store, borg, plan)
+        with pytest.raises(ProjectManagerError, match="at least 1"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                output_retries=0,
+            )
+        with pytest.raises(ProjectManagerError, match="at least 0"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                approved_plan=plan,
+                grant_budget=-1,
             )

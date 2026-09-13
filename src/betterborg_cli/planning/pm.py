@@ -22,6 +22,10 @@ from betterborg_cli.planning.findings_ledger import (
     open_task_findings,
     task_ledger_json,
 )
+from betterborg_cli.planning.grants import (
+    PLANNING_GRANT_BUDGET,
+    assess_grant,
+)
 from betterborg_cli.planning.task_render import (
     render_task_markdown,
     task_markdown_digest,
@@ -29,9 +33,13 @@ from betterborg_cli.planning.task_render import (
 from betterborg_cli.planning.task_validation import (
     TASK_NAME_PATTERN,
     TASK_REFERENCE_PATTERN,
+    NonProgressingTaskRepairError,
+    TaskGraphFinding,
     TaskGraphValidationError,
     build_plan_element_catalog,
+    task_graph_findings,
     validate_task_graph,
+    validate_task_repair_progress,
 )
 from betterborg_cli.planning.turns import (
     DurablePlanningTurns,
@@ -47,6 +55,7 @@ from betterborg_cli.store import (
     PlanningAttempt,
     PlanningAttemptStatus,
     Repository,
+    ReviewAssessment,
     SqliteStore,
     TaskBatch,
     TaskComplexity,
@@ -55,7 +64,11 @@ from betterborg_cli.store import (
     TaskRecord,
 )
 
-PM_OUTPUT_RETRY_CAP = 3
+#: Attempts a Project Manager cycle gets at a valid task graph before its
+#: grants begin. Past it an attempt is free when it strictly reduced the set of
+#: deterministic findings left by the last attempt of its cycle that produced
+#: any, and introduced none of its own; every other attempt spends a grant.
+PM_OUTPUT_RETRY_MINIMUM = 3
 _PM_PHASE = "pm_tasks"
 
 _NONBLANK_STRING: dict[str, Any] = {
@@ -216,8 +229,39 @@ def task_batch_semantic_digest(tasks: Sequence[Mapping[str, Any]]) -> str:
     return approved_plan_digest({"tasks": canonical_tasks})
 
 
+def _retry_kind(base_batch: TaskBatch | None) -> str:
+    """Name the kind of attempt a cycle has run out of.
+
+    One wording for one stop, wherever the loop notices it: a cycle with a batch
+    to revise ran out of revisions, and the first cycle of an approval ran out of
+    attempts at an output.
+    """
+
+    return "revision" if base_batch is not None else "output"
+
+
+def _repair_progressed(
+    previous: Sequence[TaskGraphFinding],
+    repaired: Sequence[TaskGraphFinding],
+) -> bool:
+    """Whether an attempt earned its refund by repairing the one before it.
+
+    The test itself is the product's own, and stricter than a falling count: an
+    attempt progresses by removing at least one of the findings left for it
+    while introducing none. An attempt with nothing to compare against has
+    removed nothing and earns nothing: a cycle's first attempt is one such, and
+    so is any attempt whose cycle has yet to produce a finding at all.
+    """
+
+    try:
+        validate_task_repair_progress(previous, repaired)
+    except NonProgressingTaskRepairError:
+        return False
+    return True
+
+
 class ProjectManagerLoop:
-    """Generate and persist a complete task batch for one approved plan."""
+    """Persist one approved plan's task batch while the grant budget holds."""
 
     def __init__(
         self,
@@ -236,9 +280,22 @@ class ProjectManagerLoop:
         child_key: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
+        output_retries: int = PM_OUTPUT_RETRY_MINIMUM,
+        grant_budget: int = PLANNING_GRANT_BUDGET,
     ) -> None:
         if cancel is not None and cancel.is_set():
             raise ProjectManagerCancelled("Project Manager run cancelled")
+        if not isinstance(output_retries, int) or output_retries < 1:
+            raise ProjectManagerError(
+                "Project Manager output retries must be a whole number of at "
+                "least 1"
+            )
+        # Zero buys nothing and is legal; below zero would stop the cycle short
+        # of the minimum it was told to run.
+        if not isinstance(grant_budget, int) or grant_budget < 0:
+            raise ProjectManagerError(
+                "Project Manager grant budget must be a whole number of at least 0"
+            )
         require_read_only_agent(
             agent, role="Project Manager", error_factory=ProjectManagerError
         )
@@ -264,6 +321,8 @@ class ProjectManagerLoop:
         self.progress = progress
         self.stage_key = stage_key
         self.child_key = child_key
+        self.output_retries = output_retries
+        self.grant_budget = grant_budget
         if progress is not None:
             if child_key is None and stage_key not in progress.stages:
                 progress.declare(StageSpec(stage_key, "Project Manager"))
@@ -407,28 +466,60 @@ class ProjectManagerLoop:
                     result=payload,
                     summary=summary,
                 )
-                if len(self._attempts_for_cycle(approval, base_batch)) >= (
-                    PM_OUTPUT_RETRY_CAP
-                ):
+                # A batch that already passed validation leaves no findings to
+                # weigh, so this attempt records nothing and an attempt with no
+                # record earned no refund.
+                if not self._cycle_continues(approval, base_batch):
                     raise ProjectManagerError(
-                        "Project Manager exhausted revision retries: " + summary
+                        f"Project Manager exhausted {_retry_kind(base_batch)} "
+                        f"retries: {summary}"
                     )
                 continue
             try:
                 validate_task_graph(plan, tasks, dependencies)
             except TaskGraphValidationError as error:
                 summary = str(error)
-                self.store.complete_planning_attempt(
-                    attempt.id,
-                    status=PlanningAttemptStatus.FAILED,
-                    result=payload,
-                    summary=summary,
+                attempts = self._attempts_for_cycle(approval, base_batch)
+                previous = self._comparable_findings(
+                    approval,
+                    plan,
+                    [item for item in attempts if item.id != attempt.id],
                 )
-                if len(self._attempts_for_cycle(approval, base_batch)) >= (
-                    PM_OUTPUT_RETRY_CAP
-                ):
+                progressed = _repair_progressed(previous, error.findings)
+                grant = assess_grant(
+                    review_round=len(attempts),
+                    minimum=self.output_retries,
+                    budget=self.grant_budget,
+                    progressed=progressed,
+                    recorded=self._assessments_for_cycle(approval, base_batch),
+                )
+                # One durable step for the attempt and what it earned: a refund
+                # recorded without its attempt would pay for work that never
+                # happened, and an attempt completed without its refund is one
+                # the guard charges for on the next entry.
+                with self.store.transaction():
+                    self.store.complete_planning_attempt(
+                        attempt.id,
+                        status=PlanningAttemptStatus.FAILED,
+                        result=payload,
+                        summary=summary,
+                    )
+                    self.store.record_review_assessment(
+                        self._assessment(
+                            approval,
+                            base_batch,
+                            attempt,
+                            round_number=len(attempts),
+                            progressed=progressed,
+                            refunded=grant.refunded,
+                            previous=previous,
+                            findings=error.findings,
+                        )
+                    )
+                if not grant.continues:
                     raise ProjectManagerError(
-                        "Project Manager exhausted output retries: " + summary
+                        f"Project Manager exhausted {_retry_kind(base_batch)} "
+                        f"retries: {summary}"
                     ) from error
                 continue
 
@@ -639,23 +730,185 @@ class ProjectManagerLoop:
     def _require_retry_budget(
         self, approval: PlanApproval, base_batch: TaskBatch | None
     ) -> None:
+        """Refuse the next attempt of a cycle whose last one failed with no
+        grants left.
+
+        Read on every entry, which is what a resumed run enters through, so it
+        reads the records the attempts left rather than judging them again: an
+        attempt whose record is missing earned no refund, which is how the
+        failures with nothing to weigh are counted without a rule of their own.
+
+        A cycle whose last attempt did not fail is left alone, as it was before
+        there was a budget: an interrupted attempt is one the turn machinery
+        resumes rather than one this loop refuses, and a cycle whose grants are
+        spent is stopped by the attempt after it instead.
+        """
+
         attempts = self._attempts_for_cycle(approval, base_batch)
-        if len(attempts) < PM_OUTPUT_RETRY_CAP or not attempts:
+        if not attempts:
             return
         latest = attempts[-1]
         if latest.status is not PlanningAttemptStatus.FAILED:
             return
-        kind = "revision" if base_batch is not None else "output"
+        if self._cycle_continues(approval, base_batch, attempts=attempts):
+            return
         raise ProjectManagerError(
-            f"Project Manager exhausted {kind} retries: "
+            f"Project Manager exhausted {_retry_kind(base_batch)} retries: "
             + (latest.summary or "last attempt failed")
         )
+
+    def _cycle_continues(
+        self,
+        approval: PlanApproval,
+        base_batch: TaskBatch | None,
+        *,
+        attempts: Sequence[PlanningAttempt] | None = None,
+    ) -> bool:
+        """Whether this cycle's unrefunded attempts leave room for another.
+
+        Where the reads with nothing of their own to weigh get their answer. The
+        validation branch reaches the same answer from the same rule, in the call
+        that also decides what its attempt earned, so the count and the comparand
+        are one everywhere: attempts, minus the refunds they recorded, against
+        the minimum plus the budget.
+        """
+
+        if attempts is None:
+            attempts = self._attempts_for_cycle(approval, base_batch)
+        recorded = self._assessments_for_cycle(approval, base_batch)
+        latest = next(
+            (item for item in recorded if item.round == len(attempts)), None
+        )
+        return assess_grant(
+            review_round=len(attempts),
+            minimum=self.output_retries,
+            budget=self.grant_budget,
+            progressed=latest is not None and bool(latest.refunded),
+            recorded=recorded,
+        ).continues
+
+    def _assessments_for_cycle(
+        self, approval: PlanApproval, base_batch: TaskBatch | None
+    ) -> list[ReviewAssessment]:
+        """Return what this cycle's attempts recorded, and no other cycle's.
+
+        Scoped the way the attempt count is scoped, because an assessment of a
+        revision cycle is evidence about the batch it revised and nothing about
+        the batch before it.
+        """
+
+        batch_id = None if base_batch is None else base_batch.id
+        return [
+            item
+            for item in self.store.list_review_assessments(
+                self.borg_id, loop=_PM_PHASE, plan_approval_id=approval.id
+            )
+            if item.batch_id == batch_id
+        ]
+
+    def _assessment(
+        self,
+        approval: PlanApproval,
+        base_batch: TaskBatch | None,
+        attempt: PlanningAttempt,
+        *,
+        round_number: int,
+        progressed: bool,
+        refunded: bool | None,
+        previous: Sequence[TaskGraphFinding],
+        findings: Sequence[TaskGraphFinding],
+    ) -> ReviewAssessment:
+        """Build the record of what one validation failure showed."""
+
+        return ReviewAssessment(
+            borg_id=self.borg_id,
+            loop=_PM_PHASE,
+            # A plan approval and the batch being revised, which is the cycle
+            # the attempt count already respects. A first cycle revises no
+            # batch and names none.
+            plan_approval_id=approval.id,
+            batch_id=None if base_batch is None else base_batch.id,
+            attempt_id=attempt.id,
+            round=round_number,
+            minimum=self.output_retries,
+            # This loop's own test and the only question it asks: its findings
+            # come from a validator rather than an argument, so there is no
+            # reviewer's verdict to read and no attempt of it is ever steered.
+            converging=progressed,
+            # No snapshot, because the test is a comparison of finding sets and
+            # not a count. A zero here would read as an attempt that left
+            # nothing open, which is the one thing a failed validation is not.
+            open_findings=None,
+            refunded=refunded,
+            # The two sides the test compared, rather than the delta between
+            # them: the rule that subtracts them has one owner, and a stored
+            # copy of its arithmetic is a second answer waiting to disagree.
+            evidence={
+                "previous": [finding.identity for finding in previous],
+                "repaired": [finding.identity for finding in findings],
+            },
+        )
+
+    def _comparable_findings(
+        self,
+        approval: PlanApproval,
+        plan: Mapping[str, Any],
+        attempts: Sequence[PlanningAttempt],
+    ) -> tuple[TaskGraphFinding, ...]:
+        """Recompute the findings of the last of these attempts that had any.
+
+        The findings are a pure function of the payload an attempt persisted and
+        the approved plan, so a resumed run recomputes them rather than reading
+        a set it never stored. An attempt that produced none is skipped rather
+        than compared against: an unparseable response leaves nothing to
+        recompute from, and a revision that changed nothing semantically matched
+        a batch that had already passed validation, so charging the next attempt
+        for landing after either would charge it for the gap.
+        """
+
+        for attempt in reversed(attempts):
+            findings = self._recomputed_findings(approval, plan, attempt)
+            if findings:
+                return findings
+        return ()
+
+    def _recomputed_findings(
+        self,
+        approval: PlanApproval,
+        plan: Mapping[str, Any],
+        attempt: PlanningAttempt,
+    ) -> tuple[TaskGraphFinding, ...]:
+        """Recompute one attempt's deterministic findings from its payload."""
+
+        payload = attempt.result
+        if not isinstance(payload, Mapping):
+            return ()
+        try:
+            _, _, tasks, dependencies = self._materialize_graph(
+                approval, attempt, dict(payload)
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A response that never parsed is already handled above, so what
+            # reaches here is a payload the schema admitted that still will not
+            # build a graph. Evidence that cannot be read is evidence of
+            # nothing: the attempt removed nothing, and earns nothing.
+            return ()
+        return task_graph_findings(plan, tasks, dependencies)
 
     def _retryable_contract_failure(
         self, approval: PlanApproval, base_batch: TaskBatch | None
     ) -> bool:
+        """Whether a malformed response is worth one more attempt.
+
+        A response this loop could not parse records nothing, so the attempt it
+        spent is one the budget counts, and a cycle that cannot stop producing
+        them stops where every other kind of grinding stops.
+        """
+
         attempts = self._attempts_for_cycle(approval, base_batch)
-        if len(attempts) >= PM_OUTPUT_RETRY_CAP or not attempts:
+        if not attempts or not self._cycle_continues(
+            approval, base_batch, attempts=attempts
+        ):
             return False
         latest = attempts[-1]
         summary = (latest.summary or "").casefold()
@@ -845,7 +1098,7 @@ class ProjectManagerLoop:
 
 
 __all__ = [
-    "PM_OUTPUT_RETRY_CAP",
+    "PM_OUTPUT_RETRY_MINIMUM",
     "PROJECT_MANAGER_TASKS_SCHEMA",
     "ProjectManagerCancelled",
     "ProjectManagerError",

@@ -146,12 +146,14 @@ class ExecutionLimits:
 class PlanningLimits:
     """Repository defaults for how long planning review may argue.
 
-    The two round counts are minimums. ``grant_budget`` is how many rounds
-    past its minimum a loop may spend closing nothing before it stops.
+    The three counts are minimums, one per planning loop. ``grant_budget`` is
+    how many rounds past its minimum a loop may spend closing nothing before it
+    stops.
     """
 
     review_rounds: int = 3
     decomposition_rounds: int = 3
+    pm_output_retries: int = 3
     grant_budget: int = 10
 
 
@@ -354,7 +356,12 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     planning_document = _optional_table(document, "planning")
     _require_only_keys(
         planning_document,
-        {"review_rounds", "decomposition_rounds", "grant_budget"},
+        {
+            "review_rounds",
+            "decomposition_rounds",
+            "pm_output_retries",
+            "grant_budget",
+        },
         section="planning",
     )
     review_rounds = _optional_int(
@@ -368,6 +375,13 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
     if decomposition_rounds < 1:
         raise RepositoryConfigError(
             "planning.decomposition_rounds must be at least 1"
+        )
+    pm_output_retries = _optional_int(
+        planning_document, "pm_output_retries", default=3, section="planning"
+    )
+    if pm_output_retries < 1:
+        raise RepositoryConfigError(
+            "planning.pm_output_retries must be at least 1"
         )
     grant_budget = _optional_int(
         planning_document, "grant_budget", default=10, section="planning"
@@ -395,6 +409,7 @@ def _parse_document(document: Mapping[str, Any]) -> RepositoryConfig:
         planning=PlanningLimits(
             review_rounds=review_rounds,
             decomposition_rounds=decomposition_rounds,
+            pm_output_retries=pm_output_retries,
             grant_budget=grant_budget,
         ),
     )

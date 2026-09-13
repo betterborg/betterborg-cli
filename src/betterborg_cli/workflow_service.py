@@ -150,6 +150,7 @@ def approve_plan_workflow(
                 cancel=cancel,
                 progress=progress,
                 review_rounds=config.planning.decomposition_rounds,
+                pm_output_retries=config.planning.pm_output_retries,
                 grant_budget=config.planning.grant_budget,
             ).run()
             borg = supervisor.borg

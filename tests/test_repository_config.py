@@ -308,6 +308,18 @@ default_branch = "main"
             "decomposition_rounds = 1.5",
             "planning.decomposition_rounds must be an integer",
         ),
+        (
+            "pm_output_retries = 0",
+            "planning.pm_output_retries must be at least 1",
+        ),
+        (
+            "pm_output_retries = -1",
+            "planning.pm_output_retries must be at least 1",
+        ),
+        (
+            "pm_output_retries = 1.5",
+            "planning.pm_output_retries must be an integer",
+        ),
         ("grant_budget = -1", "planning.grant_budget must not be negative"),
         ("grant_budget = 1.5", "planning.grant_budget must be an integer"),
     ],
@@ -408,7 +420,34 @@ def test_unconfigured_repository_keeps_the_default_decomposition_budget() -> Non
     assert PlanningLimits().decomposition_rounds == SUPERVISOR_ROUND_MINIMUM
 
 
-def test_loads_the_grant_budget_both_loops_read(git_repo: Path) -> None:
+def test_loads_the_project_manager_output_retries(git_repo: Path) -> None:
+    """How many attempts at a valid task graph a cycle gets before its grants."""
+    paths = _write_config(
+        git_repo,
+        f"""
+version = 1
+
+[repository]
+id = "{REPOSITORY_ID}"
+default_branch = "main"
+
+[planning]
+pm_output_retries = 6
+""",
+    )
+
+    config = load_repository_config(paths)
+
+    assert config.planning == PlanningLimits(pm_output_retries=6)
+
+
+def test_unconfigured_repository_keeps_the_default_output_retries() -> None:
+    from betterborg_cli.planning import PM_OUTPUT_RETRY_MINIMUM
+
+    assert PlanningLimits().pm_output_retries == PM_OUTPUT_RETRY_MINIMUM
+
+
+def test_loads_the_grant_budget_the_planning_loops_read(git_repo: Path) -> None:
     """How many rounds of showing nothing a loop may add to its minimum."""
     paths = _write_config(
         git_repo,

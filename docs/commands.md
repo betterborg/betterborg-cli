@@ -294,17 +294,48 @@ how many rounds it gets before the grants begin:
 decomposition_rounds = 5
 ```
 
-`grant_budget` is how many rounds of showing nothing either loop may add to
-its minimum, ten by default, counted per loop:
+The Project Manager's own attempts at a batch work the same way. Before any
+Supervisor sees one, Betterborg checks it against the plan it came from — every
+required plan element owned by exactly one task, every dependency pointing
+somewhere real — and hands back what it found. `pm_output_retries` is how many
+attempts a batch gets at those contracts before the grants begin, three by
+default:
+
+```toml
+[planning]
+pm_output_retries = 3
+```
+
+Past it, an attempt that removes at least one of the contract failures left for
+it and introduces none costs nothing. A failure is recognised by what it is
+about, and most are about a task and carry its place in the batch, so an
+attempt that repairs one thing while inserting or dropping a task moves every
+task after it and reads as having introduced everything it also removed: the
+safe answer, and a charged one. The two failures that are about the plan
+instead — a required plan element no task owns, a stage repository no task
+covers — name no task at all, so giving one of them an owner costs nothing even
+when the new task shifts every task behind it. One that repeats the failures,
+swaps one for another, comes back unreadable, or comes back identical to the
+batch it was revising spends a grant too, and when the grants are gone the run
+ends on whatever the last attempt got wrong — the contract it did not satisfy,
+the response that could not be read at all, or the revision that changed
+nothing. Running `betterborg plan approve NAME` again enters on the same record
+and stops in the same place, so it is a way back only once one of these numbers
+is raised.
+
+`grant_budget` is how many rounds of showing nothing any of the three may add to
+its minimum, ten by default, counted per loop — and for the Project Manager once
+for its first batch and once for every revision the Supervisor asks for, so a run
+whose Supervisor reviews three batches holds three of them:
 
 ```toml
 [planning]
 grant_budget = 10
 ```
 
-Zero is a legal budget, and asks for exactly the rounds the minimum declares
-and the blocks they reach: the first round past the minimum has no budget to
-come out of. Below zero is refused. The two minimums are whole numbers of at
+Zero is a legal budget, and asks for exactly the rounds each minimum declares
+and the stops they reach: the first round past a minimum then has no budget to
+come out of. Below zero is refused. The three minimums are whole numbers of at
 least one, and anything else is refused when the configuration is read rather
 than part-way through a review.
 
@@ -318,11 +349,13 @@ begin, never approval.
 
 Each review is told the round it is on and nothing about the budget: no loop
 knows whether a round is its last, because that depends on findings the round
-has not produced yet. All three settings are read when a run starts and govern that
-run, and a plan or a batch that has already blocked stays blocked whatever any
-of them becomes afterwards — including the account the gate gives of why it
+has not produced yet. All four settings are read when a run starts and govern
+that run, and a plan or a batch that has already blocked stays blocked whatever
+any of them becomes afterwards — including the account the gate gives of why it
 blocked, which is read from what the rounds recorded rather than from the
-settings in force now.
+settings in force now. A Project Manager out of grants is the one stop a raised
+number reaches, because it ends the run where it stands rather than blocking
+anything.
 
 Execution has its own table. `jobs` is how many tasks the scheduler runs at
 once, one to ten. `review_passes` is the minimum number of times a task goes

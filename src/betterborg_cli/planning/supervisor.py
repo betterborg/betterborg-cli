@@ -32,6 +32,7 @@ from betterborg_cli.planning.grants import (
     planning_grant_account,
 )
 from betterborg_cli.planning.pm import (
+    PM_OUTPUT_RETRY_MINIMUM,
     ProjectManagerCancelled,
     ProjectManagerError,
     ProjectManagerLoop,
@@ -232,6 +233,7 @@ class SupervisorLoop:
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
         review_rounds: int = SUPERVISOR_ROUND_MINIMUM,
+        pm_output_retries: int = PM_OUTPUT_RETRY_MINIMUM,
         grant_budget: int = PLANNING_GRANT_BUDGET,
     ) -> None:
         if cancel is not None and cancel.is_set():
@@ -246,7 +248,16 @@ class SupervisorLoop:
             raise SupervisorError(
                 "Supervisor grant budget must be a whole number of at least 0"
             )
+        # Refused here as well as by the loop it is carried to, so a caller
+        # learns it at construction like the two limits beside it rather than
+        # part-way through a decomposition round.
+        if not isinstance(pm_output_retries, int) or pm_output_retries < 1:
+            raise SupervisorError(
+                "Project Manager output retries must be a whole number of at "
+                "least 1"
+            )
         self.review_rounds = review_rounds
+        self.pm_output_retries = pm_output_retries
         self.grant_budget = grant_budget
         project_manager = pm_agent or agent
         require_read_only_agent(
@@ -396,6 +407,8 @@ class SupervisorLoop:
                         child_key=None if initial_work else child_key,
                         dirty_borg_documents=self.dirty_borg_documents,
                         worktrees_root=self.worktrees_root,
+                        output_retries=self.pm_output_retries,
+                        grant_budget=self.grant_budget,
                     ).run()
                 except ProjectManagerCancelled as error:
                     raise SupervisorCancelled(str(error)) from error
