@@ -15,6 +15,13 @@ from betterborg_cli.agent_runtime.selection import (
     require_read_only_agent,
     resolve_agent_model,
 )
+from betterborg_cli.planning.findings_ledger import (
+    REPEATS_SCHEMA,
+    RESOLVED_SCHEMA,
+    open_task_findings,
+    reconcile_task_ledger,
+    task_ledger_json,
+)
 from betterborg_cli.planning.pm import (
     ProjectManagerCancelled,
     ProjectManagerError,
@@ -71,19 +78,20 @@ SUPERVISOR_REVIEW_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "summary", "findings"],
+    "required": ["decision", "summary", "findings", "resolved"],
     "properties": {
         "decision": {
             "type": "string",
             "enum": ["approve", "request_changes"],
         },
         "summary": _NONBLANK_STRING,
+        "resolved": RESOLVED_SCHEMA,
         "findings": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["severity", "message"],
+                "required": ["severity", "message", "repeats"],
                 "properties": {
                     "severity": {
                         "type": "string",
@@ -92,6 +100,7 @@ SUPERVISOR_REVIEW_SCHEMA: dict[str, Any] = {
                     "message": _NONBLANK_STRING,
                     "suggestion": _NONBLANK_STRING,
                     "task_ref": _NONBLANK_STRING,
+                    "repeats": REPEATS_SCHEMA,
                 },
             },
         },
@@ -110,8 +119,16 @@ to commit. Do not modify files or redesign the batch; return actionable
 findings for the Project Manager. Your decision and your findings have to
 agree: return request_changes only while holding at least one blocker or major
 finding, and return approve only while holding none. A batch whose every fault
-is minor is one you approve, saying what the faults are. Return only the
-required JSON object.
+is minor is one you approve, saying what the faults are. Account for the open
+findings you were given: list in resolved the id of every one this batch
+closes, and on each finding of your own set repeats to the id of the open
+finding it raises again, or null when the objection is new. Both are always
+required, so a review that closes nothing sends an empty list and a new finding
+sends null. An open finding you neither resolve nor repeat stays open. Every
+revision mints fresh task references, so an open finding's
+raised_against_task_ref records where the objection started and is never a
+reference to reuse: a finding of your own names a task in the batch under
+review or no task at all. Return only the required JSON object.
 """
 
 
@@ -411,7 +428,9 @@ class SupervisorLoop:
                 },
             )
             try:
-                findings = self._findings(payload, attempt, batch, tasks, review_round)
+                declared = self._findings(
+                    payload, attempt, batch, tasks, review_round
+                )
             except SupervisorError as error:
                 self.store.complete_planning_attempt(
                     attempt.id,
@@ -430,6 +449,20 @@ class SupervisorLoop:
 
             decision_correction = ""
             decision = payload["decision"]
+            # Reconciled before the decision is taken, and written with it, so
+            # no reader is a round behind the objection it is judging.
+            findings = tuple(finding for finding, _ in declared)
+            ledger = reconcile_task_ledger(
+                self.store.list_task_ledger_findings(
+                    self.borg_id, plan_approval_id=approval.id
+                ),
+                findings=declared,
+                resolved=payload["resolved"],
+                attempt_id=attempt.id,
+                plan_approval_id=approval.id,
+                review_round=review_round,
+                approved=decision == "approve",
+            )
             if decision == "approve":
                 next_state = BorgState.READY_TO_EXECUTE
             elif review_round < self.review_rounds:
@@ -446,6 +479,7 @@ class SupervisorLoop:
                 )
                 for finding in findings:
                     self.store.append_task_finding(finding)
+                self.store.record_task_ledger_findings(ledger)
                 if decision != "approve":
                     borg = self._turns.transition(borg, next_state)
 
@@ -575,6 +609,15 @@ class SupervisorLoop:
         ]
         return {
             "approved_plan": plan,
+            # The history says everything every round said, with no lifecycle
+            # on any of it and no id to name a row by. The open ledger is the
+            # list a reviewer names ids from.
+            "open_supervisor_findings": [
+                task_ledger_json(row)
+                for row in open_task_findings(
+                    self.store, self.borg_id, batch.plan_approval_id
+                )
+            ],
             "prior_supervisor_findings": history,
             "task_batch": {
                 "digest": batch.digest,
@@ -593,36 +636,37 @@ class SupervisorLoop:
         batch: TaskBatch,
         tasks: tuple[TaskRecord, ...],
         review_round: int,
-    ) -> tuple[TaskFinding, ...]:
+    ) -> tuple[tuple[TaskFinding, str | None], ...]:
+        """Build this round's findings, each beside the objection it restates."""
+
         raw_findings = payload["findings"]
         if payload["decision"] == "request_changes" and not raw_findings:
             raise SupervisorError("Supervisor request_changes must include findings")
         known_refs = {task.task_ref for task in tasks}
-        findings: list[TaskFinding] = []
+        declared: list[tuple[TaskFinding, str | None]] = []
         for item in raw_findings:
             task_ref = item.get("task_ref")
             if task_ref is not None and task_ref not in known_refs:
                 raise SupervisorError(
                     f"Supervisor finding references unknown task {task_ref!r}"
                 )
-            findings.append(
-                TaskFinding(
-                    borg_id=self.borg_id,
-                    batch_id=batch.id,
-                    attempt_id=attempt.id,
-                    round=review_round,
-                    severity=item["severity"],
-                    message=item["message"].strip(),
-                    suggestion=(
-                        item["suggestion"].strip()
-                        if item.get("suggestion") is not None
-                        else None
-                    ),
-                    task_ref=task_ref,
-                )
+            finding = TaskFinding(
+                borg_id=self.borg_id,
+                batch_id=batch.id,
+                attempt_id=attempt.id,
+                round=review_round,
+                severity=item["severity"],
+                message=item["message"].strip(),
+                suggestion=(
+                    item["suggestion"].strip()
+                    if item.get("suggestion") is not None
+                    else None
+                ),
+                task_ref=task_ref,
             )
+            declared.append((finding, item["repeats"]))
         actionable = any(
-            finding.severity in {"blocker", "major"} for finding in findings
+            finding.severity in {"blocker", "major"} for finding, _ in declared
         )
         if payload["decision"] == "approve" and actionable:
             raise SupervisorError(
@@ -632,7 +676,7 @@ class SupervisorLoop:
             raise SupervisorError(
                 "Supervisor request_changes requires a blocker or major finding"
             )
-        return tuple(findings)
+        return tuple(declared)
 
     def _completed_reviews(self, approval: PlanApproval) -> list[PlanningAttempt]:
         return [

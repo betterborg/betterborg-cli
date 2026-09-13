@@ -19,6 +19,12 @@ from betterborg_cli.agent_runtime.selection import (
     resolve_agent_model,
 )
 from betterborg_cli.planning.architect import ArchitectCancelled, ArchitectLoop
+from betterborg_cli.planning.cycles import current_planning_cycle_id
+from betterborg_cli.planning.findings_ledger import (
+    REPEATS_SCHEMA,
+    RESOLVED_SCHEMA,
+    reconcile_planning_ledger,
+)
 from betterborg_cli.planning.plan_contracts import PlanValidationError
 from betterborg_cli.planning.turns import (
     DurablePlanningTurns,
@@ -50,19 +56,20 @@ TECH_LEAD_REVIEW_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "summary", "findings"],
+    "required": ["decision", "summary", "findings", "resolved"],
     "properties": {
         "decision": {
             "type": "string",
             "enum": ["approve", "request_changes"],
         },
         "summary": {"type": "string", "minLength": 1},
+        "resolved": RESOLVED_SCHEMA,
         "findings": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["severity", "message"],
+                "required": ["severity", "message", "repeats"],
                 "properties": {
                     "severity": {
                         "type": "string",
@@ -70,6 +77,7 @@ TECH_LEAD_REVIEW_SCHEMA: dict[str, Any] = {
                     },
                     "message": {"type": "string", "minLength": 1},
                     "suggestion": {"type": "string"},
+                    "repeats": REPEATS_SCHEMA,
                 },
             },
         },
@@ -77,16 +85,22 @@ TECH_LEAD_REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 _TECH_LEAD_SYSTEM_PROMPT = """You are the Tech Lead reviewing an Architect plan.
-Inspect the materialized repository, confirmed PRD, current plan, and complete
-finding history. Verify the plan against the actual code and return approve only
-when it is ready for human approval. Otherwise return concise, actionable
-findings for the Architect. Betterborg performs the delivery around the plan:
-branching, worktrees, commits, review, merge, and the repository's own checks.
-The plan covers the product change only, so never hold it to work Betterborg
-already does. A phase name is two digits then lowercase words of letters and
-digits, all joined by single hyphens and at most 32 characters, as in
-01-schema-migration, so never ask for a name the Architect cannot use. Do not
-modify files. Return only the required JSON object.
+Inspect the materialized repository, confirmed PRD, current plan, the open
+findings the plan still has to answer, and the complete finding history. Verify
+the plan against the actual code and return approve only when it is ready for
+human approval. Otherwise return concise, actionable findings for the
+Architect. Account for the open findings you were given: list in resolved the
+id of every one the current plan closes, and on each finding of your own set
+repeats to the id of the open finding it raises again, or null when the
+objection is new. Both are always required, so a review that closes nothing
+sends an empty list and a new finding sends null. An open finding you neither
+resolve nor repeat stays open. Betterborg performs the delivery around the
+plan: branching, worktrees, commits, review, merge, and the repository's own
+checks. The plan covers the product change only, so never hold it to work
+Betterborg already does. A phase name is two digits then lowercase words of
+letters and digits, all joined by single hyphens and at most 32 characters, as
+in 01-schema-migration, so never ask for a name the Architect cannot use. Do
+not modify files. Return only the required JSON object.
 """
 
 
@@ -283,7 +297,7 @@ class TechLeadLoop:
                 plan=plan,
             )
             try:
-                findings = self._findings(payload, attempt, review_round)
+                declared = self._findings(payload, attempt, review_round)
             except TechLeadError as error:
                 self.store.complete_planning_attempt(
                     attempt.id,
@@ -293,8 +307,24 @@ class TechLeadLoop:
                 )
                 raise
 
-            decision = payload["decision"]
-            if decision == "approve":
+            approved = payload["decision"] == "approve"
+            # Reconciled before the decision is taken, and written with it, so
+            # no reader is a round behind the objection it is judging.
+            findings = [finding for finding, _ in declared]
+            cycle_id = current_planning_cycle_id(self.store, self.borg_id)
+            ledger = reconcile_planning_ledger(
+                self.store.list_planning_ledger_findings(
+                    self.borg_id, cycle_id=cycle_id
+                ),
+                findings=declared,
+                resolved=payload["resolved"],
+                attempt_id=attempt.id,
+                cycle_id=cycle_id,
+                review_round=review_round,
+                approved=approved,
+            )
+
+            if approved:
                 next_state = BorgState.PLAN_APPROVAL_PENDING
             elif review_round < self.review_rounds:
                 next_state = BorgState.ARCHITECT_WORKING
@@ -310,6 +340,7 @@ class TechLeadLoop:
                 )
                 for finding in findings:
                     self.store.append_planning_finding(finding)
+                self.store.record_planning_ledger_findings(ledger)
                 borg = self._turns.transition(borg, next_state)
 
             if next_state is not BorgState.ARCHITECT_WORKING:
@@ -381,38 +412,39 @@ class TechLeadLoop:
         payload: dict[str, Any],
         attempt: PlanningAttempt,
         review_round: int,
-    ) -> list[PlanningFinding]:
+    ) -> list[tuple[PlanningFinding, str | None]]:
+        """Build this round's findings, each beside the objection it restates."""
+
         summary = str(payload["summary"])
         if not summary.strip():
             raise TechLeadError("Tech Lead summary must not be blank")
         raw_findings = list(payload["findings"])
         if payload["decision"] == "request_changes" and not raw_findings:
             raise TechLeadError("Tech Lead request_changes must include findings")
-        findings: list[PlanningFinding] = []
+        declared: list[tuple[PlanningFinding, str | None]] = []
         for item in raw_findings:
             message = str(item["message"])
             if not message.strip():
                 raise TechLeadError("Tech Lead finding messages must not be blank")
             suggestion = item.get("suggestion")
-            findings.append(
-                PlanningFinding(
-                    borg_id=self.borg_id,
-                    attempt_id=attempt.id,
-                    round=review_round,
-                    severity=str(item["severity"]),
-                    message=message.strip(),
-                    suggestion=(
-                        str(suggestion).strip() if suggestion is not None else None
-                    ),
-                )
+            finding = PlanningFinding(
+                borg_id=self.borg_id,
+                attempt_id=attempt.id,
+                round=review_round,
+                severity=str(item["severity"]),
+                message=message.strip(),
+                suggestion=(
+                    str(suggestion).strip() if suggestion is not None else None
+                ),
             )
+            declared.append((finding, item["repeats"]))
         if payload["decision"] == "approve" and any(
-            finding.severity in {"blocker", "major"} for finding in findings
+            finding.severity in {"blocker", "major"} for finding, _ in declared
         ):
             raise TechLeadError(
                 "Tech Lead cannot approve while blocker or major findings remain"
             )
-        return findings
+        return declared
 
     def _terminal_result(self) -> TechLeadResult | None:
         borg = self._turns.current_borg()

@@ -22,6 +22,7 @@ from betterborg_cli.planning import (
     TechLeadLoop,
     materialize_planning_worktree,
 )
+from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.repo_analysis import (
     build_machine_report,
@@ -30,9 +31,11 @@ from betterborg_cli.repo_analysis import (
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
     Borg,
+    FindingStatus,
     PlanChangeRequest,
     PlanningAttempt,
     PlanningFinding,
+    PlanningLedgerFinding,
     PlanningQuestion,
     PrdSession,
     Repository,
@@ -123,6 +126,40 @@ def test_materializes_detached_planning_context_without_touching_primary(
         )
         store.append_planning_finding(finding)
         store.append_plan_change_request(change_request)
+        standing = PlanningLedgerFinding(
+            borg_id=borg.id,
+            cycle_id=str(change_request.id),
+            attempt_id=attempt.id,
+            first_seen_round=1,
+            last_seen_round=1,
+            severity="major",
+            message="Rollback is not explicit.",
+            suggestion="Add a recovery step.",
+        )
+        store.record_planning_ledger_findings(
+            [
+                standing,
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=str(change_request.id),
+                    attempt_id=attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=2,
+                    status=FindingStatus.RESOLVED,
+                    severity="major",
+                    message="Migrations were not forward-only.",
+                ),
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=1,
+                    severity="blocker",
+                    message="An earlier cycle's objection.",
+                ),
+            ]
+        )
 
         status_before = _git(committed_git_repo, "status", "--short")
         worktrees_before = _git(committed_git_repo, "worktree", "list", "--porcelain")
@@ -186,7 +223,24 @@ def test_materializes_detached_planning_context_without_touching_primary(
             assert changes[0]["note"] == change_request.note
             findings = _json(context / "findings.json")
             assert findings[0]["message"] == finding.message
+            # The history is every objection every cycle collected, with no
+            # lifecycle on any of it; the ledger beside it is this cycle's
+            # open set, keyed by the id each objection was first recorded
+            # under so a reviewer can name it.
+            open_ledger = _json(context / "open-findings.json")
+            assert open_ledger == [
+                {
+                    "first_raised_in_round": 1,
+                    "id": str(standing.id),
+                    "message": "Rollback is not explicit.",
+                    "severity": "major",
+                    "suggestion": "Add a recovery step.",
+                }
+            ]
             manifest = _json(context / "manifest.json")
+            assert manifest["open_findings"] == (
+                ".betterborg/state/planning/context/open-findings.json"
+            )
             assert manifest["confirmed_prd"] == prd_path.as_posix()
             assert manifest["current_plan"] == ".betterborg/plans/safe-planning.md"
             assert manifest["dirty_borg_documents"] == [deliberate_path.as_posix()]

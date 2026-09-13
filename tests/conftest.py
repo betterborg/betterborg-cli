@@ -1008,6 +1008,7 @@ def _tech_lead_approval_response() -> dict:
         "decision": "approve",
         "summary": "The plan is ready for human approval.",
         "findings": [],
+        "resolved": [],
     }
 
 
@@ -1020,6 +1021,8 @@ def _tech_lead_change_request_response(message: str) -> dict:
                 "severity": "major",
                 "message": message,
                 "suggestion": "Clarify the plan and its verification.",
+                "repeats": None,
             }
         ],
+        "resolved": [],
     }

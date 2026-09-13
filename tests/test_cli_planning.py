@@ -21,6 +21,7 @@ from betterborg_cli.agent_runtime import (
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.planning import render_plan_markdown, validate_plan
+from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.repo_paths import RepoPaths
@@ -28,10 +29,12 @@ from betterborg_cli.repository_config import AgentStage
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    FindingStatus,
     PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningFinding,
+    PlanningLedgerFinding,
     PlanningQuestion,
     SqliteStore,
 )
@@ -596,6 +599,19 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
                 message="Name the supported platforms.",
             )
         )
+        store.record_planning_ledger_findings(
+            [
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=review_attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=1,
+                    severity="minor",
+                    message="Name the supported platforms.",
+                )
+            ]
+        )
         store.append_plan_change_request(
             PlanChangeRequest(
                 borg_id=borg.id,
@@ -624,10 +640,10 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
 
     assert markdown_result.exit_code == 0, markdown_result.output
     assert markdown_result.output.startswith(render_plan_markdown(plan))
-    # The finding belongs to the cycle a change request closed, so it no longer
-    # stands. Showing it would put a page of answered objections under a
-    # heading that says they are outstanding, with round numbers that repeat
-    # because each cycle counts its own from one.
+    # The ledger row belongs to the cycle a change request closed, and each
+    # cycle counts its own rounds from one, so showing it would put an
+    # answered objection under a heading that says it is outstanding beside a
+    # round number the new cycle will reuse.
     assert "## Tech Lead findings" not in markdown_result.output
     assert "Name the supported platforms." not in markdown_result.output
     assert markdown_progress.entries == 1
@@ -649,6 +665,91 @@ def test_plan_show_survives_checkout_drift_without_mutating_planning_history(
     assert json_progress.entries == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         assert _planning_snapshot(store, borg.id) == before
+
+
+def test_plan_show_lists_the_open_ledger_and_not_what_a_review_closed(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    monkeypatch,
+) -> None:
+    """The ledger is the row set, so the status filter is the whole narrowing.
+
+    A plan that blocks keeps its findings, and what stands against it is the
+    objections its latest revision never answered — never the ones a reviewer
+    already said the plan closed.
+    """
+    repository, paths = planning_cli_repository(committed_git_repo, "open-plan")
+    plan = planning_plan_response()
+    with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
+        borg = store.get_borg_by_name(repository.id, "open-plan")
+        assert borg is not None
+        plan_attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="architect_plan",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        review_attempt = PlanningAttempt(
+            borg_id=borg.id,
+            phase="tech_review",
+            round=1,
+            adapter="mock",
+            model="test-model",
+        )
+        store.append_planning_attempt(plan_attempt)
+        store.complete_planning_attempt(
+            plan_attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result=plan,
+            summary="Plan ready for review.",
+        )
+        store.append_planning_attempt(review_attempt)
+        store.complete_planning_attempt(
+            review_attempt.id,
+            status=PlanningAttemptStatus.COMPLETED,
+            result={"decision": "request_changes"},
+        )
+        store.record_planning_ledger_findings(
+            [
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=review_attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=2,
+                    status=FindingStatus.RESOLVED,
+                    severity="major",
+                    message="Name the supported platforms.",
+                ),
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=review_attempt.id,
+                    first_seen_round=2,
+                    last_seen_round=2,
+                    severity="blocker",
+                    message="Cover a partial rollback.",
+                    suggestion="Name the checks a partial rollback runs.",
+                ),
+            ]
+        )
+        store.compare_and_set_borg_state(
+            borg.id,
+            expected_state=borg.state,
+            expected_version=borg.state_version,
+            new_state=BorgState.BLOCKED,
+        )
+    monkeypatch.chdir(repository.root)
+
+    shown = cli_runner.invoke(cli, ["plan", "show", "open-plan"])
+
+    assert shown.exit_code == 0, shown.output
+    assert "- Round 2 (blocker): Cover a partial rollback." in shown.output
+    assert "Suggestion: Name the checks a partial rollback runs." in shown.output
+    assert "Name the supported platforms." not in shown.output
 
 
 def test_plan_show_reports_when_no_plan_is_stored(

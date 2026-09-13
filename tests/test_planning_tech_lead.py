@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from io import StringIO
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from planning_progress_test_support import BoundaryInterruptProgress
@@ -20,6 +21,8 @@ from betterborg_cli.planning import (
     TechLeadError,
     TechLeadLoop,
 )
+from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
+from betterborg_cli.planning.findings_ledger import open_planning_findings
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import (
     ChildRecord,
@@ -30,9 +33,11 @@ from betterborg_cli.progress import (
 from betterborg_cli.repository_config import PlanningLimits
 from betterborg_cli.store import (
     BorgState,
+    FindingStatus,
+    PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
-    PlanningFinding,
+    PlanningLedgerFinding,
     SqliteStore,
 )
 
@@ -1411,11 +1416,7 @@ def _current_plan(spec) -> dict:
 
 
 def _findings(spec) -> list[dict]:
-    return json.loads(
-        (
-            spec.cwd / ".betterborg/state/planning/context/findings.json"
-        ).read_text(encoding="utf-8")
-    )
+    return _published(spec, "findings.json")
 
 
 def _assert_prior_finding_count(spec, expected: int) -> None:
@@ -1554,105 +1555,749 @@ def _io(answers: Iterator[str] | None = None) -> InteractiveIO:
     )
 
 
-def _seed_review(store, borg, phase: str, decision: str, message: str) -> None:
-    """Put one completed review, and the finding it wrote, on the record."""
-    attempt = PlanningAttempt(
-        borg_id=borg.id,
-        phase=phase,
-        round=len(
-            [
-                item
-                for item in store.list_planning_attempts(borg.id)
-                if item.phase == phase
-            ]
-        )
-        + 1,
-        adapter="mock",
-        model="test-model",
-    )
-    store.append_planning_attempt(attempt)
-    store.complete_planning_attempt(
-        attempt.id,
-        status=PlanningAttemptStatus.COMPLETED,
-        result={"decision": decision},
-        summary=message,
-    )
-    if decision == "request_changes":
-        store.append_planning_finding(
-            PlanningFinding(
-                borg_id=borg.id,
-                attempt_id=attempt.id,
-                round=1,
-                severity="major",
-                message=message,
-            )
-        )
+_CONTEXT_DIR = Path(".betterborg/state/planning/context")
 
 
-def test_only_the_findings_the_current_plan_must_answer_still_stand(
+def _published(spec, name: str) -> list[dict]:
+    """Read one published planning-context document from a turn's worktree."""
+    return json.loads((spec.cwd / _CONTEXT_DIR / name).read_text(encoding="utf-8"))
+
+
+def _review(
+    decision: str,
+    *,
+    summary: str,
+    findings: Sequence[dict] = (),
+    resolved: Sequence[str] = (),
+) -> dict:
+    return {
+        "decision": decision,
+        "summary": summary,
+        "findings": list(findings),
+        "resolved": list(resolved),
+    }
+
+
+def _raised(
+    message: str,
+    *,
+    severity: str = "major",
+    repeats: str | None = None,
+    suggestion: str | None = None,
+) -> dict:
+    item: dict = {"severity": severity, "message": message, "repeats": repeats}
+    if suggestion is not None:
+        item["suggestion"] = suggestion
+    return item
+
+
+def _reviewer(
+    reviews: Sequence[Callable[[list[dict], list[dict]], dict]],
+    handed: list[list[dict]],
+) -> MockAdapter:
+    """Build a reviewer whose rounds answer the open ledger they were given."""
+
+    def answering(review):
+        def respond(spec):
+            ledger = _published(spec, "open-findings.json")
+            handed.append(ledger)
+            return review(ledger, _published(spec, "findings.json"))
+
+        return respond
+
+    reviewer = MockAdapter(name="openai")
+    for review in reviews:
+        reviewer.queue(MockResponse(dynamic=answering(review)))
+    return reviewer
+
+
+def _architect(planning_plan_response, revisions: int) -> MockAdapter:
+    architect = MockAdapter(name="openai")
+    architect.queue(MockResponse(payload={"decision": "ready_to_plan"}))
+    for index in range(revisions + 1):
+        architect.queue(
+            MockResponse(payload=planning_plan_response(summary=f"Plan {index}."))
+        )
+    return architect
+
+
+def _run_reviews(
+    repository,
+    borg,
+    store,
+    planning_plan_response,
+    reviews: Sequence[Callable[[list[dict], list[dict]], dict]],
+    handed: list[list[dict]],
+):
+    """Drive one Tech Lead cycle whose budget is exactly the rounds supplied."""
+    architect = _architect(planning_plan_response, len(reviews) - 1)
+    handoff = ArchitectLoop(repository, borg, store, architect, io=_io()).run()
+    return TechLeadLoop(
+        repository,
+        handoff.borg,
+        store,
+        _reviewer(reviews, handed),
+        architect_agent=architect,
+        io=_io(),
+        review_rounds=len(reviews),
+    ).run()
+
+
+def _ledger(store, borg_id) -> dict[str, object]:
+    return {
+        row.message: row for row in store.list_planning_ledger_findings(borg_id)
+    }
+
+
+def test_a_repeated_objection_stays_one_row_the_loop_already_failed_to_close(
     committed_git_repo: Path,
     persist_planning_context,
+    planning_plan_response,
 ) -> None:
-    """Three filters, and the record alone satisfies none of them.
+    """Resolution, carry-forward and a repeat of a row already closed.
 
-    A finding belongs to the round that wrote it. An approval answers the
-    finding that asked for it. A change request closes the cycle that held it.
-    And a Supervisor's finding is not a Tech Lead's, however alike they read.
+    A second row for the same objection would leave the first closed at the
+    round that closed it and the repeat born in the current one, so the round
+    that just heard an old objection again would read as one that fully
+    drained its predecessor.
     """
-    from betterborg_cli.planning.turns import standing_planning_findings
-    from betterborg_cli.store import PlanChangeRequest
+    handed: list[list[dict]] = []
 
-    database = committed_git_repo.parent / "standing-findings.sqlite3"
+    def round_one(ledger, _history):
+        assert ledger == []
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[
+                _raised("Cover a partial rollback.", severity="blocker"),
+            ],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is covered; the checks are not.",
+            resolved=[ledger[0]["id"]],
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def round_three(ledger, history):
+        # The closed objection left the open ledger, and the history still
+        # carries it under the id it was first recorded with.
+        assert [row["message"] for row in ledger] == ["Name the rollback checks."]
+        first = next(
+            item for item in history if item["message"] == "Cover a partial rollback."
+        )
+        return _review(
+            "request_changes",
+            summary="The rollback regressed.",
+            findings=[
+                _raised("Rollback coverage is gone again.", repeats=first["id"])
+            ],
+        )
+
+    database = committed_git_repo.parent / "ledger-repeat.sqlite3"
     with SqliteStore.open(database) as store:
         repository, borg = persist_planning_context(
-            committed_git_repo, store, "standing-findings"
+            committed_git_repo, store, "ledger-repeat"
         )
-        assert repository is not None
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three],
+            handed,
+        )
 
-        # A rejection the reviewer then approved: answered, so it stands no more.
-        _seed_review(store, borg, "tech_review", "request_changes", "cycle-1 round-1")
+        assert result.borg.state is BorgState.BLOCKED
+        # Each round was handed the ledger it answered, not a page of history.
         assert [
-            finding.message
-            for finding in standing_planning_findings(store, borg.id, "tech_review")
-        ] == ["cycle-1 round-1"]
-        _seed_review(store, borg, "tech_review", "approve", "cycle-1 approved")
-        assert standing_planning_findings(store, borg.id, "tech_review") == []
-
-        # A change request closes that cycle; the next one blocks.
-        store.append_plan_change_request(
-            PlanChangeRequest(borg_id=borg.id, round=1, note="Stage the rollout.")
-        )
-        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-1")
-        _seed_review(store, borg, "tech_review", "request_changes", "cycle-2 round-2")
-
-        standing = standing_planning_findings(store, borg.id, "tech_review")
-        assert [finding.message for finding in standing] == [
-            "cycle-2 round-1",
-            "cycle-2 round-2",
+            [row["message"] for row in ledger] for ledger in handed
+        ] == [
+            [],
+            ["Cover a partial rollback."],
+            ["Name the rollback checks."],
         ]
-        assert "cycle-1 round-1" not in [finding.message for finding in standing]
+        assert handed[1][0]["first_raised_in_round"] == 1
+        assert handed[1][0]["severity"] == "blocker"
 
-        # A second change request moves the boundary again.
-        store.append_plan_change_request(
-            PlanChangeRequest(borg_id=borg.id, round=2, note="Name the checks.")
-        )
-        _seed_review(store, borg, "tech_review", "request_changes", "cycle-3 round-1")
+        rows = _ledger(store, borg.id)
+        assert set(rows) == {"Cover a partial rollback.", "Name the rollback checks."}
+        repeated = rows["Cover a partial rollback."]
+        # The repeat moved the row instead of adding one, so it keeps the
+        # severity and message it was first recorded with.
+        assert repeated.status is FindingStatus.REGRESSED
+        assert repeated.severity == "blocker"
+        assert repeated.first_seen_round == 1
+        assert repeated.last_seen_round == 3
+        carried = rows["Name the rollback checks."]
+        assert carried.status is FindingStatus.OPEN
+        assert carried.first_seen_round == 2
+        assert carried.last_seen_round == 3
+        # The immutable record still holds one row per statement every round
+        # made, under the round that made it.
         assert [
-            finding.message
-            for finding in standing_planning_findings(store, borg.id, "tech_review")
-        ] == ["cycle-3 round-1"]
+            (item.round, item.message)
+            for item in store.list_planning_findings(borg.id)
+        ] == [
+            (1, "Cover a partial rollback."),
+            (2, "Name the rollback checks."),
+            (3, "Rollback coverage is gone again."),
+        ]
 
-        # A Supervisor finding is not a Tech Lead one.
-        _seed_review(
-            store, borg, "supervisor_review", "request_changes", "batch objection"
+
+def test_an_approval_closes_every_row_including_one_its_findings_regressed(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A reviewer that approves has said the work is ready.
+
+    An approval carrying minor findings is still an approval, so an objection
+    its own findings raised again resolves with everything else.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two things are missing.",
+            findings=[_raised("Name the rollback checks.")],
         )
-        assert [
-            finding.message
-            for finding in standing_planning_findings(store, borg.id, "tech_review")
-        ] == ["cycle-3 round-1"]
-        assert [
-            finding.message
-            for finding in standing_planning_findings(
-                store, borg.id, "supervisor_review"
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The checks are still missing.",
+            findings=[
+                _raised("The checks are still unnamed.", repeats=ledger[0]["id"]),
+                _raised("Cover the failure path."),
+            ],
+        )
+
+    def round_three(ledger, _history):
+        repeated = next(
+            row for row in ledger if row["message"] == "Name the rollback checks."
+        )
+        return _review(
+            "approve",
+            summary="The plan is ready, with one small thing left.",
+            findings=[
+                _raised(
+                    "The check names could be tidier.",
+                    severity="minor",
+                    repeats=repeated["id"],
+                )
+            ],
+        )
+
+    database = committed_git_repo.parent / "ledger-approval.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-approval"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three],
+            handed,
+        )
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        rows = _ledger(store, borg.id)
+        assert set(rows) == {"Name the rollback checks.", "Cover the failure path."}
+        assert all(
+            row.status is FindingStatus.RESOLVED and row.last_seen_round == 3
+            for row in rows.values()
+        )
+        # The regressed row kept what it was first recorded with throughout.
+        assert rows["Name the rollback checks."].severity == "major"
+        assert rows["Name the rollback checks."].first_seen_round == 1
+        assert open_planning_findings(store, borg.id) == []
+
+
+def test_a_review_closes_a_row_an_earlier_round_regressed(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """An objection raised again is still one a later round can close.
+
+    A regressed row that only an approval could close would put a floor under
+    the open count for the rest of the cycle, and leave the plan showing an
+    objection its reviewer said the revision answered.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered again.",
+            findings=[
+                _raised(
+                    "Rollback coverage is gone again.",
+                    severity="blocker",
+                    repeats=ledger[0]["id"],
+                )
+            ],
+        )
+
+    def round_three(ledger, _history):
+        regressed = next(
+            row for row in ledger if row["message"] == "Cover a partial rollback."
+        )
+        # The round a reviewer is told the objection started in is the round
+        # that raised it, not the round that last re-established its status.
+        assert regressed["first_raised_in_round"] == 1
+        return _review(
+            "request_changes",
+            summary="The rollback is covered; the checks are not.",
+            resolved=[regressed["id"]],
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "ledger-regressed-close.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-regressed-close"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two, round_three],
+            handed,
+        )
+
+        assert result.borg.state is BorgState.BLOCKED
+        rows = _ledger(store, borg.id)
+        closed = rows["Cover a partial rollback."]
+        assert closed.status is FindingStatus.RESOLVED
+        assert closed.first_seen_round == 1
+        assert closed.last_seen_round == 3
+        assert closed.severity == "blocker"
+        # What still stands is the one objection nobody has answered yet.
+        assert [row.message for row in open_planning_findings(store, borg.id)] == [
+            "Name the rollback checks."
+        ]
+
+
+def test_an_approval_closes_the_row_its_own_new_finding_opened(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Approval closes the ledger it leaves behind, not the one it inherited.
+
+    An approval may carry minor findings of its own, and a row born in the
+    approving round is one of the rows that round has to close: a plan waiting
+    for a human shows no objections at all.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are unnamed.",
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "approve",
+            summary="The plan is ready, with one small thing left.",
+            resolved=[ledger[0]["id"]],
+            findings=[_raised("Tidy the wording.", severity="minor")],
+        )
+
+    database = committed_git_repo.parent / "ledger-approval-new.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-approval-new"
+        )
+        result = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two],
+            handed,
+        )
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        rows = _ledger(store, borg.id)
+        assert set(rows) == {"Name the rollback checks.", "Tidy the wording."}
+        assert all(
+            row.status is FindingStatus.RESOLVED and row.last_seen_round == 2
+            for row in rows.values()
+        )
+        assert rows["Tidy the wording."].first_seen_round == 2
+        assert open_planning_findings(store, borg.id) == []
+
+
+def test_a_closed_id_the_ledger_cannot_place_leaves_its_row_open(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """An unrecognised id costs the loop a round, never the objection."""
+    handed: list[list[dict]] = []
+
+    def round_one(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    def round_two(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Something else is missing.",
+            resolved=["not-an-identifier", str(uuid4())],
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "ledger-unknown-resolved.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-unknown-resolved"
+        )
+        _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two],
+            handed,
+        )
+
+        rows = _ledger(store, borg.id)
+        assert rows["Cover a partial rollback."].status is FindingStatus.OPEN
+        assert rows["Cover a partial rollback."].last_seen_round == 2
+
+
+def test_a_repeat_the_ledger_cannot_place_still_records_a_regression(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """The pointer moves the right row; the claim stands without it.
+
+    Recorded as a plain new row instead, a blocker the loop has already failed
+    to close would read to the assessment as discovery on new surface.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.")],
+        )
+
+    def round_two(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered again.",
+            findings=[
+                _raised(
+                    "Rollback coverage is gone again.",
+                    severity="blocker",
+                    repeats=str(uuid4()),
+                )
+            ],
+        )
+
+    database = committed_git_repo.parent / "ledger-unknown-repeat.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-unknown-repeat"
+        )
+        _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two],
+            handed,
+        )
+
+        claimed = _ledger(store, borg.id)["Rollback coverage is gone again."]
+        assert claimed.status is FindingStatus.REGRESSED
+        assert claimed.first_seen_round == 2
+
+
+def test_a_review_that_resolves_and_repeats_one_id_leaves_it_regressed(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Only one of the two readings costs the loop nothing if it is wrong."""
+    handed: list[list[dict]] = []
+
+    def round_one(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.")],
+        )
+
+    def round_two(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Closed, and still there.",
+            resolved=[ledger[0]["id"]],
+            findings=[
+                _raised("Rollback coverage is still missing.", repeats=ledger[0]["id"])
+            ],
+        )
+
+    database = committed_git_repo.parent / "ledger-contradiction.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-contradiction"
+        )
+        _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two],
+            handed,
+        )
+
+        rows = store.list_planning_ledger_findings(borg.id)
+        assert len(rows) == 1
+        assert rows[0].status is FindingStatus.REGRESSED
+        assert rows[0].message == "Cover a partial rollback."
+
+
+def test_the_reconciliation_is_written_with_the_attempt_that_produced_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Every row this round touched names the review that touched it.
+
+    The immutable findings are untouched by any of it: they are the record of
+    what each round said, and the ledger is the current view of what stands.
+    """
+    handed: list[list[dict]] = []
+
+    def round_one(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.", severity="blocker")],
+        )
+
+    def round_two(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The checks are missing too.",
+            findings=[_raised("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "ledger-attempt.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-attempt"
+        )
+        _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [round_one, round_two],
+            handed,
+        )
+
+        reviews = [
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "tech_review"
+        ]
+        assert len(reviews) == 2
+        rows = store.list_planning_ledger_findings(borg.id)
+        assert {row.attempt_id for row in rows} == {reviews[1].id}
+
+        snapshots = store.list_planning_findings(borg.id)
+        assert [(item.round, item.severity, item.message) for item in snapshots] == [
+            (1, "blocker", "Cover a partial rollback."),
+            (2, "major", "Name the rollback checks."),
+        ]
+        assert [item.attempt_id for item in snapshots] == [
+            reviews[0].id,
+            reviews[1].id,
+        ]
+
+
+def test_a_second_planning_cycle_inherits_none_of_the_first_cycle_ledger(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Each cycle's ledger holds its own rows and answers for them alone.
+
+    A cycle can only follow one that ended in an approval, and an approval
+    resolves everything, so what an unscoped ledger would hand the new cycle is
+    a block of resolved rows landing on its restarted round numbers: a cycle
+    that raised one objection and repeated it would read as strictly draining
+    on the strength of resolutions it inherited. The scope is a column, so a
+    row of the closed cycle is left exactly as that cycle left it whatever its
+    status was — which is what the seeded open row below reads, since no
+    reachable run leaves one open in a cycle an approval closed.
+    """
+    handed: list[list[dict]] = []
+
+    def reject(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback is uncovered.",
+            findings=[_raised("Cover a partial rollback.")],
+        )
+
+    def approve(_ledger, _history):
+        return _review("approve", summary="The plan is ready.")
+
+    def second_cycle(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The staging is unspecified.",
+            findings=[_raised("Stage the rollout explicitly.")],
+        )
+
+    database = committed_git_repo.parent / "ledger-cycles.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "ledger-cycles"
+        )
+        approved = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [reject, approve],
+            handed,
+        )
+        assert approved.borg.state is BorgState.PLAN_APPROVAL_PENDING
+
+        stranded = PlanningLedgerFinding(
+            borg_id=borg.id,
+            cycle_id=INITIAL_PLANNING_CYCLE,
+            attempt_id=approved.attempt.id,
+            first_seen_round=1,
+            last_seen_round=1,
+            severity="blocker",
+            message="An objection the closed cycle never answered.",
+        )
+        store.record_planning_ledger_findings([stranded])
+
+        request = PlanChangeRequest(
+            borg_id=borg.id, round=1, note="Stage the rollout."
+        )
+        with store.transaction():
+            store.append_plan_change_request(request)
+            changed = store.compare_and_set_borg_state(
+                borg.id,
+                expected_state=approved.borg.state,
+                expected_version=approved.borg.state_version,
+                new_state=BorgState.ARCHITECT_WORKING,
             )
-        ] == ["batch objection"]
+
+        blocked = _run_reviews(
+            repository,
+            changed,
+            store,
+            planning_plan_response,
+            [second_cycle],
+            handed,
+        )
+
+        assert blocked.borg.state is BorgState.BLOCKED
+        # The new cycle's first round starts from nothing, and the resolutions
+        # that closed the first cycle stay in the first cycle.
+        assert handed[-1] == []
+        every_row = store.list_planning_ledger_findings(borg.id)
+        assert len(every_row) == 3
+        # The approval that let the cycle be changed credited its resolution
+        # to the round that established it, and the row left open in that cycle
+        # is where that cycle left it: the new cycle neither answered for it nor
+        # carried it forward onto a round of its own.
+        first_cycle = store.list_planning_ledger_findings(
+            borg.id, cycle_id=INITIAL_PLANNING_CYCLE
+        )
+        assert [
+            (row.status, row.first_seen_round, row.last_seen_round)
+            for row in first_cycle
+        ] == [
+            (FindingStatus.RESOLVED, 1, 2),
+            (FindingStatus.OPEN, 1, 1),
+        ]
+        assert first_cycle[1].attempt_id == approved.attempt.id
+        current = store.list_planning_ledger_findings(
+            borg.id, cycle_id=str(request.id)
+        )
+        assert [row.message for row in current] == ["Stage the rollout explicitly."]
+        assert [
+            row.message for row in open_planning_findings(store, borg.id)
+        ] == ["Stage the rollout explicitly."]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "missing"),
+    [
+        pytest.param(
+            lambda payload: payload.pop("resolved"), "resolved", id="resolved"
+        ),
+        pytest.param(
+            lambda payload: payload["findings"][0].pop("repeats"),
+            "repeats",
+            id="repeats",
+        ),
+    ],
+)
+def test_a_review_that_omits_a_ledger_declaration_fails_its_schema(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    mutate,
+    missing: str,
+) -> None:
+    """Requiring both is what forces a reviewer to answer rather than omit."""
+    payload = tech_lead_change_request_response("Cover a partial rollback.")
+    mutate(payload)
+    architect = _architect(planning_plan_response, 0)
+    reviewer = MockAdapter(name="openai").queue(MockResponse(payload=payload))
+    database = committed_git_repo.parent / f"ledger-schema-{missing}.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"ledger-schema-{missing}"
+        )
+        handoff = ArchitectLoop(repository, borg, store, architect, io=_io()).run()
+        expected = f"missing required property '{missing}'"
+        with pytest.raises(TechLeadError, match=expected):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                reviewer,
+                architect_agent=architect,
+                io=_io(),
+            ).run()
+
+        assert store.list_planning_ledger_findings(borg.id) == []

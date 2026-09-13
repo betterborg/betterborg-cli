@@ -18,6 +18,10 @@ from betterborg_cli.agent_runtime.selection import (
     require_read_only_agent,
     resolve_agent_model,
 )
+from betterborg_cli.planning.findings_ledger import (
+    open_task_findings,
+    task_ledger_json,
+)
 from betterborg_cli.planning.task_render import (
     render_task_markdown,
     task_markdown_digest,
@@ -147,7 +151,13 @@ sorts before its own, so number the stems of a stage in the order they must
 run. Betterborg performs the delivery around your tasks: branching, worktrees,
 commits, review, merge, and the repository's own checks. Never write a task for
 any of that. Every task changes the repository, and one with nothing to commit
-is not a task. Return only the required JSON object.
+is not a task. A revision is given every Supervisor objection its batch still
+owes an answer for, including ones raised before the batch you are revising,
+because a later review saying nothing about an objection is not agreement. Where
+one names a task, that is the task it was first raised against: a label on where
+the objection started, which may name a task no current batch holds, so answer
+the objection rather than looking its reference up. Return only the required JSON
+object.
 """
 
 
@@ -327,16 +337,14 @@ class ProjectManagerLoop:
             annotated_plan["_betterborg_task_revision"] = {
                 "batch_digest": base_batch.digest,
                 "batch_id": str(base_batch.id),
+                # The open ledger, not this batch's snapshot: carry-forward
+                # keeps an objection alive, so an objection raised two rounds
+                # ago and not repeated since is one this revision still owes
+                # an answer for.
                 "findings": [
-                    {
-                        "message": finding.message,
-                        "round": finding.round,
-                        "severity": finding.severity,
-                        "suggestion": finding.suggestion,
-                        "task_ref": finding.task_ref,
-                    }
-                    for finding in self.store.list_task_findings(
-                        self.borg_id, batch_id=base_batch.id
+                    task_ledger_json(row)
+                    for row in open_task_findings(
+                        self.store, self.borg_id, approval.id
                     )
                 ],
                 "summary": base_batch.summary,
@@ -613,17 +621,19 @@ class ProjectManagerLoop:
             return failure
         if base_batch is None:
             return None
-        findings = self.store.list_task_findings(
-            self.borg_id, batch_id=base_batch.id
-        )
-        if not findings:
+        rows = open_task_findings(self.store, self.borg_id, approval.id)
+        if not rows:
             return "Revise the complete prior task batch without dropping coverage."
+        # A reference names the task the objection was first raised against.
+        # For this round's own findings that is a task of the batch being
+        # revised; for a carried one the batch that held it is gone, which is
+        # why it is labelled rather than offered as a reference to use.
         return "Supervisor findings: " + "; ".join(
-            f"{finding.severity}"
-            + (f" [{finding.task_ref}]" if finding.task_ref else "")
-            + f": {finding.message}"
-            + (f" ({finding.suggestion})" if finding.suggestion else "")
-            for finding in findings
+            f"{row.severity}"
+            + (f" [raised against {row.task_ref}]" if row.task_ref else "")
+            + f": {row.message}"
+            + (f" ({row.suggestion})" if row.suggestion else "")
+            for row in rows
         )
 
     def _require_retry_budget(

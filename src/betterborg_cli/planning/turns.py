@@ -22,6 +22,7 @@ from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
 )
+from betterborg_cli.planning.cycles import current_planning_cycle
 from betterborg_cli.planning.plan_contracts import validate_plan
 from betterborg_cli.planning.worktree import materialize_planning_worktree
 from betterborg_cli.progress import AgentActivity
@@ -30,7 +31,6 @@ from betterborg_cli.store import (
     BorgState,
     PlanningAttempt,
     PlanningAttemptStatus,
-    PlanningFinding,
     Repository,
     SqliteStore,
 )
@@ -44,11 +44,10 @@ def current_planning_cycle_attempts(
     """Return attempts belonging to the latest human planning cycle."""
 
     attempts = store.list_planning_attempts(borg_id)
-    change_requests = store.list_plan_change_requests(borg_id)
-    if not change_requests:
+    opened_by = current_planning_cycle(store, borg_id)
+    if opened_by is None:
         return attempts
-    cycle_started_at = change_requests[-1].created_at
-    return [item for item in attempts if item.started_at >= cycle_started_at]
+    return [item for item in attempts if item.started_at >= opened_by.created_at]
 
 
 def completed_planning_phase_attempts(
@@ -60,31 +59,6 @@ def completed_planning_phase_attempts(
         item
         for item in attempts
         if item.phase == phase and item.status is PlanningAttemptStatus.COMPLETED
-    ]
-
-
-def standing_planning_findings(
-    store: SqliteStore, borg_id: UUID, phase: str
-) -> list[PlanningFinding]:
-    """Return the review findings the current plan still has to answer.
-
-    The store keeps every finding a Borg ever collected, in append order, and
-    round numbers restart with each planning cycle, so the whole list reads as
-    a page of objections with repeating rounds. What stands is narrower: the
-    findings of this cycle, and only while the latest review is still asking
-    for a revision. Once the reviewer approves, the plan answered them.
-    """
-
-    reviews = completed_planning_phase_attempts(
-        current_planning_cycle_attempts(store, borg_id), phase
-    )
-    if not reviews or (reviews[-1].result or {}).get("decision") == "approve":
-        return []
-    attempt_ids = {attempt.id for attempt in reviews}
-    return [
-        finding
-        for finding in store.list_planning_findings(borg_id)
-        if finding.attempt_id in attempt_ids
     ]
 
 

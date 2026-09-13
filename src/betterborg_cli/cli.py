@@ -71,10 +71,10 @@ from betterborg_cli.planning import (
     render_task_markdown,
     task_markdown_digest,
 )
+from betterborg_cli.planning.findings_ledger import open_planning_findings
 from betterborg_cli.planning.turns import (
     current_planning_cycle_attempts,
     latest_planning_review_requests_changes,
-    standing_planning_findings,
 )
 from betterborg_cli.plugins import (
     SUPPORTED_PLUGIN_HOSTS,
@@ -896,9 +896,7 @@ def show_plan(name: str, json_output: bool) -> None:
                 )
             attempt = validated_current_plan_attempt(paths, store, borg)
             stored_plan = attempt.result
-            findings = standing_planning_findings(
-                store, borg.id, "tech_review"
-            )
+            findings = open_planning_findings(store, borg.id)
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
 

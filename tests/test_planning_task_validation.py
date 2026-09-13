@@ -12,7 +12,12 @@ import pytest
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.retry import DEFAULT_SCHEMA_MAX_ATTEMPTS
+from betterborg_cli.agent_runtime.structured import (
+    StructuredResultError,
+    validate_structured_result,
+)
 from betterborg_cli.planning import (
+    SUPERVISOR_REVIEW_SCHEMA,
     NonProgressingTaskRepairError,
     ProjectManagerError,
     ProjectManagerLoop,
@@ -28,17 +33,21 @@ from betterborg_cli.planning import (
     validate_task_graph,
     validate_task_repair_progress,
 )
+from betterborg_cli.planning.findings_ledger import open_task_findings
 from betterborg_cli.progress import RunProgress, StageState
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    FindingStatus,
     PlanApproval,
     PlanningAttempt,
     PlanningAttemptStatus,
     SqliteStore,
+    TaskBatch,
     TaskComplexity,
     TaskDependency,
     TaskGenerationStatus,
+    TaskLedgerFinding,
     TaskRecord,
 )
 
@@ -232,12 +241,14 @@ def _review_response(
                     "message": message,
                     "suggestion": "Keep the task independently testable.",
                     "task_ref": task_ref,
+                    "repeats": None,
                 }
             )
         return {
             "decision": decision,
             "summary": f"Supervisor decided to {decision}.",
             "findings": findings,
+            "resolved": [],
         }
 
     return respond
@@ -993,12 +1004,12 @@ def test_supervisor_persists_findings_and_runs_bounded_pm_revision(
             assert context["batch_id"] == str(initial.batch.id)
             assert context["findings"][0]["severity"] == "major"
             assert "narrower scope" in context["findings"][0]["message"]
-            task_ref = context["findings"][0]["task_ref"]
+            task_ref = context["findings"][0]["raised_against_task_ref"]
             referenced_task = next(
                 task for task in context["tasks"] if task["task_ref"] == task_ref
             )
             assert referenced_task["task"]["title"] == initial.tasks[0].title
-            assert f"[{task_ref}]" in spec.user_prompt
+            assert f"[raised against {task_ref}]" in spec.user_prompt
             assert "Supervisor findings" in spec.user_prompt
             return revised_payload
 
@@ -2579,3 +2590,449 @@ def test_every_planning_role_is_told_what_betterborg_performs() -> None:
     # told to leave out.
     for prompt in (_TECH_LEAD_SYSTEM_PROMPT, _SUPERVISOR_SYSTEM_PROMPT):
         assert "never hold" in " ".join(prompt.split())
+
+
+def test_every_role_the_ledger_reaches_is_told_what_it_owes() -> None:
+    """A required field with no instruction behind it comes back empty.
+
+    The schema can make a reviewer send `resolved` and `repeats`; only the
+    instruction makes it send anything in them, and a ledger never told what
+    closed never drains. The fixer needs the other half: that an objection
+    stays open until it is answered, and that the reference a carried one
+    carries is a label rather than a task to look up.
+    """
+    from betterborg_cli.planning.pm import _PROJECT_MANAGER_SYSTEM_PROMPT
+    from betterborg_cli.planning.supervisor import _SUPERVISOR_SYSTEM_PROMPT
+    from betterborg_cli.planning.tech_lead import _TECH_LEAD_SYSTEM_PROMPT
+
+    for prompt in (_TECH_LEAD_SYSTEM_PROMPT, _SUPERVISOR_SYSTEM_PROMPT):
+        flattened = " ".join(prompt.split())
+        assert "list in resolved the id of every one" in flattened
+        assert (
+            "set repeats to the id of the open finding it raises again, or "
+            "null when the objection is new" in flattened
+        )
+        # Unconditional, because making the requirement depend on the decision
+        # would cost provider enforcement of every field at once.
+        assert "Both are always required" in flattened
+        assert (
+            "An open finding you neither resolve nor repeat stays open"
+            in flattened
+        )
+
+    fixer = " ".join(_PROJECT_MANAGER_SYSTEM_PROMPT.split())
+    assert "every Supervisor objection its batch still owes an answer for" in fixer
+    assert (
+        "may name a task no current batch holds, so answer the objection "
+        "rather than looking its reference up" in fixer
+    )
+
+
+def _ledger_review(
+    decision: str,
+    *,
+    handed: list[list[dict]],
+    message: str = "",
+    severity: str = "major",
+    closes_open: bool = False,
+    repeats_open: bool = False,
+):
+    """Review the batch in hand, recording the open ledger it was given.
+
+    Both declarations are answered against the ledger the round is handed,
+    because the ids only exist once an earlier round has raised them.
+    """
+
+    def respond(spec):
+        context = _planning_context(spec)
+        ledger = context["open_supervisor_findings"]
+        handed.append(ledger)
+        findings = []
+        if decision == "request_changes":
+            findings.append(
+                {
+                    "severity": severity,
+                    "message": message,
+                    "suggestion": "Keep the task independently testable.",
+                    "task_ref": context["task_batch"]["tasks"][0]["task_ref"],
+                    "repeats": ledger[0]["id"] if repeats_open else None,
+                }
+            )
+        return {
+            "decision": decision,
+            "summary": f"Supervisor decided to {decision}.",
+            "findings": findings,
+            "resolved": [row["id"] for row in ledger] if closes_open else [],
+        }
+
+    return respond
+
+
+def _recording_pm(payloads: Iterable[dict], handed: list[tuple[dict, str]]):
+    """Revise as scripted, recording the revision context and prompt each time."""
+    adapter = MockAdapter(name="openai")
+    for payload in payloads:
+
+        def respond(spec, payload=payload):
+            revision = _planning_context(spec)["_betterborg_task_revision"]
+            handed.append((revision, spec.user_prompt))
+            return payload
+
+        adapter.queue(MockResponse(dynamic=respond))
+    return adapter
+
+
+def test_a_supervisor_objection_outlives_the_batch_its_reference_named(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """A carried reference is a label on where the objection started.
+
+    Every revision mints fresh task ids and derives the references from them,
+    so the round that inherits an objection reviews tasks whose references are
+    all new. The fixer still owes an answer for the objection, so both places
+    the findings reach the Project Manager read the ledger rather than the one
+    batch's snapshot.
+    """
+    plan = _plan()
+    reviews: list[list[dict]] = []
+    revisions: list[tuple[dict, str]] = []
+    database = committed_git_repo.parent / "supervisor-ledger.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-ledger"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review(
+                    "request_changes",
+                    message="The first task needs a narrower scope.",
+                    handed=reviews,
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review(
+                    "request_changes",
+                    message="The second task duplicates the first.",
+                    handed=reviews,
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review("approve", handed=reviews)
+            )
+        )
+        pm = _recording_pm(
+            (
+                _pm_payload(plan, revision=" v2"),
+                _pm_payload(plan, revision=" v3"),
+            ),
+            revisions,
+        )
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+        ).run()
+
+        assert result.borg.state is BorgState.READY_TO_EXECUTE
+        batches = store.list_task_batches(borg.id)
+        assert [batch.id for batch in batches][0] == initial.batch.id
+        assert len(batches) == 3
+
+        # The second round was handed the first round's objection, labelled
+        # with the batch its reference belonged to and not with a reference
+        # into the batch under review.
+        assert len(reviews[1]) == 1
+        carried = reviews[1][0]
+        assert carried["message"] == "The first task needs a narrower scope."
+        assert carried["first_raised_in_round"] == 1
+        assert carried["raised_against_batch_id"] == str(initial.batch.id)
+        assert carried["raised_against_task_ref"] == initial.tasks[0].task_ref
+        # Against the tasks of the batch under review, which are reached
+        # through its generation: a batch id finds no task records at all, and
+        # an empty set would make the comparison below say nothing.
+        reviewed = next(
+            item
+            for item in store.list_task_generations(borg.id)
+            if item.batch_id == batches[1].id
+        )
+        live_refs = {
+            task.task_ref for task in store.list_task_records(reviewed.id)
+        }
+        assert live_refs
+        assert carried["raised_against_task_ref"] not in live_refs
+        # The first round had nothing to answer for, so the label it went on to
+        # raise could only have come from the batch it was reviewing.
+        assert reviews[0] == []
+
+        # The second revision is shown both objections, while the snapshot of
+        # the batch it is revising holds only the newer one.
+        revision, prompt = revisions[1]
+        assert [item["message"] for item in revision["findings"]] == [
+            "The first task needs a narrower scope.",
+            "The second task duplicates the first.",
+        ]
+        assert "The first task needs a narrower scope." in prompt
+        assert [
+            finding.message
+            for finding in store.list_task_findings(
+                borg.id, batch_id=batches[1].id
+            )
+        ] == ["The second task duplicates the first."]
+        assert f"[raised against {carried['raised_against_task_ref']}]" in prompt
+
+        # One ledger spans every batch of the approval, and the approval closes it.
+        rows = store.list_task_ledger_findings(
+            borg.id, plan_approval_id=approval.id
+        )
+        assert [row.message for row in rows] == [
+            "The first task needs a narrower scope.",
+            "The second task duplicates the first.",
+        ]
+        assert [row.batch_id for row in rows] == [initial.batch.id, batches[1].id]
+        assert all(row.status is FindingStatus.RESOLVED for row in rows)
+        assert all(row.last_seen_round == 3 for row in rows)
+        assert open_task_findings(store, borg.id, approval.id) == []
+
+
+def _seed_other_approval_objection(store: SqliteStore, borg) -> TaskLedgerFinding:
+    """Leave one open objection under a plan approval this run is not running.
+
+    Every table in this plan carries its scope as a column, so a row belonging
+    to another approval is neither handed to a reviewer nor moved by one.
+    """
+    other = PlanApproval(
+        borg_id=borg.id,
+        plan_digest="sha256:another-approval",
+        manifest={"plan.json": "sha256:another-approval"},
+        approved_by="test operator",
+    )
+    batch = TaskBatch(
+        borg_id=borg.id,
+        plan_approval_id=other.id,
+        round=1,
+        digest="sha256:another-batch",
+        manifest={"task-refs": ["elsewhere"]},
+        summary="A batch of another approval.",
+    )
+    attempt = PlanningAttempt(
+        borg_id=borg.id,
+        phase="supervisor_review",
+        round=1,
+        adapter="mock",
+        model="test-model",
+    )
+    stranded = TaskLedgerFinding(
+        borg_id=borg.id,
+        plan_approval_id=other.id,
+        batch_id=batch.id,
+        attempt_id=attempt.id,
+        first_seen_round=1,
+        last_seen_round=1,
+        severity="blocker",
+        message="An objection of another approval entirely.",
+    )
+    with store.transaction():
+        store.append_plan_approval(other)
+        store.append_task_batch(batch)
+        store.append_planning_attempt(attempt)
+        store.record_task_ledger_findings([stranded])
+    return stranded
+
+
+def test_a_supervisor_review_closes_and_repeats_the_rows_it_names(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The declarations a Supervisor makes are what move its ledger.
+
+    A round that says it closed an objection closes it, and one that raises an
+    objection again moves the row already holding it rather than adding a
+    second, so the loop can see which of its rounds have already tried.
+    """
+    plan = _plan()
+    reviews: list[list[dict]] = []
+    revisions: list[tuple[dict, str]] = []
+    database = committed_git_repo.parent / "supervisor-declarations.sqlite3"
+
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-declarations"
+        )
+        # Seeded before the approval this run uses, so the run's own approval
+        # stays the latest one.
+        elsewhere = _seed_other_approval_objection(store, borg)
+        approval, borg = _approve_plan(store, borg, plan)
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            MockAdapter(name="openai").queue(
+                MockResponse(payload=_pm_payload(plan))
+            ),
+            approved_plan=plan,
+        ).run()
+
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review(
+                    "request_changes",
+                    message="The first task needs a narrower scope.",
+                    handed=reviews,
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review(
+                    "request_changes",
+                    message="The second task duplicates the first.",
+                    closes_open=True,
+                    handed=reviews,
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_ledger_review(
+                    "request_changes",
+                    message="The duplication is still there.",
+                    severity="blocker",
+                    repeats_open=True,
+                    handed=reviews,
+                )
+            )
+        )
+        pm = _recording_pm(
+            (
+                _pm_payload(plan, revision=" v2"),
+                _pm_payload(plan, revision=" v3"),
+            ),
+            revisions,
+        )
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            approved_plan=plan,
+        ).run()
+
+        assert result.borg.state is BorgState.BLOCKED
+
+        # The round that closed the first objection was handed it; the round
+        # after was handed only what its predecessor left standing.
+        assert [row["message"] for row in reviews[1]] == [
+            "The first task needs a narrower scope."
+        ]
+        assert [row["message"] for row in reviews[2]] == [
+            "The second task duplicates the first."
+        ]
+
+        rows = {
+            row.message: row
+            for row in store.list_task_ledger_findings(
+                borg.id, plan_approval_id=approval.id
+            )
+        }
+        assert set(rows) == {
+            "The first task needs a narrower scope.",
+            "The second task duplicates the first.",
+        }
+        closed = rows["The first task needs a narrower scope."]
+        assert closed.status is FindingStatus.RESOLVED
+        assert closed.last_seen_round == 2
+        repeated = rows["The second task duplicates the first."]
+        assert repeated.status is FindingStatus.REGRESSED
+        assert repeated.first_seen_round == 2
+        assert repeated.last_seen_round == 3
+        # The repeat moved the row rather than adding one, so a blocker
+        # restatement could not escalate what was first recorded as a major.
+        assert repeated.severity == "major"
+        assert [
+            row.message for row in open_task_findings(store, borg.id, approval.id)
+        ] == ["The second task duplicates the first."]
+
+        # Each row names the review that last established its status, so a
+        # reader of the table can tell which round answered for it.
+        by_round = {
+            attempt.request["review_round"]: attempt.id
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "supervisor_review"
+            and attempt.status is PlanningAttemptStatus.COMPLETED
+        }
+        assert closed.attempt_id == by_round[2]
+        assert repeated.attempt_id == by_round[3]
+
+        # The objection of another approval was never handed to a round and was
+        # never moved by one, so its own loop still owes an answer for it.
+        assert all(
+            elsewhere.message not in {row["message"] for row in ledger}
+            for ledger in reviews
+        )
+        untouched = store.list_task_ledger_findings(
+            borg.id, plan_approval_id=elsewhere.plan_approval_id
+        )
+        assert untouched == [elsewhere]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "missing"),
+    [
+        pytest.param(
+            lambda payload: payload.pop("resolved"), "resolved", id="resolved"
+        ),
+        pytest.param(
+            lambda payload: payload["findings"][0].pop("repeats"),
+            "repeats",
+            id="repeats",
+        ),
+    ],
+)
+def test_a_supervisor_review_omitting_a_ledger_declaration_fails_its_schema(
+    mutate, missing: str
+) -> None:
+    """Requiring both is what forces a reviewer to answer rather than omit."""
+    payload = {
+        "decision": "request_changes",
+        "summary": "The first task needs a narrower scope.",
+        "findings": [
+            {
+                "severity": "major",
+                "message": "The first task needs a narrower scope.",
+                "repeats": None,
+            }
+        ],
+        "resolved": [],
+    }
+    validate_structured_result(payload, SUPERVISOR_REVIEW_SCHEMA)
+
+    mutate(payload)
+    with pytest.raises(
+        StructuredResultError, match=f"missing required property '{missing}'"
+    ):
+        validate_structured_result(payload, SUPERVISOR_REVIEW_SCHEMA)

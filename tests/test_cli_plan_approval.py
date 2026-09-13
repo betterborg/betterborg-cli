@@ -110,12 +110,14 @@ def _review(decision: str, message: str = "The task is ready.") -> dict:
                 "severity": "major",
                 "message": message,
                 "suggestion": "Make the task independently verifiable.",
+                "repeats": None,
             }
         )
     return {
         "decision": decision,
         "summary": message,
         "findings": findings,
+        "resolved": [],
     }
 
 
@@ -129,8 +131,10 @@ def _contradictory_review(message: str = "Only small things here.") -> dict:
                 "severity": "minor",
                 "message": message,
                 "suggestion": "Tidy the wording.",
+                "repeats": None,
             }
         ],
+        "resolved": [],
     }
 
 

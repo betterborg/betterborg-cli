@@ -27,6 +27,7 @@ from betterborg_cli.store.models import (
     ExecutionRun,
     ExecutionRunAcquisition,
     ExecutionRunStatus,
+    FindingStatus,
     GeneratedPrompt,
     Operation,
     PlanApproval,
@@ -34,6 +35,7 @@ from betterborg_cli.store.models import (
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningFinding,
+    PlanningLedgerFinding,
     PlanningQuestion,
     PrdSession,
     PrdTurn,
@@ -48,6 +50,7 @@ from betterborg_cli.store.models import (
     TaskFinding,
     TaskGeneration,
     TaskGenerationStatus,
+    TaskLedgerFinding,
     TaskRecord,
     TaskRuntime,
     TaskRuntimeCost,
@@ -738,6 +741,56 @@ class SqliteStore:
             ).fetchall()
         return [_row_to_planning_finding(row) for row in rows]
 
+    def record_planning_ledger_findings(
+        self, rows: Iterable[PlanningLedgerFinding]
+    ) -> None:
+        """Persist one reconciled tech-lead ledger, inserting and updating rows."""
+        with self.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO planning_finding_ledger(
+                        id, borg_id, cycle_id, attempt_id, first_seen_round,
+                        last_seen_round, status, severity, message, suggestion,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    -- Only lifecycle moves. What the objection was first
+                    -- recorded as is what its consumers render and what a
+                    -- repeat must not be able to escalate.
+                    ON CONFLICT(id) DO UPDATE SET
+                        attempt_id = excluded.attempt_id,
+                        last_seen_round = excluded.last_seen_round,
+                        status = excluded.status
+                    """,
+                    (
+                        str(row.id),
+                        str(row.borg_id),
+                        row.cycle_id,
+                        str(row.attempt_id),
+                        row.first_seen_round,
+                        row.last_seen_round,
+                        row.status.value,
+                        row.severity,
+                        row.message,
+                        row.suggestion,
+                        row.created_at.isoformat(),
+                    ),
+                )
+
+    def list_planning_ledger_findings(
+        self, borg_id: UUID, *, cycle_id: str | None = None
+    ) -> list[PlanningLedgerFinding]:
+        """Return tech-lead ledger rows, optionally limited to one cycle."""
+        query = "SELECT * FROM planning_finding_ledger WHERE borg_id = ?"
+        parameters: list[object] = [str(borg_id)]
+        if cycle_id is not None:
+            query += " AND cycle_id = ?"
+            parameters.append(cycle_id)
+        query += " ORDER BY created_at, id"
+        with self.locked_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_row_to_planning_ledger_finding(row) for row in rows]
+
     def append_plan_change_request(self, request: PlanChangeRequest) -> None:
         """Append one immutable human plan-revision request."""
         with self.transaction() as connection:
@@ -881,6 +934,57 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_row_to_task_finding(row) for row in rows]
+
+    def record_task_ledger_findings(
+        self, rows: Iterable[TaskLedgerFinding]
+    ) -> None:
+        """Persist one reconciled supervisor ledger, inserting and updating rows."""
+        with self.transaction() as connection:
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO task_finding_ledger(
+                        id, borg_id, plan_approval_id, batch_id, attempt_id,
+                        first_seen_round, last_seen_round, status, severity,
+                        message, suggestion, task_ref, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    -- Only lifecycle moves, for the same reason the planning
+                    -- ledger keeps what it was first recorded with.
+                    ON CONFLICT(id) DO UPDATE SET
+                        attempt_id = excluded.attempt_id,
+                        last_seen_round = excluded.last_seen_round,
+                        status = excluded.status
+                    """,
+                    (
+                        str(row.id),
+                        str(row.borg_id),
+                        str(row.plan_approval_id),
+                        str(row.batch_id),
+                        str(row.attempt_id),
+                        row.first_seen_round,
+                        row.last_seen_round,
+                        row.status.value,
+                        row.severity,
+                        row.message,
+                        row.suggestion,
+                        row.task_ref,
+                        row.created_at.isoformat(),
+                    ),
+                )
+
+    def list_task_ledger_findings(
+        self, borg_id: UUID, *, plan_approval_id: UUID | None = None
+    ) -> list[TaskLedgerFinding]:
+        """Return supervisor ledger rows, optionally limited to one approval."""
+        query = "SELECT * FROM task_finding_ledger WHERE borg_id = ?"
+        parameters: list[object] = [str(borg_id)]
+        if plan_approval_id is not None:
+            query += " AND plan_approval_id = ?"
+            parameters.append(str(plan_approval_id))
+        query += " ORDER BY created_at, id"
+        with self.locked_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_row_to_task_ledger_finding(row) for row in rows]
 
     def add_task_generation(
         self,
@@ -3275,6 +3379,22 @@ def _row_to_planning_finding(row: sqlite3.Row) -> PlanningFinding:
     )
 
 
+def _row_to_planning_ledger_finding(row: sqlite3.Row) -> PlanningLedgerFinding:
+    return PlanningLedgerFinding(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        cycle_id=row["cycle_id"],
+        attempt_id=UUID(row["attempt_id"]),
+        first_seen_round=row["first_seen_round"],
+        last_seen_round=row["last_seen_round"],
+        status=FindingStatus(row["status"]),
+        severity=row["severity"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
 def _row_to_plan_change_request(row: sqlite3.Row) -> PlanChangeRequest:
     return PlanChangeRequest(
         id=UUID(row["id"]),
@@ -3325,6 +3445,24 @@ def _row_to_task_finding(row: sqlite3.Row) -> TaskFinding:
             UUID(row["attempt_id"]) if row["attempt_id"] is not None else None
         ),
         round=row["round"],
+        severity=row["severity"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        task_ref=row["task_ref"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_task_ledger_finding(row: sqlite3.Row) -> TaskLedgerFinding:
+    return TaskLedgerFinding(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        plan_approval_id=UUID(row["plan_approval_id"]),
+        batch_id=UUID(row["batch_id"]),
+        attempt_id=UUID(row["attempt_id"]),
+        first_seen_round=row["first_seen_round"],
+        last_seen_round=row["last_seen_round"],
+        status=FindingStatus(row["status"]),
         severity=row["severity"],
         message=row["message"],
         suggestion=row["suggestion"],

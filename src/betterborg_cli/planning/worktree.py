@@ -14,6 +14,10 @@ from uuid import uuid4
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.planning.findings_ledger import (
+    open_planning_findings,
+    planning_ledger_json,
+)
 from betterborg_cli.repo_analysis import (
     build_machine_report,
     render_markdown_report,
@@ -41,6 +45,7 @@ _ANALYSIS_PATH = _CONTEXT_DIR / "analysis.json"
 _QUESTIONS_PATH = _CONTEXT_DIR / "questions.json"
 _CHANGE_REQUESTS_PATH = _CONTEXT_DIR / "change-requests.json"
 _FINDINGS_PATH = _CONTEXT_DIR / "findings.json"
+_OPEN_FINDINGS_PATH = _CONTEXT_DIR / "open-findings.json"
 
 
 class PlanningWorktreeError(RuntimeError):
@@ -229,6 +234,7 @@ def _materialize_context(
         _QUESTIONS_PATH,
         _CHANGE_REQUESTS_PATH,
         _FINDINGS_PATH,
+        _OPEN_FINDINGS_PATH,
         *(
             paths.in_checkout(paths.prompts_dir / f"{role}.system.md")
             for role in prompts
@@ -318,6 +324,18 @@ def _materialize_context(
         _FINDINGS_PATH,
         [_finding_json(item) for item in findings],
     )
+    # The history says everything every reviewer ever said, across cycles and
+    # with no lifecycle on any of it. A reviewer asked which objections it is
+    # closing needs the narrower list, keyed by the id each objection was first
+    # recorded under, because that is the id it has to name.
+    _publish_json(
+        destination,
+        _OPEN_FINDINGS_PATH,
+        [
+            planning_ledger_json(item)
+            for item in open_planning_findings(store, borg.id)
+        ],
+    )
     _publish_json(
         destination,
         _MANIFEST_PATH,
@@ -330,6 +348,7 @@ def _materialize_context(
                 path.as_posix() for path in sorted(supplied_documents)
             ],
             "findings": _FINDINGS_PATH.as_posix(),
+            "open_findings": _OPEN_FINDINGS_PATH.as_posix(),
             "prompts": prompt_manifest,
             "questions": _QUESTIONS_PATH.as_posix(),
             "repository": _REPOSITORY_PATH.as_posix(),

@@ -1934,6 +1934,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
                 "decision": "approve",
                 "summary": "The task is ready.",
                 "findings": [],
+                "resolved": [],
             }
         )
     )
@@ -2014,6 +2015,7 @@ def test_plan_approval_reuses_repository_trust_for_its_managed_worktree(
                 "decision": "approve",
                 "summary": "The task is ready.",
                 "findings": [],
+                "resolved": [],
             }
         )
     )
@@ -2963,18 +2965,27 @@ def test_the_headless_findings_are_narrowed_to_what_still_stands(
 ) -> None:
     """The payload carries the same account the terminal renders.
 
-    The store keeps every finding a Borg collected, and round numbers restart
-    each planning cycle. Handed whole to a caller with no terminal, it reads as
-    a page of outstanding objections with repeating rounds, including ones the
-    reviewer already answered by approving the revision that asked for them.
+    The immutable findings are every objection every round of every cycle ever
+    raised. Handed whole to a caller with no terminal, they read as a page of
+    outstanding objections with repeating rounds, including ones a later review
+    said the plan closed.
     """
-    from betterborg_cli.store import PlanningFinding
+    from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
+    from betterborg_cli.store import (
+        FindingStatus,
+        PlanningFinding,
+        PlanningLedgerFinding,
+    )
 
-    def seed(store, borg, decision: str, message: str) -> None:
+    database = committed_git_repo.parent / "mcp-standing.sqlite3"
+    with SqliteStore.open(database) as store:
+        _repository, borg = persist_planning_context(
+            committed_git_repo, store, "mcp-standing"
+        )
         attempt = PlanningAttempt(
             borg_id=borg.id,
             phase="tech_review",
-            round=len(store.list_planning_attempts(borg.id)) + 1,
+            round=1,
             adapter="mock",
             model="test-model",
         )
@@ -2982,10 +2993,10 @@ def test_the_headless_findings_are_narrowed_to_what_still_stands(
         store.complete_planning_attempt(
             attempt.id,
             status=PlanningAttemptStatus.COMPLETED,
-            result={"decision": decision},
-            summary=message,
+            result={"decision": "request_changes"},
+            summary="one closed, one standing",
         )
-        if decision == "request_changes":
+        for message in ("answered by the revision", "still standing"):
             store.append_planning_finding(
                 PlanningFinding(
                     borg_id=borg.id,
@@ -2995,17 +3006,33 @@ def test_the_headless_findings_are_narrowed_to_what_still_stands(
                     message=message,
                 )
             )
-
-    database = committed_git_repo.parent / "mcp-standing.sqlite3"
-    with SqliteStore.open(database) as store:
-        _repository, borg = persist_planning_context(
-            committed_git_repo, store, "mcp-standing"
+        store.record_planning_ledger_findings(
+            [
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=2,
+                    status=FindingStatus.RESOLVED,
+                    severity="major",
+                    message="answered by the revision",
+                ),
+                PlanningLedgerFinding(
+                    borg_id=borg.id,
+                    cycle_id=INITIAL_PLANNING_CYCLE,
+                    attempt_id=attempt.id,
+                    first_seen_round=1,
+                    last_seen_round=2,
+                    severity="major",
+                    message="still standing",
+                ),
+            ]
         )
-        seed(store, borg, "request_changes", "answered by the revision")
-        seed(store, borg, "approve", "approved")
-        assert len(store.list_planning_findings(borg.id)) == 1
+        assert len(store.list_planning_findings(borg.id)) == 2
 
-        # The store holds it; the plan the caller is being handed does not
-        # rest on it any more, because the reviewer approved the revision that
-        # answered it.
-        assert mcp_server._plan_findings(store, borg) == ()
+        # The record holds both; the plan the caller is being handed rests on
+        # only the one no review has closed.
+        assert [
+            finding.message for finding in mcp_server._plan_findings(store, borg)
+        ] == ["still standing"]

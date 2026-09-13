@@ -78,6 +78,14 @@ class ExecutionAttemptStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class FindingStatus(str, Enum):
+    """Lifecycle of one reviewer objection tracked across review rounds."""
+
+    OPEN = "open"
+    RESOLVED = "resolved"
+    REGRESSED = "regressed"
+
+
 class TaskRuntimeStatus(str, Enum):
     """Durable scheduling state for one generated task."""
 
@@ -400,6 +408,52 @@ class PlanningFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanningLedgerFinding:
+    """One tech-lead objection whose lifecycle outlives the round that raised it.
+
+    The immutable finding is the record of what a reviewer said; this is the
+    current view of whether the plan still has to answer it.
+    """
+
+    borg_id: UUID
+    cycle_id: str
+    attempt_id: UUID
+    first_seen_round: int
+    last_seen_round: int
+    severity: str
+    message: str
+    status: FindingStatus = FindingStatus.OPEN
+    suggestion: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    @property
+    def round(self) -> int:
+        """Expose the round the objection was first raised in."""
+        return self.first_seen_round
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "attempt_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"planning ledger finding {name} must be a UUID")
+        if not self.cycle_id.strip():
+            raise ValueError("planning ledger finding cycle must not be empty")
+        if self.first_seen_round < 1:
+            raise ValueError("planning ledger finding rounds must be positive")
+        if self.last_seen_round < self.first_seen_round:
+            raise ValueError(
+                "planning ledger finding cannot be seen before it was raised"
+            )
+        if not isinstance(self.status, FindingStatus):
+            raise TypeError("planning ledger finding status must be a FindingStatus")
+        if not self.severity.strip() or not self.message.strip():
+            raise ValueError(
+                "planning ledger finding severity and message must not be empty"
+            )
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
 class PlanChangeRequest:
     """One immutable human request in a Borg's plan-revision thread."""
 
@@ -502,6 +556,48 @@ class TaskFinding:
             raise ValueError("task finding severity and message must not be empty")
         if self.task_ref is not None and not self.task_ref.strip():
             raise ValueError("task finding task ref must not be empty")
+        _validate_utc(self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskLedgerFinding:
+    """One supervisor objection whose lifecycle outlives the batch it was raised on.
+
+    Every revision mints fresh task references, so the reference and the batch
+    it belonged to are a label on where the objection started rather than a
+    pointer into the batch under review.
+    """
+
+    borg_id: UUID
+    plan_approval_id: UUID
+    batch_id: UUID
+    attempt_id: UUID
+    first_seen_round: int
+    last_seen_round: int
+    severity: str
+    message: str
+    status: FindingStatus = FindingStatus.OPEN
+    suggestion: str | None = None
+    task_ref: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id", "plan_approval_id", "batch_id", "attempt_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"task ledger finding {name} must be a UUID")
+        if self.first_seen_round < 1:
+            raise ValueError("task ledger finding rounds must be positive")
+        if self.last_seen_round < self.first_seen_round:
+            raise ValueError("task ledger finding cannot be seen before it was raised")
+        if not isinstance(self.status, FindingStatus):
+            raise TypeError("task ledger finding status must be a FindingStatus")
+        if not self.severity.strip() or not self.message.strip():
+            raise ValueError(
+                "task ledger finding severity and message must not be empty"
+            )
+        if self.task_ref is not None and not self.task_ref.strip():
+            raise ValueError("task ledger finding task ref must not be empty")
         _validate_utc(self.created_at)
 
 

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
 from betterborg_cli.store import (
     Borg,
     BorgState,
+    FindingStatus,
     PlanChangeRequest,
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningFinding,
+    PlanningLedgerFinding,
     PlanningQuestion,
     Repository,
     SqliteStore,
@@ -94,7 +98,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         applied_at = store.applied_migrations()
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == applied_at == tuple(range(1, 13))
+        assert reopened.applied_migrations() == applied_at == tuple(range(1, 14))
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg
         assert reopened.list_planning_attempts(borg.id) == [
@@ -279,3 +283,99 @@ def test_planning_history_rejects_raw_mutation_deletion_and_replacement(
                 connection.execute(sql, parameters)
 
         assert read_history(borg.id) == expected_history
+
+
+def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
+    tmp_path: Path,
+) -> None:
+    """A ledger row is the current lifecycle view, so it is written again.
+
+    The immutable findings beside it are the record of what each round said.
+    Scoping the ledger by cycle is what stops a new cycle inheriting the block
+    of resolved rows an approval left on the previous one.
+    """
+    database = tmp_path / "state.sqlite3"
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="LedgerPlanner")
+    review = PlanningAttempt(
+        borg_id=borg.id,
+        phase="tech_review",
+        round=1,
+        adapter="mock",
+        model="test-model",
+    )
+    revision = PlanningAttempt(
+        borg_id=borg.id,
+        phase="tech_review",
+        round=2,
+        adapter="mock",
+        model="test-model",
+    )
+    change_request = PlanChangeRequest(
+        borg_id=borg.id, round=1, note="Stage the rollout."
+    )
+    raised = PlanningLedgerFinding(
+        borg_id=borg.id,
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        attempt_id=review.id,
+        first_seen_round=1,
+        last_seen_round=1,
+        severity="blocker",
+        message="Cover a partial rollback.",
+        suggestion="Name the checks it runs.",
+    )
+    next_cycle = PlanningLedgerFinding(
+        borg_id=borg.id,
+        cycle_id=str(change_request.id),
+        attempt_id=revision.id,
+        first_seen_round=1,
+        last_seen_round=1,
+        severity="major",
+        message="Stage the rollout explicitly.",
+    )
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_planning_attempt(review)
+        store.append_planning_attempt(revision)
+        store.append_plan_change_request(change_request)
+        store.record_planning_ledger_findings([raised])
+        store.record_planning_ledger_findings(
+            [
+                replace(
+                    raised,
+                    attempt_id=revision.id,
+                    first_seen_round=2,
+                    last_seen_round=2,
+                    status=FindingStatus.RESOLVED,
+                    severity="minor",
+                    message="A later round said something else.",
+                    suggestion="And suggested something else.",
+                ),
+                next_cycle,
+            ]
+        )
+
+    with SqliteStore.open(database) as reopened:
+        assert reopened.applied_migrations() == tuple(range(1, 14))
+        rows = reopened.list_planning_ledger_findings(borg.id)
+        assert len(rows) == 2
+        closed = next(row for row in rows if row.id == raised.id)
+        assert closed.status is FindingStatus.RESOLVED
+        assert closed.last_seen_round == 2
+        assert closed.attempt_id == revision.id
+        # Only lifecycle moves. A later write offering a different severity,
+        # message, suggestion or birth round changes none of them, which is
+        # what keeps a repeat from escalating a minor into a blocker.
+        assert closed.severity == "blocker"
+        assert closed.message == "Cover a partial rollback."
+        assert closed.suggestion == "Name the checks it runs."
+        assert closed.first_seen_round == 1
+        assert closed.round == 1
+        assert reopened.list_planning_ledger_findings(
+            borg.id, cycle_id=str(change_request.id)
+        ) == [next_cycle]
+        assert reopened.list_planning_ledger_findings(
+            borg.id, cycle_id=INITIAL_PLANNING_CYCLE
+        ) == [closed]
