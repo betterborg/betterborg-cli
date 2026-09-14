@@ -217,17 +217,17 @@ def test_task_estimate_reports_generation_dummy_source_and_unknown_billing(
     )
 
     assert terminal.exit_code == 0, terminal.output
-    assert terminal.output.startswith("DUMMY DATA")
-    assert f"Execution estimate for Borg 'inspect-tasks': {current.generation.id}" in (
-        terminal.output
-    )
-    assert "Task mix: 1 small, 0 medium, 0 large, 0 unsized" in terminal.output
-    assert "Total agent work (not calendar time): P50 30.0m, P80 1.0h" in (
-        terminal.output
-    )
-    assert "n=0, source=dummy_prior" in terminal.output
-    assert "API estimate: unknown" in terminal.output
-    assert "Billing mode unknown for: coding, merge, review" in terminal.output
+    assert "Execution estimate" in terminal.output.splitlines()[0]
+    assert "DUMMY DATA" in terminal.output
+    assert "borg 'inspect-tasks'" in terminal.output
+    assert str(current.generation.id) in terminal.output
+    assert "1 small · 0 medium · 0 large · 0 unsized" in terminal.output
+    assert "P50 30.0m   P80 1.0h  (not calendar time)" in terminal.output
+    assert "dummy_prior" in terminal.output
+    assert "API estimate" in terminal.output
+    assert "unknown (billing, usage, or model price is missing)" in terminal.output
+    assert "Billing unknown" in terminal.output
+    assert "coding, merge, review" in terminal.output
 
     assert machine.exit_code == 0, machine.output
     estimate = json.loads(machine.output)

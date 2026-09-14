@@ -22,6 +22,14 @@ _TRUST_DIRECTORY = "betterborg"
 _TRUST_FILENAME = "trusted-workspaces.json"
 
 
+#: The trust prompt names the workspace, then states what trusting it allows.
+TRUST_PROMPT_PREFIX = "Trust workspace "
+HOST_ACCESS_WARNING = (
+    "Betterborg's host-capable agents may read and modify files and execute "
+    "commands on this machine."
+)
+
+
 class UntrustedWorkspaceError(RuntimeError):
     """Raised when a workspace operation lacks machine-local trust."""
 
@@ -209,8 +217,7 @@ def require_workspace_trust(
         )
 
     consequence = (
-        f"Trust workspace {identity.repository_path}? Betterborg's host-capable "
-        "agents may read and modify files and execute commands on this machine."
+        f"{TRUST_PROMPT_PREFIX}{identity.repository_path}? {HOST_ACCESS_WARNING}"
     )
     if not confirm(consequence):
         raise UntrustedWorkspaceError(
