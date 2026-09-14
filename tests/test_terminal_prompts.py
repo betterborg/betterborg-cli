@@ -146,5 +146,5 @@ def test_prompts_share_the_marker_and_trust_shows_its_warning() -> None:
     assert "Workspace  /repo/demo" in result.output
     assert "Agents may read and modify files." in result.output
     assert "Trust workspace /repo/demo?" not in result.output
-    assert "› Trust this workspace [y/N]: " in result.output
-    assert "› Answer: " in result.output
+    assert "› Trust this workspace [y/N]: y\n\n" in result.output
+    assert result.output.endswith("› Answer: Linux\n\n")

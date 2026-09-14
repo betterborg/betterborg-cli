@@ -51,16 +51,23 @@ def styled_prompt(message: str) -> str:
 
 
 def prompt(message: str) -> str | None:
-    """Read one free-text answer, or ``None`` when the user aborts."""
+    """Read one free-text answer, or ``None`` when the user aborts.
+
+    A blank line follows the answer so the next card starts on its own.
+    """
     try:
-        return click.prompt(styled_prompt(message), default="", show_default=False)
+        answer = click.prompt(styled_prompt(message), default="", show_default=False)
     except click.Abort:
         return None
+    click.echo()
+    return answer
 
 
 def confirm(message: str, default: bool = False) -> bool:
-    """Ask one yes/no question with the shared marker."""
-    return click.confirm(styled_prompt(message), default=default)
+    """Ask one yes/no question with the shared marker, then leave a blank line."""
+    approved = click.confirm(styled_prompt(message), default=default)
+    click.echo()
+    return approved
 
 
 def present(card: PromptCard) -> None:
