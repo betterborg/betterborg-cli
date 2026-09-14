@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from steering_test_support import CancellingAgent
 
 from betterborg_cli.agent_runtime.base import CancellationToken
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
@@ -36,7 +37,12 @@ from betterborg_cli.planning import (
 )
 from betterborg_cli.planning.findings_ledger import open_task_findings
 from betterborg_cli.planning.supervisor import SUPERVISOR_DECISION_ROUND_CAP
-from betterborg_cli.progress import RunProgress, StageState
+from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
+    RunProgress,
+    StageState,
+)
 from betterborg_cli.store import (
     Borg,
     BorgState,
@@ -3052,6 +3058,34 @@ def test_a_supervisor_review_omitting_a_ledger_declaration_fails_its_schema(
         validate_structured_result(payload, SUPERVISOR_REVIEW_SCHEMA)
 
 
+STEERING_ACTIVITY = AgentActivity(AgentActivityKind.READING, "task-batch.json")
+
+
+def _steering(
+    rounds: int,
+    *,
+    confidence: str = "high",
+    activities: tuple[AgentActivity, ...] = (),
+) -> MockAdapter:
+    """Build a steering agent with a note for every round that can be steered.
+
+    Its own adapter, so a note never comes off the reviewer's script and the
+    reviewer's call count still counts reviews.
+    """
+    agent = MockAdapter(name="openai")
+    for index in range(rounds):
+        agent.queue(
+            MockResponse(
+                payload={
+                    "note": f"Steering note {index + 1}.",
+                    "confidence": confidence,
+                },
+                activities=activities,
+            )
+        )
+    return agent
+
+
 def _grant_review(
     decision: str,
     *,
@@ -3072,7 +3106,7 @@ def _grant_review(
         task_ref = context["task_batch"]["tasks"][0]["task_ref"]
         return {
             "decision": decision,
-            "summary": f"Supervisor decided to {decision}.",
+            "summary": f"{label}Supervisor decided to {decision}.",
             "findings": [
                 {
                     "severity": severity,
@@ -3148,6 +3182,7 @@ def test_a_draining_decomposition_runs_past_its_minimum_and_approves(
             store,
             supervisor,
             pm_agent=pm,
+            steering_agent=_steering(3),
             approved_plan=plan,
             review_rounds=1,
             grant_budget=10,
@@ -3207,6 +3242,7 @@ def test_the_decision_allowance_ends_a_granted_round_the_same_way(
                 store,
                 supervisor,
                 pm_agent=pm,
+                steering_agent=_steering(3),
                 approved_plan=plan,
                 review_rounds=review_rounds,
                 grant_budget=5,
@@ -3996,4 +4032,740 @@ def test_project_manager_minimums_below_their_floors_are_refused(
                 MockAdapter(name="openai"),
                 approved_plan=plan,
                 grant_budget=-1,
+            )
+
+
+def test_a_granted_decomposition_round_read_as_stuck_steers_the_project_manager(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The note joins the prompt of the turn that revises the batch.
+
+    It travels on the constructor of the loop that runs that turn, which is
+    where it has to arrive before that loop builds its prompt.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "supervisor-steered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-steered"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        # The steered revision misses its contract once, which is the same
+        # granted round arguing with itself rather than a round of its own.
+        pm.queue(
+            MockResponse(payload=_unowned(plan, required[0], revision=" One."))
+        )
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        steering = _steering(1)
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        # Every turn of the revision, the correction included: the prompt is
+        # rebuilt on each retry, and one rebuilt without the note spends the
+        # second half of a granted round unsteered.
+        assert len(pm.calls) == 3
+        assert all(
+            "Steering note for this revision:\n\nSteering note 1."
+            in call.user_prompt
+            for call in pm.calls[1:]
+        )
+        # The reviewer meets the revision rather than the instruction.
+        assert not any(
+            "Steering note" in call.user_prompt for call in supervisor.calls
+        )
+        assert [
+            (row.round, row.source, row.converging, str(row.plan_approval_id))
+            for row in store.list_steering_notes(borg.id)
+        ] == [(1, "agent", False, str(approval.id))]
+
+
+def test_a_steered_decomposition_reads_its_own_loops_rounds_and_not_the_pms(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Two loops record verdicts under one approval; the loop separates them.
+
+    The Project Manager's contract loop writes its own rows under the same
+    Borg and the same approval, and its minimum is its output retries rather
+    than the review's. Read together, the furthest-argued row decides, and a
+    Supervisor round still inside its own minimum is steered on an argument
+    the Project Manager was having with a validator.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "supervisor-pm-rounds.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-pm-rounds"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        # One contract failure, read as getting nowhere at its own minimum,
+        # before the batch the Supervisor reviews.
+        pm.queue(MockResponse(payload=_unowned(plan, required[0])))
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+        initial = ProjectManagerLoop(
+            repository,
+            borg,
+            store,
+            pm,
+            approved_plan=plan,
+            output_retries=1,
+            grant_budget=2,
+        ).run()
+        assert [
+            (row.round, row.minimum, row.converging)
+            for row in store.list_review_assessments(
+                borg.id, loop="pm_tasks", plan_approval_id=approval.id
+            )
+        ] == [(1, 1, False)]
+
+        for revision in (" One.", " Two."):
+            pm.queue(MockResponse(payload=_pm_payload(plan, revision=revision)))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=2))
+        )
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        # One more than the arithmetic allows, so an extra steered round shows
+        # up as a wrong count rather than as an adapter running dry.
+        steering = _steering(2)
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=2,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        # This loop's own round 1 is inside its minimum of 2, whatever the
+        # Project Manager's rows have reached.
+        assert len(steering.calls) == 1
+        assert "Steering note" not in pm.calls[2].user_prompt
+        assert "Steering note 1." in pm.calls[3].user_prompt
+        assert [
+            (row.round, row.source) for row in store.list_steering_notes(borg.id)
+        ] == [(2, "agent")]
+
+
+def test_a_steered_decomposition_reads_its_own_approvals_argument(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """An approval that blocked leaves its objections open for the next one.
+
+    Only an approval closes a task ledger, so a decomposition that spent its
+    grants leaves every row standing against a batch no later approval shares.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-stale-approval.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-stale-approval"
+        )
+        stale_approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        first = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        stale_supervisor = MockAdapter(name="openai")
+        for _round in range(2):
+            stale_supervisor.queue(
+                MockResponse(
+                    dynamic=_grant_review("request_changes", raised=1, label="Stale ")
+                )
+            )
+        blocked = SupervisorLoop(
+            repository,
+            first.borg,
+            store,
+            stale_supervisor,
+            pm_agent=pm,
+            steering_agent=_steering(1),
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=1,
+        ).run()
+        assert blocked.borg.state is BorgState.BLOCKED
+        stale = store.list_task_ledger_findings(
+            borg.id, plan_approval_id=stale_approval.id
+        )
+        assert stale and all(row.status is FindingStatus.OPEN for row in stale)
+
+        fresh_approval, borg = _approve_plan(store, blocked.borg, plan)
+        assert fresh_approval.id != stale_approval.id
+        pm.queue(MockResponse(payload=_pm_payload(plan)))
+        second = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" Two.")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("request_changes", raised=1, label="Fresh ")
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        steering = _steering(1)
+        result = SupervisorLoop(
+            repository,
+            second.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        prompt = steering.calls[0].user_prompt
+        assert "Fresh Objection 0." in prompt
+        assert "Stale Objection 0." not in prompt
+        assert "Rounds argued so far: 1." in prompt
+        # And each round's own account of what it decided, scoped the same
+        # way: the blocked approval's rounds are another argument, and read in
+        # here they would renumber this one's.
+        decided = prompt.split("## What each round decided")[1].strip().splitlines()
+        assert decided == [
+            "- Round 1: Fresh Supervisor decided to request_changes."
+        ]
+
+
+def test_a_steered_decomposition_round_reconciles_its_progress_child(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The stage refuses to complete while a child of it is still running.
+
+    Asserted with progress attached rather than switched off, because a
+    steering child left running is invisible to every test that passes none,
+    and over two steered rounds because a child can be declared and started
+    once: a loop that steers twice needs two of them, and a second round
+    handed the first round's completed child raises on its first activity.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-steered-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-steered-progress"
+        )
+        _, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        for revision in (" One.", " Two."):
+            pm.queue(MockResponse(payload=_pm_payload(plan, revision=revision)))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=2))
+        )
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        # Falls back, so the path under test is the one no note was written on.
+        steering = _steering(
+            2, confidence="low", activities=(STEERING_ACTIVITY,)
+        )
+        progress = RunProgress(stream=StringIO())
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=5,
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert progress.stages["supervisor"].state is StageState.COMPLETED
+        assert len(steering.calls) == 2
+        children = progress.stages["supervisor"].children
+        assert children["steering:1"].state is StageState.COMPLETED
+        assert children["steering:2"].state is StageState.COMPLETED
+        assert [
+            (row.round, row.source) for row in store.list_steering_notes(borg.id)
+        ] == [(1, "assembled"), (2, "assembled")]
+        # Each runner is bound to its own child, which is what the child is
+        # for: a turn reporting against the stage instead reads on screen as
+        # the reviewer stalling for as long as the note takes.
+        assert [
+            children[key].activity for key in ("steering:1", "steering:2")
+        ] == [STEERING_ACTIVITY, STEERING_ACTIVITY]
+        assert progress.stages["supervisor"].activity != STEERING_ACTIVITY
+        progress.close()
+
+
+def test_the_supervisors_steering_turn_is_handed_its_own_loops_argument(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """What the turn reads is the argument, and who it names is this answerer.
+
+    Handed nothing the turn still returns a confident note, which is the one
+    failure the confidence bar cannot catch: the bar reads the turn's own
+    certainty, and a turn shown an empty argument is certain about nothing.
+    This fixture holds one approval, so it pins what is read; the scope it is
+    read under is pinned by the cross-approval test below.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-argument.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-argument"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        for revision in (" One.", " Two."):
+            pm.queue(MockResponse(payload=_pm_payload(plan, revision=revision)))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=2))
+        )
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        # One more than the arithmetic allows, so an extra steered round shows
+        # up as a wrong count rather than as an adapter running dry.
+        steering = _steering(2)
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=2,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        prompt = steering.calls[0].user_prompt
+
+        # Who is about to answer, and what the argument is about.
+        assert "The Project Manager is about to answer these findings" in prompt
+        assert "the task batch" in prompt
+        assert "Rounds argued so far: 2." in prompt
+        # This approval's own objections, still open, with the round each
+        # started in.
+        assert (
+            "- Objection 0. (major, first raised in round 1) "
+            "(suggestion: Keep the task independently testable.)"
+        ) in prompt
+        assert (
+            "- Objection 1. (major, first raised in round 1) "
+            "(suggestion: Keep the task independently testable.)"
+        ) in prompt
+        assert "- Round 1: raised 2," in prompt
+        # Each round's own account of what it decided, and only the reviews'.
+        decided = prompt.split("## What each round decided")[1].strip().splitlines()
+        assert decided == [
+            "- Round 1: Supervisor decided to request_changes.",
+            "- Round 2: Supervisor decided to request_changes.",
+        ]
+
+
+def test_the_supervisors_note_turn_runs_on_the_steering_stage(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Its own stage's model, and not the one the reviewer runs under.
+
+    The steering stage is configurable on its own, and a turn handed the
+    loop's existing model would run the note on the reviewer's agent and
+    ignore that configuration.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-steering-model.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-steering-model"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        steering = _steering(1)
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            steering_model="steering-model",
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        attempts = store.list_planning_attempts(borg.id)
+        assert [
+            item.model for item in attempts if item.phase == "steering"
+        ] == ["steering-model"]
+        assert all(
+            item.model != "steering-model"
+            for item in attempts
+            if item.phase != "steering"
+        )
+
+
+def test_an_operator_stopping_the_run_stops_the_steered_decomposition(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """An operator who stopped the run has not asked for an unsteered revision.
+
+    The loop's cancellation error subclasses its general one, and the turn
+    reads the run's token to tell an operator's stop from a retry budget run
+    dry, so a turn handed no token would fall back and revise anyway.
+    """
+    plan = _plan()
+    cancel = CancellationToken()
+    database = committed_git_repo.parent / "supervisor-steering-stop.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-steering-stop"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        # Queued so a swallowed stop revises rather than running the adapter
+        # dry, which would stop the loop for the wrong reason.
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+
+        with pytest.raises(SupervisorCancelled):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                steering_agent=CancellingAgent(stops=True, cancel=cancel),
+                approved_plan=plan,
+                cancel=cancel,
+                review_rounds=1,
+                grant_budget=5,
+            ).run()
+
+        # The revision the operator stopped did not run, and no assembled note
+        # stood in for the one the turn did not write.
+        assert len(pm.calls) == 1
+        assert store.list_steering_notes(borg.id) == []
+
+
+def test_a_closing_decomposition_round_leaves_the_revision_prompt_alone(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Draining decides how a granted round is spent, not whether it happens."""
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-unsteered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-unsteered"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        for revision in (" One.", " Two."):
+            pm.queue(MockResponse(payload=_pm_payload(plan, revision=revision)))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=3))
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review(
+                    "request_changes", raised=1, close_open=True, label="Narrower: "
+                )
+            )
+        )
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        steering = _steering(2)
+
+        result = SupervisorLoop(
+            repository,
+            initial.borg,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=2,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        assert [
+            row.converging
+            for row in store.list_review_assessments(
+                borg.id, loop="supervisor_review", plan_approval_id=approval.id
+            )
+        ] == [False, True, True]
+        assert steering.calls == []
+        assert store.list_steering_notes(borg.id) == []
+        assert not any("Steering note" in call.user_prompt for call in pm.calls)
+
+
+def test_the_project_managers_own_contract_retries_take_no_note(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """Its findings are a validator's, naming the rule and the element that failed.
+
+    That is already the sentence a person would have written, and there is no
+    argument to read, so the loop that argues with a deterministic validator
+    steers nothing.
+    """
+    plan = _plan()
+    required = _required_refs(plan, "01-foundation")
+    database = committed_git_repo.parent / "pm-unsteered.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "pm-unsteered"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai")
+        for revision in ("", " two", " three"):
+            pm.queue(
+                MockResponse(payload=_unowned(plan, required[0], revision=revision))
+            )
+
+        with pytest.raises(ProjectManagerError, match="exhausted output retries"):
+            ProjectManagerLoop(
+                repository,
+                borg,
+                store,
+                pm,
+                approved_plan=plan,
+                output_retries=1,
+                grant_budget=2,
+            ).run()
+
+        # Three attempts, the first at the minimum and the rest past it,
+        # every one read as getting nowhere, and not one of them steered.
+        assert [
+            (row.round, row.converging)
+            for row in store.list_review_assessments(
+                borg.id, loop="pm_tasks", plan_approval_id=approval.id
+            )
+        ] == [(1, False), (2, False), (3, False)]
+        assert store.list_steering_notes(borg.id) == []
+        assert not any("Steering note" in call.user_prompt for call in pm.calls)
+
+
+def test_a_resumed_decomposition_round_reuses_the_note_its_row_already_holds(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """One note per grant, however many times the round carrying it is re-entered.
+
+    The run dies inside the steered revision, and the round it comes back into
+    finds the note already written for it rather than paying for a second turn.
+    """
+    plan = _plan()
+    database = committed_git_repo.parent / "supervisor-resumed-note.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-resumed-note"
+        )
+        approval, borg = _approve_plan(store, borg, plan)
+        pm = MockAdapter(name="openai").queue(
+            MockResponse(payload=_pm_payload(plan))
+        )
+        initial = ProjectManagerLoop(
+            repository, borg, store, pm, approved_plan=plan
+        ).run()
+        pm.queue(MockResponse(raise_error=RuntimeError("revision interrupted")))
+        supervisor = MockAdapter(name="openai")
+        supervisor.queue(
+            MockResponse(dynamic=_grant_review("request_changes", raised=1))
+        )
+        steering = _steering(2)
+
+        with pytest.raises(SupervisorError, match="revision interrupted"):
+            SupervisorLoop(
+                repository,
+                initial.borg,
+                store,
+                supervisor,
+                pm_agent=pm,
+                steering_agent=steering,
+                approved_plan=plan,
+                review_rounds=1,
+                grant_budget=5,
+            ).run()
+
+        interrupted = store.get_borg(borg.id)
+        assert interrupted is not None
+        assert interrupted.state is BorgState.PM_WORKING
+        assert len(steering.calls) == 1
+
+        pm.queue(MockResponse(payload=_pm_payload(plan, revision=" One.")))
+        supervisor.queue(
+            MockResponse(
+                dynamic=_grant_review("approve", raised=0, close_open=True)
+            )
+        )
+        result = SupervisorLoop(
+            repository,
+            interrupted,
+            store,
+            supervisor,
+            pm_agent=pm,
+            steering_agent=steering,
+            approved_plan=plan,
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.TASKS_APPROVAL_PENDING
+        # The resumed round paid for no second turn and ran on the same note.
+        assert len(steering.calls) == 1
+        assert [
+            (row.round, row.note) for row in store.list_steering_notes(borg.id)
+        ] == [(1, "Steering note 1.")]
+        assert "Steering note 1." in pm.calls[-1].user_prompt
+
+
+def test_a_supervisor_steering_agent_that_cannot_read_only_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The steering agent passes the boundary check its siblings pass.
+
+    It reads rows and returns prose, and an adapter that can enforce neither a
+    tool allowlist nor a read-only sandbox cannot be held to that.
+    """
+    unbounded = MockAdapter(name="openai")
+    unbounded.capabilities = replace(
+        unbounded.capabilities, tool_allowlist=False, read_only_sandbox=False
+    )
+    database = committed_git_repo.parent / "supervisor-unbounded.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "supervisor-unbounded"
+        )
+        with pytest.raises(SupervisorError, match="Steering read-only"):
+            SupervisorLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                steering_agent=unbounded,
             )

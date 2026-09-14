@@ -1476,6 +1476,13 @@ def _approve_plan(
             interactive=False,
             trust_requirement=planning_trust,
         ),
+        steering_agent=lambda: select_agent(
+            config,
+            AgentStage.STEERING,
+            paths,
+            interactive=False,
+            trust_requirement=planning_trust,
+        ),
         cancel=cancel,
     )
     return result.borg, result.approval, result.plan_path, result.publication

@@ -143,11 +143,16 @@ def _select_approval_agents(
     *,
     project_manager: MockAdapter,
     supervisor: MockAdapter,
+    steering: MockAdapter | None = None,
 ) -> list[AgentStage]:
     selected_stages: list[AgentStage] = []
     adapters = {
         AgentStage.PM: project_manager,
         AgentStage.SUPERVISOR: supervisor,
+        # Resolved on every approval and used only by a granted round the
+        # review read as stuck, so a test that never reaches one supplies an
+        # adapter that is never called.
+        AgentStage.STEERING: steering or MockAdapter(name="openai"),
     }
 
     def select(_config, stage, _paths, *, interactive, trust_requirement):
@@ -158,6 +163,78 @@ def _select_approval_agents(
 
     monkeypatch.setattr(cli_module, "select_agent", select)
     return selected_stages
+
+
+def test_the_approval_workflow_hands_a_steered_round_the_stages_own_agent(
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+) -> None:
+    """The steering factory's agent has to reach the loop that steers.
+
+    A loop handed the Supervisor's own agent instead runs the note on it and
+    ignores the steering configuration, and the factory is called either way.
+    """
+    plan = planning_plan_response()
+    repository, _attempt, paths = _seed_approval_pending(
+        committed_git_repo,
+        planning_cli_repository,
+        "steered-approval",
+        plan,
+    )
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\ndecomposition_rounds = 1\ngrant_budget = 2\n",
+        encoding="utf-8",
+    )
+    project_manager = MockAdapter(name="openai")
+    project_manager.queue(MockResponse(payload=_pm_tasks(plan)))
+    project_manager.queue(
+        MockResponse(
+            payload=_pm_tasks(
+                plan,
+                title="Document the independently verifiable release workflow",
+            )
+        )
+    )
+    supervisor = MockAdapter(name="openai")
+    supervisor.queue(
+        MockResponse(
+            payload=_review(
+                "request_changes",
+                "The release task needs independent verification.",
+            )
+        )
+    )
+    supervisor.queue(MockResponse(payload=_review("approve")))
+    steering = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "note": "Answer the verification objection first.",
+                "confidence": "high",
+            }
+        )
+    )
+
+    result = workflow_service_module.approve_plan_workflow(
+        paths,
+        load_repository_config(paths),
+        "steered-approval",
+        pm_agent=lambda: project_manager,
+        supervisor_agent=lambda: supervisor,
+        steering_agent=lambda: steering,
+    )
+
+    assert result.borg.state is BorgState.READY_TO_EXECUTE
+    # The granted round's note came off the stage's own agent, and reached the
+    # revision it was written for.
+    assert len(steering.calls) == 1
+    assert len(supervisor.calls) == 2
+    assert (
+        "Answer the verification objection first."
+        in project_manager.calls[-1].user_prompt
+    )
 
 
 def test_approval_workflow_uses_distinct_pm_and_supervisor_factories_for_revisions(
@@ -202,17 +279,22 @@ def test_approval_workflow_uses_distinct_pm_and_supervisor_factories_for_revisio
         constructed.append("supervisor")
         return supervisor
 
+    def steering_factory() -> MockAdapter:
+        constructed.append("steering")
+        return MockAdapter(name="openai")
+
     result = workflow_service_module.approve_plan_workflow(
         paths,
         load_repository_config(paths),
         "dual-approval",
         pm_agent=pm_factory,
         supervisor_agent=supervisor_factory,
+        steering_agent=steering_factory,
     )
 
     assert result.borg.state is BorgState.READY_TO_EXECUTE
     assert result.publication is not None
-    assert constructed == ["pm", "supervisor"]
+    assert constructed == ["pm", "supervisor", "steering"]
     assert len(project_manager.calls) == 2
     assert len(supervisor.calls) == 2
     assert all(
@@ -266,6 +348,9 @@ def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
         supervisor_factory_calls += 1
         return next(supervisors)
 
+    def steering_factory() -> MockAdapter:
+        return MockAdapter(name="openai")
+
     with pytest.raises(RuntimeError, match="review interrupted"):
         workflow_service_module.approve_plan_workflow(
             paths,
@@ -273,6 +358,7 @@ def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
             "dual-resume-approval",
             pm_agent=pm_factory,
             supervisor_agent=supervisor_factory,
+            steering_agent=steering_factory,
         )
 
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -288,6 +374,7 @@ def test_approval_workflow_resume_reconstructs_both_agents_without_repeating_pm(
         "dual-resume-approval",
         pm_agent=pm_factory,
         supervisor_agent=supervisor_factory,
+        steering_agent=steering_factory,
     )
 
     assert result.borg.state is BorgState.READY_TO_EXECUTE
@@ -444,7 +531,11 @@ def test_plan_approve_binds_exact_digest_publishes_golden_and_reaches_ready(
     project_manager_line = result.output.index("✔ Project Manager")
     supervisor_line = result.output.index("✔ Supervisor")
     assert project_manager_line < supervisor_line
-    assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
+    assert selected_stages == [
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+        AgentStage.STEERING,
+    ]
     assert project_manager is not supervisor
     assert len(project_manager.calls) == 1
     assert len(supervisor.calls) == 1
@@ -658,8 +749,10 @@ def test_plan_approve_interruption_resumes_without_reapproval_or_pm_rerun(
     assert selected_stages == [
         AgentStage.PM,
         AgentStage.SUPERVISOR,
+        AgentStage.STEERING,
         AgentStage.PM,
         AgentStage.SUPERVISOR,
+        AgentStage.STEERING,
     ]
     assert project_manager is not supervisor
     assert len(project_manager.calls) == 1

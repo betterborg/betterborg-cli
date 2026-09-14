@@ -6,14 +6,69 @@ import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from betterborg_cli.host_execution.git import SafeGit, UnsafeGitError, _status_entries
 from betterborg_cli.repo_paths import MANAGED_IGNORE_RULE
 
+#: Where a guard finding is recorded on the exception a failing phase already
+#: raised. A phase that both raised and dirtied the checkout gets its
+#: contamination attached rather than raised, and a caller that has to tell a
+#: breach from a failure reads it from the same place it reads the other arms.
+_ATTACHED_ATTRIBUTE = "_betterborg_checkout_contamination"
+
+
+class CheckoutCondition(StrEnum):
+    """Which of the guard's checks raised.
+
+    A caller that treats a checkout dirty before a phase began differently from
+    one the phase changed while it ran reads this rather than the message. Each
+    raise site names its member once and the message is rendered from that same
+    member, so neither a reword nor a mistyped argument can give one check's
+    wording to the other check's decision. ``UNREADABLE`` is the state neither
+    check reached, which is why it names no snapshot.
+    """
+
+    DIRTY = "was dirty"
+    CHANGED = "changed"
+    UNREADABLE = "could not be inspected"
+
 
 class PrimaryCheckoutContaminationError(RuntimeError):
     """Raised when host work starts dirty or changes the primary checkout."""
+
+    def __init__(self, message: str, *, condition: CheckoutCondition) -> None:
+        super().__init__(message)
+        self.condition = condition
+
+
+def attached_contamination(
+    error: BaseException,
+) -> PrimaryCheckoutContaminationError | None:
+    """Return the guard finding recorded beside a phase's own failure."""
+
+    found = getattr(error, _ATTACHED_ATTRIBUTE, None)
+    return found if isinstance(found, PrimaryCheckoutContaminationError) else None
+
+
+def checkout_was_changed(error: BaseException) -> bool:
+    """Return whether this failure carries a phase changing the checkout.
+
+    The guard raises its finding when the phase itself did not, and attaches it
+    to the phase's own exception when it did, so both the error in hand and the
+    one hanging off it are read. A checkout that was dirty before the phase
+    began is not this: the phase did not write it, and it is not evidence the
+    phase wrote anything.
+    """
+
+    for candidate in (error, attached_contamination(error)):
+        if (
+            isinstance(candidate, PrimaryCheckoutContaminationError)
+            and candidate.condition is CheckoutCondition.CHANGED
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -44,18 +99,22 @@ class PrimaryCheckoutGuard:
     def assert_clean(self, operation: str = "host execution") -> None:
         dirty = sorted(self._snapshot().status)
         if dirty:
-            raise PrimaryCheckoutContaminationError(
-                self._message(operation, "before it started", dirty)
+            raise self._contamination(
+                operation,
+                "before it started",
+                dirty,
+                condition=CheckoutCondition.DIRTY,
             )
 
     def before_phase(self, task_ref: str, phase: str) -> None:
         snapshot = self._snapshot()
         dirty = sorted(snapshot.status)
         if dirty:
-            raise PrimaryCheckoutContaminationError(
-                self._message(
-                    f"{phase} for {task_ref}", "before it started", dirty
-                )
+            raise self._contamination(
+                f"{phase} for {task_ref}",
+                "before it started",
+                dirty,
+                condition=CheckoutCondition.DIRTY,
             )
         with self._lock:
             self._snapshots[(task_ref, phase)] = snapshot
@@ -74,13 +133,11 @@ class PrimaryCheckoutGuard:
                 0, f"branch changed: {before.branch} -> {current.branch}"
             )
         if changes:
-            raise PrimaryCheckoutContaminationError(
-                self._message(
-                    f"{phase} for {task_ref}",
-                    "while it ran",
-                    changes,
-                    condition="changed",
-                )
+            raise self._contamination(
+                f"{phase} for {task_ref}",
+                "while it ran",
+                changes,
+                condition=CheckoutCondition.CHANGED,
             )
 
     @contextmanager
@@ -99,6 +156,10 @@ class PrimaryCheckoutGuard:
             except PrimaryCheckoutContaminationError as error:
                 if active_error is None:
                     raise
+                # A phase that both raised and changed the checkout has to be
+                # tellable from one that only raised, so the finding is
+                # recorded on the exception as well as read into its notes.
+                setattr(active_error, _ATTACHED_ATTRIBUTE, error)
                 active_error.add_note(str(error))
 
     def _snapshot(self) -> _CheckoutSnapshot:
@@ -126,14 +187,9 @@ class PrimaryCheckoutGuard:
         try:
             result = self._git.run(arguments, check=False)
         except UnsafeGitError as error:
-            raise PrimaryCheckoutContaminationError(
-                f"unable to inspect primary checkout {self._repo}: {error}"
-            ) from error
+            raise self._unreadable(str(error)) from error
         if result.returncode != 0:
-            raise PrimaryCheckoutContaminationError(
-                f"unable to inspect primary checkout {self._repo}: "
-                f"{result.stderr.strip()}"
-            )
+            raise self._unreadable(result.stderr.strip())
         return result.stdout
 
     def _ignored(self, path: str) -> bool:
@@ -142,17 +198,35 @@ class PrimaryCheckoutGuard:
             for prefix in self._ignored_prefixes
         )
 
-    def _message(
+    def _unreadable(self, detail: str) -> PrimaryCheckoutContaminationError:
+        """Build the condition neither snapshot check reached.
+
+        Named once here as the other two are named once at their own raise
+        sites, so this one cannot be given another check's decision either.
+        """
+        condition = CheckoutCondition.UNREADABLE
+        return PrimaryCheckoutContaminationError(
+            f"primary checkout {self._repo} {condition.value}: {detail}",
+            condition=condition,
+        )
+
+    def _contamination(
         self,
         operation: str,
         timing: str,
         entries: list[str],
         *,
-        condition: str = "was dirty",
-    ) -> str:
+        condition: CheckoutCondition,
+    ) -> PrimaryCheckoutContaminationError:
+        """Build one condition's wording and its decision from one member.
+
+        A raise site names the condition once, so it cannot give one check's
+        message to the other check's decision.
+        """
         details = "\n".join(f"  {line}" for line in entries[:40])
-        return (
-            f"primary checkout {self._repo} {condition} {timing} during "
+        return PrimaryCheckoutContaminationError(
+            f"primary checkout {self._repo} {condition.value} {timing} during "
             f"{operation}; task work was preserved and execution is blocked:\n"
-            f"{details}"
+            f"{details}",
+            condition=condition,
         )

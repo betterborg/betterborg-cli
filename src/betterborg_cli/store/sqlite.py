@@ -44,6 +44,8 @@ from betterborg_cli.store.models import (
     RepositoryAnalysis,
     RepositoryPackage,
     ReviewAssessment,
+    SteeringNote,
+    SteeringNoteSource,
     TaskBatch,
     TaskClaim,
     TaskCompletionSample,
@@ -851,6 +853,63 @@ class SqliteStore:
         with self.locked_connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [_row_to_review_assessment(row) for row in rows]
+
+    def record_steering_note(self, note: SteeringNote) -> None:
+        """Persist the note one granted round's answerer was handed."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO steering_notes(
+                    id, borg_id, loop, cycle_id, plan_approval_id, batch_id,
+                    task_id, round, attempt_id, note, source, converging,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(note.id),
+                    str(note.borg_id),
+                    note.loop,
+                    note.cycle_id,
+                    _optional_id(note.plan_approval_id),
+                    _optional_id(note.batch_id),
+                    _optional_id(note.task_id),
+                    note.round,
+                    _optional_id(note.attempt_id),
+                    note.note,
+                    note.source.value,
+                    int(note.converging),
+                    note.created_at.isoformat(),
+                ),
+            )
+
+    def list_steering_notes(
+        self,
+        borg_id: UUID,
+        *,
+        loop: str | None = None,
+        cycle_id: str | None = None,
+        plan_approval_id: UUID | None = None,
+        task_id: UUID | None = None,
+    ) -> list[SteeringNote]:
+        """Return recorded steering notes, optionally limited to one scope."""
+        query = "SELECT * FROM steering_notes WHERE borg_id = ?"
+        parameters: list[object] = [str(borg_id)]
+        if loop is not None:
+            query += " AND loop = ?"
+            parameters.append(loop)
+        if cycle_id is not None:
+            query += " AND cycle_id = ?"
+            parameters.append(cycle_id)
+        if plan_approval_id is not None:
+            query += " AND plan_approval_id = ?"
+            parameters.append(str(plan_approval_id))
+        if task_id is not None:
+            query += " AND task_id = ?"
+            parameters.append(str(task_id))
+        query += " ORDER BY created_at, round, id"
+        with self.locked_connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_row_to_steering_note(row) for row in rows]
 
     def append_plan_change_request(self, request: PlanChangeRequest) -> None:
         """Append one immutable human plan-revision request."""
@@ -3531,6 +3590,24 @@ def _row_to_review_assessment(row: sqlite3.Row) -> ReviewAssessment:
             None if row["refunded"] is None else bool(row["refunded"])
         ),
         evidence=json.loads(row["evidence"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_steering_note(row: sqlite3.Row) -> SteeringNote:
+    return SteeringNote(
+        id=UUID(row["id"]),
+        borg_id=UUID(row["borg_id"]),
+        loop=row["loop"],
+        cycle_id=row["cycle_id"],
+        plan_approval_id=_optional_uuid(row["plan_approval_id"]),
+        batch_id=_optional_uuid(row["batch_id"]),
+        task_id=_optional_uuid(row["task_id"]),
+        round=row["round"],
+        attempt_id=_optional_uuid(row["attempt_id"]),
+        note=row["note"],
+        source=SteeringNoteSource(row["source"]),
+        converging=bool(row["converging"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

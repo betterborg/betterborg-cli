@@ -35,6 +35,7 @@ from betterborg_cli.agent_runtime import (
     run_captured,
     select_agent,
 )
+from betterborg_cli.agent_runtime.api_tools import _COMMAND_ROLES
 from betterborg_cli.agent_runtime.selection import _STAGE_ROLES
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import (
@@ -174,6 +175,19 @@ def test_stage_catalog_configuration_and_security_roles_have_structural_parity(
 
     assert choice_fields == {stage.value for stage in AgentStage}
     assert set(_STAGE_ROLES) == set(AgentStage)
+
+
+def test_the_steering_stage_carries_the_planning_security_role() -> None:
+    """Named here because the parity check above cannot catch it.
+
+    That check compares stage names against the configuration fields and the
+    role map's keys, and never which role a stage maps to. A steering turn
+    reads rows and returns prose without touching a file, and the review role
+    is the one that makes an API-transport turn able to run commands.
+    """
+
+    assert _STAGE_ROLES[AgentStage.STEERING] is ApiAgentRole.PLANNING
+    assert ApiAgentRole.PLANNING not in _COMMAND_ROLES
 
 
 @pytest.mark.parametrize(

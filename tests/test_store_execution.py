@@ -258,7 +258,7 @@ def test_migration_015_execution_ledger_moves_only_lifecycle(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 16))
+        assert reopened.applied_migrations() == tuple(range(1, 17))
         rows = reopened.list_execution_ledger_findings(task.id)
         assert len(rows) == 1
         closed = rows[0]
@@ -375,7 +375,7 @@ def test_execution_ownership_records_round_trip_after_reopen(
         assert not store.task_claim_owned_by(claim.id, "wrong-token")
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 16))
+        assert reopened.applied_migrations() == tuple(range(1, 17))
         assert reopened.get_execution_run(run.id) == run
         assert reopened.list_execution_runs(borg.id) == [run]
         assert reopened.get_task_runtime(task.id) == runtime

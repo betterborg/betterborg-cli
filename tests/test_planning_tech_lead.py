@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from planning_progress_test_support import BoundaryInterruptProgress
+from steering_test_support import CancellingAgent
 
 from betterborg_cli.agent_runtime import CancellationToken
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.planning import (
     ARCHITECT_QUESTION_ROUND_CAP,
@@ -19,14 +22,25 @@ from betterborg_cli.planning import (
     ArchitectCancelled,
     ArchitectError,
     ArchitectLoop,
+    TechLeadCancelled,
     TechLeadError,
     TechLeadLoop,
 )
 from betterborg_cli.planning.cycles import INITIAL_PLANNING_CYCLE
 from betterborg_cli.planning.findings_ledger import open_planning_findings
+from betterborg_cli.planning.steering import (
+    STEERING_NOTE_SCHEMA,
+    STEERING_SYSTEM_PROMPT,
+    SteeringScope,
+    SteeringSubject,
+    assembled_steering_note,
+    render_steering_prompt,
+)
 from betterborg_cli.planning.tech_lead import tech_lead_grant_account
 from betterborg_cli.prd_session import InteractiveIO
 from betterborg_cli.progress import (
+    AgentActivity,
+    AgentActivityKind,
     ChildRecord,
     RunProgress,
     StageRecord,
@@ -40,6 +54,7 @@ from betterborg_cli.store import (
     PlanningAttempt,
     PlanningAttemptStatus,
     PlanningLedgerFinding,
+    ReviewAssessment,
     SqliteStore,
 )
 
@@ -1618,6 +1633,34 @@ def _reviewer(
     return reviewer
 
 
+STEERING_ACTIVITY = AgentActivity(AgentActivityKind.READING, "open-findings.json")
+
+
+def _steering(
+    rounds: int,
+    *,
+    confidence: str = "high",
+    activities: tuple[AgentActivity, ...] = (),
+) -> MockAdapter:
+    """Build a steering agent with a note for every round that can be steered.
+
+    One per review, which is more than the loop can reach: the round a review
+    leads into is steered at most once, and the last review leads into none.
+    """
+    agent = MockAdapter(name="openai")
+    for index in range(rounds):
+        agent.queue(
+            MockResponse(
+                payload={
+                    "note": f"Steering note {index + 1}.",
+                    "confidence": confidence,
+                },
+                activities=activities,
+            )
+        )
+    return agent
+
+
 def _architect(planning_plan_response, revisions: int) -> MockAdapter:
     architect = MockAdapter(name="openai")
     architect.queue(MockResponse(payload={"decision": "ready_to_plan"}))
@@ -1638,6 +1681,7 @@ def _run_reviews(
     *,
     review_rounds: int | None = None,
     grant_budget: int = 0,
+    steering_agent: MockAdapter | None = None,
 ):
     """Drive one Tech Lead cycle over the reviews supplied.
 
@@ -1653,6 +1697,9 @@ def _run_reviews(
         store,
         _reviewer(reviews, handed),
         architect_agent=architect,
+        steering_agent=(
+            _steering(len(reviews)) if steering_agent is None else steering_agent
+        ),
         io=_io(),
         review_rounds=len(reviews) if review_rounds is None else review_rounds,
         grant_budget=grant_budget,
@@ -2720,6 +2767,7 @@ def test_a_resumed_run_honours_the_refund_the_round_before_it_earned(
                 store,
                 reviewer,
                 architect_agent=architect,
+                steering_agent=_steering(4),
                 io=_io(),
                 review_rounds=1,
                 grant_budget=2,
@@ -2742,6 +2790,7 @@ def test_a_resumed_run_honours_the_refund_the_round_before_it_earned(
             store,
             _reviewer([standing_still, standing_still], handed),
             architect_agent=architect,
+            steering_agent=_steering(4),
             io=_io(),
             review_rounds=1,
             grant_budget=2,
@@ -2853,6 +2902,7 @@ def test_the_reviewer_is_told_its_round_and_nothing_about_the_budget(
             store,
             reviewer,
             architect_agent=architect,
+            steering_agent=_steering(3),
             io=_io(),
             review_rounds=1,
             grant_budget=7,
@@ -2912,6 +2962,7 @@ def test_a_contract_slip_ends_a_granted_round_as_it_ends_one_inside_the_minimum(
                 store,
                 _reviewer([asking, silent], handed),
                 architect_agent=architect,
+                steering_agent=_steering(2),
                 io=_io(),
                 review_rounds=review_rounds,
                 grant_budget=5,
@@ -3286,3 +3337,1316 @@ def test_the_recorded_snapshot_outlives_a_regression_that_moves_the_drain(
         }
         assert recomputed == {1: 3, 2: 3, 3: 3}
         assert recomputed[2] > rows[1].open_findings
+
+
+def _blocked(message: str) -> dict:
+    return _raised(message, severity="blocker")
+
+
+def _approving(ledger, _history):
+    return _review(
+        "approve",
+        summary="The plan is ready.",
+        resolved=[row["id"] for row in ledger],
+    )
+
+
+def _steering_rows(store, borg_id) -> list[tuple]:
+    """Read back every column a steered round records for itself."""
+    return [
+        (row.round, row.source, row.converging, row.note, row.cycle_id)
+        for row in store.list_steering_notes(borg_id)
+    ]
+
+
+def _revision_prompts(architect: MockAdapter) -> list[str]:
+    """Return the prompts of the Architect turns that wrote a plan."""
+    return [
+        call.user_prompt
+        for call in architect.calls
+        if "emit the implementation plan" in call.user_prompt
+    ]
+
+
+def test_a_granted_round_the_review_read_as_stuck_steers_the_architect(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """The round that decides is not the round that is steered.
+
+    Round one is the minimum, so the revision it asks for is the first grant,
+    and its verdict is what decides whether that grant is steered.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-stuck.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-stuck"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = _steering(1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        assert (
+            "Steering note for this revision:\n\nSteering note 1."
+            in _revision_prompts(architect)[-1]
+        )
+        # Keyed to the round whose assessment asked for it, in the ledger's
+        # numbering, and carrying the verdict and the note that was used.
+        assert _steering_rows(store, borg.id) == [
+            (1, "agent", False, "Steering note 1.", INITIAL_PLANNING_CYCLE)
+        ]
+        # And naming the turn that wrote it, which is what tells a note an
+        # agent produced from one no attempt stands behind.
+        assert [
+            item.id
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "steering"
+        ] == [row.attempt_id for row in store.list_steering_notes(borg.id)]
+
+
+def test_a_granted_round_the_review_read_as_closing_in_is_not_steered(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Draining decides how a granted round is spent, not whether it happens.
+
+    A converging loop already has the findings it has to answer in front of
+    the agent answering them, so its revision gets the prompt it would have
+    had.
+    """
+    handed: list[list[dict]] = []
+
+    def opening(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Three things stand in the way.",
+            findings=[_raised(f"Objection {index}.") for index in range(3)],
+        )
+
+    def closing(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two are answered.",
+            resolved=[row["id"] for row in ledger[:2]],
+            findings=[_raised("Objection 3.")],
+        )
+
+    database = committed_git_repo.parent / "steering-closing.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-closing"
+        )
+        architect = _architect(planning_plan_response, 2)
+        steering = _steering(2)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([opening, closing, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=2,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert [
+            row.converging
+            for row in store.list_review_assessments(
+                borg.id, loop="tech_review"
+            )
+        ] == [False, True, True]
+        assert steering.calls == []
+        assert store.list_steering_notes(borg.id) == []
+        assert not any(
+            "Steering note" in prompt for prompt in _revision_prompts(architect)
+        )
+
+
+def test_the_first_steered_round_is_the_one_the_minimum_ends_on(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A round inside the minimum is not a grant, however stuck it reads.
+
+    A refund records that a round was itself a grant, which is one round later
+    than this test, so the refund is not what triggers a note.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-minimum.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-minimum"
+        )
+        architect = _architect(planning_plan_response, 3)
+        steering = _steering(3)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, stuck, stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=3,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        # Every round read as stuck, and only the round the minimum ends on
+        # led into a grant.
+        assert [
+            row.converging
+            for row in store.list_review_assessments(
+                borg.id, loop="tech_review"
+            )
+        ] == [
+            False,
+            False,
+            False,
+            True,
+        ]
+        assert len(steering.calls) == 1
+        assert [row.round for row in store.list_steering_notes(borg.id)] == [3]
+        assert [
+            "Steering note" in prompt for prompt in _revision_prompts(architect)
+        ] == [False, False, False, True]
+
+
+def test_the_assembled_note_names_open_objections_and_how_long_each_stood() -> None:
+    """The fallback is the second place the open-objections rule is applied.
+
+    A note that lists what the reviewer already closed, or that says every
+    objection is one round old, is the misdirection the confidence bar routes
+    away from — arriving by the path it routes to.
+    """
+    raised_early = PlanningLedgerFinding(
+        borg_id=uuid4(),
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        attempt_id=uuid4(),
+        first_seen_round=1,
+        last_seen_round=4,
+        severity="blocker",
+        message="Name the rollback checks.",
+    )
+    raised_late = replace(
+        raised_early,
+        id=uuid4(),
+        first_seen_round=4,
+        message="Cover the partial rollback.",
+    )
+    closed = replace(
+        raised_early,
+        id=uuid4(),
+        status=FindingStatus.RESOLVED,
+        message="Say which region ships first.",
+    )
+
+    note = assembled_steering_note(
+        [raised_early, closed, raised_late], round_number=4
+    )
+
+    assert (
+        "Name the rollback checks. (blocker, first raised in round 1 and open "
+        "for 4 rounds)"
+    ) in note
+    assert (
+        "Cover the partial rollback. (blocker, first raised in round 4 and "
+        "open for 1 round)"
+    ) in note
+    # Closed in an earlier round, so it is not one still open.
+    assert "Say which region ships first." not in note
+
+
+def test_a_note_and_a_prompt_with_nothing_open_say_so_rather_than_nothing() -> None:
+    """Both renderings hold their shape when a section has nothing in it.
+
+    Neither is reached with an empty section by a loop that steers — a note is
+    written for a round the review left objections behind in — so what keeps
+    the headings from standing over silence is only the arms themselves.
+    """
+    verdict = ReviewAssessment(
+        borg_id=uuid4(),
+        loop="tech_lead_review",
+        round=2,
+        minimum=1,
+        converging=False,
+    )
+
+    note = assembled_steering_note([], round_number=2)
+    prompt = render_steering_prompt(
+        subject=SteeringSubject(answerer="The Architect", work="the plan"),
+        verdict=verdict,
+        ledger=[],
+        summaries=[],
+    )
+
+    assert "- none the ledger still holds open." in note
+    assert "- none the ledger still holds open." in prompt
+    assert "- no rounds have been reconciled yet." in prompt
+    assert "- no round recorded a summary." in prompt
+
+
+def test_the_steering_prompt_states_the_rules_nothing_else_holds() -> None:
+    """Three of its rules have no other enforcement anywhere in the stage.
+
+    The confidence bar reads a number the turn reports about itself, so the
+    sentence asking for it honestly is the only thing behind it; the note
+    reaching the right agent is a matter of who it is addressed to; and the
+    write tripwires block a turn that wrote without ever having told it not to.
+    """
+    assert (
+        "Report how confident you are of the note as high, medium or low, and "
+        "report it as you find it rather than to get the note used."
+    ) in STEERING_SYSTEM_PROMPT
+    assert (
+        "Write the note to the agent that will answer the findings, not to "
+        "the reviewer."
+    ) in STEERING_SYSTEM_PROMPT
+    assert "Do not modify any file." in STEERING_SYSTEM_PROMPT
+
+
+def test_a_steering_scope_names_the_run_its_note_belongs_to() -> None:
+    """A durable turn's context carries the scope its loop fills, and no other."""
+    approval_id = uuid4()
+    task_id = uuid4()
+
+    assert SteeringScope(
+        loop="tech_lead_review", cycle_id=INITIAL_PLANNING_CYCLE
+    ).request_context() == {
+        "loop": "tech_lead_review",
+        "cycle_id": INITIAL_PLANNING_CYCLE,
+    }
+    assert SteeringScope(
+        loop="supervisor_review", plan_approval_id=approval_id
+    ).request_context() == {
+        "loop": "supervisor_review",
+        "plan_approval_id": str(approval_id),
+    }
+    assert SteeringScope(
+        loop="task_review", task_id=task_id
+    ).request_context() == {"loop": "task_review", "task_id": str(task_id)}
+
+
+@pytest.mark.parametrize("confidence", ["medium", "low"])
+def test_a_note_the_turn_is_not_confident_of_is_replaced_by_the_assembled_one(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    confidence: str,
+) -> None:
+    """The costs are not symmetric, so only a confident note is attached.
+
+    A merely plausible note misdirects a round that was bought, where the
+    assembled one leaves the Architect exactly where an unsteered round would
+    have left it.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / f"steering-{confidence}.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, f"steering-{confidence}"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = _steering(1, confidence=confidence)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        rows = store.list_steering_notes(borg.id)
+        assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+        assert "Name the rollback checks." in rows[0].note
+        assert "open for 1 round" in rows[0].note
+        assert "Steering note 1." not in _revision_prompts(architect)[-1]
+        assert rows[0].note in _revision_prompts(architect)[-1]
+
+
+def test_a_steering_turn_that_fails_leaves_the_granted_round_intact(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """The round was already granted and the revision is still worth running."""
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-raises.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-raises"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = MockAdapter(name="openai").queue(
+            MockResponse(raise_error=RuntimeError("the note turn fell over"))
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        rows = store.list_steering_notes(borg.id)
+        assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+        assert rows[0].note in _revision_prompts(architect)[-1]
+        # The machinery does not close an attempt that crashed, so the turn
+        # left its own open and nothing else. The round it steers is in its
+        # request context, which is what stops the next round replaying it.
+        assert [
+            (item.status, item.request["steered_round"])
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "steering"
+        ] == [(PlanningAttemptStatus.RUNNING, 1)]
+
+
+def test_an_operator_stopping_the_run_stops_it_from_the_steering_turn_too(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """An operator who stopped the run has not asked for an unsteered revision.
+
+    The loop's cancellation error subclasses its general one, so a handler
+    reaching for the assembled note through the general one would swallow the
+    stop and revise anyway.
+    """
+    handed: list[list[dict]] = []
+    cancel = CancellationToken()
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-cancelled.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-cancelled"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = CancellingAgent(stops=True, cancel=cancel)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        with pytest.raises(TechLeadCancelled):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                _reviewer([stuck, _approving], handed),
+                architect_agent=architect,
+                steering_agent=steering,
+                io=_io(),
+                cancel=cancel,
+                review_rounds=1,
+                grant_budget=5,
+            ).run()
+
+        current = store.get_borg(borg.id)
+        assert current is not None
+        assert current.state is BorgState.ARCHITECT_WORKING
+        # No note resolved, so no row was written and no revision ran.
+        assert store.list_steering_notes(borg.id) == []
+        assert len(_revision_prompts(architect)) == 1
+
+
+def test_a_steering_turn_its_adapter_gave_up_on_falls_back_without_stopping(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A cancelled status covers two things and only one of them is a stop.
+
+    The adapters return it for an operator's stop and for bounded transient
+    retries exhausted alike, and an optional turn must not end a run over a
+    provider hiccup.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-retries.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-retries"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = CancellingAgent(stops=False)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            cancel=CancellationToken(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        rows = store.list_steering_notes(borg.id)
+        assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+        assert rows[0].note in _revision_prompts(architect)[-1]
+
+
+def test_a_resumed_granted_round_reuses_the_note_its_row_already_holds(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """There is exactly one note per grant, however often the round is re-entered."""
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-resumed.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-resumed"
+        )
+        architect = _architect(planning_plan_response, 0)
+        steering = _steering(1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        # The note is written, and the revision it was written for dies.
+        with pytest.raises((TechLeadError, ArchitectError)):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                _reviewer([stuck], handed),
+                architect_agent=architect,
+                steering_agent=steering,
+                io=_io(),
+                review_rounds=1,
+                grant_budget=5,
+            ).run()
+        assert len(steering.calls) == 1
+
+        architect.queue(
+            MockResponse(payload=planning_plan_response(summary="Resumed."))
+        )
+        resumed = TechLeadLoop(
+            repository,
+            store.get_borg(borg.id),
+            store,
+            _reviewer([_approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert resumed.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        # The resumed round paid for no second turn and ran on the same note.
+        assert len(steering.calls) == 1
+        assert [
+            (row.round, row.note) for row in store.list_steering_notes(borg.id)
+        ] == [(1, "Steering note 1.")]
+        assert "Steering note 1." in _revision_prompts(architect)[-1]
+
+
+def test_a_crashed_steering_turn_is_replaced_rather_than_replayed(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """The round in the request context is what keeps the pairing honest.
+
+    A crash leaves the attempt open, and without the round it steers in its
+    context the next granted round would replay the note written for the last.
+    """
+    handed: list[list[dict]] = []
+    stale = committed_git_repo.parent / "stale-note.json"
+
+    def crash(spec):
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.result_path.write_text(stale.read_text(encoding="utf-8"), "utf-8")
+        raise RuntimeError("the note turn crashed after writing its result")
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    stale.write_text(
+        json.dumps({"note": "The stale note.", "confidence": "high"}),
+        encoding="utf-8",
+    )
+    database = committed_git_repo.parent / "steering-crashed.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-crashed"
+        )
+        architect = _architect(planning_plan_response, 2)
+        steering = MockAdapter(name="openai")
+        steering.queue(MockResponse(dynamic=crash))
+        steering.queue(
+            MockResponse(payload={"note": "The fresh note.", "confidence": "high"})
+        )
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        attempts = [
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "steering"
+        ]
+        # The orphan the crash left is failed on the next round's entry rather
+        # than recovered into it, and the round it steers is what says so.
+        assert [item.status for item in attempts] == [
+            PlanningAttemptStatus.FAILED,
+            PlanningAttemptStatus.COMPLETED,
+        ]
+        # The whole context and not the round alone: both planning loops file
+        # under one phase in one Borg, so the scope is what keeps a crashed
+        # cycle's orphan from being replayed into the next one.
+        assert [
+            (
+                item.request["loop"],
+                item.request["cycle_id"],
+                item.request["steered_round"],
+            )
+            for item in attempts
+        ] == [
+            ("tech_review", INITIAL_PLANNING_CYCLE, 1),
+            ("tech_review", INITIAL_PLANNING_CYCLE, 2),
+        ]
+        rows = store.list_steering_notes(borg.id)
+        assert [(row.round, row.source) for row in rows] == [
+            (1, "assembled"),
+            (2, "agent"),
+        ]
+        assert rows[1].note == "The fresh note."
+        assert "The stale note." not in "".join(_revision_prompts(architect))
+
+
+def test_a_second_steered_round_gets_its_own_runner_and_progress_child(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A progress child is declared and started once, so two rounds need two.
+
+    Reusing the loop's own runner would put the note on the reviewer's agent
+    and ignore the steering configuration entirely, so each steered round
+    builds its own.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-twice.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-twice"
+        )
+        architect = _architect(planning_plan_response, 2)
+        reviewer = _reviewer([stuck, stuck, _approving], handed)
+        steering = _steering(2, activities=(STEERING_ACTIVITY,))
+        progress = RunProgress(stream=StringIO())
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        # The stage completed, which it refuses to do while a child of it is
+        # still running: every steering child is reconciled on the success path.
+        assert progress.stages["tech-lead"].state is StageState.COMPLETED
+        children = progress.stages["tech-lead"].children
+        assert [
+            children[key].state
+            for key in ("steering:1", "steering:2")
+        ] == [StageState.COMPLETED, StageState.COMPLETED]
+        assert len(steering.calls) == 2
+        assert len(reviewer.calls) == 3
+        assert [
+            (row.round, row.note) for row in store.list_steering_notes(borg.id)
+        ] == [(1, "Steering note 1."), (2, "Steering note 2.")]
+        # Each runner is bound to its own child, which is what the child is
+        # for: a turn reporting against the stage instead reads on screen as
+        # the reviewer stalling for as long as the note takes.
+        assert [
+            children[key].activity for key in ("steering:1", "steering:2")
+        ] == [STEERING_ACTIVITY, STEERING_ACTIVITY]
+        assert progress.stages["tech-lead"].activity != STEERING_ACTIVITY
+        progress.close()
+
+
+def test_a_fallen_back_steered_round_still_reconciles_its_progress_child(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Every path reconciles the child, not only the one that wrote a note.
+
+    The turn machinery emits into a child and never touches its lifecycle, so
+    the stage refuses to complete while any child of it is still running. A
+    round that fell back returns through the same point as one that succeeded,
+    so this cannot fail while its sibling passes — it is here against a
+    reconciliation that one day reads the note before deciding. Over two
+    rounds, because the note a round falls back to is assembled for the round
+    it steers, and a loop that steers once steers exactly on its minimum.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-fallback-progress.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-fallback-progress"
+        )
+        architect = _architect(planning_plan_response, 2)
+        reviewer = _reviewer([stuck, stuck, _approving], handed)
+        steering = _steering(2, confidence="medium")
+        progress = RunProgress(stream=StringIO())
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+            progress=progress,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert progress.stages["tech-lead"].state is StageState.COMPLETED
+        children = progress.stages["tech-lead"].children
+        assert [
+            children[key].state for key in ("steering:1", "steering:2")
+        ] == [StageState.COMPLETED, StageState.COMPLETED]
+        # Both rounds ran on the assembled note, which is what makes this the
+        # fallback path rather than the success one.
+        rows = store.list_steering_notes(borg.id)
+        assert [(row.round, row.source) for row in rows] == [
+            (1, "assembled"),
+            (2, "assembled"),
+        ]
+        # And the second one is assembled for the round it steers, not for the
+        # minimum that round passed.
+        assert (
+            "Name the rollback checks. (blocker, first raised in round 1 and "
+            "open for 2 rounds)"
+        ) in rows[1].note
+        progress.close()
+
+
+def test_the_note_rides_the_plan_prompts_contract_corrections(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A contract retry is the same granted round arguing with itself."""
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-correction.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-correction"
+        )
+        architect = _architect(planning_plan_response, 0)
+        invalid = planning_plan_response(summary="Invalid.")
+        invalid["phases"][0]["name"] = "02-release-workflow"
+        architect.queue(MockResponse(payload=invalid))
+        architect.queue(
+            MockResponse(payload=planning_plan_response(summary="Corrected."))
+        )
+        steering = _steering(1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            _reviewer([stuck, _approving], handed),
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        revisions = _revision_prompts(architect)[1:]
+        assert len(revisions) == 2
+        assert all("Steering note 1." in prompt for prompt in revisions)
+        assert "Return the whole plan again." in revisions[-1]
+
+
+def test_neither_the_reviewer_nor_the_question_turn_is_handed_the_note(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A reviewer told what to conclude is not a reviewer.
+
+    Nor does the note reach a turn about what the Architect needs to know. The
+    question turn is unreachable once a note exists — a note follows a review,
+    a review follows a plan, and a cycle that has planned is ready — so what is
+    asserted here is that a steered revision opens no question round, and that
+    the answering turn it does reach carries none.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    open_question = planning_plan_response(summary="Needs an answer.")
+    open_question["open_questions"] = ["Which region ships first?"]
+    database = committed_git_repo.parent / "steering-audience.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-audience"
+        )
+        architect = _architect(planning_plan_response, 0)
+        architect.queue(MockResponse(payload=open_question))
+        architect.queue(
+            MockResponse(payload={"answers": [{"q_id": "q1", "answer": "Europe."}]})
+        )
+        # Two: a plan that answered its own question and names no assumption
+        # is corrected once before it stands.
+        for summary in ("Answered.", "Answered with assumptions."):
+            architect.queue(
+                MockResponse(payload=planning_plan_response(summary=summary))
+            )
+        reviewer = _reviewer([stuck, _approving], handed)
+        steering = _steering(1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io(), unattended=True
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            steering_agent=steering,
+            io=_io(),
+            unattended=True,
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert not any("Steering note" in call.user_prompt for call in reviewer.calls)
+        answering = [
+            call.user_prompt
+            for call in architect.calls
+            if "decide them yourself" in call.user_prompt
+        ]
+        assert answering and not any("Steering note" in prompt for prompt in answering)
+        # The steered revision opened no question round of its own, which is
+        # why no prompt of that turn's can carry a note.
+        asked = [
+            attempt
+            for attempt in store.list_planning_attempts(borg.id)
+            if attempt.phase == "architect_questions"
+        ]
+        assert [attempt.round for attempt in asked] == [1]
+
+
+def test_the_note_row_carries_the_ledger_round_and_not_the_attempts_own(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """Attempts are unique per phase and round, so the two cannot be one number.
+
+    A second planning cycle restarts the ledger's rounds while the steering
+    phase's own count carries on, and a row holding the attempt's number would
+    say nothing about the round it steers.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-cycles.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-cycles"
+        )
+        first = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [stuck, _approving],
+            handed,
+            review_rounds=1,
+            grant_budget=5,
+        )
+        assert first.borg.state is BorgState.PLAN_APPROVAL_PENDING
+
+        request = PlanChangeRequest(
+            borg_id=borg.id, round=1, note="Cover the rollback path."
+        )
+        with store.transaction():
+            store.append_plan_change_request(request)
+            changed = store.compare_and_set_borg_state(
+                borg.id,
+                expected_state=first.borg.state,
+                expected_version=first.borg.state_version,
+                new_state=BorgState.ARCHITECT_WORKING,
+            )
+        second = _run_reviews(
+            repository,
+            changed,
+            store,
+            planning_plan_response,
+            [stuck, _approving],
+            handed,
+            review_rounds=1,
+            grant_budget=5,
+        )
+
+        assert second.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        attempts = [
+            item
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "steering"
+        ]
+        # The phase's own count carries across the cycles; the rows both name
+        # the ledger round one their own cycle steered.
+        assert [item.round for item in attempts] == [1, 2]
+        assert [
+            (row.round, row.cycle_id) for row in store.list_steering_notes(borg.id)
+        ] == [(1, INITIAL_PLANNING_CYCLE), (1, str(request.id))]
+
+
+def test_a_steered_cycle_reads_its_own_argument_and_not_the_one_before_it(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """A cycle that blocked leaves its objections open for the next one to see.
+
+    Only an approval closes a ledger, so a cycle that spent its grants leaves
+    every row standing. Read unscoped, the next cycle's steering turn is handed
+    objections against a plan that no longer exists.
+    """
+    handed: list[list[dict]] = []
+
+    def first_cycle(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    def second_cycle(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The migration order is still unstated.",
+            findings=[_blocked("State the migration order.")],
+        )
+
+    database = committed_git_repo.parent / "steering-stale-cycle.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-stale-cycle"
+        )
+        blocked = _run_reviews(
+            repository,
+            borg,
+            store,
+            planning_plan_response,
+            [first_cycle, first_cycle],
+            handed,
+            review_rounds=1,
+            grant_budget=1,
+        )
+        # Spent its grant without closing anything, so its rows stay open.
+        assert blocked.borg.state is BorgState.BLOCKED
+        stale = store.list_planning_ledger_findings(
+            borg.id, cycle_id=INITIAL_PLANNING_CYCLE
+        )
+        assert stale and all(row.status is FindingStatus.OPEN for row in stale)
+
+        request = PlanChangeRequest(
+            borg_id=borg.id, round=1, note="Cover the migration order."
+        )
+        with store.transaction():
+            store.append_plan_change_request(request)
+            changed = store.compare_and_set_borg_state(
+                borg.id,
+                expected_state=blocked.borg.state,
+                expected_version=blocked.borg.state_version,
+                new_state=BorgState.ARCHITECT_WORKING,
+            )
+        steering = _steering(1)
+        second = _run_reviews(
+            repository,
+            changed,
+            store,
+            planning_plan_response,
+            [second_cycle, _approving],
+            handed,
+            review_rounds=1,
+            grant_budget=5,
+            steering_agent=steering,
+        )
+
+        assert second.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        assert len(steering.calls) == 1
+        prompt = steering.calls[0].user_prompt
+        assert "State the migration order." in prompt
+        assert "Name the rollback checks." not in prompt
+        # The rounds argued are this cycle's, not both cycles' together.
+        assert "Rounds argued so far: 1." in prompt
+        decided = prompt.split("## What each round decided")[1].strip().splitlines()
+        assert decided == ["- Round 1: The migration order is still unstated."]
+
+
+def test_a_steering_agent_that_cannot_be_held_to_reading_is_refused(
+    committed_git_repo: Path,
+    persist_planning_context,
+) -> None:
+    """The steering agent passes the boundary check its siblings pass.
+
+    It reads rows and returns prose, and an adapter that can enforce neither a
+    tool allowlist nor a read-only sandbox cannot be held to that.
+    """
+    unbounded = MockAdapter(name="openai")
+    unbounded.capabilities = replace(
+        unbounded.capabilities, tool_allowlist=False, read_only_sandbox=False
+    )
+    database = committed_git_repo.parent / "steering-unbounded.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-unbounded"
+        )
+        with pytest.raises(TechLeadError, match="Steering read-only"):
+            TechLeadLoop(
+                repository,
+                borg,
+                store,
+                MockAdapter(name="openai"),
+                steering_agent=unbounded,
+                io=_io(),
+            )
+
+
+def test_the_note_turn_runs_on_the_steering_stage_and_reads_the_argument(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+) -> None:
+    """It resolves its own agent, and what it is given is the argument itself.
+
+    The open ledger, what each round raised and closed, and each round's own
+    account of what it decided. Not which arm of the assessment fired, nor
+    whether its veto is what stopped it: neither survives into the result the
+    assessment returns, and the ledger shows the same thing anyway.
+    """
+    handed: list[list[dict]] = []
+
+    def opening(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="Two things stand in the way.",
+            findings=[
+                _blocked("Name the rollback checks."),
+                _raised("Say which region ships first."),
+            ],
+        )
+
+    def standing_still(ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            resolved=[ledger[1]["id"]],
+            findings=[_raised("Cover the partial rollback.")],
+        )
+
+    database = committed_git_repo.parent / "steering-prompt.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-prompt"
+        )
+        architect = _architect(planning_plan_response, 2)
+        reviewer = _reviewer([opening, standing_still, _approving], handed)
+        steering = _steering(2)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+        result = TechLeadLoop(
+            repository,
+            handoff.borg,
+            store,
+            reviewer,
+            architect_agent=architect,
+            steering_agent=steering,
+            steering_model="steering-model",
+            io=_io(),
+            review_rounds=1,
+            grant_budget=5,
+        ).run()
+
+        assert result.borg.state is BorgState.PLAN_APPROVAL_PENDING
+        attempts = store.list_planning_attempts(borg.id)
+        # Its own stage's model, and not the one the reviewer runs under.
+        assert [
+            item.model for item in attempts if item.phase == "steering"
+        ] == ["steering-model", "steering-model"]
+        assert all(
+            item.model != "steering-model"
+            for item in attempts
+            if item.phase != "steering"
+        )
+        assert [
+            item.summary for item in attempts if item.phase == "steering"
+        ] == ["steering note reported high confidence"] * 2
+
+        # Held to reading like every other turn the planning machinery runs,
+        # which is all there is to assert: it cannot be given another set.
+        assert all(
+            call.allowed_tools == READ_ONLY_API_TOOLS for call in steering.calls
+        )
+        # And to its own instructions: the stage's constant, not the prompt of
+        # whatever loop happens to be steering.
+        assert all(
+            call.system_prompt == STEERING_SYSTEM_PROMPT
+            for call in steering.calls
+        )
+        # And to the shape it has to answer in: a permissive schema leaves the
+        # confidence the bar reads absent on every turn.
+        assert all(
+            call.schema == STEERING_NOTE_SCHEMA for call in steering.calls
+        )
+
+        prompt = steering.calls[-1].user_prompt
+        # Who is about to answer, and what the argument is about. The note is
+        # written to the agent that can act on it, so naming another loop's
+        # answerer here addresses it to an agent that never sees it.
+        assert (
+            "The Architect is about to answer these findings again, on a round "
+            "granted because the review of the implementation plan is not "
+            "closing in on agreement."
+        ) in prompt
+        # The round the argument has reached, which is what says how
+        # entrenched it is — and not the minimum it passed to get here.
+        assert "Rounds argued so far: 2." in prompt
+        assert "Name the rollback checks. (blocker, first raised in round 1)" in prompt
+        assert "Cover the partial rollback. (major, first raised in round 2)" in prompt
+        assert "Say which region ships first." not in prompt
+        assert "Round 1: raised 2, closed 0, 2 still open afterwards." in prompt
+        assert "Round 2: raised 1, closed 1, 2 still open afterwards." in prompt
+        assert "Round 1: Two things stand in the way." in prompt
+        assert "Round 2: The rollback checks are still unnamed." in prompt
+        # The verdict's own workings are not in the assessment's result and are
+        # not here either.
+        assert "veto" not in prompt and "converg" not in prompt
+
+
+def test_the_note_row_and_its_attempt_are_written_in_one_durable_step(
+    committed_git_repo: Path,
+    persist_planning_context,
+    planning_plan_response,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round that recorded which note it used but never finished its turn is
+    a round the next entry would re-run and charge twice.
+    """
+    handed: list[list[dict]] = []
+
+    def stuck(_ledger, _history):
+        return _review(
+            "request_changes",
+            summary="The rollback checks are still unnamed.",
+            findings=[_blocked("Name the rollback checks.")],
+        )
+
+    database = committed_git_repo.parent / "steering-atomic.sqlite3"
+    with SqliteStore.open(database) as store:
+        repository, borg = persist_planning_context(
+            committed_git_repo, store, "steering-atomic"
+        )
+        architect = _architect(planning_plan_response, 1)
+        steering = _steering(1)
+        handoff = ArchitectLoop(
+            repository, borg, store, architect, io=_io()
+        ).run()
+
+        def refuse(_note):
+            raise RuntimeError("the note row could not be written")
+
+        monkeypatch.setattr(store, "record_steering_note", refuse)
+        with pytest.raises(RuntimeError, match="note row"):
+            TechLeadLoop(
+                repository,
+                handoff.borg,
+                store,
+                _reviewer([stuck, _approving], handed),
+                architect_agent=architect,
+                steering_agent=steering,
+                io=_io(),
+                review_rounds=1,
+                grant_budget=5,
+            ).run()
+        monkeypatch.undo()
+
+        assert store.list_steering_notes(borg.id) == []
+        assert [
+            item.status
+            for item in store.list_planning_attempts(borg.id)
+            if item.phase == "steering"
+        ] == [PlanningAttemptStatus.RUNNING]

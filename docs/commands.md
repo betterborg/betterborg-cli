@@ -59,6 +59,8 @@ effort = "high"
 [agents.review]
 
 [agents.merge]
+
+[agents.steering]
 ```
 
 Each table accepts optional, non-empty `adapter`, `model`, and `effort`
@@ -356,6 +358,25 @@ blocked, which is read from what the rounds recorded rather than from the
 settings in force now. A Project Manager out of grants is the one stop a raised
 number reaches, because it ends the run where it stands rather than blocking
 anything.
+
+A granted round whose review said the argument was not closing in is steered.
+Before the Architect, the Project Manager or a task's fixer is asked to answer
+the findings again, a turn of its own reads the open objections, what each
+round raised and closed, and what each round decided, and writes the paragraph
+a person reading the argument would have pasted in. Only a note that turn is
+confident of is the turn's own; anything less, and any way the turn can fail,
+falls back to a paragraph assembled from the open objections without an agent,
+which is the same ledger the answerer already had in front of it in another
+form. So a granted round is not lost to a turn that could not write its note.
+What does stop it is an operator stopping the run, which stops the steered
+round along with the rest of it. In a task's review there is one more: a turn
+that wrote to the worktree or the checkout it was given no tools to touch
+blocks its task, the one thing it promised not to do. The reviewer is never
+told what to conclude — it meets the revision, not the instruction — and the
+Project Manager's own contract retries write no note of their own, because a
+validator naming the rule that failed has already written the sentence — a
+steered revision keeps the Supervisor's note across them. The turn runs on
+`[agents.steering]` like any other stage, and reads without writing anything.
 
 Execution has its own table. `jobs` is how many tasks the scheduler runs at
 once, one to ten. `review_passes` is the minimum number of times a task goes

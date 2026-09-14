@@ -1688,6 +1688,13 @@ def _invoke_host_execution(
         interactive=_stdin_is_interactive(),
         trust_requirement=execution_trust,
     )
+    steering_agent = select_agent(
+        config,
+        AgentStage.STEERING,
+        paths,
+        interactive=_stdin_is_interactive(),
+        trust_requirement=execution_trust,
+    )
     git = SafeGit(paths.root, cancel=cancel)
     environment = HostEnvironmentManager(
         paths.root,
@@ -1725,14 +1732,18 @@ def _invoke_host_execution(
         review_fix=HostReviewFixPhase(
             paths.root,
             review_agent,
+            steering_adapter=steering_agent,
             config=HostReviewFixConfig(
                 review_model=review_agent.model,
+                steering_model=steering_agent.model,
                 review_passes=config.execution.review_passes,
                 grant_budget=config.execution.grant_budget,
                 review_billing_mode=_agent_billing_mode(review_agent.name),
                 fix_billing_mode=_agent_billing_mode(review_agent.name),
+                steering_billing_mode=_agent_billing_mode(steering_agent.name),
                 review_effort=review_agent.effort,
                 fix_effort=review_agent.effort,
+                steering_effort=steering_agent.effort,
                 blocked_tasks=config.execution.blocked_tasks,
             ),
             cancel=cancel,
@@ -2115,6 +2126,13 @@ def approve_plan(
                 interactive=_stdin_is_interactive(),
                 trust_requirement=planning_trust,
             ),
+            steering_agent=lambda: select_agent(
+                config,
+                AgentStage.STEERING,
+                paths,
+                interactive=_stdin_is_interactive(),
+                trust_requirement=planning_trust,
+            ),
             on_bound=mark_resumable,
             cancel=cancel,
             progress=progress,
@@ -2278,6 +2296,13 @@ def _continue_planning(
                     interactive=interactive,
                     trust_requirement=planning_trust,
                 )
+                steering_agent = select_agent(
+                    config,
+                    AgentStage.STEERING,
+                    paths,
+                    interactive=interactive,
+                    trust_requirement=planning_trust,
+                )
                 planning_io = io or _interactive_io()
                 progress = _repository_progress(False)
                 if borg.state is BorgState.DRAFT or (
@@ -2304,6 +2329,7 @@ def _continue_planning(
                     store,
                     tech_lead_agent,
                     architect_agent=architect_agent,
+                    steering_agent=steering_agent,
                     io=planning_io,
                     unattended=unattended,
                     review_rounds=config.planning.review_rounds,

@@ -278,6 +278,7 @@ class ProjectManagerLoop:
         progress: RunProgress | None = None,
         stage_key: str = "project-manager",
         child_key: str | None = None,
+        steering_note: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
         output_retries: int = PM_OUTPUT_RETRY_MINIMUM,
@@ -321,6 +322,12 @@ class ProjectManagerLoop:
         self.progress = progress
         self.stage_key = stage_key
         self.child_key = child_key
+        # Carried from the Supervisor loop that granted this revision. The
+        # Project Manager's own contract retries never write one of their own:
+        # a validator naming the rule and the plan element that failed has
+        # already written the sentence a person would have, and there is no
+        # argument to read.
+        self.steering_note = steering_note
         self.output_retries = output_retries
         self.grant_budget = grant_budget
         if progress is not None:
@@ -434,7 +441,9 @@ class ProjectManagerLoop:
                     round_number=self._turns.next_round(_PM_PHASE),
                     schema=PROJECT_MANAGER_TASKS_SCHEMA,
                     system_prompt=_PROJECT_MANAGER_SYSTEM_PROMPT,
-                    user_prompt=self._user_prompt(feedback),
+                    user_prompt=self._user_prompt(
+                        feedback, self.steering_note
+                    ),
                     current_plan=json.dumps(
                         annotated_plan, indent=2, sort_keys=True
                     ),
@@ -668,7 +677,7 @@ class ProjectManagerLoop:
         return annotated
 
     @staticmethod
-    def _user_prompt(feedback: str | None) -> str:
+    def _user_prompt(feedback: str | None, steering_note: str | None) -> str:
         prompt = (
             "Read the approved plan named by current_plan in "
             ".betterborg/state/planning/context/manifest.json. Emit one complete "
@@ -677,6 +686,8 @@ class ProjectManagerLoop:
         )
         if feedback is not None:
             prompt += " Repair the previous rejected output: " + feedback
+        if steering_note is not None:
+            prompt += "\n\nSteering note for this revision:\n\n" + steering_note
         return prompt
 
     def _attempts_for(self, approval: PlanApproval) -> list[PlanningAttempt]:

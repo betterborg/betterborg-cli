@@ -508,6 +508,70 @@ class ReviewAssessment:
         _validate_utc(self.created_at)
 
 
+class SteeringNoteSource(str, Enum):
+    """Where the note a steered round ran on came from.
+
+    A round that could not be given an agent's note attaches the one assembled
+    from its ledger rather than nothing, so this is what tells a round that
+    fell back from a round that was never steered at all.
+    """
+
+    AGENT = "agent"
+    ASSEMBLED = "assembled"
+
+
+@dataclass(frozen=True, slots=True)
+class SteeringNote:
+    """The paragraph one granted round's answerer was handed, and its source.
+
+    Written as soon as the note resolves — after the steering turn returns or
+    its fallback stands in — because that is what lets the row record which
+    note was used. It cannot ride on the assessment that asked for it: that row
+    is written when the review ends, and the note does not exist until the
+    round it steers begins.
+
+    ``round`` is the round whose assessment asked for the note, in the ledger's
+    numbering, which is the row the note is read back beside. ``cycle_id``,
+    ``plan_approval_id``, ``batch_id`` and ``task_id`` are the scopes a loop
+    can run in, and a loop fills only the ones it has. ``converging`` is the
+    verdict that asked for the note.
+    """
+
+    borg_id: UUID
+    loop: str
+    round: int
+    note: str
+    source: SteeringNoteSource
+    converging: bool
+    cycle_id: str | None = None
+    plan_approval_id: UUID | None = None
+    batch_id: UUID | None = None
+    task_id: UUID | None = None
+    attempt_id: UUID | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name in ("id", "borg_id"):
+            if not isinstance(getattr(self, name), UUID):
+                raise TypeError(f"steering note {name} must be a UUID")
+        for name in ("plan_approval_id", "batch_id", "task_id", "attempt_id"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, UUID):
+                raise TypeError(f"steering note {name} must be a UUID")
+        if not self.loop.strip():
+            raise ValueError("steering note loop must not be empty")
+        if self.round < 1:
+            raise ValueError("steering note round must be positive")
+        if not self.note.strip():
+            raise ValueError("steering note must not be empty")
+        if not isinstance(self.source, SteeringNoteSource):
+            raise TypeError("steering note source must be a SteeringNoteSource")
+        if self.cycle_id is not None and not self.cycle_id.strip():
+            raise ValueError("steering note cycle must not be empty")
+        _validate_utc(self.created_at)
+
+
 @dataclass(frozen=True, slots=True)
 class PlanChangeRequest:
     """One immutable human request in a Borg's plan-revision thread."""

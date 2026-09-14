@@ -360,6 +360,7 @@ class ArchitectLoop:
         progress: RunProgress | None = None,
         stage_key: str = "architect",
         child_key: str | None = None,
+        steering_note: str | None = None,
         dirty_borg_documents: Sequence[Path] = (),
         worktrees_root: Path | None = None,
     ) -> None:
@@ -390,6 +391,11 @@ class ArchitectLoop:
         self.progress = progress
         self.stage_key = stage_key
         self.child_key = child_key
+        # Carried from the loop that granted this revision, because the note
+        # has to arrive before the prompt it joins is built. It joins the turn
+        # that writes the revised plan and no other: a question turn is about
+        # what the Architect needs to know rather than what it should change.
+        self.steering_note = steering_note
         self.dirty_borg_documents = tuple(dirty_borg_documents)
         self.worktrees_root = worktrees_root
         if progress is not None:
@@ -558,6 +564,14 @@ class ArchitectLoop:
                     " Revise the current plan in place, addressing every "
                     "persisted Tech Lead finding without regressing earlier "
                     "corrections."
+                )
+            # Rebuilt inside this loop, so the note rides the contract
+            # corrections below it: a retry is the same granted round arguing
+            # with itself.
+            if self.steering_note is not None:
+                user_prompt += (
+                    "\n\nSteering note for this revision:\n\n"
+                    + self.steering_note
                 )
             if correction is not None:
                 user_prompt += f"\n\n{correction}"

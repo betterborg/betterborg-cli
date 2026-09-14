@@ -39,6 +39,13 @@ from betterborg_cli.planning.pm import (
     approved_plan_digest,
     task_batch_semantic_digest,
 )
+from betterborg_cli.planning.steering import (
+    PlanningSteeringTurn,
+    SteeringScope,
+    SteeringSubject,
+    recorded_steering_note,
+    steering_verdict,
+)
 from betterborg_cli.planning.task_publication import (
     TaskPublication,
     TaskPublicationCancelled,
@@ -78,6 +85,12 @@ from betterborg_cli.store import (
 #: where its repository configures no minimum of its own.
 SUPERVISOR_ROUND_MINIMUM = 3
 _SUPERVISOR_PHASE = "supervisor_review"
+
+#: Who a steering note in this loop is written for, and what the argument it
+#: reads is about.
+_STEERING_SUBJECT = SteeringSubject(
+    answerer="The Project Manager", work="the task batch"
+)
 _PUBLICATION_DETAIL = "publishing approved tasks"
 _RETAINED_APPROVAL_RESULT = "approval retained; task publication pending"
 
@@ -223,11 +236,13 @@ class SupervisorLoop:
         agent: AgentAdapter | SelectedAgent,
         *,
         pm_agent: AgentAdapter | SelectedAgent | None = None,
+        steering_agent: AgentAdapter | SelectedAgent | None = None,
         approved_plan: Mapping[str, Any] | None = None,
         plan_approval: PlanApproval | None = None,
         artifact_dir: Path | None = None,
         model: str | None = None,
         pm_model: str | None = None,
+        steering_model: str | None = None,
         cancel: CancellationToken | None = None,
         progress: RunProgress | None = None,
         dirty_borg_documents: Sequence[Path] = (),
@@ -260,15 +275,22 @@ class SupervisorLoop:
         self.pm_output_retries = pm_output_retries
         self.grant_budget = grant_budget
         project_manager = pm_agent or agent
+        steering = steering_agent or agent
         require_read_only_agent(
             agent, role="Supervisor", error_factory=SupervisorError
         )
         require_read_only_agent(
             project_manager, role="Project Manager", error_factory=SupervisorError
         )
+        require_read_only_agent(
+            steering, role="Steering", error_factory=SupervisorError
+        )
         try:
             resolved_model = resolve_agent_model(agent, model)
             resolved_pm_model = resolve_agent_model(project_manager, pm_model)
+            resolved_steering_model = resolve_agent_model(
+                steering, steering_model
+            )
         except AgentSelectionError as error:
             raise SupervisorError(str(error)) from error
 
@@ -280,6 +302,7 @@ class SupervisorLoop:
         self.store = store
         self.agent = agent
         self.pm_agent = project_manager
+        self.steering_agent = steering
         self._supplied_plan = dict(approved_plan) if approved_plan is not None else None
         self._supplied_approval = plan_approval
         self.artifact_dir = Path(
@@ -287,6 +310,7 @@ class SupervisorLoop:
         ).resolve()
         self.model = resolved_model
         self.pm_model = resolved_pm_model
+        self.steering_model = resolved_steering_model
         self.cancel = cancel
         self.progress = progress
         self.dirty_borg_documents = tuple(dirty_borg_documents)
@@ -385,6 +409,13 @@ class SupervisorLoop:
                         "Project Manager revision requires a rejected "
                         "Supervisor attempt"
                     )
+                # Written before the revision starts, because the note has
+                # to reach the Project Manager's constructor before that loop
+                # builds the prompt it joins. Initial work is never steered:
+                # no review has argued with it yet.
+                note = (
+                    None if initial_work else self._steering_note(borg, approval)
+                )
                 if initial_work:
                     self._start_project_manager_progress()
                 else:
@@ -405,6 +436,7 @@ class SupervisorLoop:
                             "project-manager" if initial_work else "supervisor"
                         ),
                         child_key=None if initial_work else child_key,
+                        steering_note=note,
                         dirty_borg_documents=self.dirty_borg_documents,
                         worktrees_root=self.worktrees_root,
                         output_retries=self.pm_output_retries,
@@ -861,6 +893,107 @@ class SupervisorLoop:
         child = self.progress.stages["supervisor"].children[child_key]
         if child.state is StageState.PENDING:
             self.progress.start_child("supervisor", child_key)
+
+    def _steering_note(
+        self, borg: Borg, approval: PlanApproval
+    ) -> str | None:
+        """Return the note this granted revision runs on, or nothing.
+
+        A revision that follows a converging verdict, and one leading into a
+        round still inside the minimum, get the prompt they would have had: the
+        findings they have to answer are already in front of them.
+        """
+
+        scope = SteeringScope(
+            loop=_SUPERVISOR_PHASE, plan_approval_id=approval.id
+        )
+        verdict = steering_verdict(
+            self.store.list_review_assessments(
+                self.borg_id,
+                loop=_SUPERVISOR_PHASE,
+                plan_approval_id=approval.id,
+            )
+        )
+        if verdict is None:
+            return None
+        recorded = recorded_steering_note(
+            self.store, self.borg_id, scope=scope, round_number=verdict.round
+        )
+        if recorded is not None:
+            return recorded.note
+        child_key = f"steering:{verdict.round}"
+        self._start_steering_progress(child_key, verdict.round)
+        note = PlanningSteeringTurn(
+            self.repository,
+            borg,
+            self.store,
+            self.steering_agent,
+            scope=scope,
+            subject=_STEERING_SUBJECT,
+            model=self.steering_model,
+            artifact_dir=self.artifact_dir,
+            error_factory=SupervisorError,
+            cancelled_error_factory=SupervisorCancelled,
+            cancel=self.cancel,
+            progress=self.progress,
+            stage_key="supervisor" if self.progress is not None else None,
+            child_key=child_key if self.progress is not None else None,
+            dirty_borg_documents=self.dirty_borg_documents,
+            worktrees_root=self.worktrees_root,
+        ).note(
+            verdict=verdict,
+            ledger=self.store.list_task_ledger_findings(
+                self.borg_id, plan_approval_id=approval.id
+            ),
+            summaries=self._round_summaries(approval),
+        )
+        self._complete_steering_progress(child_key)
+        return note
+
+    def _round_summaries(self, approval: PlanApproval) -> list[tuple[int, str]]:
+        """Pair each completed review with its own account of what it decided."""
+
+        return [
+            (number, summary)
+            for number, attempt in enumerate(
+                self._completed_reviews(approval), start=1
+            )
+            if (summary := (attempt.summary or "").strip())
+        ]
+
+    def _start_steering_progress(self, child_key: str, review_round: int) -> None:
+        """Show a steering turn as itself rather than as the reviewer's.
+
+        A child of its own, so a long note does not read as a stalled review.
+        """
+
+        if self.progress is None:
+            return
+        if child_key not in self.progress.stages["supervisor"].children:
+            self.progress.declare_child(
+                "supervisor",
+                ChildSpec(child_key, f"Steering note {review_round}"),
+            )
+        child = self.progress.stages["supervisor"].children[child_key]
+        if child.state is StageState.PENDING:
+            self.progress.start_child("supervisor", child_key)
+
+    def _complete_steering_progress(self, child_key: str) -> None:
+        """Reconcile the steering child on every path, not only the fallbacks.
+
+        The turn machinery emits into a child and never touches its lifecycle,
+        so a note that succeeded leaves its child running exactly as a note
+        that failed does — and a stage refuses to complete while any child of
+        it is still running.
+        """
+
+        if self.progress is None:
+            return
+        child = self.progress.stages["supervisor"].children[child_key]
+        if child.state is StageState.RUNNING:
+            self.progress.complete_child(
+                "supervisor", child_key, "steering note ready"
+            )
 
     def _start_project_manager_progress(self) -> None:
         if self.progress is None:

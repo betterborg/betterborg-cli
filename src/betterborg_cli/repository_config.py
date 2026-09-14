@@ -50,6 +50,10 @@ class AgentStage(StrEnum):
     CODING = "coding"
     REVIEW = "review"
     MERGE = "merge"
+    #: The turn that tells a stalled review loop what a person reading its
+    #: argument would have told it. It belongs to no single loop: the two
+    #: planning reviews and a task's review all steer through it.
+    STEERING = "steering"
 
 
 class PreparationMode(StrEnum):
@@ -105,6 +109,7 @@ class AgentChoices:
     coding: AgentChoice = field(default_factory=AgentChoice)
     review: AgentChoice = field(default_factory=AgentChoice)
     merge: AgentChoice = field(default_factory=AgentChoice)
+    steering: AgentChoice = field(default_factory=AgentChoice)
 
     def resolve(self, stage: AgentStage) -> AgentChoice:
         """Resolve one stage, inheriting each absent value from defaults."""

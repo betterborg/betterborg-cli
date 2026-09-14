@@ -31,12 +31,12 @@ from progress_test_support import (
 
 from betterborg_cli import cli as cli_module
 from betterborg_cli.agent_runtime import (
-    ApiAgentRole,
     CancellationToken,
     MockAdapter,
     SelectedAgent,
     run_captured,
 )
+from betterborg_cli.agent_runtime.selection import _STAGE_ROLES
 from betterborg_cli.cli import CliRunContext, cli
 from betterborg_cli.host_execution import (
     HostCommand,
@@ -1250,13 +1250,19 @@ def test_execute_projection_survives_concrete_setup_and_scheduler_adoption(
         result = invocation.result(timeout=10)
 
     assert result.exit_code == 0, result.output
-    assert selected_stages == [AgentStage.CODING, AgentStage.REVIEW, AgentStage.MERGE]
+    assert selected_stages == [
+        AgentStage.CODING,
+        AgentStage.REVIEW,
+        AgentStage.MERGE,
+        AgentStage.STEERING,
+    ]
     assert setup_checkpoints == [
         "decision",
         "preflight-validation",
         "agent-coding",
         "agent-review",
         "agent-merge",
+        "agent-steering",
         "stale-cleanup-1",
         "run-acquisition",
         "stale-cleanup-2",
@@ -2987,12 +2993,14 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     assert (config.execution.review_passes, config.execution.grant_budget) == (2, 4)
     monkeypatch.setenv("EXECUTE_TOKEN", "owner-secret")
     selected_agents: list[SelectedAgent] = []
+    selected_by_stage: dict[AgentStage, SelectedAgent] = {}
     selected_stages: list[AgentStage] = []
     execution_trust: list[object] = []
     selected_settings = {
         AgentStage.CODING: ("selected-coding-model", "coding-effort"),
         AgentStage.REVIEW: ("selected-review-model", "review-effort"),
         AgentStage.MERGE: ("selected-merge-model", "merge-effort"),
+        AgentStage.STEERING: ("selected-steering-model", "steering-effort"),
     }
 
     def select(_config, stage, selected_paths, **kwargs):
@@ -3000,13 +3008,14 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         execution_trust.append(kwargs["trust_requirement"])
         model, effort = selected_settings[stage]
         selected = SelectedAgent(
-            role=ApiAgentRole(stage.value),
+            role=_STAGE_ROLES[stage],
             adapter=MockAdapter(name="openai"),
             paths=selected_paths,
             model=model,
             effort=effort,
         )
         selected_agents.append(selected)
+        selected_by_stage[stage] = selected
         return selected
 
     calls: list[tuple[object, ...]] = []
@@ -3026,6 +3035,15 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         assert review_config.review_model == "selected-review-model"
         assert review_config.review_effort == "review-effort"
         assert review_config.fix_effort == "review-effort"
+        # The stage resolves its own agent, and the phase falls back to the
+        # review adapter for a steering one it was not handed, so what the
+        # selection reached has to be read off the phase itself.
+        assert review_config.steering_model == "selected-steering-model"
+        assert review_config.steering_effort == "steering-effort"
+        assert (
+            service._runtime._review_fix._steering_adapter
+            is selected_by_stage[AgentStage.STEERING]
+        )
         assert review_config.review_passes == config.execution.review_passes
         assert review_config.grant_budget == config.execution.grant_budget
         assert service._scheduler_config.review_passes == (
@@ -3083,8 +3101,9 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
         AgentStage.CODING,
         AgentStage.REVIEW,
         AgentStage.MERGE,
+        AgentStage.STEERING,
     ]
-    assert len(selected_agents) == 3
+    assert len(selected_agents) == 4
     observed_trust_paths: list[Path] = []
     monkeypatch.setattr(
         cli_module,
@@ -3094,7 +3113,7 @@ def test_execute_assembly_invokes_the_concrete_host_execution_service(
     managed_worktree_paths = SimpleNamespace(root=paths.worktrees_dir / "task")
     for requirement in execution_trust:
         requirement(managed_worktree_paths)
-    assert observed_trust_paths == [paths.root] * 3
+    assert observed_trust_paths == [paths.root] * 4
     assert len(calls) == 1
     observed_borg, observed_generation, observed_plan, observed_kwargs = calls[0]
     assert observed_borg == borg.id
@@ -3215,7 +3234,7 @@ def test_execute_carries_the_declared_gates_to_every_consumer(
 
     def select(_config, stage, selected_paths, **_kwargs):
         return SelectedAgent(
-            role=ApiAgentRole(stage.value),
+            role=_STAGE_ROLES[stage],
             adapter=MockAdapter(name="openai"),
             paths=selected_paths,
             model=f"{stage.value}-model",

@@ -24,6 +24,8 @@ from betterborg_cli.store import (
     ReviewAssessment,
     SqliteStore,
     StaleBorgStateError,
+    SteeringNote,
+    SteeringNoteSource,
 )
 
 
@@ -100,7 +102,7 @@ def test_migration_004_planning_history_survives_reopen(tmp_path: Path) -> None:
         applied_at = store.applied_migrations()
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == applied_at == tuple(range(1, 16))
+        assert reopened.applied_migrations() == applied_at == tuple(range(1, 17))
         assert reopened.get_repository(repository.id) == repository
         assert reopened.get_borg(borg.id) == borg
         assert reopened.list_planning_attempts(borg.id) == [
@@ -360,7 +362,7 @@ def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
         )
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 16))
+        assert reopened.applied_migrations() == tuple(range(1, 17))
         rows = reopened.list_planning_ledger_findings(borg.id)
         assert len(rows) == 2
         closed = next(row for row in rows if row.id == raised.id)
@@ -381,6 +383,118 @@ def test_migration_013_finding_ledger_updates_in_place_within_its_cycle(
         assert reopened.list_planning_ledger_findings(
             borg.id, cycle_id=INITIAL_PLANNING_CYCLE
         ) == [closed]
+
+
+def test_migration_016_steering_notes_survive_reopen(tmp_path: Path) -> None:
+    """One note per grant, held by the row rather than by the loop.
+
+    A granted round is re-entered as often as it is interrupted, and the row is
+    what lets the re-entry run on the note already written for it instead of
+    paying for a second turn.
+    """
+    database = tmp_path / "state.sqlite3"
+    repository = Repository(root=tmp_path / "repository")
+    borg = Borg(repository_id=repository.id, name="SteeredPlanner")
+    change_request = PlanChangeRequest(
+        borg_id=borg.id, round=1, note="Stage the rollout."
+    )
+    written = SteeringNote(
+        borg_id=borg.id,
+        loop="tech_review",
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        round=2,
+        note="The rollback checks are the objection that matters.",
+        source=SteeringNoteSource.AGENT,
+        converging=False,
+    )
+    assembled = SteeringNote(
+        borg_id=borg.id,
+        loop="tech_review",
+        cycle_id=str(change_request.id),
+        round=1,
+        note="Two objections are still open.",
+        source=SteeringNoteSource.ASSEMBLED,
+        converging=False,
+    )
+    other_loop = SteeringNote(
+        borg_id=borg.id,
+        loop="supervisor_review",
+        cycle_id=INITIAL_PLANNING_CYCLE,
+        round=2,
+        note="The batch keeps losing the migration task.",
+        source=SteeringNoteSource.AGENT,
+        converging=False,
+    )
+    # Two tasks of one execution run share a Borg and a loop, so the task is
+    # the only thing that separates their rounds.
+    first_task, second_task = uuid4(), uuid4()
+    first_tasks_note = SteeringNote(
+        borg_id=borg.id,
+        loop="task_review",
+        task_id=first_task,
+        round=2,
+        note="Answer the timeout before the pattern.",
+        source=SteeringNoteSource.AGENT,
+        converging=False,
+    )
+    second_tasks_note = SteeringNote(
+        borg_id=borg.id,
+        loop="task_review",
+        task_id=second_task,
+        round=2,
+        note="The migration order is the objection that matters.",
+        source=SteeringNoteSource.ASSEMBLED,
+        converging=False,
+    )
+
+    with SqliteStore.open(database) as store:
+        store.add_repository(repository)
+        store.add_borg(borg)
+        store.append_plan_change_request(change_request)
+        for note in (
+            written,
+            assembled,
+            other_loop,
+            first_tasks_note,
+            second_tasks_note,
+        ):
+            store.record_steering_note(note)
+
+    with SqliteStore.open(database) as reopened:
+        assert reopened.applied_migrations() == tuple(range(1, 17))
+        assert reopened.list_steering_notes(borg.id, loop="tech_review") == [
+            written,
+            assembled,
+        ]
+        assert reopened.list_steering_notes(
+            borg.id, cycle_id=INITIAL_PLANNING_CYCLE
+        ) == [written, other_loop]
+        assert reopened.list_steering_notes(borg.id, loop="fix_review") == []
+        # A task reads its own round and never its neighbour's, which is all
+        # that separates them: the Borg, the loop and the round are shared.
+        assert reopened.list_steering_notes(
+            borg.id, loop="task_review", task_id=first_task
+        ) == [first_tasks_note]
+        assert reopened.list_steering_notes(
+            borg.id, loop="task_review", task_id=second_task
+        ) == [second_tasks_note]
+
+        # One note per grant, enforced rather than relied on: a second row for
+        # a round already steered is what the re-entry read exists to prevent,
+        # and a reader handed two has no way to say which one ran.
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.record_steering_note(
+                replace(written, id=uuid4(), source=SteeringNoteSource.ASSEMBLED)
+            )
+        # The same round of another scope is a different round.
+        reopened.record_steering_note(
+            replace(written, id=uuid4(), cycle_id=str(change_request.id))
+        )
+
+    # A round is the ledger's numbering, which starts at one, so a row that
+    # names round zero is one no read of these rows could ever pair.
+    with pytest.raises(ValueError, match="round must be positive"):
+        replace(written, id=uuid4(), round=0)
 
 
 def test_migration_014_review_assessments_survive_reopen(tmp_path: Path) -> None:
@@ -445,7 +559,7 @@ def test_migration_014_review_assessments_survive_reopen(tmp_path: Path) -> None
             store.record_review_assessment(assessment)
 
     with SqliteStore.open(database) as reopened:
-        assert reopened.applied_migrations() == tuple(range(1, 16))
+        assert reopened.applied_migrations() == tuple(range(1, 17))
         rows = reopened.list_review_assessments(borg.id, loop="tech_review")
         assert rows == [minimum_round, granted_round, next_cycle]
         # A round inside the minimum is neither charged nor refunded, so it

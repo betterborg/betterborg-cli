@@ -108,7 +108,11 @@ def test_plan_start_answers_inline_and_reaches_approval_pending(
         "Plan approval pending"
     )
     assert architect_adapter is not tech_lead_adapter
-    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
+    ]
     assert len(architect_adapter.calls) == 3
     assert len(tech_lead_adapter.calls) == 1
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
@@ -287,8 +291,10 @@ def test_plan_start_interruption_preserves_question_and_same_command_resumes(
     assert selected_stages == [
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
     ]
     assert len(architect_adapter.calls) == 3
     assert len(tech_lead_adapter.calls) == 1
@@ -358,8 +364,10 @@ def test_plan_start_resumes_directly_with_tech_lead_agent(
     assert selected_stages == [
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
     ]
     assert len(architect_adapter.calls) == 2
     assert len(tech_lead_adapter.calls) == 2
@@ -435,7 +443,11 @@ def test_plan_start_reports_review_cap_as_blocked(
         "Review the saved Tech Lead findings with: "
         "betterborg plan show blocked-plan",
     ]
-    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
+    ]
     assert len(architect_adapter.calls) == 4
     assert len(tech_lead_adapter.calls) == 3
     assert all(
@@ -545,6 +557,85 @@ def test_plan_start_honors_the_repository_review_round_budget(
         assert borg is not None
         assert borg.state is BorgState.BLOCKED
         assert len(store.list_planning_findings(borg.id)) == 1
+
+
+def test_plan_start_hands_the_steered_round_the_stages_own_agent(
+    cli_runner: CliRunner,
+    committed_git_repo: Path,
+    planning_cli_repository,
+    planning_plan_response,
+    tech_lead_change_request_response,
+    tech_lead_approval_response,
+    configure_interactive_cli,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The stage resolves an agent of its own, and it has to reach the loop.
+
+    A loop handed the reviewer's agent instead runs the note on it and ignores
+    the steering configuration, which resolving the stage alone cannot catch.
+    """
+    architect_adapter = MockAdapter(name="openai")
+    for payload in (
+        {"decision": "ready_to_plan"},
+        planning_plan_response(),
+        planning_plan_response(summary="Name the rollback checks."),
+    ):
+        architect_adapter.queue(MockResponse(payload=payload))
+    tech_lead_adapter = MockAdapter(name="openai")
+    for payload in (
+        tech_lead_change_request_response("Clarify rollback behavior."),
+        tech_lead_approval_response(),
+    ):
+        tech_lead_adapter.queue(MockResponse(payload=payload))
+    steering_adapter = MockAdapter(name="openai").queue(
+        MockResponse(
+            payload={
+                "note": "Answer the rollback objection first.",
+                "confidence": "high",
+            }
+        )
+    )
+    repository, paths = planning_cli_repository(committed_git_repo, "steered-plan")
+    config_path = paths.tracked_dir / "config.toml"
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n"
+        "[planning]\nreview_rounds = 1\ngrant_budget = 2\n",
+        encoding="utf-8",
+    )
+    configure_interactive_cli(
+        repository.root,
+        architect_adapter,
+        InteractiveIO(
+            prompt=lambda _message: None,
+            confirm=lambda _message, _default: False,
+            write=lambda _message: None,
+        ),
+        state_home=repository.root.parent / f".{repository.root.name}-state",
+    )
+    selected_stages = _select_planning_agents(
+        monkeypatch,
+        architect=architect_adapter,
+        tech_lead=tech_lead_adapter,
+        steering=steering_adapter,
+    )
+
+    result = cli_runner.invoke(cli, ["plan", "start", "steered-plan", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan approval pending" in result.output
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
+    ]
+    # The granted round's note came off the stage's own agent, and reached the
+    # revision it was written for.
+    assert len(steering_adapter.calls) == 1
+    assert len(tech_lead_adapter.calls) == 2
+    assert (
+        "Answer the rollback objection first."
+        in architect_adapter.calls[-1].user_prompt
+    )
 
 
 def test_a_plan_blocked_after_its_review_agreed_claims_no_grant_account(
@@ -1425,7 +1516,11 @@ def test_plan_start_proceeds_from_an_adopted_borg(
 
     assert result.exit_code == 0, result.output
     assert "Plan approval pending" in result.output
-    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
+    ]
     with SqliteStore.open(paths.state_dir / "betterborg.sqlite3") as store:
         borg = store.get_borg_by_name(repository.id, "adopted-plan")
         assert borg is not None
@@ -1683,11 +1778,16 @@ def _select_planning_agents(
     *,
     architect: MockAdapter,
     tech_lead: MockAdapter,
+    steering: MockAdapter | None = None,
 ) -> list[AgentStage]:
     selected_stages: list[AgentStage] = []
     adapters = {
         AgentStage.ARCHITECT: architect,
         AgentStage.TECH_LEAD: tech_lead,
+        # Resolved on every planning run and used only by a granted round the
+        # review read as stuck, so a test that never reaches one supplies an
+        # adapter that is never called.
+        AgentStage.STEERING: steering or MockAdapter(name="openai"),
     }
 
     def select(_config, stage, _paths, *, interactive, trust_requirement):
@@ -1705,11 +1805,13 @@ def _select_trust_bound_planning_agents(
     *,
     architect: MockAdapter,
     tech_lead: MockAdapter,
+    steering: MockAdapter | None = None,
 ) -> None:
     """Wrap planning adapters in the trust policy the CLI selects them under."""
     adapters = {
         AgentStage.ARCHITECT: architect,
         AgentStage.TECH_LEAD: tech_lead,
+        AgentStage.STEERING: steering or MockAdapter(name="openai"),
     }
 
     def select(_config, stage, selected_paths, **policy):

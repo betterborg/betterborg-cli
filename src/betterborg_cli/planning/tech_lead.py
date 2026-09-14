@@ -35,6 +35,13 @@ from betterborg_cli.planning.grants import (
     planning_grant_account,
 )
 from betterborg_cli.planning.plan_contracts import PlanValidationError
+from betterborg_cli.planning.steering import (
+    PlanningSteeringTurn,
+    SteeringScope,
+    SteeringSubject,
+    recorded_steering_note,
+    steering_verdict,
+)
 from betterborg_cli.planning.turns import (
     DurablePlanningTurns,
     completed_planning_phase_attempts,
@@ -62,6 +69,12 @@ from betterborg_cli.store import (
 TECH_REVIEW_ROUND_MINIMUM = 3
 _TECH_REVIEW_PHASE = "tech_review"
 _ARCHITECT_PLAN_PHASE = "architect_plan"
+
+#: Who a steering note in this loop is written for, and what the argument it
+#: reads is about.
+_STEERING_SUBJECT = SteeringSubject(
+    answerer="The Architect", work="the implementation plan"
+)
 
 TECH_LEAD_REVIEW_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -168,6 +181,7 @@ class TechLeadLoop:
         agent: AgentAdapter | SelectedAgent,
         *,
         architect_agent: AgentAdapter | SelectedAgent | None = None,
+        steering_agent: AgentAdapter | SelectedAgent | None = None,
         io: InteractiveIO,
         unattended: bool = False,
         review_rounds: int = TECH_REVIEW_ROUND_MINIMUM,
@@ -175,6 +189,7 @@ class TechLeadLoop:
         artifact_dir: Path | None = None,
         model: str | None = None,
         architect_model: str | None = None,
+        steering_model: str | None = None,
         cancel: CancellationToken | None = None,
         progress: RunProgress | None = None,
         dirty_borg_documents: Sequence[Path] = (),
@@ -189,16 +204,23 @@ class TechLeadLoop:
                 "Tech Lead grant budget must be a whole number of at least 0"
             )
         architect = architect_agent or agent
+        steering = steering_agent or agent
         require_read_only_agent(
             agent, role="Tech Lead", error_factory=TechLeadError
         )
         require_read_only_agent(
             architect, role="Architect", error_factory=TechLeadError
         )
+        require_read_only_agent(
+            steering, role="Steering", error_factory=TechLeadError
+        )
         try:
             resolved_model = resolve_agent_model(agent, model)
             resolved_architect_model = resolve_agent_model(
                 architect, architect_model
+            )
+            resolved_steering_model = resolve_agent_model(
+                steering, steering_model
             )
         except AgentSelectionError as error:
             raise TechLeadError(str(error)) from error
@@ -211,6 +233,7 @@ class TechLeadLoop:
         self.store = store
         self.agent = agent
         self.architect_agent = architect
+        self.steering_agent = steering
         self.io = io
         self.unattended = unattended
         self.review_rounds = review_rounds
@@ -220,6 +243,7 @@ class TechLeadLoop:
         ).resolve()
         self.model = resolved_model
         self.architect_model = resolved_architect_model
+        self.steering_model = resolved_steering_model
         self.cancel = cancel
         self.progress = progress
         self.dirty_borg_documents = tuple(dirty_borg_documents)
@@ -290,6 +314,10 @@ class TechLeadLoop:
                     raise TechLeadError(
                         "Architect revision requires a rejected Tech Lead attempt"
                     )
+                # Written before the revision starts, because the note has to
+                # reach the Architect's constructor before that loop builds the
+                # prompt it joins.
+                note = self._steering_note(borg)
                 self._start_revision_progress(child_key)
                 revised = ArchitectLoop(
                     self.repository,
@@ -304,6 +332,7 @@ class TechLeadLoop:
                     progress=self.progress,
                     stage_key="tech-lead",
                     child_key=child_key,
+                    steering_note=note,
                     dirty_borg_documents=self.dirty_borg_documents,
                     worktrees_root=self.worktrees_root,
                 ).run()
@@ -428,6 +457,66 @@ class TechLeadLoop:
             current_plan=json.dumps(plan, indent=2, sort_keys=True),
             turn_name="review",
         )
+
+    def _steering_note(self, borg: Borg) -> str | None:
+        """Return the note this granted revision runs on, or nothing.
+
+        A revision that follows a converging verdict, and one leading into a
+        round still inside the minimum, get the prompt they would have had: the
+        findings they have to answer are already in front of them.
+        """
+
+        cycle_id = current_planning_cycle_id(self.store, self.borg_id)
+        scope = SteeringScope(loop=_TECH_REVIEW_PHASE, cycle_id=cycle_id)
+        verdict = steering_verdict(
+            self.store.list_review_assessments(
+                self.borg_id, loop=_TECH_REVIEW_PHASE, cycle_id=cycle_id
+            )
+        )
+        if verdict is None:
+            return None
+        recorded = recorded_steering_note(
+            self.store, self.borg_id, scope=scope, round_number=verdict.round
+        )
+        if recorded is not None:
+            return recorded.note
+        child_key = f"steering:{verdict.round}"
+        self._start_steering_progress(child_key, verdict.round)
+        note = PlanningSteeringTurn(
+            self.repository,
+            borg,
+            self.store,
+            self.steering_agent,
+            scope=scope,
+            subject=_STEERING_SUBJECT,
+            model=self.steering_model,
+            artifact_dir=self.artifact_dir,
+            error_factory=TechLeadError,
+            cancelled_error_factory=TechLeadCancelled,
+            cancel=self.cancel,
+            progress=self.progress,
+            stage_key="tech-lead" if self.progress is not None else None,
+            child_key=child_key if self.progress is not None else None,
+            dirty_borg_documents=self.dirty_borg_documents,
+            worktrees_root=self.worktrees_root,
+        ).note(
+            verdict=verdict,
+            ledger=self.store.list_planning_ledger_findings(
+                self.borg_id, cycle_id=cycle_id
+            ),
+            summaries=self._round_summaries(),
+        )
+        self._complete_steering_progress(child_key)
+        return note
+
+    def _round_summaries(self) -> list[tuple[int, str]]:
+        """Pair each completed review with its own account of what it decided."""
+
+        return [
+            (number, summary)
+            for number, attempt in enumerate(self._completed_reviews(), start=1)
+            if (summary := (attempt.summary or "").strip())
+        ]
 
     def _validated_handoff(self) -> dict[str, Any]:
         attempts = self.store.list_planning_attempts(self.borg_id)
@@ -636,6 +725,40 @@ class TechLeadLoop:
         child = self.progress.stages["tech-lead"].children[child_key]
         if child.state is StageState.PENDING:
             self.progress.start_child("tech-lead", child_key)
+
+    def _start_steering_progress(self, child_key: str, review_round: int) -> None:
+        """Show a steering turn as itself rather than as the reviewer's.
+
+        A child of its own, so a long note does not read as a stalled review.
+        """
+
+        if self.progress is None:
+            return
+        if child_key not in self.progress.stages["tech-lead"].children:
+            self.progress.declare_child(
+                "tech-lead",
+                ChildSpec(child_key, f"Steering note {review_round}"),
+            )
+        child = self.progress.stages["tech-lead"].children[child_key]
+        if child.state is StageState.PENDING:
+            self.progress.start_child("tech-lead", child_key)
+
+    def _complete_steering_progress(self, child_key: str) -> None:
+        """Reconcile the steering child on every path, not only the fallbacks.
+
+        The turn machinery emits into a child and never touches its lifecycle,
+        so a note that succeeded leaves its child running exactly as a note
+        that failed does — and a stage refuses to complete while any child of
+        it is still running.
+        """
+
+        if self.progress is None:
+            return
+        child = self.progress.stages["tech-lead"].children[child_key]
+        if child.state is StageState.RUNNING:
+            self.progress.complete_child(
+                "tech-lead", child_key, "steering note ready"
+            )
 
     def _seed_revision_progress(self) -> None:
         if self.progress is None:

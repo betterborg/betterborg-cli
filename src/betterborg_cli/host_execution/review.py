@@ -17,6 +17,7 @@ from betterborg_cli.agent_runtime import (
     BillingMode,
     CancellationToken,
 )
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.host_execution._agent_phase import (
     EXISTING_TEST_REVIEW_RULE,
     EXISTING_TEST_RULE,
@@ -35,7 +36,10 @@ from betterborg_cli.host_execution.coding import (
     reviewable_coding_statuses,
 )
 from betterborg_cli.host_execution.git import SafeGit
-from betterborg_cli.host_execution.guard import PrimaryCheckoutGuard
+from betterborg_cli.host_execution.guard import (
+    PrimaryCheckoutGuard,
+    checkout_was_changed,
+)
 from betterborg_cli.host_execution.scheduler import ScheduledTaskContext
 from betterborg_cli.planning import TaskDigestDriftError
 from betterborg_cli.planning.convergence import assess_convergence, drain_evidence
@@ -52,6 +56,19 @@ from betterborg_cli.planning.grants import (
     assess_grant,
     grant_account,
 )
+from betterborg_cli.planning.steering import (
+    STEERING_NOTE_SCHEMA,
+    STEERING_PHASE,
+    STEERING_SYSTEM_PROMPT,
+    SteeringScope,
+    SteeringSubject,
+    assembled_steering_note,
+    build_steering_note,
+    confident_steering_note,
+    recorded_steering_note,
+    render_steering_prompt,
+    steering_verdict,
+)
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.repository_config import BlockedTaskPolicy
 from betterborg_cli.store import (
@@ -59,8 +76,16 @@ from betterborg_cli.store import (
     ExecutionAttemptStatus,
     ExecutionLedgerFinding,
     ReviewAssessment,
+    SteeringNote,
+    SteeringNoteSource,
     TaskRuntime,
     TaskRuntimeStatus,
+)
+
+#: Who a steering note in a task's review is written for, and what the
+#: argument it reads is about.
+_STEERING_SUBJECT = SteeringSubject(
+    answerer="The fixing agent", work="the task's commit"
 )
 
 #: Severities that hold a task. A batch whose every fault is minor is one the
@@ -121,6 +146,15 @@ class ReviewFixPhaseError(RuntimeError):
     """Raised when the review/fix lifecycle cannot safely proceed."""
 
 
+class _ArtifactSetupError(RuntimeError):
+    """Raised where one attempt's artifact directory cannot be written.
+
+    Its own class so the turn that meets it decides what it means: the task's
+    own work blocks on it, and an optional turn goes on with the assembled note
+    in place of the one it could not keep.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class HostReviewFixConfig:
     """Provider, artifact, and review-budget settings for review and fixes.
@@ -132,12 +166,19 @@ class HostReviewFixConfig:
 
     review_model: str
     fix_model: str | None = None
+    # The steering turn's own stage settings. No tool set beside them: an
+    # empty one is not a read-only one, and this is the one turn whose tool
+    # set has to be chosen for it rather than left to an adapter default, so
+    # it is a constant at the call site and never a field an operator edits.
+    steering_model: str | None = None
     review_passes: int = 3
     grant_budget: int = EXECUTION_GRANT_BUDGET
     review_billing_mode: BillingMode = BillingMode.API
     fix_billing_mode: BillingMode | None = None
+    steering_billing_mode: BillingMode | None = None
     review_effort: str | None = None
     fix_effort: str | None = None
+    steering_effort: str | None = None
     review_allowed_tools: tuple[str, ...] = ()
     fix_allowed_tools: tuple[str, ...] = ()
     blocked_tasks: BlockedTaskPolicy = BlockedTaskPolicy.STOP
@@ -149,6 +190,8 @@ class HostReviewFixConfig:
             raise ValueError("review model must not be empty")
         if self.fix_model is not None and not self.fix_model.strip():
             raise ValueError("fix model must not be empty")
+        if self.steering_model is not None and not self.steering_model.strip():
+            raise ValueError("steering model must not be empty")
         if self.review_passes < 1:
             raise ValueError("review passes must be positive")
         # Zero buys nothing and is legal; below zero would stop a task short of
@@ -161,6 +204,12 @@ class HostReviewFixConfig:
         if self.fix_billing_mode is not None:
             object.__setattr__(
                 self, "fix_billing_mode", BillingMode(self.fix_billing_mode)
+            )
+        if self.steering_billing_mode is not None:
+            object.__setattr__(
+                self,
+                "steering_billing_mode",
+                BillingMode(self.steering_billing_mode),
             )
         object.__setattr__(
             self, "review_allowed_tools", tuple(self.review_allowed_tools)
@@ -179,6 +228,14 @@ class HostReviewFixConfig:
     def resolved_fix_billing_mode(self) -> BillingMode:
         return self.fix_billing_mode or self.review_billing_mode
 
+    @property
+    def resolved_steering_model(self) -> str:
+        return self.steering_model or self.review_model
+
+    @property
+    def resolved_steering_billing_mode(self) -> BillingMode:
+        return self.steering_billing_mode or self.review_billing_mode
+
 
 class HostReviewFixPhase:
     """Review a coding commit, fixing it while its grant budget holds."""
@@ -190,6 +247,7 @@ class HostReviewFixPhase:
         *,
         config: HostReviewFixConfig,
         fix_adapter: AgentAdapter | None = None,
+        steering_adapter: AgentAdapter | None = None,
         cancel: CancellationToken | None = None,
         git: SafeGit | None = None,
     ) -> None:
@@ -201,6 +259,7 @@ class HostReviewFixPhase:
             )
         self._review_adapter = review_adapter
         self._fix_adapter = fix_adapter or review_adapter
+        self._steering_adapter = steering_adapter or review_adapter
         self._config = config
         if git is not None and git.cwd != self.repository_root:
             raise ReviewFixPhaseError(
@@ -255,12 +314,15 @@ class HostReviewFixPhase:
                 base_commit, current_commit = self._declared_commits(
                     context, worktree
                 )
-                # Only a review records an assessment, so only a review pays
-                # for finding out whose record it goes in.
+                # A review records its assessment under this Borg and a fix
+                # reads back the verdict that decides whether it is steered,
+                # so both phases want it. Only the review is held to finding
+                # it: a fix that cannot is one more way to arrive without a
+                # note, and arriving without a note never blocks a task.
                 borg_id = (
                     _assessment_borg_id(context)
                     if runtime.status is TaskRuntimeStatus.REVIEW
-                    else None
+                    else _optional_assessment_borg_id(context)
                 )
             except (
                 HostAgentPhaseError,
@@ -303,6 +365,7 @@ class HostReviewFixPhase:
                     runtime,
                     worktree,
                     inputs,
+                    borg_id=borg_id,
                     base_commit=base_commit,
                     current_commit=current_commit,
                     environment={
@@ -365,10 +428,26 @@ class HostReviewFixPhase:
         worktree: Path,
         inputs: VerifiedTaskInputs,
         *,
+        borg_id: UUID | None,
         base_commit: str,
         current_commit: str,
         environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
+        # Held here rather than on the phase object, which is one instance
+        # shared across every task in the run.
+        steering = self._steering_note(
+            context,
+            runtime,
+            worktree,
+            borg_id=borg_id,
+            base_commit=base_commit,
+            current_commit=current_commit,
+            environment=environment,
+        )
+        if steering.blocked is not None:
+            return self._block(context, steering.blocked)
+        if steering.stopped:
+            return runtime.status
         findings = self._findings_for_fix(context, runtime.review_round)
         user_prompt = _render_fix_prompt(
             inputs,
@@ -377,6 +456,7 @@ class HostReviewFixPhase:
             # requested the fix, so the runtime already carries that review's
             # ledger round and the round line agrees with the rows below it.
             review_round=runtime.review_round,
+            steering_note=steering.note,
         )
         return self._invoke(
             context,
@@ -394,6 +474,244 @@ class HostReviewFixPhase:
             base_commit=base_commit,
             current_commit=current_commit,
             environment=environment,
+        )
+
+    def _steering_note(
+        self,
+        context: ScheduledTaskContext,
+        runtime: TaskRuntime,
+        worktree: Path,
+        *,
+        borg_id: UUID | None,
+        base_commit: str,
+        current_commit: str,
+        environment: Mapping[str, str] | None,
+    ) -> _SteeringOutcome:
+        """Return the note this granted fix runs on, or the reason there is none.
+
+        A fix that follows a converging verdict, and one leading into a round
+        still inside the minimum, get the prompt they would have had: the
+        findings they have to answer are already in front of them.
+
+        Nothing here can block the task except a turn that wrote to a tree. The
+        round was already granted and the fix is still worth running, so every
+        way the turn can fail to produce a note lands on the assembled one.
+        """
+        if borg_id is None:
+            return _SteeringOutcome()
+        task_id = context.claim.task_id
+        scope = SteeringScope(loop=TASK_REVIEW_LOOP, task_id=task_id)
+        verdict = steering_verdict(
+            context.store.list_review_assessments(
+                borg_id, loop=TASK_REVIEW_LOOP, task_id=task_id
+            )
+        )
+        if verdict is None:
+            return _SteeringOutcome()
+        # The round the granted fix is filed under is the round whose
+        # assessment asked for the note: the review advanced the runtime's
+        # counter as it requested the fix, so the write and this read agree
+        # without arithmetic.
+        recorded = recorded_steering_note(
+            context.store, borg_id, scope=scope, round_number=verdict.round
+        )
+        if recorded is not None:
+            return _SteeringOutcome(note=recorded.note)
+
+        ledger = context.store.list_execution_ledger_findings(task_id)
+        assembled = assembled_steering_note(ledger, round_number=verdict.round)
+        try:
+            turn = self._perform_turn(
+                context,
+                runtime,
+                worktree,
+                phase=STEERING_PHASE,
+                adapter=self._steering_adapter,
+                model=self._config.resolved_steering_model,
+                billing_mode=self._config.resolved_steering_billing_mode,
+                effort=self._config.steering_effort,
+                # Chosen for this turn rather than left to the adapter default
+                # the driver's other turns take: an empty tool set is not a
+                # read-only one, and what keeps a turn that must not write away
+                # from the tree is this set. It reads the store and needs no
+                # file at all.
+                allowed_tools=READ_ONLY_API_TOOLS,
+                schema=STEERING_NOTE_SCHEMA,
+                system_prompt=STEERING_SYSTEM_PROMPT,
+                user_prompt=render_steering_prompt(
+                    subject=_STEERING_SUBJECT,
+                    verdict=verdict,
+                    ledger=ledger,
+                    summaries=_review_round_summaries(context),
+                ),
+                current_commit=current_commit,
+                environment=environment,
+                stop_propagates=False,
+            )
+        except _ArtifactSetupError:
+            context.store.record_steering_note(
+                build_steering_note(
+                    borg_id=borg_id,
+                    scope=scope,
+                    verdict=verdict,
+                    note=assembled,
+                    source=SteeringNoteSource.ASSEMBLED,
+                )
+            )
+            return _SteeringOutcome(note=assembled)
+
+        classified = self._classify_steering(
+            turn,
+            runtime=runtime,
+            expected_commit=current_commit,
+            assembled=assembled,
+            stopped=context.cancel.is_set(),
+        )
+        durable_result = dict(turn.result.payload or {})
+        durable_result["_betterborg"] = {
+            "artifact_dir": turn.artifacts.reference(turn.attempt_dir),
+            "base_commit": base_commit,
+            "prior_commit": current_commit,
+            "commit_sha": turn.final_commit,
+            "outcome_reason": classified.reason,
+            "note_source": classified.source,
+            "review_round": runtime.review_round,
+            "steered_round": verdict.round,
+            "provider": turn.result.provider or turn.adapter_name,
+            "model": turn.result.model or turn.model,
+            "billing_mode": turn.result.billing_mode.value,
+        }
+        note: SteeringNote | None = None
+        if classified.note is not None and classified.source is not None:
+            note = build_steering_note(
+                borg_id=borg_id,
+                scope=scope,
+                verdict=verdict,
+                note=classified.note,
+                source=classified.source,
+                # Left unnamed because the row's attempt column points at
+                # planning attempts alone, as the assessments' does.
+            )
+        # Sealed like every other turn this driver runs — the outcome, the
+        # manifest, the adapter's own transcript, the read-only mode — because
+        # a note that sent a fix at the wrong objection is the one turn whose
+        # artifacts someone will want to check afterwards. Unlike every other
+        # turn, a directory that cannot be written does not hold the task: the
+        # round was granted and the note is already in hand, so the failure is
+        # recorded and the fix still runs.
+        try:
+            turn.artifacts.finish(turn.result, durable_result)
+        except OSError as error:
+            durable_result["_betterborg"]["artifact_seal_error"] = str(error)
+        # The driver completes its attempt whatever the outcome, so the row
+        # joins that step either way. Its usage rides the attempt and goes no
+        # further: no completion-sample bucket prices a steering agent, and
+        # adding one is a change to the estimate rather than to this turn.
+        with context.store.transaction():
+            self._complete_attempt(context, turn, durable_result)
+            if note is not None:
+                context.store.record_steering_note(note)
+        return _SteeringOutcome(
+            note=classified.note,
+            blocked=classified.blocked,
+            stopped=classified.stopped,
+        )
+
+    @staticmethod
+    def _classify_steering(
+        turn: _TurnRecord,
+        *,
+        runtime: TaskRuntime,
+        expected_commit: str,
+        assembled: str,
+        stopped: bool,
+    ) -> _SteeringClassification:
+        """Read one steering turn as a note, a breach, or a stop.
+
+        Writing is the only way a steering turn can hold the task, and it is
+        read first: a turn that both raised and changed the primary checkout
+        has its contamination attached to its own exception rather than raised,
+        so discriminating by exception type alone would fall back on exactly
+        the case that most needs blocking. Restoring either tree instead is not
+        available — the Git this driver runs through withholds the destructive
+        flags as its stated contract — so the turn is kept away from the tree
+        and these are tripwires with a blocked task behind them.
+        """
+        error = turn.operational_error
+        if error is not None and checkout_was_changed(error):
+            return _SteeringClassification(
+                "steering agent changed the primary checkout",
+                blocked=(
+                    f"steering agent changed the primary checkout: {error}"
+                ),
+            )
+        if (
+            turn.actual_branch != (runtime.branch or "")
+            or turn.final_commit != expected_commit
+            or turn.after_status != turn.before_status
+        ):
+            return _SteeringClassification(
+                "steering agent modified the task worktree",
+                blocked="steering agent modified the task worktree",
+            )
+        # Read before the failures and not among them, because a stopped run
+        # arrives here as any of them: an operator who stopped the run has not
+        # asked for the round to continue unsteered. Nothing propagates out of
+        # a phase whose only handler covers its worktree checks, so the task is
+        # left claimable at the same round instead. A note the turn had already
+        # written is still recorded on the way out — it resolved before the
+        # stop reached here, and dropping it would make the round pay for a
+        # second turn on the re-entry that the row exists to spare. Only its
+        # own note: a fallback stands in for a round that is about to run, and
+        # this one is not, so the re-entry is free to try for a written note
+        # rather than inheriting the one this round would have settled for.
+        if stopped:
+            written = (
+                confident_steering_note(turn.result.payload or {})
+                if turn.result.status is AgentStatus.COMPLETED
+                else None
+            )
+            return _SteeringClassification(
+                turn.cancellation_reason or "steering agent stopped with the run",
+                stopped=True,
+                note=written,
+                source=None if written is None else SteeringNoteSource.AGENT,
+            )
+        if error is not None:
+            return _SteeringClassification(
+                str(error),
+                note=assembled,
+                source=SteeringNoteSource.ASSEMBLED,
+            )
+        if turn.result.status is AgentStatus.CANCELLED:
+            # The token is clear, so this is the other thing a cancelled status
+            # covers: a bounded transient retry budget run dry.
+            return _SteeringClassification(
+                turn.cancellation_reason
+                or "steering agent requested a resumable stop",
+                note=assembled,
+                source=SteeringNoteSource.ASSEMBLED,
+            )
+        if turn.result.status is not AgentStatus.COMPLETED:
+            return _SteeringClassification(
+                turn.result.error or "steering agent failed",
+                note=assembled,
+                source=SteeringNoteSource.ASSEMBLED,
+            )
+        confident = confident_steering_note(turn.result.payload or {})
+        if confident is None:
+            # The costs are not symmetric: a merely plausible note misdirects a
+            # round that was bought, where the assembled one leaves the fixer
+            # exactly where an unsteered round would have left it.
+            return _SteeringClassification(
+                "steering note was not attached",
+                note=assembled,
+                source=SteeringNoteSource.ASSEMBLED,
+            )
+        return _SteeringClassification(
+            "steering note attached",
+            note=confident,
+            source=SteeringNoteSource.AGENT,
         )
 
     def _invoke(
@@ -418,6 +736,157 @@ class HostReviewFixPhase:
         current_commit: str,
         environment: Mapping[str, str] | None,
     ) -> TaskRuntimeStatus:
+        try:
+            turn = self._perform_turn(
+                context,
+                runtime,
+                worktree,
+                phase=phase,
+                adapter=adapter,
+                model=model,
+                billing_mode=billing_mode,
+                effort=effort,
+                allowed_tools=allowed_tools,
+                schema=schema,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                current_commit=current_commit,
+                environment=environment,
+                stop_propagates=True,
+            )
+        except _ArtifactSetupError as error:
+            return self._block(
+                context, f"unable to create {phase} artifacts: {error}"
+            )
+
+        result = turn.result
+        ledger: tuple[ExecutionLedgerFinding, ...] = ()
+        assessment: ReviewAssessment | None = None
+        if phase == "review":
+            classified = self._classify_review(
+                result,
+                runtime=runtime,
+                borg_id=borg_id,
+                task_id=context.claim.task_id,
+                attempt_id=turn.attempt.id,
+                ledger=context.store.list_execution_ledger_findings(
+                    context.claim.task_id
+                ),
+                # Read here rather than in the classifier, which keeps every
+                # read of this round's own history outside the durable step
+                # that appends to it.
+                recorded=context.store.list_review_assessments(
+                    borg_id, loop=TASK_REVIEW_LOOP, task_id=context.claim.task_id
+                ),
+                expected_commit=current_commit,
+                final_commit=turn.final_commit,
+                expected_branch=runtime.branch or "",
+                actual_branch=turn.actual_branch,
+                before_status=turn.before_status,
+                after_status=turn.after_status,
+                operational_error=turn.operational_error,
+                cancellation_reason=turn.cancellation_reason,
+            )
+            outcome = classified.outcome
+            ledger = classified.ledger
+            assessment = classified.assessment
+        else:
+            outcome = self._classify_fix(
+                result,
+                reviewable=reviewable_coding_statuses(
+                    self._config.blocked_tasks
+                ),
+                runtime=runtime,
+                previous_commit=current_commit,
+                final_commit=turn.final_commit,
+                expected_branch=runtime.branch or "",
+                actual_branch=turn.actual_branch,
+                git=self._primary_git.for_worktree(worktree),
+                after_status=turn.after_status,
+                operational_error=turn.operational_error,
+                cancellation_reason=turn.cancellation_reason,
+            )
+
+        durable_result = dict(result.payload or {})
+        durable_result["_betterborg"] = {
+            "artifact_dir": turn.artifacts.reference(turn.attempt_dir),
+            "base_commit": base_commit,
+            "prior_commit": current_commit,
+            "commit_sha": turn.final_commit,
+            "outcome_status": outcome.status.value,
+            "outcome_reason": outcome.reason,
+            "review_round": runtime.review_round,
+            "next_review_round": outcome.review_round,
+            "provider": result.provider or adapter.name,
+            "model": result.model or model,
+            "billing_mode": result.billing_mode.value,
+        }
+        try:
+            turn.artifacts.finish(result, durable_result)
+        except OSError as error:
+            outcome = _PhaseOutcome(
+                TaskRuntimeStatus.BLOCKED,
+                f"artifact persistence failed: {error}",
+                runtime.review_round,
+                runtime.status.value,
+            )
+            durable_result["_betterborg"]["outcome_status"] = outcome.status.value
+            durable_result["_betterborg"]["outcome_reason"] = outcome.reason
+            durable_result["_betterborg"]["next_review_round"] = (
+                outcome.review_round
+            )
+
+        # One durable step for the round's findings, the grant it spent and the
+        # attempt that produced them: an interruption cannot leave objections
+        # recorded against an attempt that never finished, and a resume replays
+        # a completed attempt's outcome without re-running the classifier, so
+        # rows written after it would never be written at all. The assessment
+        # goes with them for the same reason: a round whose objections are
+        # recorded without its snapshot denies the round after it the refund it
+        # earned. A round the artifact write has already turned into a block has
+        # no round after it, and records what it found all the same rather than
+        # being carved out of the rule.
+        with context.store.transaction():
+            self._complete_attempt(context, turn, durable_result)
+            context.store.record_execution_ledger_findings(ledger)
+            if assessment is not None:
+                context.store.record_review_assessment(assessment)
+        if outcome.status is runtime.status:
+            return outcome.status
+        return self._transition(context, runtime.status, outcome)
+
+    def _perform_turn(
+        self,
+        context: ScheduledTaskContext,
+        runtime: TaskRuntime,
+        worktree: Path,
+        *,
+        phase: str,
+        adapter: AgentAdapter,
+        model: str,
+        billing_mode: BillingMode,
+        effort: str | None,
+        allowed_tools: tuple[str, ...],
+        schema: Mapping[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        current_commit: str,
+        environment: Mapping[str, str] | None,
+        stop_propagates: bool,
+    ) -> _TurnRecord:
+        """Run one provider turn and record what every turn here records.
+
+        The attempt row, the prompt and log artifacts, the usage and billing
+        mode, the primary-checkout guard and the worktree comparison before and
+        after belong to every turn the driver runs. What a turn makes of the
+        result does not, so nothing here reads an outcome.
+
+        ``stop_propagates`` says whether an adapter-level cancellation becomes
+        the run's own stop. It does for a turn whose work the task needs, so the
+        scheduler releases the claim rather than reading an unchanged phase as a
+        failure; for an optional turn it must not, or one provider hiccup drains
+        every task in flight.
+        """
         attempts = context.store.list_agent_attempts(context.claim.task_id)
         attempt_number = 1 + sum(item.phase == phase for item in attempts)
         attempt_id = uuid4()
@@ -438,9 +907,7 @@ class HostReviewFixPhase:
                 json.dumps(schema, indent=2, sort_keys=True) + "\n",
             )
         except OSError as error:
-            return self._block(
-                context, f"unable to create {phase} artifacts: {error}"
-            )
+            raise _ArtifactSetupError(str(error)) from error
 
         log_path = attempt_dir / f"{phase}.log"
         result_path = attempt_dir / f"{phase}.result.json"
@@ -503,10 +970,10 @@ class HostReviewFixPhase:
                 provider=adapter.name,
                 model=model,
             )
-        cancellation_reason = cancelled_agent_reason(
-            result,
-            context.cancel,
-            phase=phase,
+        cancellation_reason = (
+            cancelled_agent_reason(result, context.cancel, phase=phase)
+            if stop_propagates
+            else _optional_turn_stop_reason(result, context.cancel, phase=phase)
         )
         try:
             final_commit = git.head_sha()
@@ -519,119 +986,49 @@ class HostReviewFixPhase:
             final_commit = current_commit
             actual_branch = runtime.branch or ""
             after_status = before_status
+        return _TurnRecord(
+            attempt=attempt,
+            attempt_dir=attempt_dir,
+            artifacts=artifacts,
+            result=result,
+            result_path=result_path,
+            adapter_name=adapter.name,
+            model=model,
+            before_status=before_status,
+            after_status=after_status,
+            final_commit=final_commit,
+            actual_branch=actual_branch,
+            operational_error=operational_error,
+            cancellation_reason=cancellation_reason,
+        )
 
-        ledger: tuple[ExecutionLedgerFinding, ...] = ()
-        assessment: ReviewAssessment | None = None
-        if phase == "review":
-            classified = self._classify_review(
-                result,
-                runtime=runtime,
-                borg_id=borg_id,
-                task_id=context.claim.task_id,
-                attempt_id=attempt_id,
-                ledger=context.store.list_execution_ledger_findings(
-                    context.claim.task_id
-                ),
-                # Read here rather than in the classifier, which keeps every
-                # read of this round's own history outside the durable step
-                # that appends to it.
-                recorded=context.store.list_review_assessments(
-                    borg_id, loop=TASK_REVIEW_LOOP, task_id=context.claim.task_id
-                ),
-                expected_commit=current_commit,
-                final_commit=final_commit,
-                expected_branch=runtime.branch or "",
-                actual_branch=actual_branch,
-                before_status=before_status,
-                after_status=after_status,
-                operational_error=operational_error,
-                cancellation_reason=cancellation_reason,
-            )
-            outcome = classified.outcome
-            ledger = classified.ledger
-            assessment = classified.assessment
-        else:
-            outcome = self._classify_fix(
-                result,
-                reviewable=reviewable_coding_statuses(
-                    self._config.blocked_tasks
-                ),
-                runtime=runtime,
-                previous_commit=current_commit,
-                final_commit=final_commit,
-                expected_branch=runtime.branch or "",
-                actual_branch=actual_branch,
-                git=git,
-                after_status=after_status,
-                operational_error=operational_error,
-                cancellation_reason=cancellation_reason,
-            )
-
-        durable_result = dict(result.payload or {})
-        durable_result["_betterborg"] = {
-            "artifact_dir": artifacts.reference(attempt_dir),
-            "base_commit": base_commit,
-            "prior_commit": current_commit,
-            "commit_sha": final_commit,
-            "outcome_status": outcome.status.value,
-            "outcome_reason": outcome.reason,
-            "review_round": runtime.review_round,
-            "next_review_round": outcome.review_round,
-            "provider": result.provider or adapter.name,
-            "model": result.model or model,
-            "billing_mode": result.billing_mode.value,
-        }
-        try:
-            artifacts.finish(result, durable_result)
-        except OSError as error:
-            outcome = _PhaseOutcome(
-                TaskRuntimeStatus.BLOCKED,
-                f"artifact persistence failed: {error}",
-                runtime.review_round,
-                runtime.status.value,
-            )
-            durable_result["_betterborg"]["outcome_status"] = outcome.status.value
-            durable_result["_betterborg"]["outcome_reason"] = outcome.reason
-            durable_result["_betterborg"]["next_review_round"] = (
-                outcome.review_round
-            )
-
-        terminal_attempt_status = {
-            AgentStatus.COMPLETED: ExecutionAttemptStatus.COMPLETED,
-            AgentStatus.CANCELLED: ExecutionAttemptStatus.CANCELLED,
-            AgentStatus.FAILED: ExecutionAttemptStatus.FAILED,
-        }[result.status]
-        # One durable step for the round's findings, the grant it spent and the
-        # attempt that produced them: an interruption cannot leave objections
-        # recorded against an attempt that never finished, and a resume replays
-        # a completed attempt's outcome without re-running the classifier, so
-        # rows written after it would never be written at all. The assessment
-        # goes with them for the same reason: a round whose objections are
-        # recorded without its snapshot denies the round after it the refund it
-        # earned. A round the artifact write has already turned into a block has
-        # no round after it, and records what it found all the same rather than
-        # being carved out of the rule.
-        with context.store.transaction():
-            context.store.complete_agent_attempt(
-                attempt.id,
-                context.owner_token,
-                context.claim.claim_token,
-                status=terminal_attempt_status,
-                result_path=(
-                    artifacts.reference(result_path) if result_path.is_file() else None
-                ),
-                result=durable_result,
-                summary=result_summary(result),
-                duration_seconds=result.duration_seconds,
-                usage=result.usage,
-                now=context.clock(),
-            )
-            context.store.record_execution_ledger_findings(ledger)
-            if assessment is not None:
-                context.store.record_review_assessment(assessment)
-        if outcome.status is runtime.status:
-            return outcome.status
-        return self._transition(context, runtime.status, outcome)
+    def _complete_attempt(
+        self,
+        context: ScheduledTaskContext,
+        turn: _TurnRecord,
+        durable_result: dict[str, Any],
+    ) -> None:
+        """Close one turn's attempt row inside its caller's durable step."""
+        context.store.complete_agent_attempt(
+            turn.attempt.id,
+            context.owner_token,
+            context.claim.claim_token,
+            status={
+                AgentStatus.COMPLETED: ExecutionAttemptStatus.COMPLETED,
+                AgentStatus.CANCELLED: ExecutionAttemptStatus.CANCELLED,
+                AgentStatus.FAILED: ExecutionAttemptStatus.FAILED,
+            }[turn.result.status],
+            result_path=(
+                turn.artifacts.reference(turn.result_path)
+                if turn.result_path.is_file()
+                else None
+            ),
+            result=durable_result,
+            summary=result_summary(turn.result),
+            duration_seconds=turn.result.duration_seconds,
+            usage=turn.result.usage,
+            now=context.clock(),
+        )
 
     def _classify_review(
         self,
@@ -1043,6 +1440,58 @@ class HostReviewFixPhase:
 
 
 @dataclass(frozen=True, slots=True)
+class _TurnRecord:
+    """One provider turn, before anything has read what it means.
+
+    Everything the driver gathers around a turn and nothing it concludes: the
+    review and fix classifications and the steering one all read the same
+    record and reach different answers from it.
+    """
+
+    attempt: AgentAttempt
+    attempt_dir: Path
+    artifacts: AgentAttemptArtifacts
+    result: AgentResult
+    result_path: Path
+    adapter_name: str
+    model: str
+    before_status: str
+    after_status: str
+    final_commit: str
+    actual_branch: str
+    operational_error: BaseException | None
+    cancellation_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SteeringOutcome:
+    """What one granted round's steering turn left behind.
+
+    Not a task status, because a steering turn returns a note rather than a
+    verdict on the commit. ``blocked`` is the one reason it can hold the task:
+    a turn that wrote to a tree did the one thing it was built not to do.
+    ``stopped`` is an operator's cancellation, which leaves the task claimable
+    at the same round rather than propagating out of a phase whose only
+    handler covers its worktree checks.
+    """
+
+    note: str | None = None
+    blocked: str | None = None
+    stopped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _SteeringClassification:
+    """A steering turn's own outcome: the note, or the reason there is none."""
+
+    reason: str
+    note: str | None = None
+    source: SteeringNoteSource | None = None
+    blocked: str | None = None
+    stopped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _PhaseOutcome:
     status: TaskRuntimeStatus
     reason: str
@@ -1080,6 +1529,51 @@ def _assessment_borg_id(context: ScheduledTaskContext) -> UUID:
             f"execution run {context.claim.run_id} is no longer recorded"
         )
     return run.borg_id
+
+
+def _optional_assessment_borg_id(context: ScheduledTaskContext) -> UUID | None:
+    """Return the Borg a fix reads its verdict under, or nothing.
+
+    The same lookup the review is held to, for a phase that is not: a fix that
+    cannot find it arrives without a note, which is one of the several ways a
+    fix can and never a reason to block.
+    """
+    try:
+        return _assessment_borg_id(context)
+    except ReviewFixPhaseError:
+        return None
+
+
+def _optional_turn_stop_reason(
+    result: AgentResult, cancel: CancellationToken, *, phase: str
+) -> str | None:
+    """Read an optional turn's cancellation without stopping the run.
+
+    The adapters return a cancelled status for an operator's stop and for
+    bounded transient retries exhausted alike, and the driver's own reader
+    turns the second into a run-wide stop. That is right for a turn whose work
+    the task needs and wrong here: an optional turn meeting a provider hiccup
+    would drain every task in flight.
+    """
+    if result.status is not AgentStatus.CANCELLED:
+        return None
+    if cancel.is_set():
+        return f"{phase} agent was interrupted"
+    return result.error or f"{phase} agent requested a resumable stop"
+
+
+def _review_round_summaries(
+    context: ScheduledTaskContext,
+) -> list[tuple[int, str]]:
+    """Pair each completed review with its own account of what it decided."""
+
+    return [
+        (attempt.review_round + 1, summary)
+        for attempt in context.store.list_agent_attempts(context.claim.task_id)
+        if attempt.phase == "review"
+        and attempt.status is ExecutionAttemptStatus.COMPLETED
+        and (summary := (attempt.summary or "").strip())
+    ]
 
 
 def _ledger_round(runtime: TaskRuntime) -> int:
@@ -1282,6 +1776,7 @@ def _render_fix_prompt(
     *,
     findings: Sequence[ExecutionLedgerFinding],
     review_round: int,
+    steering_note: str | None = None,
 ) -> str:
     sections = [
         "Fix every open review finding in the current worktree. Keep the "
@@ -1300,11 +1795,10 @@ def _render_fix_prompt(
         "earlier round raised that the latest review did not repeat.",
         "",
         *_ledger_lines(findings),
-        "",
-        "## Assigned task",
-        "",
-        inputs.task_markdown.rstrip(),
     ]
+    if steering_note is not None:
+        sections.extend(["", "## Steering note", "", steering_note])
+    sections.extend(["", "## Assigned task", "", inputs.task_markdown.rstrip()])
     return "\n".join(sections).rstrip() + "\n"
 
 

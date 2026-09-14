@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from steering_test_support import CancellingAgent, UnpersistedNoteAgent
 
 from betterborg_cli.agent_runtime import (
     AgentArtifact,
@@ -23,6 +24,7 @@ from betterborg_cli.agent_runtime import (
     MockResponse,
     run_captured,
 )
+from betterborg_cli.agent_runtime.api_tools import READ_ONLY_API_TOOLS
 from betterborg_cli.agent_runtime.structured import (
     StructuredResultError,
     validate_structured_result,
@@ -45,16 +47,24 @@ from betterborg_cli.host_execution._agent_phase import (
     EXISTING_TEST_REVIEW_RULE,
     EXISTING_TEST_RULE,
     REVIEW_FINDING_RULE,
+    AgentAttemptArtifacts,
     VerifiedTaskInputs,
 )
 from betterborg_cli.host_execution.coding import (
     CODING_RESULT_SCHEMA,
     _render_user_prompt,
 )
+from betterborg_cli.host_execution.guard import (
+    CheckoutCondition,
+    PrimaryCheckoutContaminationError,
+    PrimaryCheckoutGuard,
+    checkout_was_changed,
+)
 from betterborg_cli.host_execution.merge import _render_merge_prompt
 from betterborg_cli.host_execution.review import (
     _render_fix_prompt,
     _render_review_prompt,
+    _review_round_summaries,
 )
 from betterborg_cli.planning import (
     approved_plan_digest,
@@ -62,6 +72,10 @@ from betterborg_cli.planning import (
     task_markdown_digest,
 )
 from betterborg_cli.planning.grants import TASK_REVIEW_LOOP
+from betterborg_cli.planning.steering import (
+    STEERING_NOTE_SCHEMA,
+    STEERING_SYSTEM_PROMPT,
+)
 from betterborg_cli.progress import AgentActivity, AgentActivityKind
 from betterborg_cli.repo_paths import RepoPaths, ensure_managed_gitignore
 from betterborg_cli.repository_config import BlockedTaskPolicy
@@ -497,6 +511,25 @@ def _ledger_row(
         severity=severity,
         message=message,
     )
+
+
+def _steering_adapter(rounds: int, *, confidence: str = "high") -> MockAdapter:
+    """Build a steering agent with a note for every pass that can be steered.
+
+    Its own adapter, so a note never comes off the reviewer's script and the
+    reviewer's call count still counts reviews.
+    """
+    agent = MockAdapter()
+    for index in range(rounds):
+        agent.queue(
+            MockResponse(
+                payload={
+                    "note": f"Steering note {index + 1}.",
+                    "confidence": confidence,
+                }
+            )
+        )
+    return agent
 
 
 def _fixing_response(
@@ -1764,6 +1797,7 @@ def test_a_draining_review_ledger_runs_past_the_configured_passes(
             fixture.repository,
             review,
             fix_adapter=fix,
+            steering_adapter=_steering_adapter(2),
             config=HostReviewFixConfig(
                 review_model="review-model", review_passes=1
             ),
@@ -1829,6 +1863,7 @@ def test_a_review_repeating_one_blocker_spends_its_budget_and_blocks(
             fixture.repository,
             review,
             fix_adapter=fix,
+            steering_adapter=_steering_adapter(2),
             config=HostReviewFixConfig(
                 review_model="review-model", review_passes=1, grant_budget=2
             ),
@@ -1971,13 +2006,21 @@ def test_a_granted_pass_is_counted_once_across_an_interrupted_run(
         monkeypatch.setattr(store, "transition_task_runtime", crash_before_blocking)
         with pytest.raises(RuntimeError, match="simulated restart"):
             HostReviewFixPhase(
-                fixture.repository, review, fix_adapter=fix, config=config
+                fixture.repository,
+                review,
+                fix_adapter=fix,
+                steering_adapter=_steering_adapter(1),
+                config=config,
             ).run(fixture.context(store))
         monkeypatch.setattr(store, "transition_task_runtime", transition)
 
         replay = MockAdapter()
         status = HostReviewFixPhase(
-            fixture.repository, replay, fix_adapter=replay, config=config
+            fixture.repository,
+            replay,
+            fix_adapter=replay,
+            steering_adapter=replay,
+            config=config,
         ).run(fixture.context(store))
         runtime = store.get_task_runtime(fixture.task.id)
         recorded = _assessments(store, fixture)
@@ -2040,6 +2083,7 @@ def test_a_fix_without_a_commit_blocks_on_the_spot_in_any_pass(
             fixture.repository,
             review,
             fix_adapter=fix,
+            steering_adapter=_steering_adapter(2),
             config=HostReviewFixConfig(
                 review_model="review-model", review_passes=review_passes
             ),
@@ -2294,6 +2338,7 @@ def test_a_grant_is_decided_on_this_tasks_passes_and_no_others(
             fixture.repository,
             review,
             fix_adapter=MockAdapter().queue(_fixing_response(fixture.task)),
+            steering_adapter=_steering_adapter(1),
             config=HostReviewFixConfig(
                 review_model="review-model", review_passes=1, grant_budget=1
             ),
@@ -2936,3 +2981,1393 @@ def test_the_review_schema_offers_only_statuses_the_run_acts_on(
         TaskRuntimeStatus.BLOCKED,
         f"review agent reported {status}",
     )
+
+
+def _blocking_review(fixture: CodingFixture) -> MockResponse:
+    """One review that requests fixes and leaves a blocker standing."""
+    return MockResponse(
+        payload=_review_payload(
+            fixture.task,
+            status="issues_found",
+            findings=[_finding(_UNBOUNDED_TIMEOUT, severity="blocker")],
+        )
+    )
+
+
+def _approving_review(fixture: CodingFixture, store: SqliteStore) -> MockResponse:
+    def approve(_spec):
+        rows = store.list_execution_ledger_findings(fixture.task.id)
+        return _review_payload(
+            fixture.task,
+            status="approved",
+            resolved=[str(row.id) for row in rows],
+        )
+
+    return MockResponse(dynamic=approve)
+
+
+def _fix_prompts(fix: MockAdapter) -> list[str]:
+    return [call.user_prompt for call in fix.calls]
+
+
+def test_a_granted_fix_the_review_read_as_stuck_carries_a_steering_note(
+    tmp_path: Path,
+) -> None:
+    """The fix is the answering turn in a task's review, so the note joins it.
+
+    The round the granted fix is filed under is the round whose assessment
+    asked for the note: the review advanced the runtime's counter as it
+    requested the fix, so the write and the resume read agree without
+    arithmetic.
+    """
+    fixture = _coding_fixture(tmp_path)
+    usage = AgentUsage(cost_usd=0.11, tokens_input=90, tokens_output=20)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = MockAdapter().queue(
+            MockResponse(
+                payload={"note": "Answer the timeout first.", "confidence": "high"},
+                usage=usage,
+            )
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                steering_model="steering-model",
+                review_passes=1,
+                grant_budget=5,
+                review_effort="review-effort",
+                steering_effort="steering-effort",
+                review_billing_mode=BillingMode.API,
+                steering_billing_mode=BillingMode.SUBSCRIPTION,
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(steering.calls) == 1
+    # Its own instructions, and not the prompt the review turn beside it runs
+    # under: the confidence it reports and the file it must not write are
+    # asked for here and nowhere else.
+    assert steering.calls[0].system_prompt == STEERING_SYSTEM_PROMPT
+    assert steering.calls[0].schema == STEERING_NOTE_SCHEMA
+    # Its own stage's settings, and not the ones the review turn beside it runs
+    # under: the stage is configured separately and every field has to arrive.
+    assert steering.calls[0].effort == "steering-effort"
+    assert steering.calls[0].billing_mode is BillingMode.SUBSCRIPTION
+    assert [call.effort for call in review.calls] == ["review-effort"] * 2
+    assert "## Steering note\n\nAnswer the timeout first." in _fix_prompts(fix)[0]
+    # The reviewer meets the fix rather than the instruction.
+    assert not any("Steering note" in call.user_prompt for call in review.calls)
+    assert [
+        (row.round, row.source, row.converging, row.task_id) for row in rows
+    ] == [(1, "agent", False, fixture.task.id)]
+
+    steering_attempts = [item for item in attempts if item.phase == "steering"]
+    assert [item.model for item in steering_attempts] == ["steering-model"]
+    # Recorded on its own attempt and nowhere else: no completion-sample
+    # bucket prices a steering agent.
+    assert [item.usage for item in steering_attempts] == [usage]
+    assert [
+        item.status for item in steering_attempts
+    ] == [ExecutionAttemptStatus.COMPLETED]
+    # Its own phase, which the replay and the commit-declaring set both ignore.
+    assert [item.phase for item in attempts] == [
+        "coding",
+        "review",
+        "steering",
+        "fix",
+        "review",
+    ]
+    assert steering.calls[0].allowed_tools == READ_ONLY_API_TOOLS
+
+
+def test_a_second_steered_round_is_keyed_to_the_round_it_steers(
+    tmp_path: Path,
+) -> None:
+    """The round a note belongs to is the ledger's, not the minimum it passed.
+
+    A loop that steers once steers exactly on its minimum, so the two numbers
+    agree there and only a second grant tells them apart: the row it writes,
+    the round its attempt records, the age its fallback note reports and the
+    row a re-entry would find are all the round it steers.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def repeating(_spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[
+                    _finding(
+                        _UNBOUNDED_TIMEOUT,
+                        severity="blocker",
+                        repeats=str(
+                            _ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id
+                        ),
+                    )
+                ],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(MockResponse(dynamic=repeating))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(_fixing_response(fixture.task))
+        )
+        # The second grant's turn fails, so the note it runs on is assembled
+        # for the round it steers rather than written for it.
+        steering = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload={
+                        "note": "Answer the timeout first.",
+                        "confidence": "high",
+                    }
+                )
+            )
+            .queue(
+                MockResponse(exit_code=1, error="provider refused the request")
+            )
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                steering_model="steering-model",
+                review_passes=1,
+                grant_budget=5,
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    # Two grants, each steered once: a second turn ran, so the re-entry read
+    # of the first round's row did not answer for the second.
+    assert len(steering.calls) == 2
+    assert [(row.round, row.source) for row in rows] == [
+        (1, "agent"),
+        (2, "assembled"),
+    ]
+    # The fallback's age is measured from the round it steers.
+    assert (
+        f"- {_UNBOUNDED_TIMEOUT} (blocker, first raised in round 1 "
+        "and open for 2 rounds)"
+    ) in rows[1].note
+    assert [
+        item.result["_betterborg"]["steered_round"]
+        for item in attempts
+        if item.phase == "steering"
+    ] == [1, 2]
+
+
+def test_the_steering_turn_is_handed_the_argument_in_the_ledgers_numbering(
+    tmp_path: Path,
+) -> None:
+    """What the turn reads is the argument, numbered as the ledger numbers it.
+
+    The summaries are built from review attempts, which carry the runtime's
+    count of the rounds behind them, so each one is named a round later than
+    the attempt that recorded it. Numbered from the attempt instead, the turn
+    would read summaries one lower than the objections printed above them.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        def repeating(_spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                findings=[
+                    _finding(
+                        _BROAD_PATTERN,
+                        repeats=str(_ledger_row_for(rows, _BROAD_PATTERN).id),
+                    ),
+                    _finding(
+                        _UNBOUNDED_TIMEOUT,
+                        severity="blocker",
+                        repeats=str(
+                            _ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id
+                        ),
+                    ),
+                ],
+            ) | {"summary": "The timeout is still unbounded."}
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[
+                            _finding(_BROAD_PATTERN),
+                            _finding(_UNBOUNDED_TIMEOUT, severity="blocker"),
+                        ],
+                    )
+                    | {"summary": "Two things stand in the way."}
+                )
+            )
+            .queue(MockResponse(dynamic=repeating))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(_fixing_response(fixture.task))
+        )
+        # One more than the arithmetic allows, so an extra steered round shows
+        # up as a wrong count rather than as an adapter running dry.
+        steering = _steering_adapter(2)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                steering_model="steering-model",
+                review_passes=2,
+                grant_budget=5,
+            ),
+        ).run(fixture.context(store))
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(steering.calls) == 1
+    prompt = steering.calls[0].user_prompt
+
+    # Who is about to answer, and what the argument is about.
+    assert (
+        "The fixing agent is about to answer these findings again, on a round "
+        "granted because the review of the task's commit is not closing in on "
+        "agreement."
+    ) in prompt
+    assert "Rounds argued so far: 2." in prompt
+    assert f"- {_BROAD_PATTERN} (major, first raised in round 1)" in prompt
+    assert f"- {_UNBOUNDED_TIMEOUT} (blocker, first raised in round 1)" in prompt
+    assert "- Round 1: raised 2," in prompt
+    # Each round's own account of what it decided, against the ledger's
+    # numbering rather than the attempt's — and the reviews' accounts alone.
+    # The coding, fix and steering attempts of the same task carry summaries
+    # too, and a section that mixed them in would name two deciders per round.
+    decided = prompt.split("## What each round decided")[1].strip().splitlines()
+    assert decided == [
+        "- Round 1: Two things stand in the way.",
+        "- Round 2: The timeout is still unbounded.",
+    ]
+    # The verdict's own workings do not survive into the assessment and are
+    # not here either.
+    assert "veto" not in prompt and "converg" not in prompt
+
+
+def test_a_steering_attempts_artifacts_are_sealed_like_every_other_turns(
+    tmp_path: Path,
+) -> None:
+    """The one turn whose note can misdirect a round is not the unsealed one.
+
+    A directory that cannot be sealed is still not the task's problem: the
+    round was granted and the note is already in hand, so the failure is
+    recorded on the attempt and the fix runs anyway.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                steering_model="steering-model",
+                review_passes=1,
+                grant_budget=5,
+            ),
+        ).run(fixture.context(store))
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    steering_attempt = next(
+        item for item in attempts if item.phase == "steering"
+    )
+    metadata = steering_attempt.result["_betterborg"]
+    assert "artifact_seal_error" not in metadata
+    # An execution attempt carries no request context, so the round the note
+    # steered and which note was used are recorded here or nowhere.
+    assert metadata["steered_round"] == 1
+    assert metadata["note_source"] == "agent"
+    # And everything the driver's other turns keep, which is the rest of the
+    # rule: the turn is one of them but for its outcome.
+    coding_metadata = attempts[0].result["_betterborg"]
+    assert metadata["base_commit"] == coding_metadata["base_commit"]
+    assert metadata["prior_commit"] == coding_metadata["commit_sha"]
+    assert metadata["commit_sha"] == coding_metadata["commit_sha"]
+    assert metadata["provider"] == coding_metadata["provider"]
+    assert metadata["model"] == "steering-model"
+    assert metadata["billing_mode"] == BillingMode.API.value
+    assert metadata["review_round"] == steering_attempt.review_round
+    # The turn resolved and its note was attached, which is the outcome the
+    # rest of this row is the record of.
+    assert metadata["outcome_reason"] == "steering note attached"
+    artifact_dir = fixture.repository / metadata["artifact_dir"]
+    manifest = artifact_dir / "artifact-manifest.json"
+    assert manifest.is_file()
+    assert not manifest.stat().st_mode & stat.S_IWUSR
+    assert (artifact_dir / "steering.outcome.json").is_file()
+
+
+def test_a_steering_directory_that_cannot_be_sealed_still_runs_the_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every other turn blocks on this; the granted round is not every turn."""
+    fixture = _coding_fixture(tmp_path)
+    original = AgentAttemptArtifacts.finish
+
+    def refuse(self, result, durable_result):
+        if self.phase == "steering":
+            raise OSError("artifact directory is read-only")
+        return original(self, result, durable_result)
+
+    monkeypatch.setattr(AgentAttemptArtifacts, "finish", refuse)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        attempts = store.list_agent_attempts(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    steering_attempt = next(
+        item for item in attempts if item.phase == "steering"
+    )
+    assert steering_attempt.status is ExecutionAttemptStatus.COMPLETED
+    assert (
+        "read-only"
+        in steering_attempt.result["_betterborg"]["artifact_seal_error"]
+    )
+    # The note still reached the fix, which is what the round was granted for.
+    assert len(rows) == 1
+    assert f"## Steering note\n\n{rows[0].note}" in _fix_prompts(fix)[0]
+
+
+def test_a_fix_that_cannot_find_its_borg_runs_unsteered_rather_than_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Arriving without a note is never a reason to hold the task.
+
+    Only the review is held to finding the Borg its verdict is recorded under.
+    A fix that cannot is one more way to arrive unsteered, and the round it was
+    granted still runs.
+    """
+    fixture = _coding_fixture(tmp_path)
+    original = SqliteStore.get_execution_run
+    lookups: list[int] = []
+
+    def vanishing(self, run_id):
+        # Gone for the fix's lookup alone: the review found it and recorded its
+        # verdict under it, and every later round finds it again.
+        lookups.append(1)
+        return None if len(lookups) == 2 else original(self, run_id)
+
+    monkeypatch.setattr(SqliteStore, "get_execution_run", vanishing)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    # The granted fix ran, and ran unsteered.
+    assert len(fix.calls) == 1
+    assert not any("Steering note" in prompt for prompt in _fix_prompts(fix))
+    assert steering.calls == []
+    assert rows == []
+
+
+def test_the_guard_separates_a_checkout_it_found_dirty_from_one_it_watched_change(
+    tmp_path: Path,
+) -> None:
+    """The discriminator has to come off the guard, not off the reader.
+
+    Both conditions reach a caller as one exception class with a message from a
+    private formatter, and a steering turn reads the difference before every
+    other arm: found dirty falls back, watched change blocks the task. So the
+    guard itself has to be the one asked, over a checkout it really inspected.
+    """
+    fixture = _coding_fixture(tmp_path)
+    guard = PrimaryCheckoutGuard(fixture.repository)
+
+    guard.before_phase("task-1", "steering")
+    (fixture.repository / "README.md").write_text("# Written\n", encoding="utf-8")
+    with pytest.raises(PrimaryCheckoutContaminationError) as watched:
+        guard.after_phase("task-1", "steering")
+
+    # Dirty on entry to a phase of its own, with nothing to blame it on.
+    with pytest.raises(PrimaryCheckoutContaminationError) as found:
+        PrimaryCheckoutGuard(fixture.repository).before_phase("task-2", "steering")
+
+    assert checkout_was_changed(watched.value) is True
+    assert checkout_was_changed(found.value) is False
+    assert CheckoutCondition.CHANGED.value in str(watched.value)
+    assert CheckoutCondition.DIRTY.value in str(found.value)
+
+
+def test_a_blank_steering_model_is_refused_like_the_models_beside_it() -> None:
+    """A stage configured to nothing is a turn with no model to run on."""
+    with pytest.raises(ValueError, match="steering model must not be empty"):
+        HostReviewFixConfig(review_model="review-model", steering_model="   ")
+
+
+def test_a_checkout_that_could_not_be_read_is_not_read_as_a_write(
+    tmp_path: Path,
+) -> None:
+    """The third condition is the one that must not block the task.
+
+    A turn whose checkout could not be inspected has not been shown to have
+    written anything, so it falls back like every other failure to produce a
+    note. Asked of the guard rather than of a hand-built error, because what
+    decides this is the condition the guard attaches.
+    """
+    outside = tmp_path / "not-a-repository"
+    outside.mkdir()
+
+    with pytest.raises(PrimaryCheckoutContaminationError) as unreadable:
+        PrimaryCheckoutGuard(outside).before_phase("task-1", "steering")
+
+    assert checkout_was_changed(unreadable.value) is False
+    assert CheckoutCondition.UNREADABLE.value in str(unreadable.value)
+
+
+def test_only_a_completed_review_is_a_rounds_own_account_of_itself() -> None:
+    """Three filters decide what the steering turn reads as a round's decision.
+
+    A review cancelled or failed at one round still carries that round's number
+    and a summary of how it ended, and the attempt that replaced it carries
+    them too — so an unfiltered read names two deciders for one round. The
+    other two filters keep out the turns that answered rather than decided.
+    """
+
+    @dataclass(frozen=True)
+    class _Attempt:
+        phase: str
+        status: ExecutionAttemptStatus
+        review_round: int
+        summary: str | None
+
+    attempts = [
+        _Attempt("coding", ExecutionAttemptStatus.COMPLETED, 0, "Implemented."),
+        _Attempt("review", ExecutionAttemptStatus.CANCELLED, 0, "Interrupted."),
+        _Attempt("review", ExecutionAttemptStatus.COMPLETED, 0, "Two things."),
+        _Attempt("fix", ExecutionAttemptStatus.COMPLETED, 1, "Fixed one."),
+        _Attempt("review", ExecutionAttemptStatus.FAILED, 1, "Unreadable."),
+        _Attempt("review", ExecutionAttemptStatus.COMPLETED, 1, "Still open."),
+        _Attempt("steering", ExecutionAttemptStatus.COMPLETED, 1, "Note ready."),
+        _Attempt("review", ExecutionAttemptStatus.COMPLETED, 2, "   "),
+    ]
+
+    class _Store:
+        @staticmethod
+        def list_agent_attempts(_task_id):
+            return attempts
+
+    class _Claim:
+        task_id = uuid4()
+
+    class _Context:
+        store = _Store()
+        claim = _Claim()
+
+    assert _review_round_summaries(_Context()) == [
+        (1, "Two things."),
+        (2, "Still open."),
+    ]
+
+
+def test_a_closing_review_leaves_the_fix_prompt_alone(tmp_path: Path) -> None:
+    """A fix that already has the findings in front of it needs no note."""
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+
+        def closing(_spec):
+            rows = store.list_execution_ledger_findings(fixture.task.id)
+            return _review_payload(
+                fixture.task,
+                status="issues_found",
+                resolved=[
+                    str(_ledger_row_for(rows, _BROAD_PATTERN).id),
+                    str(_ledger_row_for(rows, _UNBOUNDED_TIMEOUT).id),
+                ],
+                findings=[_finding(_UNNAMED_FIXTURE)],
+            )
+
+        review = (
+            MockAdapter()
+            .queue(
+                MockResponse(
+                    payload=_review_payload(
+                        fixture.task,
+                        status="issues_found",
+                        findings=[_BROAD_PATTERN, _UNBOUNDED_TIMEOUT],
+                    )
+                )
+            )
+            .queue(MockResponse(dynamic=closing))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = (
+            MockAdapter()
+            .queue(_fixing_response(fixture.task))
+            .queue(_fixing_response(fixture.task))
+        )
+        steering = _steering_adapter(2)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=2, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        recorded = _assessments(store, fixture)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert [item.converging for item in recorded] == [False, True, True]
+    assert steering.calls == []
+    assert rows == []
+    assert not any("Steering note" in prompt for prompt in _fix_prompts(fix))
+
+
+def test_a_tasks_steering_reads_its_own_verdicts_and_no_other_tasks(
+    tmp_path: Path,
+) -> None:
+    """The task is the only thing that separates two tasks' rounds.
+
+    Every task of one execution run shares a Borg and a loop, so a verdict read
+    across the run takes the furthest-argued task's and steers a round that is
+    still inside its own minimum — on an argument it never had.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        # Another task of the same run, four rounds into a stuck argument.
+        store.record_review_assessment(
+            ReviewAssessment(
+                borg_id=fixture.borg.id,
+                loop=TASK_REVIEW_LOOP,
+                task_id=uuid4(),
+                round=4,
+                minimum=2,
+                converging=False,
+                open_findings=3,
+                refunded=False,
+            )
+        )
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model",
+                steering_model="steering-model",
+                review_passes=2,
+                grant_budget=5,
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    # This task's first round is inside its own minimum, whatever the other
+    # task's argument has reached.
+    assert steering.calls == []
+    assert rows == []
+    assert not any("Steering note" in call.user_prompt for call in fix.calls)
+
+
+def test_an_operator_stopping_the_run_leaves_the_task_at_the_same_round(
+    tmp_path: Path,
+) -> None:
+    """Nothing propagates out of a phase whose only handler covers its checks.
+
+    A cancelled steering turn is recorded as cancelled and the phase returns
+    the status it came in with, so the task is claimable at the round it was
+    steering.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=CancellingAgent(stops=True, cancel=cancel),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.FIX
+    assert runtime is not None and runtime.review_round == 1
+    assert runtime.status is TaskRuntimeStatus.FIX
+    assert fix.calls == []
+    # No note resolved, so no row was written and the resumed round writes one.
+    assert rows == []
+    steering_attempts = [item for item in attempts if item.phase == "steering"]
+    assert [item.status for item in steering_attempts] == [
+        ExecutionAttemptStatus.CANCELLED
+    ]
+    # Read as the operator's stop rather than as the other thing a cancelled
+    # status covers, and named for the phase that was stopped.
+    assert (
+        steering_attempts[0].result["_betterborg"]["outcome_reason"]
+        == "steering agent was interrupted"
+    )
+
+
+def test_a_note_written_before_the_stop_reached_it_is_still_recorded(
+    tmp_path: Path,
+) -> None:
+    """A stop does not un-write a note the turn had already written.
+
+    The row is what spares the re-entered round a second turn, so a note that
+    resolved before the stop arrived is recorded on the way out even though
+    the round it was written for does not run now.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    def note_then_stop(_spec):
+        cancel.cancel()
+        return {"note": "Answer the timeout first.", "confidence": "high"}
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        steering = MockAdapter().queue(MockResponse(dynamic=note_then_stop))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    # The operator's stop still leaves the task where it was.
+    assert status is TaskRuntimeStatus.FIX
+    assert runtime is not None and runtime.review_round == 1
+    assert fix.calls == []
+    # And the note it had already written is on the record for the re-entry.
+    assert [(row.round, row.source, row.note) for row in rows] == [
+        (1, "agent", "Answer the timeout first.")
+    ]
+    assert [
+        item.status for item in attempts if item.phase == "steering"
+    ] == [ExecutionAttemptStatus.COMPLETED]
+
+
+def test_a_note_the_stopped_turn_never_finished_is_not_recorded(
+    tmp_path: Path,
+) -> None:
+    """Only the turn's own note survives a stop, and a failed turn has none.
+
+    A failed result can still carry a payload — the native adapters return one
+    when they cannot write the result file — so a reader that takes the
+    payload without reading the status records a note the turn never
+    delivered, and the re-entered round runs on it.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=UnpersistedNoteAgent(
+                note="Answer the timeout first.", cancel=cancel
+            ),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.FIX
+    assert runtime is not None and runtime.review_round == 1
+    assert fix.calls == []
+    assert rows == []
+
+
+def test_a_note_the_stopped_turn_was_unsure_of_is_not_recorded(
+    tmp_path: Path,
+) -> None:
+    """The bar a steered round applies still applies on the way out.
+
+    A row kept through a stop is what the re-entered round runs on without a
+    second turn, so a note the turn was unsure of would reach a fixer through
+    the one path where no round is left to reject it.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    def note_then_stop(_spec):
+        cancel.cancel()
+        return {"note": "Answer the timeout first.", "confidence": "medium"}
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        steering = MockAdapter().queue(MockResponse(dynamic=note_then_stop))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.FIX
+    assert runtime is not None and runtime.review_round == 1
+    assert fix.calls == []
+    # The turn resolved, so this is the bar and not the stop: nothing is
+    # recorded, and the re-entry is free to try for a note again.
+    assert rows == []
+    assert [
+        item.status for item in attempts if item.phase == "steering"
+    ] == [ExecutionAttemptStatus.COMPLETED]
+
+
+def test_a_steering_turn_that_raised_under_a_stopped_run_spends_no_more_turns(
+    tmp_path: Path,
+) -> None:
+    """A stopped run reaches this classification as any of its failures.
+
+    Read as one of them the phase would fall back and spend the fix turn the
+    operator asked it not to spend.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    def stop_and_raise(_spec):
+        cancel.cancel()
+        raise RuntimeError("the note turn died with the run")
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=MockAdapter().queue(
+                MockResponse(dynamic=stop_and_raise)
+            ),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.FIX
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.FIX
+    assert runtime.review_round == 1
+    assert fix.calls == []
+    assert rows == []
+
+
+def test_a_steering_turn_its_adapter_gave_up_on_runs_the_fix_anyway(
+    tmp_path: Path,
+) -> None:
+    """An optional turn must not drain every task in flight over a hiccup.
+
+    The adapters report an operator's stop and their own exhausted transient
+    retries with one status, and the driver turns the second into a run-wide
+    stop for a turn whose work the task needs. This one is not that turn.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=CancellingAgent(stops=False),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert cancel.is_set() is False
+    assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+    assert rows[0].note in _fix_prompts(fix)[0]
+    # What the note says, and not only that the row and the prompt agree: both
+    # are written from one string, so comparing them holds for any content.
+    assert (
+        f"- {_UNBOUNDED_TIMEOUT} (blocker, first raised in round 1 "
+        "and open for 1 round)"
+    ) in rows[0].note
+    # The adapter's own account of what it gave up on, and not the wording an
+    # operator's stop would have carried.
+    assert [
+        item.result["_betterborg"]["outcome_reason"]
+        for item in attempts
+        if item.phase == "steering"
+    ] == ["transient provider failures exhausted the retry budget"]
+
+
+def test_a_steering_turn_the_provider_refused_runs_the_fix_on_the_fallback(
+    tmp_path: Path,
+) -> None:
+    """A turn that reports its failure is the shape the providers report in.
+
+    They return a failed result where the machinery around them raises, so a
+    non-zero exit and a rejected schema reach the classification as a status
+    and not as an exception, carrying the provider's own account of it.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = MockAdapter().queue(
+            MockResponse(exit_code=1, error="provider refused the request")
+        )
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=CancellationToken()))
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+    assert rows[0].note in _fix_prompts(fix)[0]
+    steering_attempts = [item for item in attempts if item.phase == "steering"]
+    assert [item.status for item in steering_attempts] == [
+        ExecutionAttemptStatus.FAILED
+    ]
+    # What the provider said, and not the bar's account of a missing note.
+    assert (
+        steering_attempts[0].result["_betterborg"]["outcome_reason"]
+        == "provider refused the request"
+    )
+
+
+@pytest.mark.parametrize("failure", ["unwritable-artifacts", "dirty-checkout"])
+def test_the_drivers_own_failure_paths_fall_back_rather_than_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """The task's work is not what failed, and the fix is still worth running.
+
+    Each of these ends a turn the task depends on, which is right for the
+    driver's own turns and wrong for an optional one.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    if failure == "unwritable-artifacts":
+        write_text = AgentAttemptArtifacts.write_text
+
+        def refuse(self, name, content):
+            if self.phase == "steering":
+                raise OSError("no space left on device")
+            return write_text(self, name, content)
+
+        monkeypatch.setattr(AgentAttemptArtifacts, "write_text", refuse)
+    else:
+        before_phase = PrimaryCheckoutGuard.before_phase
+
+        def dirty(self, task_ref, phase_name):
+            if phase_name == "steering":
+                raise PrimaryCheckoutContaminationError(
+                    "primary checkout was dirty before it started",
+                    condition=CheckoutCondition.DIRTY,
+                )
+            return before_phase(self, task_ref, phase_name)
+
+        monkeypatch.setattr(PrimaryCheckoutGuard, "before_phase", dirty)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1)
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert runtime is not None and runtime.status is TaskRuntimeStatus.MERGING
+    assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+    assert rows[0].note in _fix_prompts(fix)[0]
+
+
+def test_a_steering_turn_that_wrote_to_the_task_worktree_blocks_the_task(
+    tmp_path: Path,
+) -> None:
+    """Writing is the one thing a steering turn was built not to do.
+
+    Restoring the tree instead is not available: the Git this driver runs
+    through withholds the destructive flags as its stated contract, so the
+    comparison is a tripwire with a blocked task behind it.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    def write(spec):
+        (spec.cwd / "feature.txt").write_text("steered\n", encoding="utf-8")
+        return MockResponse(
+            payload={"note": "Answer the timeout first.", "confidence": "high"}
+        )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=MockAdapter().queue(MockResponse(dynamic=write)),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.state_reason == "steering agent modified the task worktree"
+    # The edits never reached the fix, because the fix never ran.
+    assert fix.calls == []
+    assert rows == []
+
+
+def test_a_fix_is_not_steered_by_a_note_its_turn_was_unsure_of(
+    tmp_path: Path,
+) -> None:
+    """The bar is the same one the planning loops hold, and this half pays more.
+
+    A merely plausible note misdirects a round that costs a fix turn and the
+    review that judges it, where the assembled one leaves the fixer exactly
+    where an unsteered round would have.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        steering = _steering_adapter(1, confidence="medium")
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.MERGING
+    assert len(steering.calls) == 1
+    # The turn's own paragraph is not what the fix was handed.
+    assert "Steering note 1." not in _fix_prompts(fix)[0]
+    assert [(row.round, row.source) for row in rows] == [(1, "assembled")]
+    assert f"## Steering note\n\n{rows[0].note}" in _fix_prompts(fix)[0]
+    # The bar's own account of why, and not one of the failure reasons: the
+    # turn resolved, and what it returned was not confident enough to use.
+    assert [
+        item.result["_betterborg"]["outcome_reason"]
+        for item in attempts
+        if item.phase == "steering"
+    ] == ["steering note was not attached"]
+
+
+@pytest.mark.parametrize("leaves", ["commit", "branch"])
+def test_a_steering_turn_that_left_a_clean_tree_behind_it_still_blocks(
+    tmp_path: Path, leaves: str
+) -> None:
+    """A tree can be left changed without being left dirty.
+
+    Every other agent in this driver is told to commit its work, and a steering
+    turn under a loosened sandbox can do the same — or leave the worktree on
+    another branch. Either way the status comparison is silent, and unnoticed
+    the commit is absorbed into the fix's own work and reviewed as the task's.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    def commit(spec):
+        (spec.cwd / "feature.txt").write_text("steered\n", encoding="utf-8")
+        if leaves == "commit":
+            _git(spec.cwd, "add", "feature.txt")
+            _git(spec.cwd, "commit", "-m", "steering turn commit")
+        else:
+            _git(spec.cwd, "stash", "--include-untracked")
+            _git(spec.cwd, "switch", "-c", "steering-wandered")
+        return MockResponse(
+            payload={"note": "Answer the timeout first.", "confidence": "high"}
+        )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=MockAdapter().queue(MockResponse(dynamic=commit)),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.state_reason == "steering agent modified the task worktree"
+    # The commit never reached the fix, because the fix never ran.
+    assert fix.calls == []
+    assert rows == []
+
+
+def test_a_steering_turn_that_wrote_and_then_stopped_the_run_still_blocks(
+    tmp_path: Path,
+) -> None:
+    """A breach is read before a stop, or it outlives the run unattributed.
+
+    Recorded as a stop, the task stays claimable, nothing names the write, and
+    the next phase to meet the guard blocks on a dirty tree it did not make.
+    """
+    fixture = _coding_fixture(tmp_path)
+    cancel = CancellationToken()
+
+    def write_then_stop(spec):
+        (spec.cwd / "feature.txt").write_text("steered\n", encoding="utf-8")
+        cancel.cancel()
+        return MockResponse(
+            payload={"note": "Answer the timeout first.", "confidence": "high"}
+        )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=MockAdapter().queue(
+                MockResponse(dynamic=write_then_stop)
+            ),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store, cancel=cancel))
+        runtime = store.get_task_runtime(fixture.task.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert runtime.state_reason == "steering agent modified the task worktree"
+    assert fix.calls == []
+
+
+@pytest.mark.parametrize(
+    "raises", [False, True], ids=["guard-raises", "guard-attaches"]
+)
+def test_a_steering_turn_that_dirtied_the_primary_checkout_blocks_the_task(
+    tmp_path: Path, raises: bool
+) -> None:
+    """Both arms block, including the one attached to a turn that raised first.
+
+    The guard raises the same class for a checkout dirty on entry as for one a
+    phase changed while it ran, so an implementer telling them apart by type
+    would fall back on exactly the case that most needs blocking.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    def contaminate(spec):
+        (fixture.repository / "README.md").write_text(
+            "# Fixture\nsteered\n", encoding="utf-8"
+        )
+        if raises:
+            raise RuntimeError("the note turn fell over after writing")
+        return MockResponse(
+            payload={"note": "Answer the timeout first.", "confidence": "high"}
+        )
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+        status = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=MockAdapter().queue(
+                MockResponse(dynamic=contaminate)
+            ),
+            config=HostReviewFixConfig(
+                review_model="review-model", review_passes=1, grant_budget=5
+            ),
+        ).run(fixture.context(store))
+        runtime = store.get_task_runtime(fixture.task.id)
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert status is TaskRuntimeStatus.BLOCKED
+    assert runtime is not None
+    assert (runtime.state_reason or "").startswith(
+        "steering agent changed the primary checkout"
+    )
+    assert fix.calls == []
+    assert rows == []
+
+
+def test_a_steered_round_re_entered_reuses_the_note_its_row_already_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One note per grant, however many times the round carrying it is re-entered.
+
+    The restart here is inside the steered fix itself, which is the re-entry
+    that would otherwise pay for a second turn.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = (
+            MockAdapter()
+            .queue(_blocking_review(fixture))
+            .queue(_approving_review(fixture, store))
+        )
+        steering = MockAdapter().queue(
+            MockResponse(
+                payload={"note": "Answer the timeout first.", "confidence": "high"}
+            )
+        )
+        config = HostReviewFixConfig(
+            review_model="review-model", review_passes=1, grant_budget=5
+        )
+        append = store.append_agent_attempt
+
+        def crash_before_the_fix(attempt, *args, **kwargs):
+            if attempt.phase == "fix":
+                raise RuntimeError("simulated restart inside the steered fix")
+            return append(attempt, *args, **kwargs)
+
+        monkeypatch.setattr(store, "append_agent_attempt", crash_before_the_fix)
+        with pytest.raises(RuntimeError, match="simulated restart"):
+            HostReviewFixPhase(
+                fixture.repository,
+                review,
+                fix_adapter=MockAdapter(),
+                steering_adapter=steering,
+                config=config,
+            ).run(fixture.context(store))
+        monkeypatch.setattr(store, "append_agent_attempt", append)
+
+        interrupted = store.get_task_runtime(fixture.task.id)
+        assert interrupted is not None
+        assert interrupted.status is TaskRuntimeStatus.FIX
+        assert interrupted.review_round == 1
+        assert len(steering.calls) == 1
+
+        fix = MockAdapter().queue(_fixing_response(fixture.task))
+        resumed = HostReviewFixPhase(
+            fixture.repository,
+            review,
+            fix_adapter=fix,
+            steering_adapter=steering,
+            config=config,
+        ).run(fixture.context(store))
+        rows = store.list_steering_notes(fixture.borg.id)
+
+    assert resumed is TaskRuntimeStatus.MERGING
+    # The resumed round paid for no second turn and ran on the same note.
+    assert len(steering.calls) == 1
+    assert [(row.round, row.note) for row in rows] == [
+        (1, "Answer the timeout first.")
+    ]
+    assert "Answer the timeout first." in _fix_prompts(fix)[0]
+
+
+def test_the_execution_note_row_joins_the_step_that_completes_its_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round that recorded which note it used but never finished its turn is
+    a round the next entry would re-run and charge twice.
+    """
+    fixture = _coding_fixture(tmp_path)
+
+    with SqliteStore.open(fixture.database) as store:
+        _prepare_review(fixture, store)
+        review = MockAdapter().queue(_blocking_review(fixture))
+        fix = MockAdapter()
+
+        def refuse(_note):
+            raise RuntimeError("the note row could not be written")
+
+        monkeypatch.setattr(store, "record_steering_note", refuse)
+        with pytest.raises(RuntimeError, match="note row"):
+            HostReviewFixPhase(
+                fixture.repository,
+                review,
+                fix_adapter=fix,
+                steering_adapter=_steering_adapter(1),
+                config=HostReviewFixConfig(
+                    review_model="review-model", review_passes=1, grant_budget=5
+                ),
+            ).run(fixture.context(store))
+        monkeypatch.undo()
+
+        rows = store.list_steering_notes(fixture.borg.id)
+        attempts = store.list_agent_attempts(fixture.task.id)
+
+    assert rows == []
+    assert fix.calls == []
+    assert [
+        item.status for item in attempts if item.phase == "steering"
+    ] == [ExecutionAttemptStatus.RUNNING]

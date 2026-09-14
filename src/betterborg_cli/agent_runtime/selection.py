@@ -58,6 +58,11 @@ _STAGE_ROLES = {
     AgentStage.CODING: ApiAgentRole.CODING,
     AgentStage.REVIEW: ApiAgentRole.REVIEW,
     AgentStage.MERGE: ApiAgentRole.MERGE,
+    # Planning, not review, though one of the three loops it serves is a
+    # task's: a steering turn reads rows and returns prose without touching a
+    # file, and the review role is the one that makes an API-transport turn
+    # able to run commands.
+    AgentStage.STEERING: ApiAgentRole.PLANNING,
 }
 _SETUP_GUIDANCE = (
     "Install and log in to the 'claude' or 'codex' CLI, or set "

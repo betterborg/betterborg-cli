@@ -45,6 +45,7 @@ from betterborg_cli.agent_runtime import (
 )
 from betterborg_cli.agent_runtime.mock import MockAdapter, MockResponse
 from betterborg_cli.agent_runtime.process import run_captured
+from betterborg_cli.agent_runtime.selection import _STAGE_ROLES
 from betterborg_cli.host_execution import (
     HostExecutionResult,
     HostPreflightPlan,
@@ -1749,6 +1750,7 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
         return {
             AgentStage.ARCHITECT: architect,
             AgentStage.TECH_LEAD: tech_lead,
+            AgentStage.STEERING: MockAdapter(name="openai"),
         }[stage]
 
     def continue_spy(selected_paths, name, *, change_note=None, io=None, cancel=None):
@@ -1785,7 +1787,11 @@ def test_plan_start_recovers_questions_injects_answers_and_shows_plan(
 
     assert started["status"] == BorgState.PLAN_APPROVAL_PENDING.value
     assert continuations == [("mcp-start", None)]
-    assert selected_stages == [AgentStage.ARCHITECT, AgentStage.TECH_LEAD]
+    assert selected_stages == [
+        AgentStage.ARCHITECT,
+        AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
+    ]
     assert len(architect.calls) == 3
     assert len(tech_lead.calls) == 1
     assert [action["arguments"]["action"] for action in started["next_actions"]] == [
@@ -1835,6 +1841,7 @@ def test_plan_change_validates_note_and_preserves_service_history(
         return {
             AgentStage.ARCHITECT: architect,
             AgentStage.TECH_LEAD: tech_lead,
+            AgentStage.STEERING: MockAdapter(name="openai"),
         }[stage]
 
     def continue_spy(selected_paths, name, *, change_note=None, io=None, cancel=None):
@@ -1894,8 +1901,10 @@ def test_plan_change_validates_note_and_preserves_service_history(
     assert selected_stages == [
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
         AgentStage.ARCHITECT,
         AgentStage.TECH_LEAD,
+        AgentStage.STEERING,
     ]
     # Two turns per cycle: the cycle asks, then plans.
     assert len(architect.calls) == 4
@@ -1945,6 +1954,7 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
         return {
             AgentStage.PM: project_manager,
             AgentStage.SUPERVISOR: supervisor,
+            AgentStage.STEERING: MockAdapter(name="openai"),
         }[stage]
 
     monkeypatch.chdir(committed_git_repo)
@@ -1969,7 +1979,11 @@ def test_plan_approval_automatically_decomposes_without_another_gate(
     )
 
     assert result["status"] == BorgState.READY_TO_EXECUTE.value
-    assert selected_stages == [AgentStage.PM, AgentStage.SUPERVISOR]
+    assert selected_stages == [
+        AgentStage.PM,
+        AgentStage.SUPERVISOR,
+        AgentStage.STEERING,
+    ]
     assert len(project_manager.calls) == 1
     assert len(supervisor.calls) == 1
     assert [artifact["kind"] for artifact in result["artifacts"]] == [
@@ -2022,6 +2036,7 @@ def test_plan_approval_reuses_repository_trust_for_its_managed_worktree(
     adapters = {
         AgentStage.PM: project_manager,
         AgentStage.SUPERVISOR: supervisor,
+        AgentStage.STEERING: MockAdapter(name="openai"),
     }
 
     def select(_config, stage, selected_paths, **policy):
@@ -2079,6 +2094,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         AgentStage.CODING: ("mcp-coding-model", "mcp-coding-effort"),
         AgentStage.REVIEW: ("mcp-review-model", "mcp-review-effort"),
         AgentStage.MERGE: ("mcp-merge-model", "mcp-merge-effort"),
+        AgentStage.STEERING: ("mcp-steering-model", "mcp-steering-effort"),
     }
     invoke_host_execution = cli_module._invoke_host_execution
 
@@ -2086,7 +2102,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         selected_stages.append(stage)
         model, effort = selected_settings[stage]
         return SelectedAgent(
-            role=ApiAgentRole(stage.value),
+            role=_STAGE_ROLES[stage],
             adapter=MockAdapter(name="openai"),
             paths=selected_paths,
             model=model,
@@ -2189,6 +2205,7 @@ def test_task_list_matches_runtime_projection_and_execute_uses_host_service(
         AgentStage.CODING,
         AgentStage.REVIEW,
         AgentStage.MERGE,
+        AgentStage.STEERING,
     ]
     assert len(requests) == 1
     assert "Approve this estimate" in requests[0].message
@@ -2934,7 +2951,11 @@ def test_a_blocked_plan_hands_a_headless_caller_its_findings_and_a_way_to_them(
         tech_lead.queue(MockResponse(payload=tech_lead_change_request_response(message)))
 
     def select(_config, stage, _paths, **_kwargs):
-        return {AgentStage.ARCHITECT: architect, AgentStage.TECH_LEAD: tech_lead}[stage]
+        return {
+            AgentStage.ARCHITECT: architect,
+            AgentStage.TECH_LEAD: tech_lead,
+            AgentStage.STEERING: MockAdapter(name="openai"),
+        }[stage]
 
     monkeypatch.chdir(committed_git_repo)
     monkeypatch.setattr(
