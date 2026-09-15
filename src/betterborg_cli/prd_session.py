@@ -89,13 +89,51 @@ class _PrdSessionCancelled(Exception):
     """Stop a cooperative agent cancellation without treating it as failure."""
 
 
+@dataclass(frozen=True, slots=True)
+class PromptCard:
+    """One decision put to the user, with the context that frames it.
+
+    A card carries structure, not presentation: a terminal draws it as a
+    panel, while a transcript or an MCP elicitation flattens it to lines.
+    ``details`` pairs a short label with its text ("Why this matters", ...).
+    ``markdown`` is a reviewable document shown in full, such as a PRD draft.
+    """
+
+    title: str
+    question: str | None = None
+    details: tuple[tuple[str, str], ...] = ()
+    markdown: str | None = None
+    footer: str | None = None
+    tone: str = "question"
+    #: Label of the input line when the question itself sits in the card.
+    answer_label: str = "Answer"
+
+    def fallback_lines(self) -> tuple[str, ...]:
+        """Flatten the framing context to the plain lines it used to be."""
+        lines = [f"{label}: {text}" for label, text in self.details]
+        if self.markdown is not None:
+            lines.append(self.markdown)
+        return tuple(lines)
+
+
+Present: TypeAlias = Callable[[PromptCard], None]
+
+
 class InteractiveIO:
     """Small injectable boundary for interactive prompts and rendering."""
 
-    def __init__(self, *, prompt: Prompt, confirm: Confirm, write: Write) -> None:
+    def __init__(
+        self,
+        *,
+        prompt: Prompt,
+        confirm: Confirm,
+        write: Write,
+        present: Present | None = None,
+    ) -> None:
         self._prompt = prompt
         self._confirm = confirm
         self._write = write
+        self._present = present
 
     def prompt(self, message: str) -> str | None:
         """Return an answer, or ``None`` when the user cancels."""
@@ -108,6 +146,28 @@ class InteractiveIO:
     def write(self, message: str) -> None:
         """Render reviewable text for the user."""
         self._write(message)
+
+    def show(self, card: PromptCard) -> None:
+        """Render a card's framing context, styled when a presenter exists."""
+        if self._present is not None:
+            self._present(card)
+            return
+        for line in card.fallback_lines():
+            self._write(line)
+
+    def ask(self, card: PromptCard) -> str | None:
+        """Show a card and return its answer, or ``None`` when cancelled.
+
+        With a presenter the question lives inside the card and the input
+        line carries only ``answer_label``; without one the question is the
+        prompt itself, exactly as before cards existed.
+        """
+        if card.question is None:
+            raise ValueError("a card must carry a question to be asked")
+        self.show(card)
+        if self._present is not None:
+            return self._prompt(card.answer_label)
+        return self._prompt(card.question)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +302,9 @@ class PrdSession:
                             "questions pending",
                             questions=questions,
                         )
-                    if not self._answer_questions(session, questions):
+                    if not self._answer_questions(
+                        session, questions, name=name, round_number=round_number
+                    ):
                         reason = (
                             "interrupted" if self._cancelled() else "cancelled"
                         )
@@ -267,7 +329,7 @@ class PrdSession:
             if self.interactive:
                 assert self.io is not None
                 with self._suspend_output():
-                    self.io.write(body_md)
+                    self.io.show(self._draft_card(name, body_md))
                     edit_requested = False
                     if not self._cancelled() and self.editor is not None:
                         edit_requested = self.io.confirm(
@@ -284,7 +346,7 @@ class PrdSession:
                                 content=body_md,
                             )
                             if not self._cancelled():
-                                self.io.write(body_md)
+                                self.io.show(self._draft_card(name, body_md))
                     if not self._cancelled():
                         confirmed = self.io.confirm(
                             f"Create Borg {name!r} with this PRD?", default=False
@@ -387,6 +449,15 @@ class PrdSession:
     def _cancelled(self) -> bool:
         return self.cancel is not None and self.cancel.is_set()
 
+    @staticmethod
+    def _draft_card(name: str, body_md: str) -> PromptCard:
+        return PromptCard(
+            title="PRD draft",
+            markdown=body_md,
+            footer=f"borg {name!r}",
+            tone="review",
+        )
+
     def _suspend_output(self) -> AbstractContextManager[object]:
         return (
             self.progress.suspend()
@@ -433,14 +504,25 @@ class PrdSession:
         return result.payload
 
     def _answer_questions(
-        self, session: StoredPrdSession, questions: tuple[str, ...]
+        self,
+        session: StoredPrdSession,
+        questions: tuple[str, ...],
+        *,
+        name: str,
+        round_number: int,
     ) -> bool:
         assert self.io is not None
-        for question in questions:
+        total = len(questions)
+        for position, question in enumerate(questions, start=1):
             if self._cancelled():
                 return False
+            card = PromptCard(
+                title=f"PRD question {position} of {total}",
+                question=question,
+                footer=f"interview round {round_number} · borg {name!r}",
+            )
             with self._suspend_output():
-                answer = self.io.prompt(question)
+                answer = self.io.ask(card)
             if answer is None:
                 return False
             answer = answer.strip()

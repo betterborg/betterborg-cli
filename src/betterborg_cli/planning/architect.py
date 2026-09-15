@@ -31,7 +31,7 @@ from betterborg_cli.planning.turns import (
     planning_attempt_duration,
     planning_attempt_result,
 )
-from betterborg_cli.prd_session import InteractiveIO
+from betterborg_cli.prd_session import InteractiveIO, PromptCard
 from betterborg_cli.progress import ChildSpec, RunProgress, StageSpec, StageState
 from betterborg_cli.repo_paths import RepoPaths
 from betterborg_cli.store import (
@@ -763,7 +763,7 @@ class ArchitectLoop:
         if self.unattended:
             decided, answers = self._assume_question_round(question)
         else:
-            answers = self._prompt_question_round(question)
+            answers = self._prompt_question_round(borg, question)
         # The turn that decided and the round it decided are recorded
         # together. Split across two writes, a run killed between them leaves
         # a completed turn whose answer nothing reads: the resume finds the
@@ -780,20 +780,31 @@ class ArchitectLoop:
             return self._turns.transition(borg, BorgState.ARCHITECT_WORKING)
 
     def _prompt_question_round(
-        self, question: PlanningQuestion
+        self, borg: Borg, question: PlanningQuestion
     ) -> list[dict[str, object]]:
         """Ask the operator at the terminal for one round of answers."""
         answers: list[dict[str, object]] = []
-        for item in question.questions:
+        total = len(question.questions)
+        for position, item in enumerate(question.questions, start=1):
             suspension = self.progress.suspend() if self.progress else nullcontext()
             with suspension:
                 why = str(item.get("why") or "").strip()
                 hint = str(item.get("hint") or "").strip()
+                details: list[tuple[str, str]] = []
                 if why:
-                    self.io.write(f"Why this matters: {why}")
+                    details.append(("Why this matters", why))
                 if hint:
-                    self.io.write(f"Answer guidance: {hint}")
-                answer = self.io.prompt(str(item["question"]))
+                    details.append(("Answer guidance", hint))
+                card = PromptCard(
+                    title=f"Architect question {position} of {total}",
+                    question=str(item["question"]),
+                    details=tuple(details),
+                    footer=(
+                        f"round {question.round} of {ARCHITECT_QUESTION_ROUND_CAP}"
+                        f" · borg {borg.name!r}"
+                    ),
+                )
+                answer = self.io.ask(card)
             if answer is None:
                 raise ArchitectCancelled("Architect questions are awaiting answers")
             answer = answer.strip()

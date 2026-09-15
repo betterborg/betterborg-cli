@@ -907,7 +907,9 @@ def test_init_prework_failures_leave_root_progress_unobserved(
         arguments = ["init"]
         monkeypatch.setattr(cli_module, "_stdin_is_interactive", lambda: True)
         monkeypatch.setattr(
-            cli_module.click, "confirm", lambda *_args, **_kwargs: False
+            cli_module.terminal_prompts,
+            "confirm_workspace_trust",
+            lambda *_args, **_kwargs: False,
         )
     elif failure == "path-discovery":
         monkeypatch.setattr(
@@ -2838,6 +2840,9 @@ def test_interactive_trust_command_explains_host_access(
     result = cli_runner.invoke(cli, ["trust"], input="y\n")
 
     assert result.exit_code == 0
-    assert "read and modify files" in result.output
-    assert "execute commands on this machine" in result.output
+    # The warning sits in a panel, so it may wrap across bordered lines.
+    flattened = " ".join(result.output.replace("│", " ").split())
+    assert "Trust this workspace?" in flattened
+    assert "read and modify files" in flattened
+    assert "execute commands on this machine" in flattened
     assert f"Trusted workspace: {git_repo}" in result.output

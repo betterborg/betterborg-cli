@@ -23,11 +23,10 @@ from uuid import UUID
 
 import click
 
-from betterborg_cli import __version__
+from betterborg_cli import __version__, terminal_prompts
 from betterborg_cli.agent_runtime import BillingMode, CancellationToken, run_captured
 from betterborg_cli.agent_runtime.selection import select_agent
 from betterborg_cli.execution_estimate import (
-    DUMMY_PRIOR_LABEL,
     estimate_generation,
     phase_billing_from_config,
 )
@@ -84,6 +83,7 @@ from betterborg_cli.plugins import (
 )
 from betterborg_cli.prd_session import (
     InteractiveIO,
+    PromptCard,
     adopt_prd,
     validate_borg_name,
 )
@@ -116,6 +116,7 @@ from betterborg_cli.store import (
     TaskRuntimeCost,
     TaskRuntimeRow,
 )
+from betterborg_cli.terminal_prompts import format_duration as _format_duration
 from betterborg_cli.workflow_service import (
     EXECUTION_PREFLIGHT_STAGE,
     ExecutionDecisionRequest,
@@ -528,7 +529,7 @@ def _trusted_workspace_callback(function):
                     paths,
                     explicit=explicit_trust,
                     interactive=interactive,
-                    confirm=lambda prompt: click.confirm(prompt, default=False),
+                    confirm=terminal_prompts.confirm_workspace_trust,
                     cancel=cancel,
                 )
         except (UntrustedWorkspaceError, ValueError, RuntimeError) as error:
@@ -1037,52 +1038,9 @@ def estimate_tasks(name: str, json_output: bool) -> None:
 
 def _write_execution_estimate(name: str, estimate: dict[str, object]) -> None:
     """Render the estimate shared by inspection and the execution gate."""
-    mix = estimate["task_mix"]
-    time = estimate["time"]
-    click.echo(DUMMY_PRIOR_LABEL)
-    click.echo(f"Execution estimate for Borg {name!r}: {estimate['generation_id']}")
-    click.echo(
-        "Task mix: "
-        f"{mix['small']} small, {mix['medium']} medium, {mix['large']} large, "
-        f"{mix['unsized']} unsized"
+    terminal_prompts.console().print(
+        terminal_prompts.render_execution_estimate(name, estimate)
     )
-    click.echo(
-        "Total agent work (not calendar time): "
-        f"P50 {_format_duration(time['p50'])}, "
-        f"P80 {_format_duration(time['p80'])}"
-    )
-    if time["unknown_tasks"]:
-        click.echo(f"Unknown time: {time['unknown_tasks']} task(s)")
-    click.echo(f"Local completion sample: {estimate['sample_size']} task(s)")
-    for item in estimate["per_complexity"]:
-        click.echo(
-            f"  {item['complexity']}: {item['task_count']} task(s), "
-            f"n={item['sample_size']}, source={item['source']}, "
-            f"P50 {_format_duration(item['time']['p50'])}, "
-            f"P80 {_format_duration(item['time']['p80'])}"
-        )
-
-    billing = estimate["billing"]
-    api = billing["api"]
-    if api["unknown"]:
-        click.echo("API estimate: unknown (billing, usage, or model price is missing)")
-    elif api["estimate"] is None:
-        click.echo("API estimate: not used")
-    else:
-        click.echo(
-            f"API estimate: P50 ${api['estimate']['p50']:.4f}, "
-            f"P80 ${api['estimate']['p80']:.4f} USD"
-        )
-    subscription = billing["subscription"]
-    if subscription["included"]:
-        click.echo(
-            "Subscription work included for "
-            f"{', '.join(subscription['phases'])}; USD: unknown/not applicable"
-        )
-    if billing["unknown_phases"]:
-        click.echo(
-            "Billing mode unknown for: " + ", ".join(billing["unknown_phases"])
-        )
 
 
 @cli.command(name="execute")
@@ -1143,7 +1101,7 @@ def execute_borg(
             _write_execution_estimate(name, estimate)
             if auto_execute:
                 return ExecutionDecisionRequest("auto_execute", "bypassed")
-            approved = click.confirm(
+            approved = terminal_prompts.confirm(
                 "Approve this estimate and begin host execution?",
                 default=False,
             )
@@ -2059,17 +2017,6 @@ def _task_runtime_totals(rows: list[TaskRuntimeRow]) -> dict[str, object]:
     }
 
 
-def _format_duration(value: object) -> str:
-    if value is None:
-        return "unknown duration"
-    seconds = float(value)
-    if seconds < 60:
-        return f"{seconds:g}s"
-    if seconds < 3600:
-        return f"{seconds / 60:.1f}m"
-    return f"{seconds / 3600:.1f}h"
-
-
 def _format_runtime_cost(value: object) -> str:
     if not isinstance(value, dict):
         raise TypeError("runtime cost must be serialized before formatting")
@@ -2201,7 +2148,17 @@ def change_plan(
 ) -> None:
     """Request changes to a plan awaiting human approval."""
     if note is None:
-        note = _prompt("Change note")
+        note = _interactive_io().ask(
+            PromptCard(
+                title="Plan change",
+                question=(
+                    "Describe, in plain language, what the Architect "
+                    "should change in the plan."
+                ),
+                footer=f"borg {name!r}",
+                answer_label="Change note",
+            )
+        )
     if note is None or not note.strip():
         raise click.ClickException("plan change note must not be empty")
     note = note.strip()
@@ -2439,18 +2396,7 @@ def _validate_create_name(name: str) -> None:
 
 
 def _interactive_io() -> InteractiveIO:
-    return InteractiveIO(
-        prompt=_prompt,
-        confirm=lambda message, default: click.confirm(message, default=default),
-        write=click.echo,
-    )
-
-
-def _prompt(message: str) -> str | None:
-    try:
-        return click.prompt(message, default="", show_default=False)
-    except click.Abort:
-        return None
+    return terminal_prompts.interactive_io()
 
 
 def _edit_markdown(body: str) -> str | None:
