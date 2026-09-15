@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "betterborg",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "source": "./plugins/betterborg",
       "description": "Plan and execute repository work with Betterborg"
     }
