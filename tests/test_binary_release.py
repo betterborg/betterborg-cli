@@ -50,14 +50,14 @@ def test_release_manifest_has_exact_stable_shape(tmp_path: Path) -> None:
         ],
     }
     assert set(expected_assets) == {
-        "betterborg-darwin-arm64",
-        "betterborg-darwin-arm64.sha256",
-        "betterborg-darwin-x86_64",
-        "betterborg-darwin-x86_64.sha256",
-        "betterborg-linux-arm64",
-        "betterborg-linux-arm64.sha256",
-        "betterborg-linux-x86_64",
-        "betterborg-linux-x86_64.sha256",
+        "betterborg-darwin-arm64.tar.gz",
+        "betterborg-darwin-arm64.tar.gz.sha256",
+        "betterborg-darwin-x86_64.tar.gz",
+        "betterborg-darwin-x86_64.tar.gz.sha256",
+        "betterborg-linux-arm64.tar.gz",
+        "betterborg-linux-arm64.tar.gz.sha256",
+        "betterborg-linux-x86_64.tar.gz",
+        "betterborg-linux-x86_64.tar.gz.sha256",
         "install.sh",
         "release-manifest.json",
     }
@@ -66,7 +66,7 @@ def test_release_manifest_has_exact_stable_shape(tmp_path: Path) -> None:
 def test_manifest_rejects_a_stale_checksum(tmp_path: Path) -> None:
     directory = tmp_path / "release"
     _artifact_set(directory)
-    artifact = directory / "betterborg-linux-x86_64"
+    artifact = directory / "betterborg-linux-x86_64.tar.gz"
     artifact.write_bytes(b"changed after checksum")
 
     with pytest.raises(
@@ -189,12 +189,14 @@ def test_workflows_encode_four_native_targets_old_glibc_and_attestations() -> No
     assert "--find-links /tmp/betterborg-wheels" in workflow
     assert "--requirement requirements-dev.lock" not in workflow
     linux_build = workflow.split(
-        "- name: Build Linux one-file binary on glibc 2.17", maxsplit=1
-    )[1].split("- name: Smoke Darwin binary version", maxsplit=1)[0]
+        "- name: Build Linux bundle archive on glibc 2.17", maxsplit=1
+    )[1].split("- name: Smoke Darwin archive version", maxsplit=1)[0]
     assert linux_build.index("mkdir release") < linux_build.index("docker run")
     assert "mkdir -p release" not in linux_build
     assert 'test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"' in workflow
     assert 'version)" = "betterborg $REVIEWED_VERSION"' in workflow
+    assert workflow.count("scripts/release_artifacts.py archive") == 2
+    assert workflow.count('tar -xzf "release/$ARTIFACT.tar.gz"') == 2
     assert "scripts/release_artifacts.py checksum" in workflow
     assert "scripts/release_artifacts.py manifest" in workflow
     assert workflow.count("uses: actions/attest@v4") == 2

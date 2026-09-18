@@ -6,11 +6,15 @@ REPOSITORY_RELEASES_URL=${_BETTERBORG_RELEASES_URL:-https://github.com/betterbor
 SELECTED_VERSION=${BETTERBORG_VERSION:-}
 INSTALL_HOME=${HOME:-}
 TEMPORARY_DIRECTORY=
-STAGED_EXECUTABLE=
+STAGED_BUNDLE=
+STAGED_LINK=
 
 cleanup() {
-    if [ -n "$STAGED_EXECUTABLE" ]; then
-        rm -f "$STAGED_EXECUTABLE"
+    if [ -n "$STAGED_LINK" ]; then
+        rm -f "$STAGED_LINK"
+    fi
+    if [ -n "$STAGED_BUNDLE" ]; then
+        rm -rf "$STAGED_BUNDLE"
     fi
     if [ -n "$TEMPORARY_DIRECTORY" ]; then
         rm -rf "$TEMPORARY_DIRECTORY"
@@ -147,12 +151,13 @@ detect_target() {
                 "No standalone Betterborg release supports $detected_system/$detected_architecture."
             ;;
     esac
-    TARGET="betterborg-$TARGET_OS-$TARGET_ARCH"
+    TARGET="betterborg-$TARGET_OS-$TARGET_ARCH.tar.gz"
 }
 
 detect_target
 
 command -v curl >/dev/null 2>&1 || fail 'curl is required to download Betterborg.'
+command -v tar >/dev/null 2>&1 || fail 'tar is required to unpack Betterborg.'
 [ -n "$INSTALL_HOME" ] || fail 'HOME must be set for a persistent user installation.'
 
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/betterborg-install.XXXXXXXX") || \
@@ -202,15 +207,22 @@ ACTUAL_SHA256=$(sha256 "$ARTIFACT")
 
 INSTALL_DIRECTORY="$INSTALL_HOME/.local/bin"
 INSTALL_PATH="$INSTALL_DIRECTORY/betterborg"
+VERSIONS_DIRECTORY="$INSTALL_HOME/.local/share/betterborg/versions"
+VERSION_DIRECTORY="$VERSIONS_DIRECTORY/$VERSION"
 mkdir -p "$INSTALL_DIRECTORY" || fail "could not create $INSTALL_DIRECTORY."
+mkdir -p "$VERSIONS_DIRECTORY" || fail "could not create $VERSIONS_DIRECTORY."
 if [ -e "$INSTALL_PATH" ] && [ ! -f "$INSTALL_PATH" ]; then
     fail "$INSTALL_PATH exists and is not a regular file."
 fi
 
-STAGED_EXECUTABLE=$(mktemp "$INSTALL_DIRECTORY/.betterborg.install.XXXXXXXX") || \
-    fail "could not stage the executable in $INSTALL_DIRECTORY."
-cp "$ARTIFACT" "$STAGED_EXECUTABLE" || fail 'could not stage the verified executable.'
-chmod 755 "$STAGED_EXECUTABLE" || fail 'could not make the staged executable runnable.'
+# The bundle keeps its shared libraries beside the executable, so it lives in a
+# versioned directory and $INSTALL_PATH is a symbolic link to its executable.
+STAGED_BUNDLE=$(mktemp -d "$VERSIONS_DIRECTORY/.install.XXXXXXXX") || \
+    fail "could not stage the bundle in $VERSIONS_DIRECTORY."
+tar -xzf "$ARTIFACT" -C "$STAGED_BUNDLE" || fail 'could not unpack the verified download.'
+STAGED_EXECUTABLE="$STAGED_BUNDLE/betterborg/betterborg"
+[ -f "$STAGED_EXECUTABLE" ] && [ -x "$STAGED_EXECUTABLE" ] || \
+    fail 'the verified download does not contain the betterborg executable.'
 
 if ! STAGED_VERSION=$("$STAGED_EXECUTABLE" version 2>/dev/null); then
     fail 'the verified download could not report its version; nothing was installed.'
@@ -218,15 +230,42 @@ fi
 [ "$STAGED_VERSION" = "betterborg $VERSION" ] || \
     fail "the verified download reported '$STAGED_VERSION', expected 'betterborg $VERSION'; nothing was installed."
 
-mv -f "$STAGED_EXECUTABLE" "$INSTALL_PATH" || \
+# A running betterborg keeps loading files from the bundle it started from, so
+# the bundle the link pointed at survives until the installation after this one.
+PREVIOUS_VERSION_DIRECTORY=
+if [ -L "$INSTALL_PATH" ]; then
+    PREVIOUS_EXECUTABLE=$(readlink "$INSTALL_PATH") || PREVIOUS_EXECUTABLE=
+    case "$PREVIOUS_EXECUTABLE" in
+        "$VERSIONS_DIRECTORY"/*/betterborg)
+            PREVIOUS_VERSION_DIRECTORY=${PREVIOUS_EXECUTABLE%/betterborg}
+            ;;
+    esac
+fi
+
+rm -rf "$VERSION_DIRECTORY" || fail "could not replace $VERSION_DIRECTORY."
+mv "$STAGED_BUNDLE/betterborg" "$VERSION_DIRECTORY" || \
+    fail "could not install $VERSION_DIRECTORY."
+
+STAGED_LINK="$INSTALL_DIRECTORY/.betterborg.install.$$"
+rm -f "$STAGED_LINK"
+ln -s "$VERSION_DIRECTORY/betterborg" "$STAGED_LINK" || \
+    fail "could not stage the link in $INSTALL_DIRECTORY."
+mv -f "$STAGED_LINK" "$INSTALL_PATH" || \
     fail "could not atomically install $INSTALL_PATH."
-STAGED_EXECUTABLE=
+STAGED_LINK=
 
 if ! INSTALLED_VERSION=$("$INSTALL_PATH" version 2>/dev/null); then
     fail "the persistent executable at $INSTALL_PATH failed verification."
 fi
 [ "$INSTALLED_VERSION" = "betterborg $VERSION" ] || \
     fail "the persistent executable at $INSTALL_PATH failed version verification."
+
+for installed_version_directory in "$VERSIONS_DIRECTORY"/*; do
+    [ -d "$installed_version_directory" ] || continue
+    [ "$installed_version_directory" != "$VERSION_DIRECTORY" ] || continue
+    [ "$installed_version_directory" != "$PREVIOUS_VERSION_DIRECTORY" ] || continue
+    rm -rf "$installed_version_directory"
+done
 
 printf 'Installed Betterborg %s at %s.\n' "$VERSION" "$INSTALL_PATH"
 case ":${PATH:-}:" in

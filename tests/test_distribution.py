@@ -288,7 +288,7 @@ multiprocessing.freeze_support = freeze_support
     assert Version(rich_metadata.stdout.strip()).major == 15
 
 
-def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> None:
+def test_binary_bundle_reports_version_and_contains_assets(tmp_path: Path) -> None:
     pyinstaller = Path(sys.executable).with_name(
         "pyinstaller.exe" if os.name == "nt" else "pyinstaller"
     )
@@ -307,7 +307,8 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
         REPOSITORY_ROOT / "betterborg.spec",
         cwd=REPOSITORY_ROOT,
     )
-    binary = output / ("betterborg.exe" if os.name == "nt" else "betterborg")
+    bundle = output / "betterborg"
+    binary = bundle / ("betterborg.exe" if os.name == "nt" else "betterborg")
 
     assert _run(binary, "version").stdout.strip() == f"betterborg {__version__}"
     with LocalHttpServer(
@@ -322,9 +323,11 @@ def test_one_file_binary_reports_version_and_contains_assets(tmp_path: Path) -> 
         )
     assert worker.stdout.strip() == "200 frozen-worker-response"
     assert [request.path for request in server.requests] == ["/frozen-worker"]
-    from PyInstaller.archive.readers import CArchiveReader
-
-    bundled = set(CArchiveReader(str(binary)).toc)
+    bundled = {
+        path.relative_to(bundle / "_internal").as_posix()
+        for path in (bundle / "_internal").rglob("*")
+        if path.is_file()
+    }
     assert all(
         asset in bundled for asset in PACKAGE_ASSETS if not asset.endswith(".py")
     )

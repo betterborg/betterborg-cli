@@ -60,7 +60,7 @@ jobs:
       - name: Build wheel and source distribution
         run: make build
 
-      - name: Build local one-file binary
+      - name: Build local binary bundle
         run: make binary
 
   binary-release-validation:

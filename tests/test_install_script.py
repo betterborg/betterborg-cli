@@ -35,9 +35,13 @@ case "${1:-}" in
     *) exit 9 ;;
 esac
 """
+    bundle = directory / "bundle"
+    bundle.mkdir()
+    _write_tool(bundle / release_artifacts.BUNDLE_NAME, binary)
     for target in release_artifacts.TARGETS:
-        _write_tool(directory / target.filename, binary)
+        release_artifacts.write_archive(bundle, directory / target.filename)
         release_artifacts.write_checksum(directory / target.filename)
+    shutil.rmtree(bundle)
     shutil.copyfile(INSTALLER, directory / release_artifacts.INSTALLER_FILENAME)
     release_artifacts.write_manifest(
         version, directory, directory / "release-manifest.json"
@@ -54,11 +58,13 @@ def _run_installer(
     extra_environment: dict[str, str] | None = None,
     tamper_target: bool = False,
     existing_install: str | None = None,
+    existing_versions: tuple[str, ...] = (),
+    linked_version: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     fixture = tmp_path / "release"
     _fixture_release(fixture, version)
     if tamper_target:
-        (fixture / "betterborg-linux-x86_64").write_text(
+        (fixture / "betterborg-linux-x86_64.tar.gz").write_text(
             "tampered\n", encoding="utf-8"
         )
     tools = tmp_path / "tools"
@@ -69,6 +75,16 @@ def _run_installer(
         installed = home / ".local/bin/betterborg"
         installed.parent.mkdir(parents=True)
         installed.write_text(existing_install, encoding="utf-8")
+    versions = home / ".local/share/betterborg/versions"
+    for existing_version in existing_versions:
+        (versions / existing_version).mkdir(parents=True)
+        (versions / existing_version / "betterborg").write_text(
+            "#!/bin/sh\n", encoding="utf-8"
+        )
+    if linked_version is not None:
+        link = home / ".local/bin/betterborg"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(versions / linked_version / "betterborg")
     temporary = tmp_path / "temporary"
     temporary.mkdir()
     curl_log = tmp_path / "curl.log"
@@ -134,15 +150,15 @@ cp "$RELEASE_FIXTURE/${url##*/}" "$destination"
 @pytest.mark.parametrize(
     ("system", "architecture", "kernel", "target"),
     (
-        ("Linux", "x86_64", "6.8.0", "betterborg-linux-x86_64"),
-        ("Linux", "aarch64", "6.8.0", "betterborg-linux-arm64"),
-        ("Darwin", "amd64", "23.4.0", "betterborg-darwin-x86_64"),
-        ("Darwin", "arm64", "23.4.0", "betterborg-darwin-arm64"),
+        ("Linux", "x86_64", "6.8.0", "betterborg-linux-x86_64.tar.gz"),
+        ("Linux", "aarch64", "6.8.0", "betterborg-linux-arm64.tar.gz"),
+        ("Darwin", "amd64", "23.4.0", "betterborg-darwin-x86_64.tar.gz"),
+        ("Darwin", "arm64", "23.4.0", "betterborg-darwin-arm64.tar.gz"),
         (
             "Linux",
             "x86_64",
             "5.15.153.1-microsoft-standard-WSL2",
-            "betterborg-linux-x86_64",
+            "betterborg-linux-x86_64.tar.gz",
         ),
     ),
 )
@@ -174,7 +190,7 @@ def test_selected_version_uses_only_versioned_manifest_and_assets(
     assert result.returncode == 0, result.stderr
     assert curl_log.read_text(encoding="utf-8").splitlines() == [
         "https://releases.example.test/download/v1.2.3/release-manifest.json",
-        "https://releases.example.test/download/v1.2.3/betterborg-linux-x86_64",
+        "https://releases.example.test/download/v1.2.3/betterborg-linux-x86_64.tar.gz",
     ]
 
 
@@ -184,18 +200,19 @@ def test_install_is_atomic_verified_and_activates_plugins_last(
     result, home, _curl_log, install_log = _run_installer(tmp_path)
 
     installed = home / ".local/bin/betterborg"
+    versions = home / ".local/share/betterborg/versions"
     assert result.returncode == 0, result.stderr
-    assert installed.read_bytes() == (
-        tmp_path / "release/betterborg-linux-x86_64"
-    ).read_bytes()
+    assert installed.is_symlink()
+    assert Path(os.readlink(installed)) == versions / "1.2.3/betterborg"
     assert installed.stat().st_mode & stat.S_IXUSR
     calls = [line.split("|", 2) for line in install_log.read_text().splitlines()]
-    assert calls[0][0].startswith(str(home / ".local/bin/.betterborg.install."))
+    assert calls[0][0].startswith(str(versions / ".install."))
     assert calls[0][1] == "version"
     assert calls[1][0:2] == [str(installed), "version"]
     assert calls[2][0:2] == [str(installed), "plugins install --all"]
     assert calls[2][2].split(":", 1)[0] == str(installed.parent)
     assert not list(installed.parent.glob(".betterborg.install.*"))
+    assert [path.name for path in versions.iterdir()] == ["1.2.3"]
     assert "Add " + str(installed.parent) + " to PATH" in result.stdout
     assert f'export PATH="{installed.parent}:$PATH"' in result.stdout
 
@@ -233,6 +250,61 @@ def test_version_failure_does_not_replace_existing_install(
         line.split("|", 2)[1] for line in install_log.read_text().splitlines()
     ] == ["version"]
     assert not list(installed.parent.glob(".betterborg.install.*"))
+    assert not list((home / ".local/share/betterborg/versions").iterdir())
+
+
+def test_install_replaces_a_one_file_executable_with_the_bundle_link(
+    tmp_path: Path,
+) -> None:
+    result, home, _curl_log, _install_log = _run_installer(
+        tmp_path, existing_install="one-file installation\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (home / ".local/bin/betterborg").is_symlink()
+
+
+def test_upgrade_keeps_only_the_new_and_the_previously_linked_bundle(
+    tmp_path: Path,
+) -> None:
+    result, home, _curl_log, _install_log = _run_installer(
+        tmp_path,
+        existing_versions=("1.0.0", "1.1.0"),
+        linked_version="1.1.0",
+    )
+
+    versions = home / ".local/share/betterborg/versions"
+    assert result.returncode == 0, result.stderr
+    assert sorted(path.name for path in versions.iterdir()) == ["1.1.0", "1.2.3"]
+
+
+def test_reinstalling_the_linked_version_replaces_its_bundle(
+    tmp_path: Path,
+) -> None:
+    result, home, _curl_log, _install_log = _run_installer(
+        tmp_path, existing_versions=("1.2.3",), linked_version="1.2.3"
+    )
+
+    installed = home / ".local/share/betterborg/versions/1.2.3/betterborg"
+    assert result.returncode == 0, result.stderr
+    assert "INSTALL_LOG" in installed.read_text(encoding="utf-8")
+
+
+def test_version_failure_keeps_the_previously_linked_bundle(
+    tmp_path: Path,
+) -> None:
+    result, home, _curl_log, _install_log = _run_installer(
+        tmp_path,
+        extra_environment={"REPORTED_VERSION": "9.9.9"},
+        existing_versions=("1.1.0",),
+        linked_version="1.1.0",
+    )
+
+    versions = home / ".local/share/betterborg/versions"
+    assert result.returncode == 1
+    assert Path(os.readlink(home / ".local/bin/betterborg")) == (
+        versions / "1.1.0/betterborg"
+    )
 
 
 def test_plugin_failure_occurs_after_persistent_install_verification(

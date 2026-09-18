@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build Darwin one-file binary
+      - name: Build Darwin bundle archive
         if: ${{ matrix.family == 'darwin' }}
         env:
           ARTIFACT: ${{ matrix.artifact }}
@@ -84,9 +84,10 @@ jobs:
           make sync
           make binary
           mkdir release
-          mv dist/betterborg "release/$ARTIFACT"
+          python3 scripts/release_artifacts.py archive \
+            dist/betterborg "release/$ARTIFACT.tar.gz"
 
-      - name: Build Linux one-file binary on glibc 2.17
+      - name: Build Linux bundle archive on glibc 2.17
         if: ${{ matrix.family == 'linux' }}
         env:
           ARTIFACT: ${{ matrix.artifact }}
@@ -118,18 +119,21 @@ jobs:
               /tmp/betterborg-build/bin/pip install --no-build-isolation --no-deps .
               /tmp/betterborg-build/bin/pyinstaller \
                 --clean --noconfirm --distpath /tmp/dist betterborg.spec
-              mv /tmp/dist/betterborg "release/$ARTIFACT"
+              "$interpreter" scripts/release_artifacts.py archive \
+                /tmp/dist/betterborg "release/$ARTIFACT.tar.gz"
             '
 
-      - name: Smoke Darwin binary version
+      - name: Smoke Darwin archive version
         if: ${{ matrix.family == 'darwin' }}
         env:
           ARTIFACT: ${{ matrix.artifact }}
           REVIEWED_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          test "$("release/$ARTIFACT" version)" = "betterborg $REVIEWED_VERSION"
+          mkdir smoke
+          tar -xzf "release/$ARTIFACT.tar.gz" -C smoke
+          test "$(smoke/betterborg/betterborg version)" = "betterborg $REVIEWED_VERSION"
 
-      - name: Smoke Linux binary on glibc 2.17
+      - name: Smoke Linux archive on glibc 2.17
         if: ${{ matrix.family == 'linux' }}
         env:
           ARTIFACT: ${{ matrix.artifact }}
@@ -144,13 +148,15 @@ jobs:
             "$MANYLINUX_IMAGE" \
             bash -euxo pipefail -c '
               test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.17"
-              test "$("release/$ARTIFACT" version)" = "betterborg $REVIEWED_VERSION"
+              mkdir /tmp/smoke
+              tar -xzf "release/$ARTIFACT.tar.gz" -C /tmp/smoke
+              test "$(/tmp/smoke/betterborg/betterborg version)" = "betterborg $REVIEWED_VERSION"
             '
 
       - name: Create SHA-256 checksum
         env:
           ARTIFACT: ${{ matrix.artifact }}
-        run: python3 scripts/release_artifacts.py checksum "release/$ARTIFACT"
+        run: python3 scripts/release_artifacts.py checksum "release/$ARTIFACT.tar.gz"
 
       - name: Attest binary and checksum
         if: ${{ inputs.attest }}

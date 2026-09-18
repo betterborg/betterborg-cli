@@ -1,4 +1,4 @@
-"""Create and validate checksums and the standalone binary release manifest."""
+"""Create archives, checksums, and the standalone binary release manifest."""
 
 from __future__ import annotations
 
@@ -6,12 +6,16 @@ import argparse
 import hashlib
 import json
 import sys
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
 SCHEMA_VERSION = 1
 INSTALLER_FILENAME = "install.sh"
+# Every archive holds one directory with this name, and the executable inside
+# it carries the same name.
+BUNDLE_NAME = "betterborg"
 
 
 @dataclass(frozen=True)
@@ -22,10 +26,10 @@ class Target:
 
 
 TARGETS = (
-    Target("betterborg-darwin-arm64", "darwin", "arm64"),
-    Target("betterborg-darwin-x86_64", "darwin", "x86_64"),
-    Target("betterborg-linux-arm64", "linux", "arm64"),
-    Target("betterborg-linux-x86_64", "linux", "x86_64"),
+    Target("betterborg-darwin-arm64.tar.gz", "darwin", "arm64"),
+    Target("betterborg-darwin-x86_64.tar.gz", "darwin", "x86_64"),
+    Target("betterborg-linux-arm64.tar.gz", "linux", "arm64"),
+    Target("betterborg-linux-x86_64.tar.gz", "linux", "x86_64"),
 )
 
 
@@ -47,6 +51,17 @@ def sha256(path: Path) -> str:
     except OSError as error:
         _fail(f"could not read release artifact {path}: {error}")
     return digest.hexdigest()
+
+
+def write_archive(bundle: Path, output: Path) -> None:
+    """Pack one built bundle directory as a release archive."""
+    if not (bundle / BUNDLE_NAME).is_file():
+        _fail(f"bundle has no {BUNDLE_NAME} executable: {bundle}")
+    try:
+        with tarfile.open(output, "w:gz") as archive:
+            archive.add(bundle, arcname=BUNDLE_NAME)
+    except OSError as error:
+        _fail(f"could not write release archive {output}: {error}")
 
 
 def write_checksum(path: Path) -> Path:
@@ -132,6 +147,9 @@ def write_manifest(version: str, directory: Path, output: Path) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    archive = subparsers.add_parser("archive")
+    archive.add_argument("bundle", type=Path)
+    archive.add_argument("output", type=Path)
     checksum = subparsers.add_parser("checksum")
     checksum.add_argument("artifact", type=Path)
     manifest = subparsers.add_parser("manifest")
@@ -144,7 +162,9 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = _parser().parse_args()
     try:
-        if arguments.command == "checksum":
+        if arguments.command == "archive":
+            write_archive(arguments.bundle, arguments.output)
+        elif arguments.command == "checksum":
             write_checksum(arguments.artifact)
         else:
             write_manifest(arguments.version, arguments.directory, arguments.output)

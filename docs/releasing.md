@@ -87,8 +87,9 @@ different commit under the reviewed tag's version.
    digests match. It compares their SHA-256 digests again after any upload.
 4. The PyPI verification gate must succeed before any standalone build starts.
    The reusable build workflow then produces and version-smokes
-   `betterborg-darwin-arm64`, `betterborg-darwin-x86_64`, `betterborg-linux-arm64`, and
-   `betterborg-linux-x86_64`, writes one `.sha256` sidecar per binary, and generates
+   `betterborg-darwin-arm64.tar.gz`, `betterborg-darwin-x86_64.tar.gz`,
+   `betterborg-linux-arm64.tar.gz`, and `betterborg-linux-x86_64.tar.gz`, writes one
+   `.sha256` sidecar per archive, and generates
    `release-manifest.json`, and packages `install.sh` beside them. Each
    protected binary/checksum pair, the manifest, and the installer receives a
    GitHub artifact attestation.
