@@ -11,6 +11,7 @@ const test = require("node:test");
 
 const metadata = require("../package.json");
 const {
+  extractArchive,
   launch,
   reportFailure,
   resolveCli,
@@ -86,10 +87,10 @@ test("packed package includes the readme, license, and attribution notice", () =
 });
 
 test("target mapping accepts only released platforms and architectures", () => {
-  assert.equal(targetFor("darwin", "arm64"), "betterborg-darwin-arm64");
-  assert.equal(targetFor("darwin", "x64"), "betterborg-darwin-x86_64");
-  assert.equal(targetFor("linux", "arm64"), "betterborg-linux-arm64");
-  assert.equal(targetFor("linux", "x64"), "betterborg-linux-x86_64");
+  assert.equal(targetFor("darwin", "arm64"), "betterborg-darwin-arm64.tar.gz");
+  assert.equal(targetFor("darwin", "x64"), "betterborg-darwin-x86_64.tar.gz");
+  assert.equal(targetFor("linux", "arm64"), "betterborg-linux-arm64.tar.gz");
+  assert.equal(targetFor("linux", "x64"), "betterborg-linux-x86_64.tar.gz");
   assert.equal(targetFor("win32", "x64"), null);
   assert.equal(targetFor("linux", "ia32"), null);
 });
@@ -111,7 +112,7 @@ test("only a lone exact version flag is translated", () => {
 
 test("a cached binary must match its exact checksum sidecar", (t) => {
   const directory = temporaryDirectory(t);
-  const target = "betterborg-linux-x86_64";
+  const target = "betterborg-linux-x86_64.tar.gz";
   const binary = path.join(directory, target);
   const checksum = `${binary}.sha256`;
   fs.writeFileSync(binary, "trusted bytes");
@@ -270,10 +271,19 @@ test("POSIX resolution skips its own regular npm shim and falls back to uvx", as
   });
 });
 
-test("resolution downloads and verifies the target into the cache", async (t) => {
+function unpackFixtureBundle(_archivePath, destination) {
+  fs.mkdirSync(path.join(destination, "betterborg", "_internal"), {
+    recursive: true,
+  });
+  fs.writeFileSync(path.join(destination, "betterborg", "betterborg"), "bundle", {
+    mode: 0o600,
+  });
+}
+
+test("resolution downloads, verifies, and unpacks the target into the cache", async (t) => {
   const directory = temporaryDirectory(t);
   const cache = path.join(directory, "cache");
-  const content = Buffer.from("release binary");
+  const content = Buffer.from("release archive");
   const expected = crypto.createHash("sha256").update(content).digest("hex");
   const downloads = [];
   const resolved = await resolveCli("1.2.3", {
@@ -284,27 +294,36 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
       fs.writeFileSync(
         destination,
         url.endsWith(".sha256")
-          ? `${expected}  betterborg-darwin-arm64\n`
+          ? `${expected}  betterborg-darwin-arm64.tar.gz\n`
           : content,
       );
     },
     environment: { PATH: "" },
+    extract: unpackFixtureBundle,
     platform: "darwin",
     randomBytes: () => Buffer.from("12345678"),
   });
 
-  assert.equal(resolved.command, path.join(cache, "betterborg-darwin-arm64"));
+  assert.equal(
+    resolved.command,
+    path.join(cache, "bundle", "betterborg", "betterborg"),
+  );
   assert.equal(resolved.source, "release");
   assert.equal(verifiedBinary(
-    resolved.command,
-    `${resolved.command}.sha256`,
-    "betterborg-darwin-arm64",
+    path.join(cache, "betterborg-darwin-arm64.tar.gz"),
+    path.join(cache, "betterborg-darwin-arm64.tar.gz.sha256"),
+    "betterborg-darwin-arm64.tar.gz",
   ), true);
   assert.deepEqual(downloads.map((url) => url.split("/").at(-1)), [
-    "betterborg-darwin-arm64",
-    "betterborg-darwin-arm64.sha256",
+    "betterborg-darwin-arm64.tar.gz",
+    "betterborg-darwin-arm64.tar.gz.sha256",
   ]);
   assertExecutableMode(resolved.command);
+  assert.deepEqual(fs.readdirSync(cache).sort(), [
+    "betterborg-darwin-arm64.tar.gz",
+    "betterborg-darwin-arm64.tar.gz.sha256",
+    "bundle",
+  ]);
 
   fs.chmodSync(resolved.command, 0o600);
   const reused = await resolveCli("1.2.3", {
@@ -314,11 +333,102 @@ test("resolution downloads and verifies the target into the cache", async (t) =>
       assert.fail("a verified cache entry must not be downloaded again");
     },
     environment: { PATH: "" },
+    extract: () => {
+      assert.fail("a verified cache entry must not be unpacked again");
+    },
     platform: "darwin",
   });
   assert.equal(reused.command, resolved.command);
   assertExecutableMode(reused.command);
 });
+
+test("a verified archive without its unpacked bundle is installed again", async (t) => {
+  const directory = temporaryDirectory(t);
+  const cache = path.join(directory, "cache");
+  const content = Buffer.from("release archive");
+  const expected = crypto.createHash("sha256").update(content).digest("hex");
+  const options = {
+    architecture: "arm64",
+    cacheDirectory: cache,
+    download: async (url, destination) => {
+      fs.writeFileSync(
+        destination,
+        url.endsWith(".sha256")
+          ? `${expected}  betterborg-darwin-arm64.tar.gz\n`
+          : content,
+      );
+    },
+    environment: { PATH: "" },
+    extract: unpackFixtureBundle,
+    platform: "darwin",
+  };
+  const first = await resolveCli("1.2.3", options);
+  fs.rmSync(path.join(cache, "bundle"), { recursive: true });
+
+  const second = await resolveCli("1.2.3", options);
+
+  assert.equal(second.command, first.command);
+  assert.equal(fs.existsSync(second.command), true);
+});
+
+test("an archive without the executable is rejected and leaves no cache entry", async (t) => {
+  const directory = temporaryDirectory(t);
+  const cache = path.join(directory, "cache");
+  const content = Buffer.from("release archive");
+  const expected = crypto.createHash("sha256").update(content).digest("hex");
+
+  await assert.rejects(
+    resolveCli("1.2.3", {
+      architecture: "arm64",
+      cacheDirectory: cache,
+      download: async (url, destination) => {
+        fs.writeFileSync(
+          destination,
+          url.endsWith(".sha256")
+            ? `${expected}  betterborg-darwin-arm64.tar.gz\n`
+            : content,
+        );
+      },
+      environment: { PATH: "" },
+      extract: () => {},
+      platform: "darwin",
+    }),
+    /does not contain the betterborg executable/,
+  );
+  assert.deepEqual(fs.readdirSync(cache), []);
+});
+
+test(
+  "the default extractor unpacks a gzip tar archive",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const directory = temporaryDirectory(t);
+    const source = path.join(directory, "source", "betterborg");
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "betterborg"), "bundle", { mode: 0o755 });
+    const archive = path.join(directory, "bundle.tar.gz");
+    childProcess.execFileSync("tar", [
+      "-czf",
+      archive,
+      "-C",
+      path.join(directory, "source"),
+      "betterborg",
+    ]);
+    const destination = path.join(directory, "destination");
+    fs.mkdirSync(destination);
+
+    extractArchive(archive, destination);
+
+    assert.equal(
+      fs.readFileSync(path.join(destination, "betterborg", "betterborg"), "utf8"),
+      "bundle",
+    );
+    assert.throws(
+      () => extractArchive(path.join(directory, "missing.tar.gz"), destination),
+      /could not unpack missing\.tar\.gz/,
+    );
+  },
+);
 
 test(
   "a failed release verification falls back to uvx with an exact version",

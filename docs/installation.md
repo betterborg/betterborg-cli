@@ -40,10 +40,18 @@ curl -fsSL \
   | sh
 ```
 
-The installer selects ARM64 or x86_64 from the release manifest, verifies the
-binary's SHA-256 digest and exact version before atomically replacing
-`~/.local/bin/betterborg`, and only then runs `betterborg plugins install --all`. It prints
-PATH guidance when `~/.local/bin` is not already visible.
+The installer selects ARM64 or x86_64 from the release manifest and verifies
+the archive's SHA-256 digest and exact version. It unpacks the release to
+`~/.local/share/betterborg/versions/<version>`, atomically points the
+`~/.local/bin/betterborg` link at it, and only then runs
+`betterborg plugins install --all`. It prints PATH guidance when `~/.local/bin` is not
+already visible.
+
+The release is a directory, not a single file, because its shared libraries
+need stable paths to start quickly on macOS. An upgrade keeps the version it
+replaces, so a `betterborg` that is still running keeps working, and removes any
+older ones. To uninstall, delete `~/.local/bin/betterborg` and
+`~/.local/share/betterborg`.
 
 ## Ephemeral wrappers
 

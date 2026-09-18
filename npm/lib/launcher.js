@@ -18,7 +18,7 @@ function targetFor(platform, architecture) {
   if (!operatingSystem || !targetArchitecture) {
     return null;
   }
-  return `betterborg-${operatingSystem}-${targetArchitecture}`;
+  return `betterborg-${operatingSystem}-${targetArchitecture}.tar.gz`;
 }
 
 function translateVersionArguments(arguments_) {
@@ -219,6 +219,18 @@ async function downloadToFile(url, destination) {
   fs.writeFileSync(destination, content, { flag: "wx" });
 }
 
+function extractArchive(archivePath, destination) {
+  const completed = spawnSync("tar", ["-xzf", archivePath, "-C", destination], {
+    stdio: "ignore",
+  });
+  if (completed.error || completed.status !== 0) {
+    const reason = completed.error
+      ? completed.error.message
+      : `tar exited with status ${completed.status}`;
+    throw new Error(`could not unpack ${path.basename(archivePath)}: ${reason}`);
+  }
+}
+
 function defaultCacheDirectory(version, dependencies) {
   const root = dependencies.environment.XDG_CACHE_HOME
     ? dependencies.pathModule.resolve(dependencies.environment.XDG_CACHE_HOME)
@@ -229,29 +241,38 @@ function defaultCacheDirectory(version, dependencies) {
 async function cachedRelease(version, target, dependencies) {
   const directory =
     dependencies.cacheDirectory || defaultCacheDirectory(version, dependencies);
-  const binaryPath = dependencies.pathModule.join(directory, target);
+  const archivePath = dependencies.pathModule.join(directory, target);
   const checksumPath = dependencies.pathModule.join(directory, `${target}.sha256`);
+  // The archive holds a betterborg directory whose executable has the same name.
+  const bundleDirectory = dependencies.pathModule.join(directory, "bundle");
+  const executablePath = dependencies.pathModule.join(
+    bundleDirectory,
+    "betterborg",
+    "betterborg",
+  );
   if (
-    verifiedBinary(binaryPath, checksumPath, target, dependencies.fileSystem)
+    verifiedBinary(archivePath, checksumPath, target, dependencies.fileSystem) &&
+    dependencies.fileSystem.existsSync(executablePath)
   ) {
-    dependencies.fileSystem.chmodSync(binaryPath, 0o755);
-    return binaryPath;
+    dependencies.fileSystem.chmodSync(executablePath, 0o755);
+    return executablePath;
   }
 
   dependencies.fileSystem.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const nonce = dependencies.randomBytes(8).toString("hex");
-  const temporaryBinary = `${binaryPath}.${nonce}.tmp`;
+  const temporaryArchive = `${archivePath}.${nonce}.tmp`;
   const temporaryChecksum = `${checksumPath}.${nonce}.tmp`;
+  const temporaryBundle = `${bundleDirectory}.${nonce}.tmp`;
   const releaseRoot = `https://github.com/${REPOSITORY}/releases/download/v${version}`;
   try {
-    await dependencies.download(`${releaseRoot}/${target}`, temporaryBinary);
+    await dependencies.download(`${releaseRoot}/${target}`, temporaryArchive);
     await dependencies.download(
       `${releaseRoot}/${target}.sha256`,
       temporaryChecksum,
     );
     if (
       !verifiedBinary(
-        temporaryBinary,
+        temporaryArchive,
         temporaryChecksum,
         target,
         dependencies.fileSystem,
@@ -259,13 +280,33 @@ async function cachedRelease(version, target, dependencies) {
     ) {
       throw new Error(`downloaded ${target} failed SHA-256 verification`);
     }
-    dependencies.fileSystem.chmodSync(temporaryBinary, 0o755);
-    dependencies.fileSystem.renameSync(temporaryBinary, binaryPath);
+    dependencies.fileSystem.mkdirSync(temporaryBundle, { mode: 0o700 });
+    dependencies.extract(temporaryArchive, temporaryBundle);
+    const unpackedExecutable = dependencies.pathModule.join(
+      temporaryBundle,
+      "betterborg",
+      "betterborg",
+    );
+    if (!dependencies.fileSystem.existsSync(unpackedExecutable)) {
+      throw new Error(`${target} does not contain the betterborg executable`);
+    }
+    dependencies.fileSystem.chmodSync(unpackedExecutable, 0o755);
+    // The checksum moves last: a cache entry counts only once it is complete.
+    dependencies.fileSystem.rmSync(bundleDirectory, {
+      recursive: true,
+      force: true,
+    });
+    dependencies.fileSystem.renameSync(temporaryBundle, bundleDirectory);
+    dependencies.fileSystem.renameSync(temporaryArchive, archivePath);
     dependencies.fileSystem.renameSync(temporaryChecksum, checksumPath);
-    return binaryPath;
+    return executablePath;
   } finally {
-    dependencies.fileSystem.rmSync(temporaryBinary, { force: true });
+    dependencies.fileSystem.rmSync(temporaryArchive, { force: true });
     dependencies.fileSystem.rmSync(temporaryChecksum, { force: true });
+    dependencies.fileSystem.rmSync(temporaryBundle, {
+      recursive: true,
+      force: true,
+    });
   }
 }
 
@@ -279,6 +320,7 @@ function withDefaults(overrides = {}) {
   return {
     cacheDirectory: null,
     download: downloadToFile,
+    extract: extractArchive,
     environment: process.env,
     fileSystem: fs,
     homeDirectory: os.homedir(),
@@ -411,6 +453,7 @@ function reportFailure(error, dependencies = {}) {
 
 module.exports = {
   cachedRelease,
+  extractArchive,
   launch,
   main,
   reportFailure,
